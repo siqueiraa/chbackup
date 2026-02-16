@@ -1,0 +1,64 @@
+# =============================================================================
+# docker-compose.test.yml — Integration test environment
+# =============================================================================
+# Runs Altinity ClickHouse + chbackup against real S3.
+#
+# Required env vars:
+#   S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY
+#
+# Optional env vars:
+#   S3_REGION      (default: us-east-1)
+#   S3_PATH        (default: chbackup-test/${CH_VERSION}/${RUN_ID:-local})
+#   CH_VERSION     (default: 25.3.8.10041.altinitystable)
+#   LOG_LEVEL      (default: debug)
+#   TEST_FILTER    (default: empty, runs all tests)
+#   RUN_ID         (default: local)
+#
+# Usage:
+#   export S3_BUCKET=my-bucket S3_ACCESS_KEY=xxx S3_SECRET_KEY=xxx
+#   docker compose -f docker-compose.test.yml up -d --build
+#   docker compose -f docker-compose.test.yml exec chbackup-test /test/run_tests.sh
+#   docker compose -f docker-compose.test.yml down -v
+# =============================================================================
+
+services:
+  zookeeper:
+    image: zookeeper:3.8
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  chbackup-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      args:
+        CH_VERSION: ${CH_VERSION:-25.3.8.10041.altinitystable}
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+      - "7171:7171"
+    environment:
+      # S3 credentials (required)
+      S3_BUCKET: ${S3_BUCKET:?S3_BUCKET is required}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is required}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY is required}
+      S3_PREFIX: ${S3_PATH:-chbackup-test/${CH_VERSION:-25.3.8.10041.altinitystable}/${RUN_ID:-local}}
+      # chbackup settings
+      CHBACKUP_CONFIG: /etc/chbackup/config.yml
+      LOG_LEVEL: ${LOG_LEVEL:-debug}
+      # Test runner settings
+      TEST_FILTER: ${TEST_FILTER:-}
+      RUN_ID: ${RUN_ID:-local}
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client -q 'SELECT 1'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30

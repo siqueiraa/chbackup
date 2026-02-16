@@ -1,0 +1,26 @@
+<!--
+  ClickHouse config overlay for integration tests.
+  Mounted into /etc/clickhouse-server/config.d/test.xml
+-->
+<clickhouse>
+    <!-- ZooKeeper connection for ReplicatedMergeTree tables -->
+    <zookeeper>
+        <node>
+            <host>zookeeper</host>
+            <port>2181</port>
+        </node>
+        <session_timeout_ms>30000</session_timeout_ms>
+    </zookeeper>
+
+    <!-- Default replica macros for ReplicatedMergeTree -->
+    <macros>
+        <shard>01</shard>
+        <replica>replica01</replica>
+    </macros>
+
+    <!-- Listen on all interfaces (container networking) -->
+    <listen_host>0.0.0.0</listen_host>
+
+    <!-- Reduce memory for test environment -->
+    <max_server_memory_usage_to_ram_ratio>0.5</max_server_memory_usage_to_ram_ratio>
+</clickhouse>

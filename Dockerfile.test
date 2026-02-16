@@ -1,0 +1,39 @@
+# =============================================================================
+# Dockerfile.test — All-in-one integration test container
+# =============================================================================
+# Altinity ClickHouse server + pre-built chbackup static binary.
+# Used by docker-compose.test.yml for integration tests against real S3.
+#
+# Build context expects:
+#   target/x86_64-unknown-linux-musl/release/chbackup  (static binary)
+#   test/configs/                                       (config overlays)
+#   test/fixtures/                                      (SQL fixtures)
+#   test/run_tests.sh                                   (test entrypoint)
+# =============================================================================
+
+ARG CH_VERSION=25.3.8.10041.altinitystable
+FROM altinity/clickhouse-server:${CH_VERSION}
+
+# Install test dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    jq \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built static chbackup binary
+COPY target/x86_64-unknown-linux-musl/release/chbackup /usr/local/bin/chbackup
+RUN chmod +x /usr/local/bin/chbackup
+
+# Copy test configs
+COPY test/configs/clickhouse-config.xml /etc/clickhouse-server/config.d/test.xml
+COPY test/configs/chbackup-test.yml /etc/chbackup/config.yml
+
+# Copy test fixtures and runner
+COPY test/fixtures/ /test/fixtures/
+COPY test/run_tests.sh /test/run_tests.sh
+RUN chmod +x /test/run_tests.sh
+
+# ClickHouse HTTP, native protocol, chbackup API
+EXPOSE 8123 9000 7171

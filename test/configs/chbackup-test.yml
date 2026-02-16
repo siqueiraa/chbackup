@@ -1,0 +1,47 @@
+# =============================================================================
+# chbackup test configuration
+# =============================================================================
+# Minimal config for integration tests. S3 credentials are injected via
+# environment variables: S3_BUCKET, S3_REGION, S3_ACCESS_KEY, S3_SECRET_KEY,
+# S3_PREFIX.
+# =============================================================================
+
+general:
+  log_level: debug
+  log_format: text
+  upload_concurrency: 2
+  download_concurrency: 2
+  backups_to_keep_local: 0
+  backups_to_keep_remote: 0
+  retries_on_failure: 3
+  retries_pause: 2s
+
+clickhouse:
+  host: localhost
+  port: 9000
+  username: default
+  password: ''
+  data_path: /var/lib/clickhouse
+  config_dir: /etc/clickhouse-server
+  sync_replicated_tables: true
+  log_sql_queries: true
+  timeout: 2m
+
+s3:
+  # Injected via env vars: S3_BUCKET, S3_REGION, S3_ACCESS_KEY, S3_SECRET_KEY
+  bucket: ''
+  region: us-east-1
+  # Injected via env var: S3_PREFIX
+  prefix: chbackup-test
+  storage_class: STANDARD
+  debug: false
+
+backup:
+  tables: '*.*'
+  allow_empty_backups: false
+  compression: lz4
+  compression_level: 1
+
+api:
+  listen: 0.0.0.0:7171
+  enable_metrics: true
