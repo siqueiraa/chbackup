@@ -1,0 +1,271 @@
+# =============================================================================
+# chbackup configuration
+# =============================================================================
+#
+# This file shows all configuration parameters with their default values.
+# Place this at /etc/chbackup/config.yml or specify with -c/--config flag.
+#
+# Environment variables can override values (e.g., S3_BUCKET, CLICKHOUSE_HOST).
+# CLI --env flags take highest priority: --env s3.bucket=my-bucket
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# General settings: logging, concurrency, retry behavior, progress tracking.
+# These control global behavior across all commands.
+# -----------------------------------------------------------------------------
+general:
+  # Log level: debug | info | warning | error
+  log_level: info
+  # Log format: text (human-readable, default) | json (structured, for Loki/ELK)
+  log_format: text
+  # Disable progress bar (auto-disabled when stdout is not a TTY)
+  disable_progress_bar: false
+  # Local backup retention: 0 = unlimited, -1 = delete local after upload
+  backups_to_keep_local: 0
+  # Remote backup retention: after upload, delete oldest exceeding this count
+  backups_to_keep_remote: 7
+  # Parallel part uploads (auto-tuned: round(sqrt(CPU/2)))
+  upload_concurrency: 4
+  # Parallel part downloads
+  download_concurrency: 4
+  # Upload rate limit per part: 0 = no throttle (bytes/sec)
+  upload_max_bytes_per_second: 0
+  # Download rate limit per part: 0 = no throttle (bytes/sec)
+  download_max_bytes_per_second: 0
+  # Concurrent server-side copy operations for object disks
+  object_disk_server_side_copy_concurrency: 32
+  # Retry count for upload/download failures
+  retries_on_failure: 3
+  # Wait duration between retries
+  retries_pause: 5s
+  # Percent jitter on retries_pause (avoids thundering herd)
+  retries_jitter: 30
+  # Track progress in state files for --resume
+  use_resumable_state: true
+
+# -----------------------------------------------------------------------------
+# ClickHouse connection and behavior settings.
+# Controls how chbackup connects to ClickHouse and manages backup/restore ops.
+# Must run on the same host as ClickHouse (FREEZE creates hardlinks).
+# -----------------------------------------------------------------------------
+clickhouse:
+  # ClickHouse hostname
+  host: localhost
+  # ClickHouse native protocol port (HTTP port is typically 8123)
+  port: 9000
+  # ClickHouse username
+  username: default
+  # ClickHouse password (env: CLICKHOUSE_PASSWORD)
+  password: ''
+  # Path to ClickHouse data directory (for hardlinks during FREEZE)
+  data_path: /var/lib/clickhouse
+  # Path to ClickHouse server config directory
+  config_dir: /etc/clickhouse-server
+  # Use TLS for ClickHouse connection
+  secure: false
+  # Skip TLS certificate verification
+  skip_verify: false
+  # TLS client key file
+  tls_key: ''
+  # TLS client certificate file
+  tls_cert: ''
+  # TLS custom CA file
+  tls_ca: ''
+  # Run SYSTEM SYNC REPLICA before FREEZE
+  sync_replicated_tables: true
+  # Wait for replication queue before ATTACH
+  check_replicas_before_attach: true
+  # Validate column type consistency before backup
+  check_parts_columns: false
+  # Timeout for waiting on mutations to complete
+  mutation_wait_timeout: 5m
+  # Use DETACH/ATTACH TABLE mode for full restores
+  restore_as_attach: false
+  # Execute DDL with ON CLUSTER clause (cluster name, empty = disabled)
+  restore_schema_on_cluster: ''
+  # Rewrite Distributed engine cluster references during restore
+  restore_distributed_cluster: ''
+  # Concurrent restore table operations
+  max_connections: 1
+  # Log SQL queries at info level (false = debug level)
+  log_sql_queries: true
+  # Skip tables dropped during backup (CH error 60/81)
+  ignore_not_exists_error_during_freeze: true
+  # Freeze individual parts instead of whole table
+  freeze_by_part: false
+  # WHERE clause for part filtering when freeze_by_part: true
+  freeze_by_part_where: ''
+  # Backup pending mutations from system.mutations
+  backup_mutations: true
+  # Command to run after --rbac or --configs restore
+  restart_command: exec:systemctl restart clickhouse-server
+  # Verbose ClickHouse client debug logging
+  debug: false
+  # Always include RBAC objects in backup
+  rbac_backup_always: false
+  # Always include CH config files in backup
+  config_backup_always: false
+  # Always include named collections in backup
+  named_collections_backup_always: false
+  # On RBAC restore conflict: recreate | ignore | fail
+  rbac_resolve_conflicts: recreate
+  # Glob patterns for tables to exclude from backup
+  skip_tables:
+    - system.*
+    - INFORMATION_SCHEMA.*
+    - information_schema.*
+  # Engine names to exclude (e.g., Kafka, S3Queue)
+  skip_table_engines: []
+  # Disk names to exclude from backup
+  skip_disks: []
+  # Disk types to exclude (e.g., cache, local)
+  skip_disk_types: []
+  # Default ZooKeeper replica path template
+  default_replica_path: /clickhouse/tables/{shard}/{database}/{table}
+  # Default replica name template
+  default_replica_name: '{replica}'
+  # ClickHouse query timeout
+  timeout: 5m
+
+# -----------------------------------------------------------------------------
+# S3 storage settings.
+# chbackup is S3-only: no GCS, Azure, or local-only backup mode.
+# Supports MinIO, Ceph, R2, and other S3-compatible stores via endpoint.
+# -----------------------------------------------------------------------------
+s3:
+  # S3 bucket name (env: S3_BUCKET)
+  bucket: my-backup-bucket
+  # AWS region (env: S3_REGION)
+  region: us-east-1
+  # Custom endpoint URL for MinIO, R2, etc. (env: S3_ENDPOINT)
+  endpoint: ''
+  # S3 key prefix; supports {macro} expansion from system.macros
+  prefix: chbackup
+  # AWS access key ID (env: S3_ACCESS_KEY)
+  access_key: ''
+  # AWS secret access key (env: S3_SECRET_KEY)
+  secret_key: ''
+  # AWS IAM role to assume (env: S3_ASSUME_ROLE_ARN)
+  assume_role_arn: ''
+  # Use path-style addressing (required for MinIO, Ceph)
+  force_path_style: false
+  # Disable SSL for local S3-compatible stores
+  disable_ssl: false
+  # Skip S3 TLS certificate verification
+  disable_cert_verification: false
+  # S3 ACL: private, bucket-owner-full-control, or empty to disable
+  acl: ''
+  # S3 storage class
+  storage_class: STANDARD
+  # Server-side encryption: AES256 | aws:kms | empty
+  sse: ''
+  # KMS key ID for aws:kms encryption
+  sse_kms_key_id: ''
+  # Maximum number of parts for multipart upload
+  max_parts_count: 10000
+  # Multipart chunk size in bytes (0 = auto: remote_size / max_parts_count)
+  chunk_size: 0
+  # S3 SDK internal concurrency per upload
+  concurrency: 1
+  # Separate S3 prefix for object disk backup data
+  object_disk_path: ''
+  # If CopyObject fails, fallback to streaming download+reupload
+  allow_object_disk_streaming: false
+  # Verbose S3 SDK request/response logging
+  debug: false
+
+# -----------------------------------------------------------------------------
+# Backup operation settings.
+# Controls compression, concurrency, and retry behavior for backup operations.
+# These apply specifically to the create/upload/download data pipeline.
+# -----------------------------------------------------------------------------
+backup:
+  # Default table filter pattern (globs: db.*, *.table)
+  tables: '*.*'
+  # Allow creating empty backup when no tables match filter
+  allow_empty_backups: false
+  # Compression algorithm: lz4 | zstd | gzip | none
+  compression: lz4
+  # Compression level (algorithm-dependent)
+  compression_level: 1
+  # Parallel part uploads for backup operations
+  upload_concurrency: 4
+  # Parallel part downloads for backup operations
+  download_concurrency: 4
+  # Concurrent object disk copy operations
+  object_disk_copy_concurrency: 8
+  # Upload rate limit: 0 = unlimited (bytes/sec)
+  upload_max_bytes_per_second: 0
+  # Download rate limit: 0 = unlimited (bytes/sec)
+  download_max_bytes_per_second: 0
+  # Retry count for upload/download failures
+  retries_on_failure: 5
+  # Duration between retries
+  retries_duration: 10s
+  # Randomize retry delay by +/- this fraction (e.g., 0.1 = 10%)
+  retries_jitter: 0.1
+  # Projection patterns to skip (e.g., db.table:proj_name)
+  skip_projections: []
+
+# -----------------------------------------------------------------------------
+# Retention policy (separate from general retention counters).
+# Applied after backup/upload operations.
+# -----------------------------------------------------------------------------
+retention:
+  # Local backup retention: 0 = unlimited, -1 = delete local after upload
+  backups_to_keep_local: 0
+  # Remote backup retention: 0 = unlimited
+  backups_to_keep_remote: 0
+
+# -----------------------------------------------------------------------------
+# Watch mode settings.
+# Scheduled backup loop that runs incremental + periodic full backups.
+# Activated via `chbackup watch` or `chbackup server --watch`.
+# -----------------------------------------------------------------------------
+watch:
+  # Enable watch loop in server mode
+  enabled: false
+  # Interval between incremental backup checks
+  watch_interval: 1h
+  # Interval between full backups (must be > watch_interval)
+  full_interval: 24h
+  # Backup name template ({shard}, {type}, {time} macros)
+  name_template: shard{shard}-{type}-{time:%Y%m%d_%H%M%S}
+  # Abort after N consecutive failures
+  max_consecutive_errors: 5
+  # Wait duration before retrying after error
+  retry_interval: 5m
+  # Clean local backup after successful upload
+  delete_local_after_upload: true
+
+# -----------------------------------------------------------------------------
+# API server settings (for Kubernetes integration).
+# Activated via `chbackup server`. Provides REST API + Prometheus metrics.
+# -----------------------------------------------------------------------------
+api:
+  # Listen address for the API server
+  listen: localhost:7171
+  # Enable Prometheus /metrics endpoint
+  enable_metrics: true
+  # Create system.backup_list and system.backup_actions URL tables in ClickHouse
+  create_integration_tables: true
+  # DNS name for URL engine (default: localhost)
+  integration_tables_host: ''
+  # Basic auth username (empty = no auth)
+  username: ''
+  # Basic auth password
+  password: ''
+  # Use TLS for API endpoint
+  secure: false
+  # TLS certificate file
+  certificate_file: ''
+  # TLS private key file
+  private_key_file: ''
+  # TLS CA cert file
+  ca_cert_file: ''
+  # Allow concurrent operations on different backup names
+  allow_parallel: false
+  # Auto-resume interrupted upload/download on server startup
+  complete_resumable_after_restart: true
+  # If watch loop dies unexpectedly, exit the server process
+  watch_is_main_process: false
