@@ -1,6 +1,13 @@
+pub mod backup;
 pub mod clickhouse;
 pub mod config;
+pub mod download;
 pub mod error;
+pub mod list;
 pub mod lock;
 pub mod logging;
+pub mod manifest;
+pub mod restore;
 pub mod storage;
+pub mod table_filter;
+pub mod upload;

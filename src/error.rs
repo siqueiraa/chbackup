@@ -15,6 +15,15 @@ pub enum ChBackupError {
     #[error("Lock error: {0}")]
     LockError(String),
 
+    #[error("Backup error: {0}")]
+    BackupError(String),
+
+    #[error("Restore error: {0}")]
+    RestoreError(String),
+
+    #[error("Manifest error: {0}")]
+    ManifestError(String),
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 }
