@@ -1,15 +1,18 @@
 mod cli;
 
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Result};
+use chrono::Utc;
 use chbackup::clickhouse::ChClient;
 use chbackup::config::Config;
 use chbackup::lock::{lock_for_command, lock_path_for_scope, PidLock};
 use chbackup::logging;
 use chbackup::storage::S3Client;
+use chbackup::{backup, download, list, restore, upload};
 use clap::Parser;
 use cli::{Cli, Command};
-use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Extract the command name (as used by [`lock_for_command`]) from a [`Command`].
 fn command_name(cmd: &Command) -> &'static str {
@@ -111,62 +114,230 @@ async fn main() -> Result<()> {
 
     // 4. Execute command.
     match cli.command {
-        Command::Create { backup_name, .. } => {
-            info!(backup_name = ?backup_name, "create: not implemented yet");
-        }
-        Command::Upload { backup_name, .. } => {
-            info!(backup_name = ?backup_name, "upload: not implemented yet");
-        }
-        Command::Download { backup_name, .. } => {
-            info!(backup_name = ?backup_name, "download: not implemented yet");
-        }
-        Command::Restore { backup_name, .. } => {
-            info!(backup_name = ?backup_name, "restore: not implemented yet");
-        }
-        Command::CreateRemote { backup_name, .. } => {
-            info!(backup_name = ?backup_name, "create_remote: not implemented yet");
-        }
-        Command::RestoreRemote { backup_name, .. } => {
-            info!(backup_name = ?backup_name, "restore_remote: not implemented yet");
-        }
-        Command::List { location } => {
-            info!(location = ?location, "Connecting to ClickHouse");
+        Command::Create {
+            tables,
+            partitions,
+            diff_from,
+            skip_projections,
+            schema,
+            rbac,
+            configs,
+            named_collections,
+            skip_check_parts_columns,
+            resume,
+            backup_name,
+        } => {
+            // Warn about Phase 2+ flags that are not yet implemented
+            if partitions.is_some() {
+                warn!("--partitions flag is not implemented in Phase 1, ignoring");
+            }
+            if diff_from.is_some() {
+                warn!("--diff-from flag is not implemented in Phase 1, ignoring");
+            }
+            if skip_projections.is_some() {
+                warn!("--skip-projections flag is not implemented in Phase 1, ignoring");
+            }
+            if rbac {
+                warn!("--rbac flag is not implemented in Phase 1, ignoring");
+            }
+            if configs {
+                warn!("--configs flag is not implemented in Phase 1, ignoring");
+            }
+            if named_collections {
+                warn!("--named-collections flag is not implemented in Phase 1, ignoring");
+            }
+            if skip_check_parts_columns {
+                warn!("--skip-check-parts-columns flag is not implemented in Phase 1, ignoring");
+            }
+            if resume {
+                warn!("--resume flag is not implemented in Phase 1, ignoring");
+            }
+
+            let name = resolve_backup_name(backup_name);
             let ch = ChClient::new(&config.clickhouse)?;
-            match ch.ping().await {
-                Ok(()) => info!("ClickHouse connection OK"),
-                Err(e) => info!(error = %e, "ClickHouse connection failed"),
+
+            let _manifest = backup::create(
+                &config,
+                &ch,
+                &name,
+                tables.as_deref(),
+                schema,
+            )
+            .await?;
+
+            info!(backup_name = %name, "Create command complete");
+        }
+
+        Command::Upload {
+            delete_local,
+            diff_from_remote,
+            resume,
+            backup_name,
+        } => {
+            if diff_from_remote.is_some() {
+                warn!("--diff-from-remote flag is not implemented in Phase 1, ignoring");
+            }
+            if resume {
+                warn!("--resume flag is not implemented in Phase 1, ignoring");
             }
 
-            info!(location = ?location, "Connecting to S3");
+            let name = backup_name_required(backup_name, "upload")?;
             let s3 = S3Client::new(&config.s3).await?;
-            match s3.ping().await {
-                Ok(()) => info!("S3 connection OK"),
-                Err(e) => info!(error = %e, "S3 connection failed"),
+
+            let backup_dir = PathBuf::from(&config.clickhouse.data_path)
+                .join("backup")
+                .join(&name);
+
+            upload::upload(&config, &s3, &name, &backup_dir, delete_local).await?;
+
+            info!(backup_name = %name, "Upload command complete");
+        }
+
+        Command::Download {
+            hardlink_exists_files,
+            resume,
+            backup_name,
+        } => {
+            if hardlink_exists_files {
+                warn!("--hardlink-exists-files flag is not implemented in Phase 1, ignoring");
+            }
+            if resume {
+                warn!("--resume flag is not implemented in Phase 1, ignoring");
             }
 
-            info!("list: not implemented yet");
+            let name = backup_name_required(backup_name, "download")?;
+            let s3 = S3Client::new(&config.s3).await?;
+
+            let backup_dir = download::download(&config, &s3, &name).await?;
+
+            info!(
+                backup_name = %name,
+                backup_dir = %backup_dir.display(),
+                "Download command complete"
+            );
         }
+
+        Command::Restore {
+            tables,
+            rename_as,
+            database_mapping,
+            partitions,
+            schema,
+            data_only,
+            rm,
+            resume,
+            rbac,
+            configs,
+            named_collections,
+            skip_empty_tables,
+            backup_name,
+        } => {
+            // Warn about Phase 2+ flags
+            if rename_as.is_some() {
+                warn!("--as flag is not implemented in Phase 1, ignoring");
+            }
+            if database_mapping.is_some() {
+                warn!("--database-mapping flag is not implemented in Phase 1, ignoring");
+            }
+            if partitions.is_some() {
+                warn!("--partitions flag is not implemented in Phase 1, ignoring");
+            }
+            if rm {
+                warn!("--rm flag is not implemented in Phase 1, ignoring");
+            }
+            if resume {
+                warn!("--resume flag is not implemented in Phase 1, ignoring");
+            }
+            if rbac {
+                warn!("--rbac flag is not implemented in Phase 1, ignoring");
+            }
+            if configs {
+                warn!("--configs flag is not implemented in Phase 1, ignoring");
+            }
+            if named_collections {
+                warn!("--named-collections flag is not implemented in Phase 1, ignoring");
+            }
+            if skip_empty_tables {
+                warn!("--skip-empty-tables flag is not implemented in Phase 1, ignoring");
+            }
+
+            let name = backup_name_required(backup_name, "restore")?;
+            let ch = ChClient::new(&config.clickhouse)?;
+
+            restore::restore(
+                &config,
+                &ch,
+                &name,
+                tables.as_deref(),
+                schema,
+                data_only,
+            )
+            .await?;
+
+            info!(backup_name = %name, "Restore command complete");
+        }
+
+        Command::CreateRemote { backup_name, .. } => {
+            info!(backup_name = ?backup_name, "create_remote: not implemented in Phase 1");
+        }
+
+        Command::RestoreRemote { backup_name, .. } => {
+            info!(backup_name = ?backup_name, "restore_remote: not implemented in Phase 1");
+        }
+
+        Command::List { location } => {
+            let s3 = S3Client::new(&config.s3).await?;
+            let loc = location.map(map_cli_location);
+
+            list::list(
+                &config.clickhouse.data_path,
+                &s3,
+                loc.as_ref(),
+            )
+            .await?;
+
+            info!("List command complete");
+        }
+
         Command::Tables { .. } => {
-            info!("tables: not implemented yet");
+            info!("tables: not implemented in Phase 1");
         }
+
         Command::Delete {
             location,
             backup_name,
         } => {
-            info!(location = ?location, backup_name = ?backup_name, "delete: not implemented yet");
+            let name = backup_name_required(backup_name, "delete")?;
+            let s3 = S3Client::new(&config.s3).await?;
+            let loc = map_cli_location(location);
+
+            list::delete(
+                &config.clickhouse.data_path,
+                &s3,
+                &loc,
+                &name,
+            )
+            .await?;
+
+            info!(backup_name = %name, "Delete command complete");
         }
+
         Command::Clean { name } => {
-            info!(name = ?name, "clean: not implemented yet");
+            info!(name = ?name, "clean: not implemented in Phase 1");
         }
+
         Command::CleanBroken { location } => {
-            info!(location = ?location, "clean_broken: not implemented yet");
+            info!(location = ?location, "clean_broken: not implemented in Phase 1");
         }
+
         Command::Watch { .. } => {
-            info!("watch: not implemented yet");
+            info!("watch: not implemented in Phase 1");
         }
+
         Command::Server { watch } => {
-            info!(watch = watch, "server: not implemented yet");
+            info!(watch = watch, "server: not implemented in Phase 1");
         }
+
         // default-config and print-config handled above (early return).
         Command::DefaultConfig | Command::PrintConfig => unreachable!(),
     }
@@ -175,4 +346,27 @@ async fn main() -> Result<()> {
     info!(command = cmd_name, "Command complete");
 
     Ok(())
+}
+
+/// Generate a backup name from the current UTC timestamp if none is provided.
+///
+/// Format: `YYYY-MM-DDTHHMMSS` (e.g. `2024-01-15T143052`).
+fn resolve_backup_name(name: Option<String>) -> String {
+    name.unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string())
+}
+
+/// Require a backup name, returning an error if not provided.
+fn backup_name_required(name: Option<String>, command: &str) -> Result<String> {
+    match name {
+        Some(n) => Ok(n),
+        None => bail!("backup_name is required for the '{}' command", command),
+    }
+}
+
+/// Map the CLI `Location` enum to the list module's `Location` enum.
+fn map_cli_location(loc: cli::Location) -> list::Location {
+    match loc {
+        cli::Location::Local => list::Location::Local,
+        cli::Location::Remote => list::Location::Remote,
+    }
 }
