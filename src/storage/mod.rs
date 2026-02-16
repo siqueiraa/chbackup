@@ -1,3 +1,3 @@
 pub mod s3;
 
-pub use s3::S3Client;
+pub use s3::{S3Client, S3Object};

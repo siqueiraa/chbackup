@@ -1,8 +1,19 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::config::Region;
-use tracing::info;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier, ServerSideEncryption};
+use chrono::{DateTime, Utc};
+use tracing::{debug, info};
 
 use crate::config::S3Config;
+
+/// Metadata about an S3 object returned by list operations.
+#[derive(Debug, Clone)]
+pub struct S3Object {
+    pub key: String,
+    pub size: i64,
+    pub last_modified: Option<DateTime<Utc>>,
+}
 
 /// Thin wrapper around `aws_sdk_s3::Client` with config-driven setup.
 ///
@@ -15,6 +26,12 @@ pub struct S3Client {
     bucket: String,
     /// The key prefix from config.
     prefix: String,
+    /// S3 storage class for new objects.
+    storage_class: String,
+    /// Server-side encryption type ("", "AES256", "aws:kms").
+    sse: String,
+    /// KMS key ID for aws:kms encryption.
+    sse_kms_key_id: String,
 }
 
 impl S3Client {
@@ -71,6 +88,9 @@ impl S3Client {
             inner: client,
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone(),
+            storage_class: config.storage_class.clone(),
+            sse: config.sse.clone(),
+            sse_kms_key_id: config.sse_kms_key_id.clone(),
         })
     }
 
@@ -115,10 +135,337 @@ impl S3Client {
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
+
+    // -- Key helpers --
+
+    /// Prepend the configured prefix to a relative key.
+    ///
+    /// If the prefix is empty, returns the key as-is. Otherwise, ensures
+    /// a single `/` separator between prefix and key.
+    pub fn full_key(&self, relative_key: &str) -> String {
+        if self.prefix.is_empty() {
+            return relative_key.to_string();
+        }
+        let prefix = self.prefix.trim_end_matches('/');
+        format!("{}/{}", prefix, relative_key)
+    }
+
+    // -- PUT operations --
+
+    /// Upload an object to S3 with the configured storage class and encryption.
+    ///
+    /// The `key` is relative to the configured prefix (prefix is prepended).
+    pub async fn put_object(&self, key: &str, body: Vec<u8>) -> Result<()> {
+        self.put_object_with_options(key, body, None).await
+    }
+
+    /// Upload an object to S3 with optional content type.
+    ///
+    /// The `key` is relative to the configured prefix (prefix is prepended).
+    pub async fn put_object_with_options(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<()> {
+        let full_key = self.full_key(key);
+        let size = body.len();
+
+        debug!(
+            key = %full_key,
+            size = size,
+            "Uploading object to S3"
+        );
+
+        let mut req = self
+            .inner
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .body(ByteStream::from(body));
+
+        // Apply storage class
+        if !self.storage_class.is_empty() {
+            let sc: aws_sdk_s3::types::StorageClass = self.storage_class.as_str().into();
+            req = req.storage_class(sc);
+        }
+
+        // Apply server-side encryption
+        if self.sse == "aws:kms" {
+            req = req.server_side_encryption(ServerSideEncryption::AwsKms);
+            if !self.sse_kms_key_id.is_empty() {
+                req = req.ssekms_key_id(&self.sse_kms_key_id);
+            }
+        } else if self.sse == "AES256" {
+            req = req.server_side_encryption(ServerSideEncryption::Aes256);
+        }
+
+        // Apply content type
+        if let Some(ct) = content_type {
+            req = req.content_type(ct);
+        }
+
+        req.send()
+            .await
+            .with_context(|| format!("Failed to upload object: {}", full_key))?;
+
+        debug!(key = %full_key, size = size, "Upload complete");
+        Ok(())
+    }
+
+    // -- GET operations --
+
+    /// Download a full object from S3 into memory.
+    ///
+    /// The `key` is relative to the configured prefix (prefix is prepended).
+    pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
+        let full_key = self.full_key(key);
+
+        debug!(key = %full_key, "Downloading object from S3");
+
+        let resp = self
+            .inner
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .send()
+            .await
+            .with_context(|| format!("Failed to download object: {}", full_key))?;
+
+        let body = resp
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("Failed to read body of object: {}", full_key))?;
+
+        let bytes = body.into_bytes().to_vec();
+        debug!(key = %full_key, size = bytes.len(), "Download complete");
+        Ok(bytes)
+    }
+
+    /// Download an object from S3 as a streaming body.
+    ///
+    /// The `key` is relative to the configured prefix (prefix is prepended).
+    pub async fn get_object_stream(&self, key: &str) -> Result<ByteStream> {
+        let full_key = self.full_key(key);
+
+        debug!(key = %full_key, "Getting object stream from S3");
+
+        let resp = self
+            .inner
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .send()
+            .await
+            .with_context(|| format!("Failed to get object stream: {}", full_key))?;
+
+        Ok(resp.body)
+    }
+
+    // -- LIST operations --
+
+    /// List common prefixes (directories) under the given prefix with a delimiter.
+    ///
+    /// The `prefix` is relative to the configured prefix.
+    pub async fn list_common_prefixes(
+        &self,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>> {
+        let full_prefix = self.full_key(prefix);
+        let mut prefixes = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .inner
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&full_prefix)
+                .delimiter(delimiter);
+
+            if let Some(token) = &continuation_token {
+                req = req.continuation_token(token);
+            }
+
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Failed to list prefixes under: {}", full_prefix))?;
+
+            for cp in resp.common_prefixes() {
+                if let Some(p) = cp.prefix() {
+                    prefixes.push(p.to_string());
+                }
+            }
+
+            if resp.is_truncated() == Some(true) {
+                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(prefixes)
+    }
+
+    /// List all objects under the given prefix.
+    ///
+    /// The `prefix` is relative to the configured prefix. Handles pagination.
+    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<S3Object>> {
+        let full_prefix = self.full_key(prefix);
+        let mut objects = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .inner
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&full_prefix);
+
+            if let Some(token) = &continuation_token {
+                req = req.continuation_token(token);
+            }
+
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Failed to list objects under: {}", full_prefix))?;
+
+            for obj in resp.contents() {
+                let key = obj.key().unwrap_or_default().to_string();
+                let size = obj.size().unwrap_or(0);
+                let last_modified = obj.last_modified().and_then(|dt| {
+                    let secs = dt.secs();
+                    DateTime::from_timestamp(secs, dt.subsec_nanos())
+                });
+
+                objects.push(S3Object {
+                    key,
+                    size,
+                    last_modified,
+                });
+            }
+
+            if resp.is_truncated() == Some(true) {
+                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(objects)
+    }
+
+    // -- DELETE operations --
+
+    /// Delete a single object from S3.
+    ///
+    /// The `key` is relative to the configured prefix.
+    pub async fn delete_object(&self, key: &str) -> Result<()> {
+        let full_key = self.full_key(key);
+
+        debug!(key = %full_key, "Deleting object from S3");
+
+        self.inner
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .send()
+            .await
+            .with_context(|| format!("Failed to delete object: {}", full_key))?;
+
+        Ok(())
+    }
+
+    /// Delete multiple objects from S3 in batches of 1000.
+    ///
+    /// The `keys` are relative to the configured prefix.
+    pub async fn delete_objects(&self, keys: Vec<String>) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        // S3 DeleteObjects supports max 1000 objects per request
+        for chunk in keys.chunks(1000) {
+            let identifiers: Vec<ObjectIdentifier> = chunk
+                .iter()
+                .map(|key| {
+                    let full_key = self.full_key(key);
+                    ObjectIdentifier::builder()
+                        .key(full_key)
+                        .build()
+                        .expect("ObjectIdentifier key is required")
+                })
+                .collect();
+
+            let delete = Delete::builder()
+                .set_objects(Some(identifiers))
+                .build()
+                .context("Failed to build Delete request")?;
+
+            debug!(
+                count = chunk.len(),
+                "Batch deleting objects from S3"
+            );
+
+            self.inner
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(delete)
+                .send()
+                .await
+                .context("Failed to batch delete objects")?;
+        }
+
+        Ok(())
+    }
+
+    // -- HEAD operations --
+
+    /// Check if an object exists and return its size.
+    ///
+    /// Returns `Some(size)` if the object exists, `None` if not found.
+    /// The `key` is relative to the configured prefix.
+    pub async fn head_object(&self, key: &str) -> Result<Option<u64>> {
+        let full_key = self.full_key(key);
+
+        debug!(key = %full_key, "Checking object existence in S3");
+
+        match self
+            .inner
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let size = resp.content_length().unwrap_or(0) as u64;
+                Ok(Some(size))
+            }
+            Err(err) => {
+                // Check if it's a 404 Not Found
+                let service_err = err.into_service_error();
+                if service_err.is_not_found() {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to head object {}: {}",
+                        full_key,
+                        service_err
+                    ))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::config::S3Config;
 
     #[test]
@@ -131,7 +478,65 @@ mod tests {
         assert!(config.endpoint.is_empty());
     }
 
-    // NOTE: S3Client::new() is async and requires tokio runtime + real/mocked
-    // AWS credentials. Integration tests will cover actual S3 connectivity.
-    // Here we only verify config defaults compile and look correct.
+    #[test]
+    fn test_full_key_with_prefix() {
+        let client = mock_s3_client("my-bucket", "chbackup");
+        assert_eq!(
+            client.full_key("backup/metadata.json"),
+            "chbackup/backup/metadata.json"
+        );
+    }
+
+    #[test]
+    fn test_full_key_with_trailing_slash_prefix() {
+        let client = mock_s3_client("my-bucket", "chbackup/");
+        assert_eq!(
+            client.full_key("backup/metadata.json"),
+            "chbackup/backup/metadata.json"
+        );
+    }
+
+    #[test]
+    fn test_full_key_empty_prefix() {
+        let client = mock_s3_client("my-bucket", "");
+        assert_eq!(
+            client.full_key("backup/metadata.json"),
+            "backup/metadata.json"
+        );
+    }
+
+    #[test]
+    fn test_full_key_nested_prefix() {
+        let client = mock_s3_client("my-bucket", "prod/region1/chbackup");
+        assert_eq!(
+            client.full_key("daily/metadata.json"),
+            "prod/region1/chbackup/daily/metadata.json"
+        );
+    }
+
+    /// Create a minimal S3Client for unit testing (no real AWS connection).
+    /// Only the bucket/prefix fields are meaningful for key computation tests.
+    fn mock_s3_client(bucket: &str, prefix: &str) -> S3Client {
+        let config = S3Config {
+            bucket: bucket.to_string(),
+            region: "us-east-1".to_string(),
+            ..S3Config::default()
+        };
+
+        // Build a minimal AWS S3 client config (won't make real calls)
+        let s3_config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(Region::new("us-east-1"))
+            .build();
+        let inner = aws_sdk_s3::Client::from_conf(s3_config);
+
+        S3Client {
+            inner,
+            bucket: config.bucket,
+            prefix: prefix.to_string(),
+            storage_class: "STANDARD".to_string(),
+            sse: String::new(),
+            sse_kms_key_id: String::new(),
+        }
+    }
 }
