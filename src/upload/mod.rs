@@ -241,14 +241,6 @@ pub async fn upload(
         })?;
     }
 
-    // DEBUG_MARKER:F007 - verify upload completion
-    info!(
-        target: "debug",
-        "DEBUG_VERIFY:F007 parts={} compressed_size={} backup_name={}",
-        total_parts, total_compressed_size, backup_name
-    );
-    // END_DEBUG_MARKER:F007
-
     Ok(())
 }
 

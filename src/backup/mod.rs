@@ -325,14 +325,6 @@ pub async fn create(
         "Backup created successfully"
     );
 
-    // DEBUG_MARKER:F006 - verify backup creation produces valid manifest
-    info!(
-        target: "debug",
-        "DEBUG_VERIFY:F006 tables={} parts={} backup_name={}",
-        table_count, part_count, backup_name
-    );
-    // END_DEBUG_MARKER:F006
-
     Ok(manifest)
 }
 
