@@ -1,0 +1,47 @@
+[package]
+name = "chbackup"
+version = "0.1.0"
+edition = "2021"
+description = "Drop-in Rust replacement for Altinity/clickhouse-backup"
+license = "MIT"
+
+[[bin]]
+name = "chbackup"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# ClickHouse
+clickhouse = { version = "0.13", features = ["inserter"] }
+
+# S3
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+
+# Compression (future phases)
+lz4_flex = "0.11"
+
+# Directory walks (future phases)
+walkdir = "2"
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
