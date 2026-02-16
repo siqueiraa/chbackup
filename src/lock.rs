@@ -61,9 +61,8 @@ impl PidLock {
             timestamp: Utc::now().to_rfc3339(),
         };
 
-        let json = serde_json::to_string_pretty(&info).map_err(|e| {
-            ChBackupError::LockError(format!("failed to serialize lock info: {e}"))
-        })?;
+        let json = serde_json::to_string_pretty(&info)
+            .map_err(|e| ChBackupError::LockError(format!("failed to serialize lock info: {e}")))?;
 
         // Ensure parent directory exists.
         if let Some(parent) = path.parent() {
@@ -206,7 +205,10 @@ mod tests {
         assert!(result.is_err(), "second acquire on same path should fail");
         let err = result.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("lock held by PID"), "error should mention PID: {msg}");
+        assert!(
+            msg.contains("lock held by PID"),
+            "error should mention PID: {msg}"
+        );
     }
 
     #[test]

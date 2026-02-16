@@ -32,8 +32,7 @@ impl S3Client {
         );
 
         // Start building the AWS SDK config from environment defaults.
-        let mut loader = aws_config::from_env()
-            .region(Region::new(config.region.clone()));
+        let mut loader = aws_config::from_env().region(Region::new(config.region.clone()));
 
         // Set custom endpoint if provided (MinIO, Ceph, R2, etc.).
         if !config.endpoint.is_empty() {
@@ -46,8 +45,8 @@ impl S3Client {
             let credentials = aws_sdk_s3::config::Credentials::new(
                 &config.access_key,
                 &config.secret_key,
-                None,  // session token
-                None,  // expiry
+                None, // session token
+                None, // expiry
                 "chbackup-static",
             );
             loader = loader.credentials_provider(credentials);

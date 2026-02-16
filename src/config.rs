@@ -492,7 +492,8 @@ impl Default for GeneralConfig {
             download_concurrency: default_concurrency_4(),
             upload_max_bytes_per_second: 0,
             download_max_bytes_per_second: 0,
-            object_disk_server_side_copy_concurrency: default_object_disk_server_side_copy_concurrency(),
+            object_disk_server_side_copy_concurrency:
+                default_object_disk_server_side_copy_concurrency(),
             retries_on_failure: default_retries_on_failure_3(),
             retries_pause: default_retries_pause(),
             retries_jitter: default_retries_jitter_30(),
@@ -901,9 +902,9 @@ impl Config {
     /// Supported keys use dot notation: s3.bucket, clickhouse.host, etc.
     fn apply_cli_env_overrides(&mut self, overrides: &[String]) -> Result<()> {
         for kv in overrides {
-            let (key, value) = kv
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("Invalid --env format: '{}'. Expected KEY=VALUE", kv))?;
+            let (key, value) = kv.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("Invalid --env format: '{}'. Expected KEY=VALUE", kv)
+            })?;
 
             self.set_field(key.trim(), value.trim())?;
         }
@@ -916,52 +917,132 @@ impl Config {
             // General
             "general.log_level" => self.general.log_level = value.to_string(),
             "general.log_format" => self.general.log_format = value.to_string(),
-            "general.disable_progress_bar" => self.general.disable_progress_bar = value.parse().context("Invalid bool for general.disable_progress_bar")?,
-            "general.backups_to_keep_local" => self.general.backups_to_keep_local = value.parse().context("Invalid i32 for general.backups_to_keep_local")?,
-            "general.backups_to_keep_remote" => self.general.backups_to_keep_remote = value.parse().context("Invalid i32 for general.backups_to_keep_remote")?,
-            "general.upload_concurrency" => self.general.upload_concurrency = value.parse().context("Invalid u32 for general.upload_concurrency")?,
-            "general.download_concurrency" => self.general.download_concurrency = value.parse().context("Invalid u32 for general.download_concurrency")?,
-            "general.upload_max_bytes_per_second" => self.general.upload_max_bytes_per_second = value.parse().context("Invalid u64")?,
-            "general.download_max_bytes_per_second" => self.general.download_max_bytes_per_second = value.parse().context("Invalid u64")?,
-            "general.object_disk_server_side_copy_concurrency" => self.general.object_disk_server_side_copy_concurrency = value.parse().context("Invalid u32")?,
-            "general.retries_on_failure" => self.general.retries_on_failure = value.parse().context("Invalid u32")?,
+            "general.disable_progress_bar" => {
+                self.general.disable_progress_bar = value
+                    .parse()
+                    .context("Invalid bool for general.disable_progress_bar")?
+            }
+            "general.backups_to_keep_local" => {
+                self.general.backups_to_keep_local = value
+                    .parse()
+                    .context("Invalid i32 for general.backups_to_keep_local")?
+            }
+            "general.backups_to_keep_remote" => {
+                self.general.backups_to_keep_remote = value
+                    .parse()
+                    .context("Invalid i32 for general.backups_to_keep_remote")?
+            }
+            "general.upload_concurrency" => {
+                self.general.upload_concurrency = value
+                    .parse()
+                    .context("Invalid u32 for general.upload_concurrency")?
+            }
+            "general.download_concurrency" => {
+                self.general.download_concurrency = value
+                    .parse()
+                    .context("Invalid u32 for general.download_concurrency")?
+            }
+            "general.upload_max_bytes_per_second" => {
+                self.general.upload_max_bytes_per_second = value.parse().context("Invalid u64")?
+            }
+            "general.download_max_bytes_per_second" => {
+                self.general.download_max_bytes_per_second = value.parse().context("Invalid u64")?
+            }
+            "general.object_disk_server_side_copy_concurrency" => {
+                self.general.object_disk_server_side_copy_concurrency =
+                    value.parse().context("Invalid u32")?
+            }
+            "general.retries_on_failure" => {
+                self.general.retries_on_failure = value.parse().context("Invalid u32")?
+            }
             "general.retries_pause" => self.general.retries_pause = value.to_string(),
-            "general.retries_jitter" => self.general.retries_jitter = value.parse().context("Invalid u32")?,
-            "general.use_resumable_state" => self.general.use_resumable_state = value.parse().context("Invalid bool")?,
+            "general.retries_jitter" => {
+                self.general.retries_jitter = value.parse().context("Invalid u32")?
+            }
+            "general.use_resumable_state" => {
+                self.general.use_resumable_state = value.parse().context("Invalid bool")?
+            }
 
             // ClickHouse
             "clickhouse.host" => self.clickhouse.host = value.to_string(),
-            "clickhouse.port" => self.clickhouse.port = value.parse().context("Invalid u16 for clickhouse.port")?,
+            "clickhouse.port" => {
+                self.clickhouse.port = value.parse().context("Invalid u16 for clickhouse.port")?
+            }
             "clickhouse.username" => self.clickhouse.username = value.to_string(),
             "clickhouse.password" => self.clickhouse.password = value.to_string(),
             "clickhouse.data_path" => self.clickhouse.data_path = value.to_string(),
             "clickhouse.config_dir" => self.clickhouse.config_dir = value.to_string(),
-            "clickhouse.secure" => self.clickhouse.secure = value.parse().context("Invalid bool")?,
-            "clickhouse.skip_verify" => self.clickhouse.skip_verify = value.parse().context("Invalid bool")?,
+            "clickhouse.secure" => {
+                self.clickhouse.secure = value.parse().context("Invalid bool")?
+            }
+            "clickhouse.skip_verify" => {
+                self.clickhouse.skip_verify = value.parse().context("Invalid bool")?
+            }
             "clickhouse.tls_key" => self.clickhouse.tls_key = value.to_string(),
             "clickhouse.tls_cert" => self.clickhouse.tls_cert = value.to_string(),
             "clickhouse.tls_ca" => self.clickhouse.tls_ca = value.to_string(),
-            "clickhouse.sync_replicated_tables" => self.clickhouse.sync_replicated_tables = value.parse().context("Invalid bool")?,
-            "clickhouse.check_replicas_before_attach" => self.clickhouse.check_replicas_before_attach = value.parse().context("Invalid bool")?,
-            "clickhouse.check_parts_columns" => self.clickhouse.check_parts_columns = value.parse().context("Invalid bool")?,
-            "clickhouse.mutation_wait_timeout" => self.clickhouse.mutation_wait_timeout = value.to_string(),
-            "clickhouse.restore_as_attach" => self.clickhouse.restore_as_attach = value.parse().context("Invalid bool")?,
-            "clickhouse.restore_schema_on_cluster" => self.clickhouse.restore_schema_on_cluster = value.to_string(),
-            "clickhouse.restore_distributed_cluster" => self.clickhouse.restore_distributed_cluster = value.to_string(),
-            "clickhouse.max_connections" => self.clickhouse.max_connections = value.parse().context("Invalid u32")?,
-            "clickhouse.log_sql_queries" => self.clickhouse.log_sql_queries = value.parse().context("Invalid bool")?,
-            "clickhouse.ignore_not_exists_error_during_freeze" => self.clickhouse.ignore_not_exists_error_during_freeze = value.parse().context("Invalid bool")?,
-            "clickhouse.freeze_by_part" => self.clickhouse.freeze_by_part = value.parse().context("Invalid bool")?,
-            "clickhouse.freeze_by_part_where" => self.clickhouse.freeze_by_part_where = value.to_string(),
-            "clickhouse.backup_mutations" => self.clickhouse.backup_mutations = value.parse().context("Invalid bool")?,
+            "clickhouse.sync_replicated_tables" => {
+                self.clickhouse.sync_replicated_tables = value.parse().context("Invalid bool")?
+            }
+            "clickhouse.check_replicas_before_attach" => {
+                self.clickhouse.check_replicas_before_attach =
+                    value.parse().context("Invalid bool")?
+            }
+            "clickhouse.check_parts_columns" => {
+                self.clickhouse.check_parts_columns = value.parse().context("Invalid bool")?
+            }
+            "clickhouse.mutation_wait_timeout" => {
+                self.clickhouse.mutation_wait_timeout = value.to_string()
+            }
+            "clickhouse.restore_as_attach" => {
+                self.clickhouse.restore_as_attach = value.parse().context("Invalid bool")?
+            }
+            "clickhouse.restore_schema_on_cluster" => {
+                self.clickhouse.restore_schema_on_cluster = value.to_string()
+            }
+            "clickhouse.restore_distributed_cluster" => {
+                self.clickhouse.restore_distributed_cluster = value.to_string()
+            }
+            "clickhouse.max_connections" => {
+                self.clickhouse.max_connections = value.parse().context("Invalid u32")?
+            }
+            "clickhouse.log_sql_queries" => {
+                self.clickhouse.log_sql_queries = value.parse().context("Invalid bool")?
+            }
+            "clickhouse.ignore_not_exists_error_during_freeze" => {
+                self.clickhouse.ignore_not_exists_error_during_freeze =
+                    value.parse().context("Invalid bool")?
+            }
+            "clickhouse.freeze_by_part" => {
+                self.clickhouse.freeze_by_part = value.parse().context("Invalid bool")?
+            }
+            "clickhouse.freeze_by_part_where" => {
+                self.clickhouse.freeze_by_part_where = value.to_string()
+            }
+            "clickhouse.backup_mutations" => {
+                self.clickhouse.backup_mutations = value.parse().context("Invalid bool")?
+            }
             "clickhouse.restart_command" => self.clickhouse.restart_command = value.to_string(),
             "clickhouse.debug" => self.clickhouse.debug = value.parse().context("Invalid bool")?,
-            "clickhouse.rbac_backup_always" => self.clickhouse.rbac_backup_always = value.parse().context("Invalid bool")?,
-            "clickhouse.config_backup_always" => self.clickhouse.config_backup_always = value.parse().context("Invalid bool")?,
-            "clickhouse.named_collections_backup_always" => self.clickhouse.named_collections_backup_always = value.parse().context("Invalid bool")?,
-            "clickhouse.rbac_resolve_conflicts" => self.clickhouse.rbac_resolve_conflicts = value.to_string(),
-            "clickhouse.default_replica_path" => self.clickhouse.default_replica_path = value.to_string(),
-            "clickhouse.default_replica_name" => self.clickhouse.default_replica_name = value.to_string(),
+            "clickhouse.rbac_backup_always" => {
+                self.clickhouse.rbac_backup_always = value.parse().context("Invalid bool")?
+            }
+            "clickhouse.config_backup_always" => {
+                self.clickhouse.config_backup_always = value.parse().context("Invalid bool")?
+            }
+            "clickhouse.named_collections_backup_always" => {
+                self.clickhouse.named_collections_backup_always =
+                    value.parse().context("Invalid bool")?
+            }
+            "clickhouse.rbac_resolve_conflicts" => {
+                self.clickhouse.rbac_resolve_conflicts = value.to_string()
+            }
+            "clickhouse.default_replica_path" => {
+                self.clickhouse.default_replica_path = value.to_string()
+            }
+            "clickhouse.default_replica_name" => {
+                self.clickhouse.default_replica_name = value.to_string()
+            }
             "clickhouse.timeout" => self.clickhouse.timeout = value.to_string(),
 
             // S3
@@ -972,51 +1053,89 @@ impl Config {
             "s3.access_key" => self.s3.access_key = value.to_string(),
             "s3.secret_key" => self.s3.secret_key = value.to_string(),
             "s3.assume_role_arn" => self.s3.assume_role_arn = value.to_string(),
-            "s3.force_path_style" => self.s3.force_path_style = value.parse().context("Invalid bool")?,
+            "s3.force_path_style" => {
+                self.s3.force_path_style = value.parse().context("Invalid bool")?
+            }
             "s3.disable_ssl" => self.s3.disable_ssl = value.parse().context("Invalid bool")?,
-            "s3.disable_cert_verification" => self.s3.disable_cert_verification = value.parse().context("Invalid bool")?,
+            "s3.disable_cert_verification" => {
+                self.s3.disable_cert_verification = value.parse().context("Invalid bool")?
+            }
             "s3.acl" => self.s3.acl = value.to_string(),
             "s3.storage_class" => self.s3.storage_class = value.to_string(),
             "s3.sse" => self.s3.sse = value.to_string(),
             "s3.sse_kms_key_id" => self.s3.sse_kms_key_id = value.to_string(),
-            "s3.max_parts_count" => self.s3.max_parts_count = value.parse().context("Invalid u32")?,
+            "s3.max_parts_count" => {
+                self.s3.max_parts_count = value.parse().context("Invalid u32")?
+            }
             "s3.chunk_size" => self.s3.chunk_size = value.parse().context("Invalid u64")?,
             "s3.concurrency" => self.s3.concurrency = value.parse().context("Invalid u32")?,
             "s3.object_disk_path" => self.s3.object_disk_path = value.to_string(),
-            "s3.allow_object_disk_streaming" => self.s3.allow_object_disk_streaming = value.parse().context("Invalid bool")?,
+            "s3.allow_object_disk_streaming" => {
+                self.s3.allow_object_disk_streaming = value.parse().context("Invalid bool")?
+            }
             "s3.debug" => self.s3.debug = value.parse().context("Invalid bool")?,
 
             // Backup
             "backup.tables" => self.backup.tables = value.to_string(),
-            "backup.allow_empty_backups" => self.backup.allow_empty_backups = value.parse().context("Invalid bool")?,
+            "backup.allow_empty_backups" => {
+                self.backup.allow_empty_backups = value.parse().context("Invalid bool")?
+            }
             "backup.compression" => self.backup.compression = value.to_string(),
-            "backup.compression_level" => self.backup.compression_level = value.parse().context("Invalid u32")?,
-            "backup.upload_concurrency" => self.backup.upload_concurrency = value.parse().context("Invalid u32")?,
-            "backup.download_concurrency" => self.backup.download_concurrency = value.parse().context("Invalid u32")?,
-            "backup.object_disk_copy_concurrency" => self.backup.object_disk_copy_concurrency = value.parse().context("Invalid u32")?,
-            "backup.upload_max_bytes_per_second" => self.backup.upload_max_bytes_per_second = value.parse().context("Invalid u64")?,
-            "backup.download_max_bytes_per_second" => self.backup.download_max_bytes_per_second = value.parse().context("Invalid u64")?,
-            "backup.retries_on_failure" => self.backup.retries_on_failure = value.parse().context("Invalid u32")?,
+            "backup.compression_level" => {
+                self.backup.compression_level = value.parse().context("Invalid u32")?
+            }
+            "backup.upload_concurrency" => {
+                self.backup.upload_concurrency = value.parse().context("Invalid u32")?
+            }
+            "backup.download_concurrency" => {
+                self.backup.download_concurrency = value.parse().context("Invalid u32")?
+            }
+            "backup.object_disk_copy_concurrency" => {
+                self.backup.object_disk_copy_concurrency = value.parse().context("Invalid u32")?
+            }
+            "backup.upload_max_bytes_per_second" => {
+                self.backup.upload_max_bytes_per_second = value.parse().context("Invalid u64")?
+            }
+            "backup.download_max_bytes_per_second" => {
+                self.backup.download_max_bytes_per_second = value.parse().context("Invalid u64")?
+            }
+            "backup.retries_on_failure" => {
+                self.backup.retries_on_failure = value.parse().context("Invalid u32")?
+            }
             "backup.retries_duration" => self.backup.retries_duration = value.to_string(),
-            "backup.retries_jitter" => self.backup.retries_jitter = value.parse().context("Invalid f64")?,
+            "backup.retries_jitter" => {
+                self.backup.retries_jitter = value.parse().context("Invalid f64")?
+            }
 
             // Retention
-            "retention.backups_to_keep_local" => self.retention.backups_to_keep_local = value.parse().context("Invalid i32")?,
-            "retention.backups_to_keep_remote" => self.retention.backups_to_keep_remote = value.parse().context("Invalid i32")?,
+            "retention.backups_to_keep_local" => {
+                self.retention.backups_to_keep_local = value.parse().context("Invalid i32")?
+            }
+            "retention.backups_to_keep_remote" => {
+                self.retention.backups_to_keep_remote = value.parse().context("Invalid i32")?
+            }
 
             // Watch
             "watch.enabled" => self.watch.enabled = value.parse().context("Invalid bool")?,
             "watch.watch_interval" => self.watch.watch_interval = value.to_string(),
             "watch.full_interval" => self.watch.full_interval = value.to_string(),
             "watch.name_template" => self.watch.name_template = value.to_string(),
-            "watch.max_consecutive_errors" => self.watch.max_consecutive_errors = value.parse().context("Invalid u32")?,
+            "watch.max_consecutive_errors" => {
+                self.watch.max_consecutive_errors = value.parse().context("Invalid u32")?
+            }
             "watch.retry_interval" => self.watch.retry_interval = value.to_string(),
-            "watch.delete_local_after_upload" => self.watch.delete_local_after_upload = value.parse().context("Invalid bool")?,
+            "watch.delete_local_after_upload" => {
+                self.watch.delete_local_after_upload = value.parse().context("Invalid bool")?
+            }
 
             // API
             "api.listen" => self.api.listen = value.to_string(),
-            "api.enable_metrics" => self.api.enable_metrics = value.parse().context("Invalid bool")?,
-            "api.create_integration_tables" => self.api.create_integration_tables = value.parse().context("Invalid bool")?,
+            "api.enable_metrics" => {
+                self.api.enable_metrics = value.parse().context("Invalid bool")?
+            }
+            "api.create_integration_tables" => {
+                self.api.create_integration_tables = value.parse().context("Invalid bool")?
+            }
             "api.integration_tables_host" => self.api.integration_tables_host = value.to_string(),
             "api.username" => self.api.username = value.to_string(),
             "api.password" => self.api.password = value.to_string(),
@@ -1024,9 +1143,15 @@ impl Config {
             "api.certificate_file" => self.api.certificate_file = value.to_string(),
             "api.private_key_file" => self.api.private_key_file = value.to_string(),
             "api.ca_cert_file" => self.api.ca_cert_file = value.to_string(),
-            "api.allow_parallel" => self.api.allow_parallel = value.parse().context("Invalid bool")?,
-            "api.complete_resumable_after_restart" => self.api.complete_resumable_after_restart = value.parse().context("Invalid bool")?,
-            "api.watch_is_main_process" => self.api.watch_is_main_process = value.parse().context("Invalid bool")?,
+            "api.allow_parallel" => {
+                self.api.allow_parallel = value.parse().context("Invalid bool")?
+            }
+            "api.complete_resumable_after_restart" => {
+                self.api.complete_resumable_after_restart = value.parse().context("Invalid bool")?
+            }
+            "api.watch_is_main_process" => {
+                self.api.watch_is_main_process = value.parse().context("Invalid bool")?
+            }
 
             _ => {
                 return Err(anyhow::anyhow!("Unknown config key: '{}'", key));

@@ -90,7 +90,10 @@ mod tests {
     fn test_ch_client_new_default_config() {
         let config = ClickHouseConfig::default();
         let client = ChClient::new(&config);
-        assert!(client.is_ok(), "ChClient::new should succeed with default config");
+        assert!(
+            client.is_ok(),
+            "ChClient::new should succeed with default config"
+        );
         let client = client.unwrap();
         assert_eq!(client.host, "localhost");
         assert_eq!(client.port, 9000);
@@ -105,7 +108,10 @@ mod tests {
             ..ClickHouseConfig::default()
         };
         let client = ChClient::new(&config);
-        assert!(client.is_ok(), "ChClient::new should succeed with secure config");
+        assert!(
+            client.is_ok(),
+            "ChClient::new should succeed with secure config"
+        );
     }
 
     #[test]
@@ -116,6 +122,9 @@ mod tests {
             ..ClickHouseConfig::default()
         };
         let client = ChClient::new(&config);
-        assert!(client.is_ok(), "ChClient::new should succeed with credentials");
+        assert!(
+            client.is_ok(),
+            "ChClient::new should succeed with credentials"
+        );
     }
 }

@@ -14,8 +14,8 @@ pub fn init_logging(log_format: &str, log_level: &str, is_server: bool) {
     let use_json = log_format.eq_ignore_ascii_case("json") || is_server;
 
     // Build the env filter: RUST_LOG takes precedence over the config log_level.
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
     if use_json {
         let subscriber = tracing_subscriber::fmt()
