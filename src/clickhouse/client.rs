@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::config::ClickHouseConfig;
 
@@ -14,6 +14,40 @@ pub struct ChClient {
     /// Store the config for logging/diagnostics.
     host: String,
     port: u16,
+    /// Whether to log SQL queries at info level (vs debug).
+    log_sql_queries: bool,
+}
+
+/// Row from `system.tables` query.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub struct TableRow {
+    pub database: String,
+    pub name: String,
+    pub engine: String,
+    pub create_table_query: String,
+    pub uuid: String,
+    pub data_paths: Vec<String>,
+    pub total_bytes: Option<u64>,
+}
+
+/// Row from `system.mutations` query.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub struct MutationRow {
+    pub database: String,
+    pub table: String,
+    pub mutation_id: String,
+    pub command: String,
+    pub parts_to_do_names: Vec<String>,
+    pub is_done: u8,
+}
+
+/// Row from `system.disks` query.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub struct DiskRow {
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "type")]
+    pub disk_type: String,
 }
 
 impl ChClient {
@@ -45,6 +79,7 @@ impl ChClient {
             inner: client,
             host: config.host.clone(),
             port: config.port,
+            log_sql_queries: config.log_sql_queries,
         })
     }
 
@@ -79,6 +114,304 @@ impl ChClient {
     pub fn inner(&self) -> &clickhouse::Client {
         &self.inner
     }
+
+    // -- Query execution helpers --
+
+    /// Log and execute a SQL statement. Logs at info or debug level based
+    /// on the `log_sql_queries` setting.
+    async fn log_and_execute(&self, sql: &str, description: &str) -> Result<()> {
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing {}", description);
+        } else {
+            debug!(sql = %sql, "Executing {}", description);
+        }
+        self.inner
+            .query(sql)
+            .execute()
+            .await
+            .with_context(|| format!("{} failed: {}", description, sql))?;
+        Ok(())
+    }
+
+    // -- FREEZE / UNFREEZE --
+
+    /// Execute ALTER TABLE FREEZE WITH NAME for the given table.
+    pub async fn freeze_table(
+        &self,
+        db: &str,
+        table: &str,
+        freeze_name: &str,
+    ) -> Result<()> {
+        let sql = format!(
+            "ALTER TABLE `{}`.`{}` FREEZE WITH NAME '{}'",
+            db, table, freeze_name
+        );
+        self.log_and_execute(&sql, "FREEZE").await
+    }
+
+    /// Execute ALTER TABLE UNFREEZE WITH NAME for the given table.
+    pub async fn unfreeze_table(
+        &self,
+        db: &str,
+        table: &str,
+        freeze_name: &str,
+    ) -> Result<()> {
+        let sql = format!(
+            "ALTER TABLE `{}`.`{}` UNFREEZE WITH NAME '{}'",
+            db, table, freeze_name
+        );
+        self.log_and_execute(&sql, "UNFREEZE").await
+    }
+
+    // -- Table queries --
+
+    /// List all user tables (excluding system databases).
+    pub async fn list_tables(&self) -> Result<Vec<TableRow>> {
+        let sql = "SELECT database, name, engine, create_table_query, \
+                   toString(uuid) as uuid, data_paths, total_bytes \
+                   FROM system.tables \
+                   WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')";
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing list_tables");
+        } else {
+            debug!(sql = %sql, "Executing list_tables");
+        }
+
+        let rows = self
+            .inner
+            .query(sql)
+            .fetch_all::<TableRow>()
+            .await
+            .context("Failed to list tables from system.tables")?;
+
+        info!(table_count = rows.len(), "Listed tables");
+        Ok(rows)
+    }
+
+    /// Get the CREATE TABLE DDL for a specific table.
+    pub async fn get_table_ddl(&self, db: &str, table: &str) -> Result<String> {
+        let sql = format!(
+            "SELECT create_table_query FROM system.tables \
+             WHERE database = '{}' AND name = '{}'",
+            db, table
+        );
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing get_table_ddl");
+        } else {
+            debug!(sql = %sql, "Executing get_table_ddl");
+        }
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct DdlRow {
+            create_table_query: String,
+        }
+
+        let row = self
+            .inner
+            .query(&sql)
+            .fetch_one::<DdlRow>()
+            .await
+            .with_context(|| format!("Failed to get DDL for {}.{}", db, table))?;
+
+        Ok(row.create_table_query)
+    }
+
+    // -- Mutations --
+
+    /// Check for pending data mutations on the given tables.
+    ///
+    /// `targets` is a list of (database, table) pairs to check.
+    pub async fn check_pending_mutations(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<Vec<MutationRow>> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build the IN clause for (database, table) pairs
+        let pairs: Vec<String> = targets
+            .iter()
+            .map(|(db, table)| format!("('{}', '{}')", db, table))
+            .collect();
+        let in_clause = pairs.join(", ");
+
+        let sql = format!(
+            "SELECT database, table, mutation_id, command, parts_to_do_names, is_done \
+             FROM system.mutations \
+             WHERE is_done = 0 AND (database, table) IN ({})",
+            in_clause
+        );
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing check_pending_mutations");
+        } else {
+            debug!(sql = %sql, "Executing check_pending_mutations");
+        }
+
+        let rows = self
+            .inner
+            .query(&sql)
+            .fetch_all::<MutationRow>()
+            .await
+            .context("Failed to check pending mutations")?;
+
+        Ok(rows)
+    }
+
+    // -- Replica sync --
+
+    /// Execute SYSTEM SYNC REPLICA for the given table.
+    pub async fn sync_replica(&self, db: &str, table: &str) -> Result<()> {
+        let sql = format!("SYSTEM SYNC REPLICA `{}`.`{}`", db, table);
+        self.log_and_execute(&sql, "SYNC REPLICA").await
+    }
+
+    // -- Part attachment --
+
+    /// Execute ALTER TABLE ATTACH PART for the given part name.
+    pub async fn attach_part(
+        &self,
+        db: &str,
+        table: &str,
+        part_name: &str,
+    ) -> Result<()> {
+        let sql = format!(
+            "ALTER TABLE `{}`.`{}` ATTACH PART '{}'",
+            db, table, part_name
+        );
+        self.log_and_execute(&sql, "ATTACH PART").await
+    }
+
+    // -- Server info --
+
+    /// Get the ClickHouse server version string.
+    pub async fn get_version(&self) -> Result<String> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct VersionRow {
+            version: String,
+        }
+
+        let row = self
+            .inner
+            .query("SELECT version() as version")
+            .fetch_one::<VersionRow>()
+            .await
+            .context("Failed to get ClickHouse version")?;
+
+        Ok(row.version)
+    }
+
+    /// Get disk information from system.disks.
+    pub async fn get_disks(&self) -> Result<Vec<DiskRow>> {
+        let sql = "SELECT name, path, type FROM system.disks";
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing get_disks");
+        } else {
+            debug!(sql = %sql, "Executing get_disks");
+        }
+
+        let rows = self
+            .inner
+            .query(sql)
+            .fetch_all::<DiskRow>()
+            .await
+            .context("Failed to get disks from system.disks")?;
+
+        Ok(rows)
+    }
+
+    // -- DDL execution --
+
+    /// Execute arbitrary DDL (CREATE DATABASE, CREATE TABLE, etc.).
+    pub async fn execute_ddl(&self, ddl: &str) -> Result<()> {
+        self.log_and_execute(ddl, "DDL").await
+    }
+
+    /// Check if a database exists.
+    pub async fn database_exists(&self, db: &str) -> Result<bool> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct CountRow {
+            cnt: u64,
+        }
+
+        let sql = format!(
+            "SELECT count() as cnt FROM system.databases WHERE name = '{}'",
+            db
+        );
+
+        let row = self
+            .inner
+            .query(&sql)
+            .fetch_one::<CountRow>()
+            .await
+            .with_context(|| format!("Failed to check if database '{}' exists", db))?;
+
+        Ok(row.cnt > 0)
+    }
+
+    /// Check if a table exists.
+    pub async fn table_exists(&self, db: &str, table: &str) -> Result<bool> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct CountRow {
+            cnt: u64,
+        }
+
+        let sql = format!(
+            "SELECT count() as cnt FROM system.tables \
+             WHERE database = '{}' AND name = '{}'",
+            db, table
+        );
+
+        let row = self
+            .inner
+            .query(&sql)
+            .fetch_one::<CountRow>()
+            .await
+            .with_context(|| format!("Failed to check if table {}.{} exists", db, table))?;
+
+        Ok(row.cnt > 0)
+    }
+}
+
+/// Sanitize a name for use in freeze names.
+///
+/// Replaces all non-alphanumeric characters (except underscore) with underscore.
+pub fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Generate the freeze name for a backup operation.
+///
+/// Format: `chbackup_{backup_name}_{db}_{table}`
+pub fn freeze_name(backup_name: &str, db: &str, table: &str) -> String {
+    format!(
+        "chbackup_{}_{}_{}",
+        sanitize_name(backup_name),
+        sanitize_name(db),
+        sanitize_name(table)
+    )
+}
+
+/// Generate the SQL string for a FREEZE command (for testing).
+pub fn freeze_sql(db: &str, table: &str, freeze_name: &str) -> String {
+    format!(
+        "ALTER TABLE `{}`.`{}` FREEZE WITH NAME '{}'",
+        db, table, freeze_name
+    )
+}
+
+/// Generate the SQL string for an UNFREEZE command (for testing).
+pub fn unfreeze_sql(db: &str, table: &str, freeze_name: &str) -> String {
+    format!(
+        "ALTER TABLE `{}`.`{}` UNFREEZE WITH NAME '{}'",
+        db, table, freeze_name
+    )
 }
 
 #[cfg(test)]
@@ -97,6 +430,7 @@ mod tests {
         let client = client.unwrap();
         assert_eq!(client.host, "localhost");
         assert_eq!(client.port, 9000);
+        assert!(client.log_sql_queries);
     }
 
     #[test]
@@ -126,5 +460,52 @@ mod tests {
             client.is_ok(),
             "ChClient::new should succeed with credentials"
         );
+    }
+
+    #[test]
+    fn test_freeze_sql_format() {
+        let sql = freeze_sql("default", "trades", "chbackup_daily_default_trades");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`trades` FREEZE WITH NAME 'chbackup_daily_default_trades'"
+        );
+    }
+
+    #[test]
+    fn test_unfreeze_sql_format() {
+        let sql = unfreeze_sql("default", "trades", "chbackup_daily_default_trades");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`trades` UNFREEZE WITH NAME 'chbackup_daily_default_trades'"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_freeze_name() {
+        assert_eq!(sanitize_name("daily-2024-01-15"), "daily_2024_01_15");
+        assert_eq!(sanitize_name("my_backup"), "my_backup");
+        assert_eq!(sanitize_name("backup.name"), "backup_name");
+        assert_eq!(sanitize_name("with spaces"), "with_spaces");
+        assert_eq!(sanitize_name("special!@#$chars"), "special____chars");
+        assert_eq!(sanitize_name("already_clean_123"), "already_clean_123");
+    }
+
+    #[test]
+    fn test_freeze_name_generation() {
+        let name = freeze_name("daily-20240115", "default", "trades");
+        assert_eq!(name, "chbackup_daily_20240115_default_trades");
+
+        let name = freeze_name("backup.v2", "my-db", "my.table");
+        assert_eq!(name, "chbackup_backup_v2_my_db_my_table");
+    }
+
+    #[test]
+    fn test_ch_client_log_sql_queries_setting() {
+        let config = ClickHouseConfig {
+            log_sql_queries: false,
+            ..ClickHouseConfig::default()
+        };
+        let client = ChClient::new(&config).unwrap();
+        assert!(!client.log_sql_queries);
     }
 }
