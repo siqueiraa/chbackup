@@ -1,6 +1,32 @@
 use chbackup::config::Config;
 use std::io::Write;
+use std::sync::Mutex;
 use tempfile::NamedTempFile;
+
+/// Global lock to prevent env var tests from running in parallel.
+/// Tests that modify environment variables must hold this lock.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Clear all env vars that the config overlay reads, so tests don't
+/// contaminate each other.
+fn clear_config_env_vars() {
+    std::env::remove_var("S3_BUCKET");
+    std::env::remove_var("S3_REGION");
+    std::env::remove_var("S3_ENDPOINT");
+    std::env::remove_var("S3_PREFIX");
+    std::env::remove_var("S3_ACCESS_KEY");
+    std::env::remove_var("S3_SECRET_KEY");
+    std::env::remove_var("S3_ASSUME_ROLE_ARN");
+    std::env::remove_var("S3_FORCE_PATH_STYLE");
+    std::env::remove_var("CLICKHOUSE_HOST");
+    std::env::remove_var("CLICKHOUSE_PORT");
+    std::env::remove_var("CLICKHOUSE_USERNAME");
+    std::env::remove_var("CLICKHOUSE_PASSWORD");
+    std::env::remove_var("CLICKHOUSE_DATA_PATH");
+    std::env::remove_var("CHBACKUP_LOG_LEVEL");
+    std::env::remove_var("CHBACKUP_LOG_FORMAT");
+    std::env::remove_var("API_LISTEN");
+}
 
 #[test]
 fn test_default_config_serializes() {
@@ -26,6 +52,9 @@ fn test_default_config_serializes() {
 
 #[test]
 fn test_config_from_yaml() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_config_env_vars();
+
     // Parse a minimal YAML config with a few overrides
     let yaml = r#"
 general:
@@ -68,8 +97,10 @@ s3:
 
 #[test]
 fn test_env_overlay() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_config_env_vars();
+
     // Environment variable overlay should override config values
-    // Use a unique env var set to avoid interfering with other tests
     std::env::set_var("S3_BUCKET", "env-bucket-override");
     std::env::set_var("CLICKHOUSE_HOST", "env-ch-host");
 
@@ -92,12 +123,14 @@ clickhouse:
     assert_eq!(config.clickhouse.host, "env-ch-host");
 
     // Clean up env vars
-    std::env::remove_var("S3_BUCKET");
-    std::env::remove_var("CLICKHOUSE_HOST");
+    clear_config_env_vars();
 }
 
 #[test]
 fn test_cli_env_override() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_config_env_vars();
+
     // CLI --env overrides should take priority over env vars
     std::env::set_var("S3_BUCKET", "env-bucket");
 
@@ -127,11 +160,14 @@ clickhouse:
     assert_eq!(config.clickhouse.port, 9999);
 
     // Clean up
-    std::env::remove_var("S3_BUCKET");
+    clear_config_env_vars();
 }
 
 #[test]
 fn test_validation_full_interval() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_config_env_vars();
+
     // full_interval <= watch_interval should fail when watch is enabled
     let yaml = r#"
 watch:
@@ -146,7 +182,10 @@ watch:
         .expect("write yaml to temp file");
 
     let result = Config::load(tmpfile.path(), &[]);
-    assert!(result.is_err(), "Should fail when full_interval <= watch_interval");
+    assert!(
+        result.is_err(),
+        "Should fail when full_interval <= watch_interval"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("full_interval") && err_msg.contains("watch_interval"),

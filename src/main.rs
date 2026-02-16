@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod error;
 
 pub use error::ChBackupError;
@@ -6,6 +7,8 @@ pub use error::ChBackupError;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Command};
+use config::Config;
+use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -73,10 +76,14 @@ async fn main() -> Result<()> {
             );
         }
         Command::DefaultConfig => {
-            println!("default-config: not implemented yet");
+            let yaml = Config::default_yaml()?;
+            print!("{yaml}");
         }
         Command::PrintConfig => {
-            println!("print-config: not implemented yet");
+            let config_path = Path::new(&cli.config);
+            let config = Config::load(config_path, &cli.env_overrides)?;
+            let yaml = serde_yaml::to_string(&config)?;
+            print!("{yaml}");
         }
         Command::Watch { .. } => {
             println!("watch: not implemented yet");
