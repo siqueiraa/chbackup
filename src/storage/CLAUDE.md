@@ -56,6 +56,18 @@ pub struct S3Object {
 - `delete_object(key) -> Result<()>` -- Delete single object
 - `delete_objects(keys) -> Result<()>` -- Batch delete (groups of 1000 per S3 API limit)
 - `head_object(key) -> Result<Option<u64>>` -- Check existence and get size
+- `create_multipart_upload(key) -> Result<String>` -- Initiate multipart upload
+- `upload_part(key, upload_id, part_number, body) -> Result<String>` -- Upload chunk
+- `complete_multipart_upload(key, upload_id, parts) -> Result<()>` -- Finalize multipart
+- `abort_multipart_upload(key, upload_id) -> Result<()>` -- Cancel multipart
+- `calculate_chunk_size(data_len, config_chunk_size, max_parts_count) -> u64` -- Chunk sizing (standalone fn)
+
+### Multipart Upload API (Phase 2a)
+- `create_multipart_upload(key) -> Result<String>` -- Initiate multipart upload, returns upload_id. Applies same SSE/storage_class as `put_object`.
+- `upload_part(key, upload_id, part_number, body) -> Result<String>` -- Upload a single chunk, returns ETag. Part numbers must be 1-10000.
+- `complete_multipart_upload(key, upload_id, parts) -> Result<()>` -- Finalize with list of `(part_number, e_tag)` tuples.
+- `abort_multipart_upload(key, upload_id) -> Result<()>` -- Cancel and clean up partial uploads.
+- `calculate_chunk_size(data_len, config_chunk_size, max_parts_count) -> u64` -- Standalone pure function. When `config_chunk_size` is 0, auto-computes from `data_len / max_parts_count`. Enforces 5 MiB minimum (S3 requirement).
 
 ### Error Handling
 - All methods return `anyhow::Result` with `.context()` annotations

@@ -51,6 +51,15 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - `check_mutations(ch, targets, timeout) -> Result<()>` -- Mutation pre-flight
 - `sync_replicas(ch, tables) -> Result<()>` -- Replica sync pre-flight
 
+### Parallel FREEZE Pattern (Phase 2a)
+- Tables are frozen and collected in parallel, bounded by `effective_max_connections(config)` via a `tokio::Semaphore`
+- Each `tokio::spawn` task: acquires permit -> FREEZE -> `collect_parts` (via `spawn_blocking`) -> returns `(FreezeInfo, full_name, TableManifest)`
+- Uses `futures::future::try_join_all` on `JoinHandle` vec for fail-fast error propagation
+- Per-task `FreezeInfo` collection: each spawned task creates its own `FreezeInfo` instead of mutating a shared `FreezeGuard`
+- After all tasks join: aggregate `FreezeInfo` entries into a `FreezeGuard`, aggregate `TableManifest` entries into the manifest `HashMap`
+- Error cleanup: on any task error, all successfully frozen tables are still unfrozen via the assembled `FreezeGuard`
+- `ChClient` and `Arc<Vec<TableRow>>` are cloned into each spawn (both are `Clone`)
+
 ### Error Handling
 - Uses `anyhow::Result` throughout with `.context()` for error chain
 - `ignore_not_exists_error_during_freeze` config controls whether missing tables abort or warn

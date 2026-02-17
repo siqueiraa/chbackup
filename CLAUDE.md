@@ -32,16 +32,17 @@
 |-----------|-------|
 | CLI | `clap` (derive API) |
 | Config | `serde_yaml` + env overlay |
-| ClickHouse | `clickhouse-rs` (async, connection pooling) |
+| ClickHouse | `clickhouse` v0.13 (HTTP protocol, async) |
 | S3 | `aws-sdk-s3` + `aws-config` |
 | Async | `tokio` |
 | Async streams | `tokio-util` (codec feature) |
 | Directory walks | `walkdir` (via `spawn_blocking`) |
 | Errors | `thiserror` + `anyhow` |
 | Logging | `tracing` + `tracing-subscriber` |
-| Compression | `lz4_flex` + `async-compression` |
+| Compression | `lz4_flex` (sync, via `spawn_blocking`) |
 | Archiving | `tar` (v0.4, sync, via `spawn_blocking`) |
 | CRC64 | `crc` (v3, CRC_64_XZ algorithm) |
+| Concurrency utils | `futures` (v0.3, for `try_join_all`) |
 | Glob matching | `glob` (v0.3, for table filter `-t` flag) |
 | Unix permissions | `nix` (v0.29, chown for restore) |
 
@@ -58,6 +59,7 @@ Things that are easy to get wrong when reading the design doc:
 
 **Phase 0** (skeleton): Complete -- CLI, config, ChClient, S3Client, PidLock, logging, error types.
 **Phase 1** (MVP): Complete -- Single-table backup and restore pipeline (sequential, no parallelism).
+**Phase 2a** (parallelism): Complete -- Parallel operations for all four command pipelines (create, upload, download, restore), multipart S3 upload for large parts, byte-level rate limiting.
 
 ## Source Module Map
 
@@ -66,19 +68,21 @@ src/
   main.rs            -- CLI entry point, command dispatch
   lib.rs             -- Module declarations
   cli.rs             -- clap derive CLI definitions
+  concurrency.rs     -- Effective concurrency accessors (upload, download, max_connections)
   config.rs          -- Config loader (~106 params, env overlay)
   error.rs           -- ChBackupError (thiserror)
   lock.rs            -- PidLock (three-tier scope)
   logging.rs         -- tracing init (text/JSON)
   manifest.rs        -- BackupManifest, TableManifest, PartInfo, DatabaseInfo (serde JSON)
+  rate_limiter.rs    -- Token-bucket rate limiter (shared via Arc, 0 = unlimited)
   table_filter.rs    -- Glob pattern matching for -t flag
   list.rs            -- list + delete commands (local dir scan + S3)
-  backup/            -- create command: FREEZE, shadow walk, hardlink, CRC64, UNFREEZE
-  upload/            -- upload command: tar+LZ4 compress, S3 PutObject
-  download/          -- download command: S3 GetObject, LZ4+untar decompress
-  restore/           -- restore command: CREATE DB/TABLE, hardlink to detached, ATTACH PART
+  backup/            -- create command: parallel FREEZE, shadow walk, hardlink, CRC64, UNFREEZE
+  upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart
+  download/          -- download command: parallel S3 GetObject, LZ4+untar decompress
+  restore/           -- restore command: CREATE DB/TABLE, parallel hardlink+ATTACH PART
   clickhouse/        -- ChClient wrapper (FREEZE/UNFREEZE, DDL, queries)
-  storage/           -- S3Client wrapper (put, get, list, delete, head)
+  storage/           -- S3Client wrapper (put, get, list, delete, head, multipart)
 ```
 
 Each directory module has its own `CLAUDE.md` with detailed API and pattern documentation.
@@ -101,19 +105,22 @@ delete:   rm local dir or S3Client.delete_objects
 - **FreezeGuard**: Tracks frozen tables for cleanup; explicit `unfreeze_all()` (not Drop-based)
 - **SortPartsByMinBlock**: Parse part name from right (partition can contain underscores)
 - **Hardlink with EXDEV fallback**: `std::fs::hard_link` with copy fallback on cross-device (error 18)
-- **Buffered upload/download**: Phase 1 buffers in memory; Phase 2 will add streaming multipart
+- **Buffered upload/download**: Buffers in memory; single PutObject for parts <= 32 MiB, multipart for larger
 - **spawn_blocking for sync I/O**: walkdir, tar, lz4 compression/decompression run via `spawn_blocking`
+- **Flat semaphore concurrency**: Each command pipeline uses a single `Arc<Semaphore>` shared across all spawned tasks; effective concurrency resolved from config via `concurrency.rs`
+- **Rate limiting**: Token-bucket `RateLimiter` (shared via `Clone`/`Arc`) gates bytes per second for uploads and downloads; 0 = unlimited
+- **OwnedAttachParams**: Owned variant of `AttachParams` for crossing `tokio::spawn` boundaries (no lifetime constraints)
 
-## Phase 1 Limitations
+## Remaining Limitations
 
-- No parallel operations (Phase 2)
-- No multipart S3 upload (Phase 2)
 - No incremental backups / --diff-from (Phase 2b)
 - No S3 disk support (Phase 2c)
 - No resume (Phase 2d)
 - No Mode A restore / --rm (Phase 4d)
 - No table remap / --as (Phase 4a)
 - No RBAC/config backup (Phase 4e)
+- No parallel ATTACH within a single table (deferred -- tables parallel is sufficient)
+- No streaming multipart upload (Phase 2a buffers compressed data, then decides single vs multipart)
 
 ## Build & Test
 

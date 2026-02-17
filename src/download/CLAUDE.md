@@ -40,6 +40,14 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
 - `compress_part(part_dir, archive_name) -> Result<Vec<u8>>` -- Sync tar+LZ4 (for testing)
 - `decompress_lz4(data) -> Result<Vec<u8>>` -- Raw LZ4 frame decompression
 
+### Parallel Download Pattern (Phase 2a)
+- All parts across all tables are flattened into a single `Vec<DownloadWorkItem>` work queue
+- Download concurrency bounded by `effective_download_concurrency(config)` via a `tokio::Semaphore`
+- Each `tokio::spawn` task: acquires permit -> `s3.get_object` -> `rate_limiter.consume()` -> `spawn_blocking` decompress -> returns `(table_key, compressed_size)`
+- `RateLimiter` gates total bytes downloaded per second (0 = unlimited)
+- Uses `futures::future::try_join_all` for fail-fast error propagation
+- After all tasks join: tally totals, then save per-table metadata and manifest sequentially
+
 ### Error Handling
 - Uses `anyhow::Result` with `.context()` for error chain
 - Logs warnings for parts that fail to download but does not abort the entire backup

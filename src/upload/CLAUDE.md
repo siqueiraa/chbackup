@@ -38,6 +38,16 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 - `upload(config, s3, backup_name, backup_dir, delete_local) -> Result<()>` -- Main entry point
 - `compress_part(part_dir, archive_name) -> Result<Vec<u8>>` -- Sync tar+LZ4 compression
 
+### Parallel Upload Pattern (Phase 2a)
+- All parts across all tables are flattened into a single `Vec<UploadWorkItem>` work queue
+- Upload concurrency bounded by `effective_upload_concurrency(config)` via a `tokio::Semaphore`
+- Each `tokio::spawn` task: acquires permit -> `spawn_blocking` compress -> decide single vs multipart -> upload -> `rate_limiter.consume()`
+- **Multipart threshold**: compressed data > 32 MiB (`MULTIPART_THRESHOLD`) uses multipart upload; otherwise single `PutObject`
+- Multipart flow: `create_multipart_upload` -> chunked `upload_part` (chunk size from `calculate_chunk_size`) -> `complete_multipart_upload`; on error, `abort_multipart_upload` for cleanup
+- `RateLimiter` gates total bytes uploaded per second (0 = unlimited)
+- Uses `futures::future::try_join_all` for fail-fast error propagation
+- After all tasks join: results `(table_key, disk_name, PartInfo, compressed_size)` are applied to the manifest sequentially (no concurrent HashMap mutation)
+
 ### Error Handling
 - Uses `anyhow::Result` with `.context()` for error chain
 - Updates manifest `compressed_size` after all uploads complete

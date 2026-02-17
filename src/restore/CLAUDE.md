@@ -41,11 +41,21 @@ Queries `system.tables` for `data_paths` column to find the table's data directo
 - `restore(config, ch, backup_name, table_pattern, schema_only, data_only) -> Result<()>` -- Main entry point
 - `create_databases(ch, manifest) -> Result<()>` -- DDL for databases
 - `create_tables(ch, manifest, filter) -> Result<()>` -- DDL for tables
-- `attach_parts(params) -> Result<u64>` -- Hardlink + ATTACH PART, returns count
+- `attach_parts(params) -> Result<u64>` -- Hardlink + ATTACH PART (borrowed params), returns count
+- `attach_parts_owned(params) -> Result<u64>` -- Hardlink + ATTACH PART (owned params for tokio::spawn)
+- `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries
 - `detect_clickhouse_ownership(data_path) -> Result<(Option<u32>, Option<u32>)>` -- UID/GID detection
 - `get_table_data_path(ch, db, table) -> Result<PathBuf>` -- Query data_paths
 - `sort_parts_by_min_block(parts) -> Vec<PartInfo>` -- Sorted copy
 - `needs_sequential_attach(engine) -> bool` -- Engine classification
+
+### Parallel Restore Pattern (Phase 2a)
+- Tables are restored in parallel, bounded by `effective_max_connections(config)` via a `tokio::Semaphore`
+- Each `tokio::spawn` task: acquires permit -> `attach_parts_owned(OwnedAttachParams)` -> returns `(table_key, attached_count)`
+- `OwnedAttachParams` uses owned types (`String`, `PathBuf`, `Vec<PartInfo>`) to cross `tokio::spawn` boundaries (no lifetime constraints)
+- Engine-aware ATTACH routing: `needs_sequential_attach(engine)` returns true for Replacing/Collapsing/Versioned engines, ensuring sorted sequential ATTACH; plain MergeTree also uses sequential ATTACH within a single table (parallelism is across tables)
+- `attach_parts_owned()` bridges to the internal `attach_parts_inner()` which accepts borrowed `AttachParams` -- no duplication of attach logic
+- Uses `futures::future::try_join_all` for fail-fast error propagation
 
 ### Error Handling
 - Uses `anyhow::Result` with `.context()` for error chain
