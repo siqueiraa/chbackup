@@ -4,7 +4,7 @@
 //! 1. Lists tables matching the filter pattern
 //! 2. Checks for pending mutations (design 3.1)
 //! 3. Syncs replicas for Replicated tables (design 3.2)
-//! 4. FREEZEs each table
+//! 4. FREEZEs each table (parallel, bounded by max_connections)
 //! 5. Walks shadow directories and hardlinks parts to backup staging
 //! 6. Computes CRC64 checksums of each part's checksums.txt
 //! 7. UNFREEZEs all tables
@@ -18,18 +18,22 @@ pub mod sync_replica;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use futures::future::try_join_all;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::clickhouse::client::{freeze_name, ChClient, TableRow};
+use crate::concurrency::effective_max_connections;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, DatabaseInfo, TableManifest};
 use crate::table_filter::{is_engine_excluded, is_excluded, TableFilter};
 
 use self::collect::collect_parts;
-use self::freeze::{freeze_table, FreezeGuard};
+use self::freeze::{FreezeGuard, FreezeInfo};
 
 /// Create a local backup.
 ///
@@ -133,102 +137,29 @@ pub async fn create(
     std::fs::create_dir_all(&backup_dir)
         .with_context(|| format!("Failed to create backup directory: {}", backup_dir.display()))?;
 
-    // 9. FREEZE tables and collect parts
-    let mut freeze_guard = FreezeGuard::new();
+    // 9. FREEZE tables and collect parts (parallel, bounded by max_connections)
     let mut table_manifests: HashMap<String, TableManifest> = HashMap::new();
     let mut databases_seen: HashMap<String, String> = HashMap::new();
 
+    // Separate metadata-only / schema-only tables from data tables
+    let mut data_tables: Vec<TableRow> = Vec::new();
+
     for table_row in &filtered_tables {
         let db = &table_row.database;
-        let table = &table_row.name;
-        let full_name = format!("{}.{}", db, table);
+        let full_name = format!("{}.{}", db, table_row.name);
 
         // Track unique databases for DDL
         if !databases_seen.contains_key(db) {
-            // We use a simple CREATE DATABASE IF NOT EXISTS
             let ddl = format!("CREATE DATABASE IF NOT EXISTS `{}` ENGINE = Atomic", db);
             databases_seen.insert(db.clone(), ddl);
         }
 
-        // Determine if this is a metadata-only table (views, dictionaries, etc.)
         let is_metadata_only = is_metadata_only_engine(&table_row.engine);
 
         if !schema_only && !is_metadata_only {
-            // Generate freeze name
-            let fname = freeze_name(backup_name, db, table);
-
-            // FREEZE the table
-            let frozen = freeze_table(
-                ch,
-                &mut freeze_guard,
-                db,
-                table,
-                &fname,
-                config.clickhouse.ignore_not_exists_error_during_freeze,
-            )
-            .await?;
-
-            if !frozen {
-                info!(
-                    db = %db,
-                    table = %table,
-                    "Table skipped (not found during FREEZE)"
-                );
-                continue;
-            }
-
-            // Collect parts from shadow using spawn_blocking for filesystem I/O
-            let data_path = config.clickhouse.data_path.clone();
-            let fname_clone = fname.clone();
-            let backup_dir_clone = backup_dir.clone();
-            let tables_for_collect: Vec<TableRow> = all_tables.clone();
-
-            let parts_map = tokio::task::spawn_blocking(move || {
-                collect_parts(
-                    &data_path,
-                    &fname_clone,
-                    &backup_dir_clone,
-                    &tables_for_collect,
-                )
-            })
-            .await
-            .context("spawn_blocking panicked during collect_parts")??;
-
-            // Get mutations for this specific table
-            // Phase 1: mutation info doesn't carry db/table, include all
-            let table_mutations: Vec<_> = all_mutations.clone();
-
-            // Build TableManifest
-            let parts_for_table = parts_map.get(&full_name).cloned().unwrap_or_default();
-            let total_bytes = parts_for_table.iter().map(|p| p.size).sum();
-
-            let mut parts_by_disk: HashMap<String, Vec<_>> = HashMap::new();
-            if !parts_for_table.is_empty() {
-                // Phase 1: all parts go to "default" disk
-                parts_by_disk.insert("default".to_string(), parts_for_table);
-            }
-
-            table_manifests.insert(
-                full_name,
-                TableManifest {
-                    ddl: table_row.create_table_query.clone(),
-                    uuid: if table_row.uuid.is_empty()
-                        || table_row.uuid == "00000000-0000-0000-0000-000000000000"
-                    {
-                        None
-                    } else {
-                        Some(table_row.uuid.clone())
-                    },
-                    engine: table_row.engine.clone(),
-                    total_bytes,
-                    parts: parts_by_disk,
-                    pending_mutations: table_mutations,
-                    metadata_only: false,
-                    dependencies: Vec::new(),
-                },
-            );
+            data_tables.push((*table_row).clone());
         } else {
-            // Schema-only or metadata-only table
+            // Schema-only or metadata-only table -- no FREEZE needed
             table_manifests.insert(
                 full_name,
                 TableManifest {
@@ -251,11 +182,171 @@ pub async fn create(
         }
     }
 
-    // 10. UNFREEZE all tables
+    // Parallel FREEZE + collect for data tables
+    let max_conn = effective_max_connections(config) as usize;
+    let semaphore = Arc::new(Semaphore::new(max_conn));
+
+    info!(
+        "Freezing {} tables (max_connections={})",
+        data_tables.len(),
+        max_conn
+    );
+
+    let all_tables_arc = Arc::new(all_tables.clone());
+    let mut handles = Vec::with_capacity(data_tables.len());
+
+    for table_row in &data_tables {
+        let sem = semaphore.clone();
+        let ch = ch.clone();
+        let backup_name_owned = backup_name.to_string();
+        let db = table_row.database.clone();
+        let table = table_row.name.clone();
+        let data_path = config.clickhouse.data_path.clone();
+        let backup_dir_clone = backup_dir.clone();
+        let tables_for_collect = all_tables_arc.clone();
+        let ignore_not_exists = config.clickhouse.ignore_not_exists_error_during_freeze;
+        let all_mutations_clone = all_mutations.clone();
+        let table_row_clone = table_row.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
+
+            let full_name = format!("{}.{}", db, table);
+            let fname = freeze_name(&backup_name_owned, &db, &table);
+
+            // FREEZE the table
+            info!(
+                db = %db,
+                table = %table,
+                freeze_name = %fname,
+                "Freezing table"
+            );
+
+            let freeze_result = ch.freeze_table(&db, &table, &fname).await;
+            let frozen = match freeze_result {
+                Ok(()) => true,
+                Err(e) => {
+                    let err_msg = format!("{e:#}");
+                    if ignore_not_exists
+                        && (err_msg.contains("UNKNOWN_TABLE")
+                            || err_msg.contains("UNKNOWN_DATABASE")
+                            || err_msg.contains("Code: 60")
+                            || err_msg.contains("Code: 81"))
+                    {
+                        warn!(
+                            db = %db,
+                            table = %table,
+                            error = %e,
+                            "Table not found during FREEZE (possibly dropped), skipping"
+                        );
+                        false
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+
+            if !frozen {
+                info!(
+                    db = %db,
+                    table = %table,
+                    "Table skipped (not found during FREEZE)"
+                );
+                return Ok(None);
+            }
+
+            let freeze_info = FreezeInfo {
+                database: db.clone(),
+                table: table.clone(),
+                freeze_name: fname.clone(),
+            };
+
+            // Collect parts from shadow using spawn_blocking for filesystem I/O
+            let fname_for_collect = fname;
+            let parts_map = tokio::task::spawn_blocking(move || {
+                collect_parts(
+                    &data_path,
+                    &fname_for_collect,
+                    &backup_dir_clone,
+                    &tables_for_collect,
+                )
+            })
+            .await
+            .context("spawn_blocking panicked during collect_parts")??;
+
+            // Build TableManifest
+            let parts_for_table = parts_map.get(&full_name).cloned().unwrap_or_default();
+            let total_bytes = parts_for_table.iter().map(|p| p.size).sum();
+
+            let mut parts_by_disk: HashMap<String, Vec<_>> = HashMap::new();
+            if !parts_for_table.is_empty() {
+                parts_by_disk.insert("default".to_string(), parts_for_table);
+            }
+
+            let table_manifest = TableManifest {
+                ddl: table_row_clone.create_table_query.clone(),
+                uuid: if table_row_clone.uuid.is_empty()
+                    || table_row_clone.uuid == "00000000-0000-0000-0000-000000000000"
+                {
+                    None
+                } else {
+                    Some(table_row_clone.uuid.clone())
+                },
+                engine: table_row_clone.engine.clone(),
+                total_bytes,
+                parts: parts_by_disk,
+                pending_mutations: all_mutations_clone,
+                metadata_only: false,
+                dependencies: Vec::new(),
+            };
+
+            Ok(Some((freeze_info, full_name, table_manifest)))
+        });
+
+        handles.push(handle);
+    }
+
+    // Await all tasks, collecting results
+    let results = try_join_all(handles).await.context(
+        "A FREEZE+collect task panicked",
+    )?;
+
+    // Build FreezeGuard from successful results for cleanup, and aggregate table manifests
+    let mut freeze_guard = FreezeGuard::new();
+    let mut had_error = false;
+    let mut first_error: Option<anyhow::Error> = None;
+
+    for result in results {
+        match result {
+            Ok(Some((freeze_info, full_name, table_manifest))) => {
+                freeze_guard.add(freeze_info);
+                table_manifests.insert(full_name, table_manifest);
+            }
+            Ok(None) => {
+                // Table was skipped (not found during FREEZE)
+            }
+            Err(e) => {
+                if !had_error {
+                    had_error = true;
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+
+    // 10. UNFREEZE all tables (even on error, clean up frozen tables)
     info!("Unfreezing all tables");
     freeze_guard.unfreeze_all(ch).await?;
     // Clear the guard so Drop doesn't warn
     let _ = std::mem::take(&mut freeze_guard);
+
+    // Propagate the first error if any task failed
+    if let Some(e) = first_error {
+        return Err(e);
+    }
 
     // 11. Build database list
     let databases: Vec<DatabaseInfo> = databases_seen
@@ -349,6 +440,31 @@ fn is_metadata_only_engine(engine: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use self::freeze::FreezeInfo;
+
+    #[test]
+    fn test_freeze_info_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FreezeInfo>();
+    }
+
+    #[test]
+    fn test_table_row_clone() {
+        let row = TableRow {
+            database: "default".to_string(),
+            name: "trades".to_string(),
+            engine: "MergeTree".to_string(),
+            create_table_query: "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id".to_string(),
+            uuid: "abc-123".to_string(),
+            data_paths: vec!["/var/lib/clickhouse/store/abc/abc123/".to_string()],
+            total_bytes: Some(1000),
+        };
+
+        let cloned = row.clone();
+        assert_eq!(cloned.database, "default");
+        assert_eq!(cloned.name, "trades");
+        assert_eq!(cloned.engine, "MergeTree");
+    }
 
     #[test]
     fn test_is_metadata_only_engine() {
