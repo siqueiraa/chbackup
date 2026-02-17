@@ -2,23 +2,39 @@
 //!
 //! Upload flow:
 //! 1. Read manifest from `{backup_dir}/metadata.json`
-//! 2. For each table in manifest, for each part:
-//!    - Read part directory from backup staging
-//!    - Compress (tar + LZ4) to in-memory buffer
-//!    - Upload to S3 with key `{backup_name}/data/{url_db}/{url_table}/{part_name}.tar.lz4`
-//! 3. Upload manifest JSON last (per design 3.6 -- backup is only "visible" when metadata.json exists)
-//! 4. If delete_local, remove local backup directory
+//! 2. Flatten all parts across all tables into a single work queue
+//! 3. Upload parts in parallel (bounded by upload_concurrency semaphore)
+//!    - Parts with compressed size > 32MB use multipart upload
+//!    - Rate limiter gates bytes uploaded
+//! 4. Upload manifest JSON last (per design 3.6 -- backup is only "visible" when metadata.json exists)
+//! 5. If delete_local, remove local backup directory
 
 pub mod stream;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use futures::future::try_join_all;
+use tokio::sync::Semaphore;
 use tracing::{debug, info};
 
+use crate::concurrency::effective_upload_concurrency;
 use crate::config::Config;
-use crate::manifest::BackupManifest;
+use crate::manifest::{BackupManifest, PartInfo};
+use crate::rate_limiter::RateLimiter;
+use crate::storage::s3::calculate_chunk_size;
 use crate::storage::S3Client;
+
+/// Multipart upload threshold: parts with compressed data larger than 32 MiB
+/// use multipart upload instead of a single PutObject.
+const MULTIPART_THRESHOLD: u64 = 32 * 1024 * 1024;
+
+/// Check if a given data size should use multipart upload.
+fn should_use_multipart(compressed_size: u64) -> bool {
+    compressed_size > MULTIPART_THRESHOLD
+}
 
 /// URL-encode a component for use in S3 key paths.
 ///
@@ -51,10 +67,24 @@ fn s3_key_for_part(backup_name: &str, db: &str, table: &str, part_name: &str) ->
     )
 }
 
+/// A work item for the parallel upload queue.
+struct UploadWorkItem {
+    /// Table key in "db.table" format.
+    table_key: String,
+    /// Disk name within the table's parts map.
+    disk_name: String,
+    /// Part info (name, size, etc.).
+    part: PartInfo,
+    /// Local directory containing the part's data files.
+    part_dir: PathBuf,
+    /// S3 key where the compressed archive will be uploaded.
+    s3_key: String,
+}
+
 /// Upload a local backup to S3.
 ///
 /// Reads the manifest from the local backup directory, compresses each part
-/// with tar+LZ4, uploads to S3, and uploads the manifest last.
+/// with tar+LZ4, uploads to S3 in parallel, and uploads the manifest last.
 ///
 /// # Arguments
 ///
@@ -97,11 +127,10 @@ pub async fn upload(
         "Loaded manifest"
     );
 
-    // 2. Upload each part
-    let mut total_parts = 0u64;
-    let mut total_compressed_size = 0u64;
+    // 2. Flatten all parts into work items
+    let mut work_items: Vec<UploadWorkItem> = Vec::new();
+    let mut table_count = 0u64;
 
-    // We need to iterate over table keys and mutate their parts, so we collect keys first
     let table_keys: Vec<String> = manifest.tables.keys().cloned().collect();
 
     for table_key in &table_keys {
@@ -109,11 +138,10 @@ pub async fn upload(
             .split_once('.')
             .unwrap_or(("default", table_key));
 
-        let table_manifest = manifest
-            .tables
-            .get(table_key)
-            .expect("table key exists")
-            .clone();
+        let table_manifest = match manifest.tables.get(table_key) {
+            Some(tm) => tm,
+            None => continue,
+        };
 
         // Skip metadata-only tables (no data parts)
         if table_manifest.metadata_only {
@@ -121,13 +149,9 @@ pub async fn upload(
             continue;
         }
 
-        // Collect all parts with their disk names for mutation
-        let mut updated_parts: std::collections::HashMap<String, Vec<crate::manifest::PartInfo>> =
-            std::collections::HashMap::new();
+        let mut has_parts = false;
 
         for (disk_name, parts) in &table_manifest.parts {
-            let mut updated_disk_parts = Vec::new();
-
             for part in parts {
                 // Locate part directory in the backup staging area
                 let part_dir = find_part_dir(backup_dir, db, table, &part.name)?;
@@ -143,65 +167,177 @@ pub async fn upload(
                 // Generate S3 key
                 let s3_key = s3_key_for_part(backup_name, db, table, &part.name);
 
-                debug!(
-                    table = %table_key,
-                    part = %part.name,
-                    s3_key = %s3_key,
-                    "Compressing and uploading part"
-                );
+                work_items.push(UploadWorkItem {
+                    table_key: table_key.clone(),
+                    disk_name: disk_name.clone(),
+                    part: part.clone(),
+                    part_dir,
+                    s3_key,
+                });
 
-                // Compress part using spawn_blocking (sync tar + LZ4)
-                let part_dir_clone = part_dir.clone();
-                let part_name = part.name.clone();
-                let compressed = tokio::task::spawn_blocking(move || {
-                    stream::compress_part(&part_dir_clone, &part_name)
-                })
-                .await
-                .context("Compress task panicked")?
-                .with_context(|| {
-                    format!("Failed to compress part {}", part.name)
-                })?;
-
-                let compressed_size = compressed.len() as u64;
-
-                // Upload to S3
-                s3.put_object(&s3_key, compressed)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to upload part {} to S3", part.name)
-                    })?;
-
-                total_parts += 1;
-                total_compressed_size += compressed_size;
-
-                // Update part info with S3 key
-                let mut updated_part = part.clone();
-                updated_part.backup_key = s3_key;
-                updated_part.source = "uploaded".to_string();
-                updated_disk_parts.push(updated_part);
-
-                debug!(
-                    table = %table_key,
-                    part = %part.name,
-                    compressed_size = compressed_size,
-                    "Part uploaded"
-                );
+                has_parts = true;
             }
-
-            updated_parts.insert(disk_name.clone(), updated_disk_parts);
         }
 
-        // Update manifest with S3 keys
-        if let Some(tm) = manifest.tables.get_mut(table_key) {
-            tm.parts = updated_parts;
+        if has_parts {
+            table_count += 1;
         }
     }
 
-    // 3. Update manifest with compressed_size and data_format
+    let total_parts = work_items.len();
+    let concurrency = effective_upload_concurrency(config) as usize;
+
+    info!(
+        "Uploading {} parts across {} tables (concurrency={})",
+        total_parts, table_count, concurrency
+    );
+
+    // 3. Upload parts in parallel with semaphore and rate limiter
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let rate_limiter = RateLimiter::new(config.backup.upload_max_bytes_per_second);
+    let s3_chunk_size = config.s3.chunk_size;
+    let s3_max_parts_count = config.s3.max_parts_count;
+
+    let mut handles = Vec::with_capacity(total_parts);
+
+    for item in work_items {
+        let sem = semaphore.clone();
+        let s3 = s3.clone();
+        let rate_limiter = rate_limiter.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
+
+            debug!(
+                table = %item.table_key,
+                part = %item.part.name,
+                s3_key = %item.s3_key,
+                "Compressing and uploading part"
+            );
+
+            // Compress part using spawn_blocking (sync tar + LZ4)
+            let part_dir = item.part_dir.clone();
+            let part_name_for_compress = item.part.name.clone();
+            let compressed = tokio::task::spawn_blocking(move || {
+                stream::compress_part(&part_dir, &part_name_for_compress)
+            })
+            .await
+            .context("Compress task panicked")?
+            .with_context(|| format!("Failed to compress part {}", item.part.name))?;
+
+            let compressed_size = compressed.len() as u64;
+
+            // Decide between single PutObject and multipart upload
+            if should_use_multipart(compressed_size) {
+                debug!(
+                    table = %item.table_key,
+                    part = %item.part.name,
+                    compressed_size = compressed_size,
+                    "Part using multipart upload"
+                );
+
+                let chunk_size =
+                    calculate_chunk_size(compressed_size, s3_chunk_size, s3_max_parts_count)
+                        as usize;
+
+                // Create multipart upload
+                let upload_id = s3.create_multipart_upload(&item.s3_key).await?;
+
+                // Upload chunks, aborting on error
+                let upload_result = async {
+                    let mut completed_parts: Vec<(i32, String)> = Vec::new();
+                    let mut part_number = 1i32;
+
+                    for chunk_start in (0..compressed.len()).step_by(chunk_size) {
+                        let chunk_end = (chunk_start + chunk_size).min(compressed.len());
+                        let chunk_data = compressed[chunk_start..chunk_end].to_vec();
+
+                        let e_tag = s3
+                            .upload_part(&item.s3_key, &upload_id, part_number, chunk_data)
+                            .await?;
+
+                        completed_parts.push((part_number, e_tag));
+                        part_number += 1;
+                    }
+
+                    s3.complete_multipart_upload(&item.s3_key, &upload_id, completed_parts)
+                        .await?;
+
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+
+                if let Err(e) = upload_result {
+                    // Best-effort abort to clean up partial upload
+                    let _ = s3.abort_multipart_upload(&item.s3_key, &upload_id).await;
+                    return Err(e).with_context(|| {
+                        format!("Multipart upload failed for part {}", item.part.name)
+                    });
+                }
+            } else {
+                // Single PutObject
+                s3.put_object(&item.s3_key, compressed)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to upload part {} to S3", item.part.name)
+                    })?;
+            }
+
+            // Rate limit after upload
+            rate_limiter.consume(compressed_size).await;
+
+            // Build updated part info
+            let mut updated_part = item.part.clone();
+            updated_part.backup_key = item.s3_key.clone();
+            updated_part.source = "uploaded".to_string();
+
+            debug!(
+                table = %item.table_key,
+                part = %item.part.name,
+                compressed_size = compressed_size,
+                "Part uploaded"
+            );
+
+            Ok((item.table_key, item.disk_name, updated_part, compressed_size))
+        });
+
+        handles.push(handle);
+    }
+
+    // Await all uploads
+    let results: Vec<(String, String, PartInfo, u64)> = try_join_all(handles)
+        .await
+        .context("An upload task panicked")?
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+
+    // 4. Apply results to manifest sequentially
+    let mut total_compressed_size = 0u64;
+
+    // Group results by (table_key, disk_name)
+    let mut updates: HashMap<(String, String), Vec<PartInfo>> = HashMap::new();
+    for (table_key, disk_name, updated_part, compressed) in results {
+        total_compressed_size += compressed;
+        updates
+            .entry((table_key, disk_name))
+            .or_default()
+            .push(updated_part);
+    }
+
+    for ((table_key, disk_name), updated_parts) in updates {
+        if let Some(tm) = manifest.tables.get_mut(&table_key) {
+            tm.parts.insert(disk_name, updated_parts);
+        }
+    }
+
+    // 5. Update manifest with compressed_size and data_format
     manifest.compressed_size = total_compressed_size;
     manifest.data_format = data_format.clone();
 
-    // 4. Upload manifest LAST (per design 3.6)
+    // 6. Upload manifest LAST (per design 3.6)
     let manifest_key = format!("{}/metadata.json", backup_name);
     let manifest_bytes = manifest.to_json_bytes()?;
 
@@ -215,7 +351,7 @@ pub async fn upload(
         .await
         .context("Failed to upload manifest to S3")?;
 
-    // 5. Update local manifest with S3 keys
+    // 7. Update local manifest with S3 keys
     manifest
         .save_to_file(&manifest_path)
         .context("Failed to update local manifest with S3 keys")?;
@@ -227,7 +363,7 @@ pub async fn upload(
         "Upload complete"
     );
 
-    // 6. Delete local backup if requested
+    // 8. Delete local backup if requested
     if delete_local {
         info!(
             backup_dir = %backup_dir.display(),
@@ -281,6 +417,48 @@ fn find_part_dir(backup_dir: &Path, db: &str, table: &str, part_name: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_should_use_multipart() {
+        // Exactly at threshold: should NOT use multipart (must be strictly greater)
+        assert!(!should_use_multipart(32 * 1024 * 1024));
+        // Below threshold
+        assert!(!should_use_multipart(1024));
+        assert!(!should_use_multipart(0));
+        // Above threshold
+        assert!(should_use_multipart(32 * 1024 * 1024 + 1));
+        assert!(should_use_multipart(100 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_upload_work_item_construction() {
+        // Verify work items collect correct fields from manifest data
+        let part = PartInfo {
+            name: "202401_1_50_3".to_string(),
+            size: 134_217_728,
+            backup_key: String::new(),
+            source: "uploaded".to_string(),
+            checksum_crc64: 12345,
+            s3_objects: None,
+        };
+
+        let work_item = UploadWorkItem {
+            table_key: "default.trades".to_string(),
+            disk_name: "default".to_string(),
+            part: part.clone(),
+            part_dir: PathBuf::from("/tmp/backup/shadow/default/trades/202401_1_50_3"),
+            s3_key: "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string(),
+        };
+
+        assert_eq!(work_item.table_key, "default.trades");
+        assert_eq!(work_item.disk_name, "default");
+        assert_eq!(work_item.part.name, "202401_1_50_3");
+        assert_eq!(work_item.part.size, 134_217_728);
+        assert_eq!(
+            work_item.s3_key,
+            "daily/data/default/trades/202401_1_50_3.tar.lz4"
+        );
+    }
 
     #[test]
     fn test_url_encode_component_simple() {
