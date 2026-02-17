@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod clickhouse;
+pub mod concurrency;
 pub mod config;
 pub mod download;
 pub mod error;
