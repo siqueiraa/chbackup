@@ -34,17 +34,23 @@ use crate::manifest::{BackupManifest, DatabaseInfo, TableManifest};
 use crate::table_filter::{is_engine_excluded, is_excluded, TableFilter};
 
 use self::collect::collect_parts;
+use self::diff::diff_parts;
 use self::freeze::{FreezeGuard, FreezeInfo};
 
 /// Create a local backup.
 ///
 /// Returns the manifest describing the backup contents.
+///
+/// If `diff_from` is provided, the specified local backup is used as a base
+/// for incremental comparison. Parts matching by name+CRC64 are carried
+/// forward (referencing the base backup's S3 key) instead of being re-uploaded.
 pub async fn create(
     config: &Config,
     ch: &ChClient,
     backup_name: &str,
     table_pattern: Option<&str>,
     schema_only: bool,
+    diff_from: Option<&str>,
 ) -> Result<BackupManifest> {
     info!(
         backup_name = %backup_name,
@@ -370,7 +376,7 @@ pub async fn create(
     }
 
     // 13. Build manifest
-    let manifest = BackupManifest {
+    let mut manifest = BackupManifest {
         manifest_version: 1,
         name: backup_name.to_string(),
         timestamp: Utc::now(),
@@ -388,6 +394,24 @@ pub async fn create(
         rbac: None,
     };
 
+    // 13b. Apply incremental diff if --diff-from is specified
+    if let Some(base_name) = diff_from {
+        info!(base = %base_name, "Loading base manifest for diff-from");
+        let base_manifest_path = PathBuf::from(&config.clickhouse.data_path)
+            .join("backup")
+            .join(base_name)
+            .join("metadata.json");
+        let base = BackupManifest::load_from_file(&base_manifest_path)
+            .with_context(|| format!("Failed to load base backup '{}' for --diff-from", base_name))?;
+        let result = diff_parts(&mut manifest, &base);
+        info!(
+            carried = result.carried,
+            uploaded = result.uploaded,
+            crc_mismatches = result.crc_mismatches,
+            "Incremental diff applied to manifest"
+        );
+    }
+
     // 14. Save manifest
     let manifest_path = backup_dir.join("metadata.json");
     manifest.save_to_file(&manifest_path)?;
@@ -398,7 +422,6 @@ pub async fn create(
         .unwrap_or(0);
 
     // Update manifest with metadata_size and re-save
-    let mut manifest = manifest;
     manifest.metadata_size = metadata_size;
     manifest.save_to_file(&manifest_path)?;
 
