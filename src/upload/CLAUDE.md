@@ -34,8 +34,15 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 - `url_encode_component()` percent-encodes non-alphanumeric chars except `-`, `_`, `.`
 - Does NOT preserve `/` (encodes individual path components)
 
+### Incremental Upload (--diff-from-remote)
+- When `diff_from_remote` is set, `upload()` loads the remote base manifest from S3 (`{base_name}/metadata.json`) before building the work queue
+- Calls `backup::diff::diff_parts(&mut manifest, &base)` to mark matching parts as carried
+- Carried parts (`.source.starts_with("carried:")`) are skipped during work queue construction -- their data already exists on S3 from the base backup
+- Updated manifest (with both uploaded and carried parts) is saved locally and then uploaded to S3 last (atomicity guarantee still applies)
+- `compressed_size` is only counted for actually uploaded parts, not carried parts
+
 ### Public API
-- `upload(config, s3, backup_name, backup_dir, delete_local) -> Result<()>` -- Main entry point
+- `upload(config, s3, backup_name, backup_dir, delete_local, diff_from_remote: Option<&str>) -> Result<()>` -- Main entry point; when `diff_from_remote` is provided, loads remote base manifest and skips carried parts
 - `compress_part(part_dir, archive_name) -> Result<Vec<u8>>` -- Sync tar+LZ4 compression
 
 ### Parallel Upload Pattern (Phase 2a)

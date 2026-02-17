@@ -13,6 +13,7 @@ src/backup/
   mod.rs          -- Entry point: create() orchestrates the full backup flow
   checksum.rs     -- CRC64 computation using crc crate (CRC_64_XZ algorithm)
   collect.rs      -- Shadow directory walk, hardlink parts to backup staging, URL encoding
+  diff.rs         -- Incremental diff logic: diff_parts() compares current vs base manifest
   freeze.rs       -- FreezeGuard pattern for safe FREEZE/UNFREEZE lifecycle
   mutations.rs    -- Pre-flight pending mutation check (design 3.1)
   sync_replica.rs -- SYSTEM SYNC REPLICA for Replicated engines (design 3.2)
@@ -34,6 +35,14 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - Uses `crc::Crc::<u64>::new(&crc::CRC_64_XZ)` for ClickHouse-compatible checksums
 - Computes CRC64 of the `checksums.txt` file content for each part
 
+### Incremental Diff Pattern (diff.rs)
+- `diff_parts(current: &mut BackupManifest, base: &BackupManifest) -> DiffResult`: pure function (no I/O), compares parts by `(table_key, disk_name, part_name, checksum_crc64)`
+- Matching parts (same name + CRC64): `source` set to `"carried:{base_name}"`, `backup_key` copied from base manifest
+- CRC64 mismatch (same name, different checksum): part stays `source = "uploaded"` (re-uploaded) + `warn!()` log per design doc section 3.5
+- Extra tables in base that are not in current: gracefully ignored
+- `DiffResult` returns counts: `carried`, `uploaded`, `crc_mismatches`
+- Triggered by `--diff-from` flag in `create()`, or by `--diff-from-remote` in `upload()` (reuses same function)
+
 ### Backup Directory Layout
 ```
 {data_path}/backup/{backup_name}/
@@ -43,7 +52,8 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 ```
 
 ### Public API
-- `create(config, ch, backup_name, table_pattern, schema_only) -> Result<BackupManifest>` -- Main entry point
+- `create(config, ch, backup_name, table_pattern, schema_only, diff_from: Option<&str>) -> Result<BackupManifest>` -- Main entry point; when `diff_from` is provided, loads base manifest from local disk and applies `diff_parts()` before saving
+- `diff_parts(current, base) -> DiffResult` -- Incremental comparison of current vs base manifest parts
 - `compute_crc64(path) -> Result<u64>` -- File-level CRC64
 - `compute_crc64_bytes(data) -> u64` -- In-memory CRC64
 - `collect_parts(shadow_path, backup_dir, ...) -> Result<Vec<PartInfo>>` -- Walk and hardlink
