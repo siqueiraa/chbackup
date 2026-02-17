@@ -3,11 +3,11 @@
 //! Implements Mode B (non-destructive) restore flow from design doc section 5:
 //! 1. Read manifest from `{backup_dir}/metadata.json`
 //! 2. CREATE databases from manifest.databases DDL
-//! 3. For each table in manifest (filtered by table_pattern):
+//! 3. For each table in manifest (filtered by table_pattern), parallel by max_connections:
 //!    - If table does not exist: CREATE TABLE from DDL
 //!    - Sort parts by (partition, min_block)
 //!    - Hardlink parts to detached/ directory
-//!    - ALTER TABLE ATTACH PART for each part
+//!    - ALTER TABLE ATTACH PART for each part (engine-aware routing)
 //! 4. Log summary
 
 pub mod attach;
@@ -15,22 +15,27 @@ pub mod schema;
 pub mod sort;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::future::try_join_all;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::clickhouse::client::ChClient;
+use crate::concurrency::effective_max_connections;
 use crate::config::Config;
 use crate::manifest::BackupManifest;
 use crate::table_filter::TableFilter;
 
-use attach::{attach_parts, detect_clickhouse_ownership, get_table_data_path, AttachParams};
+use attach::{attach_parts_owned, detect_clickhouse_ownership, get_table_data_path, OwnedAttachParams};
 use schema::{create_databases, create_tables};
 
 /// Restore a backup to ClickHouse.
 ///
 /// Implements Mode B (non-destructive): creates databases and tables if they
 /// don't exist, then attaches data parts via detached/ directory.
+/// Tables are restored in parallel, bounded by max_connections semaphore.
 ///
 /// # Arguments
 ///
@@ -131,8 +136,8 @@ pub async fn restore(
         Vec::new()
     });
 
-    let mut total_attached = 0u64;
-    let mut tables_restored = 0u64;
+    // Collect tables that need data restore
+    let mut restore_items: Vec<(String, OwnedAttachParams)> = Vec::new();
 
     for table_key in &table_keys {
         let table_manifest = match manifest.tables.get(table_key) {
@@ -175,21 +180,66 @@ pub async fn restore(
             "Restoring table data"
         );
 
-        let attached = attach_parts(&AttachParams {
-            ch,
-            db,
-            table,
-            parts: &all_parts,
-            backup_dir: &backup_dir,
-            table_data_path: &table_data_path,
-            clickhouse_uid: ch_uid,
-            clickhouse_gid: ch_gid,
-        })
-        .await
-        .with_context(|| format!("Failed to attach parts for table {}", table_key))?;
+        restore_items.push((
+            table_key.clone(),
+            OwnedAttachParams {
+                ch: ch.clone(),
+                db: db.to_string(),
+                table: table.to_string(),
+                parts: all_parts,
+                backup_dir: backup_dir.clone(),
+                table_data_path,
+                clickhouse_uid: ch_uid,
+                clickhouse_gid: ch_gid,
+                engine: table_manifest.engine.clone(),
+            },
+        ));
+    }
 
+    let max_conn = effective_max_connections(config) as usize;
+    let table_count = restore_items.len();
+
+    info!(
+        "Restoring {} tables (max_connections={})",
+        table_count, max_conn
+    );
+
+    // 6. Parallel table restore with semaphore
+    let semaphore = Arc::new(Semaphore::new(max_conn));
+
+    let mut handles = Vec::with_capacity(table_count);
+
+    for (table_key, params) in restore_items {
+        let sem = semaphore.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
+
+            let attached = attach_parts_owned(params)
+                .await
+                .with_context(|| format!("Failed to attach parts for table {}", table_key))?;
+
+            Ok::<(String, u64), anyhow::Error>((table_key, attached))
+        });
+
+        handles.push(handle);
+    }
+
+    // Await all restore tasks
+    let results: Vec<(String, u64)> = try_join_all(handles)
+        .await
+        .context("A restore task panicked")?
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+
+    // 7. Tally totals
+    let mut total_attached = 0u64;
+    let tables_restored = results.len() as u64;
+    for (_table_key, attached) in &results {
         total_attached += attached;
-        tables_restored += 1;
     }
 
     info!(
