@@ -12,6 +12,7 @@
 
 pub mod checksum;
 pub mod collect;
+pub mod diff;
 pub mod freeze;
 pub mod mutations;
 pub mod sync_replica;
