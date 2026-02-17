@@ -129,28 +129,25 @@ async fn main() -> Result<()> {
         } => {
             // Warn about Phase 2+ flags that are not yet implemented
             if partitions.is_some() {
-                warn!("--partitions flag is not implemented in Phase 1, ignoring");
-            }
-            if diff_from.is_some() {
-                warn!("--diff-from flag is not implemented in Phase 1, ignoring");
+                warn!("--partitions flag is not yet implemented, ignoring");
             }
             if skip_projections.is_some() {
-                warn!("--skip-projections flag is not implemented in Phase 1, ignoring");
+                warn!("--skip-projections flag is not yet implemented, ignoring");
             }
             if rbac {
-                warn!("--rbac flag is not implemented in Phase 1, ignoring");
+                warn!("--rbac flag is not yet implemented, ignoring");
             }
             if configs {
-                warn!("--configs flag is not implemented in Phase 1, ignoring");
+                warn!("--configs flag is not yet implemented, ignoring");
             }
             if named_collections {
-                warn!("--named-collections flag is not implemented in Phase 1, ignoring");
+                warn!("--named-collections flag is not yet implemented, ignoring");
             }
             if skip_check_parts_columns {
-                warn!("--skip-check-parts-columns flag is not implemented in Phase 1, ignoring");
+                warn!("--skip-check-parts-columns flag is not yet implemented, ignoring");
             }
             if resume {
-                warn!("--resume flag is not implemented in Phase 1, ignoring");
+                warn!("--resume flag is not yet implemented, ignoring");
             }
 
             let name = resolve_backup_name(backup_name);
@@ -162,6 +159,7 @@ async fn main() -> Result<()> {
                 &name,
                 tables.as_deref(),
                 schema,
+                diff_from.as_deref(),
             )
             .await?;
 
@@ -174,11 +172,8 @@ async fn main() -> Result<()> {
             resume,
             backup_name,
         } => {
-            if diff_from_remote.is_some() {
-                warn!("--diff-from-remote flag is not implemented in Phase 1, ignoring");
-            }
             if resume {
-                warn!("--resume flag is not implemented in Phase 1, ignoring");
+                warn!("--resume flag is not yet implemented, ignoring");
             }
 
             let name = backup_name_required(backup_name, "upload")?;
@@ -188,7 +183,15 @@ async fn main() -> Result<()> {
                 .join("backup")
                 .join(&name);
 
-            upload::upload(&config, &s3, &name, &backup_dir, delete_local).await?;
+            upload::upload(
+                &config,
+                &s3,
+                &name,
+                &backup_dir,
+                delete_local,
+                diff_from_remote.as_deref(),
+            )
+            .await?;
 
             info!(backup_name = %name, "Upload command complete");
         }
@@ -277,8 +280,69 @@ async fn main() -> Result<()> {
             info!(backup_name = %name, "Restore command complete");
         }
 
-        Command::CreateRemote { backup_name, .. } => {
-            info!(backup_name = ?backup_name, "create_remote: not implemented in Phase 1");
+        Command::CreateRemote {
+            tables,
+            diff_from_remote,
+            delete_source,
+            rbac,
+            configs,
+            named_collections,
+            skip_check_parts_columns,
+            skip_projections,
+            resume,
+            backup_name,
+        } => {
+            // Warn about unimplemented Phase 2+ flags
+            if rbac {
+                warn!("--rbac flag is not yet implemented, ignoring");
+            }
+            if configs {
+                warn!("--configs flag is not yet implemented, ignoring");
+            }
+            if named_collections {
+                warn!("--named-collections flag is not yet implemented, ignoring");
+            }
+            if skip_check_parts_columns {
+                warn!("--skip-check-parts-columns flag is not yet implemented, ignoring");
+            }
+            if skip_projections.is_some() {
+                warn!("--skip-projections flag is not yet implemented, ignoring");
+            }
+            if resume {
+                warn!("--resume flag is not yet implemented, ignoring");
+            }
+
+            let name = resolve_backup_name(backup_name);
+            let ch = ChClient::new(&config.clickhouse)?;
+            let s3 = S3Client::new(&config.s3).await?;
+
+            // Step 1: Create local backup (no local diff-from for create_remote)
+            let _manifest = backup::create(
+                &config,
+                &ch,
+                &name,
+                tables.as_deref(),
+                false, // schema_only
+                None,  // diff_from (create_remote uses diff_from_remote on upload side)
+            )
+            .await?;
+
+            // Step 2: Upload to S3 (with optional diff-from-remote)
+            let backup_dir = PathBuf::from(&config.clickhouse.data_path)
+                .join("backup")
+                .join(&name);
+
+            upload::upload(
+                &config,
+                &s3,
+                &name,
+                &backup_dir,
+                delete_source,
+                diff_from_remote.as_deref(),
+            )
+            .await?;
+
+            info!(backup_name = %name, "CreateRemote command complete");
         }
 
         Command::RestoreRemote { backup_name, .. } => {
