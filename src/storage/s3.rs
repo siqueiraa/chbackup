@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{Delete, ObjectIdentifier, ServerSideEncryption};
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, ServerSideEncryption,
+};
 use chrono::{DateTime, Utc};
 use tracing::{debug, info};
 
@@ -461,6 +463,220 @@ impl S3Client {
             }
         }
     }
+
+    // -- Multipart upload operations --
+
+    /// Initiate a multipart upload and return the upload ID.
+    ///
+    /// The `key` is relative to the configured prefix. SSE and storage class
+    /// settings are applied consistently with `put_object`.
+    pub async fn create_multipart_upload(&self, key: &str) -> Result<String> {
+        let full_key = self.full_key(key);
+
+        debug!(key = %full_key, "Creating multipart upload");
+
+        let mut req = self
+            .inner
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&full_key);
+
+        // Apply storage class (same as put_object)
+        if !self.storage_class.is_empty() {
+            let sc: aws_sdk_s3::types::StorageClass = self.storage_class.as_str().into();
+            req = req.storage_class(sc);
+        }
+
+        // Apply server-side encryption (same as put_object)
+        if self.sse == "aws:kms" {
+            req = req.server_side_encryption(ServerSideEncryption::AwsKms);
+            if !self.sse_kms_key_id.is_empty() {
+                req = req.ssekms_key_id(&self.sse_kms_key_id);
+            }
+        } else if self.sse == "AES256" {
+            req = req.server_side_encryption(ServerSideEncryption::Aes256);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to create multipart upload for: {}", full_key))?;
+
+        let upload_id = resp
+            .upload_id()
+            .ok_or_else(|| anyhow::anyhow!("No upload_id returned for multipart upload: {}", full_key))?
+            .to_string();
+
+        debug!(key = %full_key, upload_id = %upload_id, "Multipart upload created");
+        Ok(upload_id)
+    }
+
+    /// Upload a single part of a multipart upload.
+    ///
+    /// Returns the ETag of the uploaded part, which is needed for
+    /// `complete_multipart_upload`. Part numbers must be between 1 and 10000.
+    pub async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: Vec<u8>,
+    ) -> Result<String> {
+        let full_key = self.full_key(key);
+        let size = body.len();
+
+        debug!(
+            key = %full_key,
+            upload_id = %upload_id,
+            part_number = part_number,
+            size = size,
+            "Uploading part"
+        );
+
+        let resp = self
+            .inner
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to upload part {} for {}: upload_id={}",
+                    part_number, full_key, upload_id
+                )
+            })?;
+
+        let e_tag = resp
+            .e_tag()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No ETag returned for part {} of {}: upload_id={}",
+                    part_number,
+                    full_key,
+                    upload_id
+                )
+            })?
+            .to_string();
+
+        debug!(
+            key = %full_key,
+            part_number = part_number,
+            e_tag = %e_tag,
+            "Part uploaded"
+        );
+        Ok(e_tag)
+    }
+
+    /// Complete a multipart upload by assembling all uploaded parts.
+    ///
+    /// `parts` is a list of `(part_number, e_tag)` tuples from `upload_part` calls.
+    /// Parts must be in ascending order by part number.
+    pub async fn complete_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<()> {
+        let full_key = self.full_key(key);
+
+        debug!(
+            key = %full_key,
+            upload_id = %upload_id,
+            part_count = parts.len(),
+            "Completing multipart upload"
+        );
+
+        let completed_parts: Vec<CompletedPart> = parts
+            .into_iter()
+            .map(|(part_number, e_tag)| {
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(e_tag)
+                    .build()
+            })
+            .collect();
+
+        let completed = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+
+        self.inner
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .upload_id(upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to complete multipart upload for {}: upload_id={}",
+                    full_key, upload_id
+                )
+            })?;
+
+        debug!(key = %full_key, upload_id = %upload_id, "Multipart upload completed");
+        Ok(())
+    }
+
+    /// Abort a multipart upload, cleaning up any uploaded parts.
+    ///
+    /// This should be called when a multipart upload fails partway through
+    /// to avoid leaving orphaned parts in S3.
+    pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        let full_key = self.full_key(key);
+
+        debug!(
+            key = %full_key,
+            upload_id = %upload_id,
+            "Aborting multipart upload"
+        );
+
+        self.inner
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to abort multipart upload for {}: upload_id={}",
+                    full_key, upload_id
+                )
+            })?;
+
+        debug!(key = %full_key, upload_id = %upload_id, "Multipart upload aborted");
+        Ok(())
+    }
+}
+
+/// S3 minimum part size: 5 MiB (except the last part).
+const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// Calculate the chunk size for multipart upload.
+///
+/// When `config_chunk_size` is 0 (auto), computes the chunk size as
+/// `data_len / max_parts_count`, rounded up. The result is clamped to
+/// at least `S3_MIN_PART_SIZE` (5 MiB) to satisfy S3 requirements.
+///
+/// When `config_chunk_size` is > 0, uses that value directly but still
+/// enforces the 5 MiB minimum.
+pub fn calculate_chunk_size(data_len: u64, config_chunk_size: u64, max_parts_count: u32) -> u64 {
+    let chunk = if config_chunk_size > 0 {
+        config_chunk_size
+    } else {
+        // Auto: divide data evenly across max_parts_count, rounding up
+        let parts = max_parts_count.max(1) as u64;
+        data_len.div_ceil(parts)
+    };
+
+    // Enforce S3 minimum part size
+    chunk.max(S3_MIN_PART_SIZE)
 }
 
 #[cfg(test)]
@@ -512,6 +728,61 @@ mod tests {
             client.full_key("daily/metadata.json"),
             "prod/region1/chbackup/daily/metadata.json"
         );
+    }
+
+    #[test]
+    fn test_multipart_chunk_calculation() {
+        // 100MB file with default max_parts_count=10000 and chunk_size=0 (auto)
+        let data_len = 100 * 1024 * 1024;
+        let chunk = calculate_chunk_size(data_len, 0, 10000);
+        // 100MB / 10000 = ~10KB, but S3 minimum is 5MB
+        assert_eq!(chunk, S3_MIN_PART_SIZE);
+
+        // 100GB file with auto chunk_size
+        let data_len = 100 * 1024 * 1024 * 1024_u64;
+        let chunk = calculate_chunk_size(data_len, 0, 10000);
+        // 100GB / 10000 = ~10MB, which is above minimum
+        assert!(chunk >= S3_MIN_PART_SIZE);
+        // Number of parts should not exceed max_parts_count
+        let part_count = data_len.div_ceil(chunk);
+        assert!(part_count <= 10000);
+    }
+
+    #[test]
+    fn test_calculate_chunk_size_auto() {
+        // Auto mode: config_chunk_size = 0
+        // 50GB data, 10000 max parts -> ~5.3MB per chunk (above minimum)
+        let data_len = 50 * 1024 * 1024 * 1024_u64;
+        let chunk = calculate_chunk_size(data_len, 0, 10000);
+        let auto_computed = data_len.div_ceil(10000);
+        assert_eq!(chunk, auto_computed);
+        assert!(chunk >= S3_MIN_PART_SIZE);
+
+        // 500GB data, 10000 max parts -> ~50MB per chunk
+        let data_len = 500 * 1024 * 1024 * 1024_u64;
+        let chunk = calculate_chunk_size(data_len, 0, 10000);
+        let expected = data_len.div_ceil(10000);
+        assert_eq!(chunk, expected);
+    }
+
+    #[test]
+    fn test_calculate_chunk_size_explicit() {
+        // Explicit chunk size: 64MB
+        let explicit = 64 * 1024 * 1024;
+        let chunk = calculate_chunk_size(1024 * 1024 * 1024, explicit, 10000);
+        assert_eq!(chunk, explicit);
+    }
+
+    #[test]
+    fn test_calculate_chunk_size_minimum() {
+        // Explicit chunk size below 5MB should be clamped to 5MB
+        let small_chunk = 1024 * 1024; // 1MB
+        let chunk = calculate_chunk_size(100 * 1024 * 1024, small_chunk, 10000);
+        assert_eq!(chunk, S3_MIN_PART_SIZE);
+
+        // Auto with very large max_parts_count should also clamp to 5MB
+        let chunk = calculate_chunk_size(10 * 1024 * 1024, 0, 10000);
+        assert_eq!(chunk, S3_MIN_PART_SIZE);
     }
 
     /// Create a minimal S3Client for unit testing (no real AWS connection).
