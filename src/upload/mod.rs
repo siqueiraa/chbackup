@@ -20,6 +20,7 @@ use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
 
+use crate::backup::diff::diff_parts;
 use crate::concurrency::effective_upload_concurrency;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo};
@@ -86,6 +87,11 @@ struct UploadWorkItem {
 /// Reads the manifest from the local backup directory, compresses each part
 /// with tar+LZ4, uploads to S3 in parallel, and uploads the manifest last.
 ///
+/// If `diff_from_remote` is provided, the specified remote backup's manifest
+/// is loaded from S3 and used as a base for incremental comparison. Parts
+/// matching by name+CRC64 are carried forward (skipped in the upload queue),
+/// referencing the base backup's S3 key.
+///
 /// # Arguments
 ///
 /// * `config` - Application configuration
@@ -93,12 +99,14 @@ struct UploadWorkItem {
 /// * `backup_name` - Name of the backup to upload
 /// * `backup_dir` - Path to the local backup directory
 /// * `delete_local` - If true, remove local backup directory after successful upload
+/// * `diff_from_remote` - Optional remote base backup name for incremental upload
 pub async fn upload(
     config: &Config,
     s3: &S3Client,
     backup_name: &str,
     backup_dir: &Path,
     delete_local: bool,
+    diff_from_remote: Option<&str>,
 ) -> Result<()> {
     info!(
         backup_name = %backup_name,
@@ -118,6 +126,38 @@ pub async fn upload(
 
     let mut manifest = BackupManifest::load_from_file(&manifest_path)
         .with_context(|| format!("Failed to load manifest from: {}", manifest_path.display()))?;
+
+    // 1b. If --diff-from-remote is specified, load remote base manifest and apply diff
+    if let Some(base_name) = diff_from_remote {
+        info!(base = %base_name, "Loading remote base manifest for diff-from-remote");
+        let base_manifest_key = format!("{}/metadata.json", base_name);
+        let base_bytes = s3
+            .get_object(&base_manifest_key)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to download base manifest for --diff-from-remote '{}'",
+                    base_name
+                )
+            })?;
+        let base = BackupManifest::from_json_bytes(&base_bytes).with_context(|| {
+            format!(
+                "Failed to parse base manifest for --diff-from-remote '{}'",
+                base_name
+            )
+        })?;
+        let result = diff_parts(&mut manifest, &base);
+        info!(
+            carried = result.carried,
+            uploaded = result.uploaded,
+            crc_mismatches = result.crc_mismatches,
+            "Incremental diff applied to manifest (diff-from-remote)"
+        );
+        // Save updated manifest locally so carried parts are recorded
+        manifest
+            .save_to_file(&manifest_path)
+            .context("Failed to save updated manifest after diff-from-remote")?;
+    }
 
     let data_format = &config.backup.compression;
 
@@ -153,6 +193,17 @@ pub async fn upload(
 
         for (disk_name, parts) in &table_manifest.parts {
             for part in parts {
+                // Skip carried parts -- their data is already on S3 from the base backup
+                if part.source.starts_with("carried:") {
+                    debug!(
+                        table = %table_key,
+                        part = %part.name,
+                        source = %part.source,
+                        "Skipping carried part (already on S3)"
+                    );
+                    continue;
+                }
+
                 // Locate part directory in the backup staging area
                 let part_dir = find_part_dir(backup_dir, db, table, &part.name)?;
 
@@ -327,9 +378,24 @@ pub async fn upload(
             .push(updated_part);
     }
 
-    for ((table_key, disk_name), updated_parts) in updates {
+    for ((table_key, disk_name), uploaded_parts) in updates {
         if let Some(tm) = manifest.tables.get_mut(&table_key) {
-            tm.parts.insert(disk_name, updated_parts);
+            // Preserve carried parts (already have correct backup_key from diff),
+            // then append the newly uploaded parts with updated S3 keys.
+            let carried: Vec<PartInfo> = tm
+                .parts
+                .get(&disk_name)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter(|p| p.source.starts_with("carried:"))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut merged = carried;
+            merged.extend(uploaded_parts);
+            tm.parts.insert(disk_name, merged);
         }
     }
 
