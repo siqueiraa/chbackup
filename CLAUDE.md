@@ -64,6 +64,7 @@ Things that are easy to get wrong when reading the design doc:
 **Phase 2c** (S3 object disk): Complete -- S3 disk metadata parser (5 format versions), disk-aware shadow walk, CopyObject with retry+streaming fallback, mixed disk upload/download, UUID-isolated S3 restore with same-name optimization.
 **Phase 2d** (resume & reliability): Complete -- Resumable upload/download/restore via state files, atomic manifest upload (.tmp+CopyObject+delete), post-download CRC64 verification with retry, disk space pre-flight check, partition-level FREEZE, disk filtering (skip_disks/skip_disk_types), parts column consistency check, broken backup cleanup (clean_broken), ClickHouse TLS support.
 **Phase 3d** (watch mode): Complete -- Watch state machine loop with full+incremental backup chains, name template resolution ({type}/{time:FORMAT}/{shard} macros), resume-on-restart from remote backup listing, SIGHUP config hot-reload, API endpoints (watch/start, watch/stop, watch/status, reload), server --watch flag, Prometheus watch metrics.
+**Phase 3e** (docker/deploy): Complete -- Production Dockerfile, GitHub Actions CI with ClickHouse version matrix, K8s sidecar example, integration test seed data and round-trip smoke tests, WATCH_INTERVAL/FULL_INTERVAL env var overlay.
 
 ## Source Module Map
 
@@ -143,6 +144,7 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **Watch name templates**: `resolve_name_template()` substitutes `{type}`, `{time:FORMAT}`, and ClickHouse `system.macros` values; `resolve_template_prefix()` extracts the static prefix for backup filtering
 - **Watch config hot-reload**: SIGHUP (Unix) or `/api/v1/reload` triggers `Config::load()` + `validate()` at next sleep entry; current cycle completes first (design 10.8); logs old->new values for key parameters
 - **Watch server integration**: `start_server()` optionally spawns watch loop as background task; `spawn_watch_from_state()` enables dynamic start via API; channels (`watch::Sender<bool>`) for shutdown/reload signaling
+- **Watch env var overlay**: `WATCH_INTERVAL` and `FULL_INTERVAL` env vars are mapped in `apply_env_overlay()` for K8s deployments where config file overlay is less ergonomic than environment variables
 
 ## Remaining Limitations
 
@@ -157,9 +159,20 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 ```bash
 cargo build --release --target x86_64-unknown-linux-musl  # static binary
 cargo test                                                  # unit tests
+docker build -t chbackup .                                  # production image
 ```
 
 Integration tests require real ClickHouse + S3 (no mocks).
+
+## Infrastructure Files
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile` | Production multi-stage build (musl static binary, Alpine runtime) |
+| `.github/workflows/ci.yml` | CI with ClickHouse version matrix (23.8, 24.3, 24.8, 25.1) |
+| `examples/kubernetes/sidecar.yaml` | K8s sidecar deployment example (server --watch) |
+| `test/fixtures/seed_data.sql` | Deterministic test data for round-trip verification |
+| `test/run_tests.sh` | Integration test runner with round-trip smoke test |
 
 ## Git Conventions
 
