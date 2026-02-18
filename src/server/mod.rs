@@ -12,6 +12,7 @@
 
 pub mod actions;
 pub mod auth;
+pub mod metrics;
 pub mod routes;
 pub mod state;
 
