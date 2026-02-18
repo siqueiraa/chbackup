@@ -1,0 +1,294 @@
+{
+  "plan": "2026-02-18-03-phase3c-retention-gc",
+  "status": {"pass": 7, "fail": 0, "total": 7},
+  "last_updated": "2026-02-18T21:15:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "feature",
+      "description": "Config resolution helpers + local retention: effective_retention_local/remote resolve retention.* vs general.*, retention_local deletes oldest local backups exceeding keep count",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub fn effective_retention_local' src/list.rs && grep -n 'pub fn effective_retention_remote' src/list.rs && grep -n 'pub fn retention_local' src/list.rs",
+            "expected": "3 matches (one per function)",
+            "fail_message": "One or more retention functions not found in src/list.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after adding retention functions"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_effective_retention_local test_retention_local_deletes_oldest test_retention_local_skips_broken test_retention_local_zero_means_unlimited -- --test-threads=1 2>&1 | grep -E '(test result|FAILED)'",
+            "expected": "test result: ok",
+            "fail_message": "Retention local unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Unit-testable pure logic functions; behavioral layer provides comprehensive coverage with 4 test cases covering config resolution, deletion ordering, broken backup exclusion, and unlimited semantics",
+            "covered_by": ["F001"],
+            "alternative_verification": {
+              "command": "cargo test test_retention_local -- --test-threads=1 2>&1 | grep -c 'test result: ok'",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": "2026-02-18T20:00:00Z"
+    },
+    {
+      "id": "F002",
+      "category": "feature",
+      "description": "GC key collection: collect_keys_from_manifest extracts all backup_key values from manifest tables and S3 objects",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'fn collect_keys_from_manifest' src/list.rs && grep -n 'pub async fn gc_collect_referenced_keys' src/list.rs",
+            "expected": "2 matches (one per function)",
+            "fail_message": "GC key collection functions not found in src/list.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after adding GC functions"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_collect_referenced_keys_from_manifest -- --test-threads=1 2>&1 | grep -E '(test result|FAILED)'",
+            "expected": "test result: ok",
+            "fail_message": "GC key collection unit test failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "collect_keys_from_manifest is pure in-memory logic; gc_collect_referenced_keys requires real S3 (integration test). Behavioral layer tests the key extraction logic thoroughly.",
+            "covered_by": ["F002"],
+            "alternative_verification": {
+              "command": "cargo test test_collect_referenced_keys -- --test-threads=1 2>&1 | grep -c 'test result: ok'",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": "2026-02-18T20:10:00Z"
+    },
+    {
+      "id": "F003",
+      "category": "feature",
+      "description": "GC-safe deletion + remote retention: gc_delete_backup only deletes unreferenced S3 keys, retention_remote orchestrates GC-safe deletion of oldest remote backups",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub async fn gc_delete_backup' src/list.rs && grep -n 'pub async fn retention_remote' src/list.rs",
+            "expected": "2 matches (one per function)",
+            "fail_message": "GC delete or remote retention functions not found in src/list.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after adding GC delete and remote retention"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_gc_filter_unreferenced_keys -- --test-threads=1 2>&1 | grep -E '(test result|FAILED)'",
+            "expected": "test result: ok",
+            "fail_message": "GC filtering unit test failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "gc_delete_backup and retention_remote require real S3 for integration testing. The GC filtering logic is unit-tested. Full E2E validation requires real S3 + multiple backups.",
+            "covered_by": ["F003"],
+            "alternative_verification": {
+              "command": "cargo test test_gc_filter -- --test-threads=1 2>&1 | grep -c 'test result: ok'",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": "2026-02-18T20:20:00Z"
+    },
+    {
+      "id": "F004",
+      "category": "feature",
+      "description": "CLI clean command wiring: Command::Clean dispatches to list::clean_shadow",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'clean_shadow' src/main.rs",
+            "expected": "at least 1 match",
+            "fail_message": "clean_shadow not called from main.rs Command::Clean handler"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after wiring clean command"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo build --release 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Release build failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "CLI wiring is structural; clean command requires real ClickHouse for get_disks(). Compilation + build proves correct wiring.",
+            "covered_by": ["F006"],
+            "alternative_verification": {
+              "command": "grep -c 'clean_shadow' src/main.rs",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": "2026-02-18T21:00:00Z"
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "API clean endpoint: clean_stub replaced with real handler following operation pattern",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub async fn clean(' src/server/routes.rs && grep -c 'clean_stub' src/server/routes.rs | grep -x '0'",
+            "expected": "clean function found AND 0 occurrences of clean_stub",
+            "fail_message": "clean handler not found or clean_stub still exists"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after replacing clean_stub"
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -n 'routes::clean)' src/server/mod.rs && grep -c 'clean_stub' src/server/mod.rs | grep -x '0'",
+            "expected": "routes::clean wired in mod.rs AND 0 references to clean_stub",
+            "fail_message": "Route wiring not updated from clean_stub to clean"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "API handler requires running server with ClickHouse. Structural + compilation layers verify correct wiring. Handler follows identical pattern to clean_remote_broken (already working).",
+            "covered_by": ["F004", "F006"],
+            "alternative_verification": {
+              "command": "grep -c 'try_start_op.*clean' src/server/routes.rs",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": "2026-02-18T21:00:00Z"
+    },
+    {
+      "id": "F006",
+      "category": "feature",
+      "description": "Shadow directory cleanup: clean_shadow removes chbackup_* dirs from shadow paths, with optional name filter",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'fn clean_shadow_dir' src/list.rs && grep -n 'pub async fn clean_shadow' src/list.rs",
+            "expected": "2 matches (private helper + public async function)",
+            "fail_message": "clean_shadow functions not found in src/list.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after adding clean_shadow"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_clean_shadow_removes_chbackup_dirs test_clean_shadow_with_name_filter -- --test-threads=1 2>&1 | grep -E '(test result|FAILED)'",
+            "expected": "test result: ok",
+            "fail_message": "Shadow cleanup unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "clean_shadow_dir is tested with filesystem-level unit tests (tempdir). The async wrapper clean_shadow only adds get_disks + spawn_blocking, which requires real ClickHouse.",
+            "covered_by": ["F006"],
+            "alternative_verification": {
+              "command": "cargo test test_clean_shadow -- --test-threads=1 2>&1 | grep -c 'test result: ok'",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [6],
+      "verified_at": "2026-02-18T20:42:00Z"
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for server module with clean endpoint documentation",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f src/server/CLAUDE.md && echo EXISTS",
+            "expected": "EXISTS",
+            "fail_message": "src/server/CLAUDE.md does not exist"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -q 'Parent Context' src/server/CLAUDE.md && grep -q 'Directory Structure' src/server/CLAUDE.md && grep -q 'Key Patterns' src/server/CLAUDE.md && grep -q 'Parent Rules' src/server/CLAUDE.md && echo VALID",
+            "expected": "VALID",
+            "fail_message": "CLAUDE.md missing required sections"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Documentation file - no runtime behavior",
+            "covered_by": ["FDOC"],
+            "alternative_verification": {
+              "command": "grep -c 'clean' src/server/CLAUDE.md",
+              "expected": "at least 1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [7],
+      "verified_at": "2026-02-18T21:15:00Z"
+    }
+  ]
+}

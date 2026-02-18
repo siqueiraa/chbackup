@@ -1,0 +1,32 @@
+{
+  "git_base": "df21301",
+  "modules": [
+    {
+      "path": "src/list.rs",
+      "type": "file",
+      "claude_md": "N/A",
+      "triggers": ["new_functions"],
+      "action": "modify"
+    },
+    {
+      "path": "src/server",
+      "type": "directory_module",
+      "claude_md": "exists",
+      "triggers": ["stub_replacement", "new_route_handler"],
+      "action": "update"
+    },
+    {
+      "path": "src/main.rs",
+      "type": "file",
+      "claude_md": "N/A",
+      "triggers": ["command_dispatch"],
+      "action": "modify"
+    }
+  ],
+  "summary": {
+    "to_modify": ["src/list.rs", "src/server/routes.rs", "src/server/mod.rs", "src/main.rs"],
+    "to_update_claude_md": ["src/server"],
+    "no_change": ["src/config.rs", "src/lock.rs", "src/error.rs"],
+    "total_affected": 4
+  }
+}

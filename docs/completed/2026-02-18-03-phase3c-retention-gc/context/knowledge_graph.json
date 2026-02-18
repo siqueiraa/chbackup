@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "generated_at": "2026-02-18T00:00:00Z",
+  "verified_symbols": {
+    "Config": {
+      "import": "crate::config::Config",
+      "kind": "struct",
+      "fields": ["general", "clickhouse", "s3", "backup", "retention", "watch", "api"],
+      "location": "src/config.rs:8"
+    },
+    "RetentionConfig": {
+      "import": "crate::config::RetentionConfig",
+      "kind": "struct",
+      "fields": ["backups_to_keep_local", "backups_to_keep_remote"],
+      "location": "src/config.rs:378"
+    },
+    "GeneralConfig": {
+      "import": "crate::config::GeneralConfig",
+      "kind": "struct",
+      "fields": ["log_level", "log_format", "disable_progress_bar", "backups_to_keep_local", "backups_to_keep_remote", "upload_concurrency", "download_concurrency", "upload_max_bytes_per_second", "download_max_bytes_per_second", "object_disk_server_side_copy_concurrency", "retries_on_failure", "retries_pause", "retries_jitter", "use_resumable_state"],
+      "location": "src/config.rs:36"
+    },
+    "BackupSummary": {
+      "import": "crate::list::BackupSummary",
+      "kind": "struct",
+      "fields": ["name", "timestamp", "size", "compressed_size", "table_count", "is_broken", "broken_reason"],
+      "location": "src/list.rs:24"
+    },
+    "Location_list": {
+      "import": "crate::list::Location",
+      "kind": "enum",
+      "variants": ["Local", "Remote"],
+      "location": "src/list.rs:17"
+    },
+    "BackupManifest": {
+      "import": "crate::manifest::BackupManifest",
+      "kind": "struct",
+      "fields": ["manifest_version", "name", "timestamp", "clickhouse_version", "chbackup_version", "data_format", "compressed_size", "metadata_size", "disks", "disk_types", "disk_remote_paths", "tables", "databases", "functions", "named_collections", "rbac"],
+      "location": "src/manifest.rs:19"
+    },
+    "TableManifest": {
+      "import": "crate::manifest::TableManifest",
+      "kind": "struct",
+      "fields": ["ddl", "uuid", "engine", "total_bytes", "parts", "pending_mutations", "metadata_only", "dependencies"],
+      "location": "src/manifest.rs:86"
+    },
+    "PartInfo": {
+      "import": "crate::manifest::PartInfo",
+      "kind": "struct",
+      "fields": ["name", "size", "backup_key", "source", "checksum_crc64", "s3_objects"],
+      "location": "src/manifest.rs:121"
+    },
+    "S3ObjectInfo": {
+      "import": "crate::manifest::S3ObjectInfo",
+      "kind": "struct",
+      "fields": ["path", "size", "backup_key"],
+      "location": "src/manifest.rs:150"
+    },
+    "S3Client": {
+      "import": "crate::storage::S3Client",
+      "kind": "struct",
+      "fields": ["client", "bucket", "prefix", "storage_class", "sse", "sse_kms_key_id"],
+      "location": "src/storage/s3.rs:27"
+    },
+    "S3Object": {
+      "import": "crate::storage::S3Object",
+      "kind": "struct",
+      "fields": ["key", "size", "last_modified"],
+      "location": "src/storage/s3.rs:35"
+    },
+    "ChClient": {
+      "import": "crate::clickhouse::ChClient",
+      "kind": "struct",
+      "fields": ["client", "log_sql_queries"],
+      "location": "src/clickhouse/client.rs:14"
+    },
+    "DiskRow": {
+      "import": "crate::clickhouse::DiskRow",
+      "kind": "struct",
+      "fields": ["name", "path", "type_field", "remote_path"],
+      "location": "src/clickhouse/client.rs:72"
+    },
+    "ChBackupError": {
+      "import": "crate::error::ChBackupError",
+      "kind": "enum",
+      "variants": ["ClickHouseError", "S3Error", "ConfigError", "LockError", "BackupError", "RestoreError", "ManifestError", "IoError"],
+      "location": "src/error.rs:4"
+    },
+    "LockScope": {
+      "import": "crate::lock::LockScope",
+      "kind": "enum",
+      "variants": ["Backup", "Global", "None"],
+      "location": "src/lock.rs:101"
+    },
+    "PidLock": {
+      "import": "crate::lock::PidLock",
+      "kind": "struct",
+      "fields": ["path"],
+      "location": "src/lock.rs:27"
+    },
+    "AppState": {
+      "import": "crate::server::state::AppState",
+      "kind": "struct",
+      "fields": ["config", "ch", "s3", "action_log", "current_op", "op_semaphore", "metrics"],
+      "location": "src/server/state.rs:26"
+    },
+    "Metrics": {
+      "import": "crate::server::metrics::Metrics",
+      "kind": "struct",
+      "fields": ["registry", "backup_duration_seconds", "backup_size_bytes", "backup_last_success_timestamp", "parts_uploaded_total", "parts_skipped_incremental_total", "errors_total", "successful_operations_total", "number_backups_local", "number_backups_remote", "in_progress", "watch_state", "watch_last_full_timestamp", "watch_last_incremental_timestamp", "watch_consecutive_errors"],
+      "location": "src/server/metrics.rs"
+    },
+    "list_local": {
+      "import": "crate::list::list_local",
+      "kind": "function",
+      "signature": "fn(data_path: &str) -> Result<Vec<BackupSummary>>",
+      "location": "src/list.rs:81"
+    },
+    "list_remote": {
+      "import": "crate::list::list_remote",
+      "kind": "function",
+      "signature": "async fn(s3: &S3Client) -> Result<Vec<BackupSummary>>",
+      "location": "src/list.rs:125"
+    },
+    "delete_local": {
+      "import": "crate::list::delete_local",
+      "kind": "function",
+      "signature": "fn(data_path: &str, backup_name: &str) -> Result<()>",
+      "location": "src/list.rs:217"
+    },
+    "delete_remote": {
+      "import": "crate::list::delete_remote",
+      "kind": "function",
+      "signature": "async fn(s3: &S3Client, backup_name: &str) -> Result<()>",
+      "location": "src/list.rs:248"
+    },
+    "clean_broken_local": {
+      "import": "crate::list::clean_broken_local",
+      "kind": "function",
+      "signature": "fn(data_path: &str) -> Result<usize>",
+      "location": "src/list.rs:292"
+    },
+    "clean_broken_remote": {
+      "import": "crate::list::clean_broken_remote",
+      "kind": "function",
+      "signature": "async fn(s3: &S3Client) -> Result<usize>",
+      "location": "src/list.rs:325"
+    },
+    "clean_broken": {
+      "import": "crate::list::clean_broken",
+      "kind": "function",
+      "signature": "async fn(data_path: &str, s3: &S3Client, location: &Location) -> Result<()>",
+      "location": "src/list.rs:356"
+    },
+    "lock_for_command": {
+      "import": "crate::lock::lock_for_command",
+      "kind": "function",
+      "signature": "fn(command: &str, backup_name: Option<&str>) -> LockScope",
+      "location": "src/lock.rs:116"
+    },
+    "strip_s3_prefix": {
+      "import": "crate::list::strip_s3_prefix (private)",
+      "kind": "function",
+      "signature": "fn(key: &str, prefix: &str) -> String",
+      "location": "src/list.rs:435"
+    },
+    "sanitize_name": {
+      "import": "crate::clickhouse::sanitize_name",
+      "kind": "function",
+      "signature": "fn(name: &str) -> String",
+      "location": "src/clickhouse/client.rs:622"
+    },
+    "freeze_name": {
+      "import": "crate::clickhouse::freeze_name",
+      "kind": "function",
+      "signature": "fn(backup_name: &str, db: &str, table: &str) -> String",
+      "location": "src/clickhouse/client.rs:637"
+    }
+  },
+  "constraints": [
+    "no_actors_project_uses_plain_async",
+    "s3_only_storage",
+    "global_pid_lock_for_retention",
+    "broken_backups_excluded_from_retention_count",
+    "retention_deletes_oldest_first_by_timestamp"
+  ]
+}
