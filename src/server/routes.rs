@@ -1092,14 +1092,38 @@ pub async fn clean(
     }))
 }
 
-/// POST /api/v1/reload -- config hot-reload (Phase 3d)
-pub async fn reload_stub() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+/// POST /api/v1/reload -- config hot-reload
+///
+/// If the watch loop is active, sends a reload signal via the watch channel.
+/// If the watch loop is not active, this is a no-op (server-only mode has no
+/// dynamic config yet).
+pub async fn reload(
+    State(state): State<AppState>,
+) -> Result<Json<ReloadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(tx) = &state.watch_reload_tx {
+        tx.send(true).ok();
+        info!("Config reload signal sent to watch loop");
+        Ok(Json(ReloadResponse {
+            status: "reloaded".to_string(),
+        }))
+    } else {
+        // No watch loop active; acknowledge the request anyway
+        info!("Config reload requested (no watch loop active)");
+        Ok(Json(ReloadResponse {
+            status: "reloaded".to_string(),
+        }))
+    }
 }
 
-/// POST /api/v1/restart -- server restart (Phase 3d)
+/// Response for POST /api/v1/reload
+#[derive(Debug, Serialize)]
+pub struct ReloadResponse {
+    pub status: String,
+}
+
+/// POST /api/v1/restart -- server restart (not yet implemented)
 pub async fn restart_stub() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+    (StatusCode::NOT_IMPLEMENTED, "not implemented")
 }
 
 /// GET /api/v1/tables -- table listing (Phase 4f)
@@ -1107,19 +1131,121 @@ pub async fn tables_stub() -> (StatusCode, &'static str) {
     (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 4f)")
 }
 
-/// POST /api/v1/watch/start -- start watch loop (Phase 3d)
-pub async fn watch_start_stub() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+/// POST /api/v1/watch/start -- start the watch loop
+///
+/// If the watch loop is already active, returns 409 Conflict.
+/// Otherwise, creates channels, spawns the watch loop, and stores
+/// the handles in AppState.
+pub async fn watch_start(
+    State(mut state): State<AppState>,
+) -> Result<Json<WatchActionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check if watch is already active
+    {
+        let ws = state.watch_status.lock().await;
+        if ws.active {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "watch loop already active".to_string(),
+                }),
+            ));
+        }
+    }
+
+    // Query macros from ClickHouse for template resolution
+    let macros = state.ch.get_macros().await.unwrap_or_default();
+
+    let config_path = state.config_path.clone();
+    super::spawn_watch_from_state(&mut state, config_path, macros).await;
+
+    info!("Watch loop started via API");
+    Ok(Json(WatchActionResponse {
+        status: "started".to_string(),
+    }))
 }
 
-/// POST /api/v1/watch/stop -- stop watch loop (Phase 3d)
-pub async fn watch_stop_stub() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+/// POST /api/v1/watch/stop -- stop the watch loop
+///
+/// If the watch loop is not active, returns 404.
+/// Otherwise, sends a shutdown signal to the watch loop.
+pub async fn watch_stop(
+    State(state): State<AppState>,
+) -> Result<Json<WatchActionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let is_active = {
+        let ws = state.watch_status.lock().await;
+        ws.active
+    };
+
+    if !is_active {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "watch loop not active".to_string(),
+            }),
+        ));
+    }
+
+    if let Some(tx) = &state.watch_shutdown_tx {
+        tx.send(true).ok();
+    }
+
+    info!("Watch loop stop signal sent via API");
+    Ok(Json(WatchActionResponse {
+        status: "stopped".to_string(),
+    }))
 }
 
-/// GET /api/v1/watch/status -- watch loop status (Phase 3d)
-pub async fn watch_status_stub() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+/// GET /api/v1/watch/status -- return current watch loop status
+pub async fn watch_status(
+    State(state): State<AppState>,
+) -> Json<WatchStatusResponse> {
+    let ws = state.watch_status.lock().await;
+
+    let next_in = ws.next_backup_in.map(format_duration);
+
+    Json(WatchStatusResponse {
+        state: ws.state.clone(),
+        active: ws.active,
+        last_full: ws.last_full.map(|t| t.to_rfc3339()),
+        last_incr: ws.last_incr.map(|t| t.to_rfc3339()),
+        consecutive_errors: ws.consecutive_errors,
+        next_in,
+    })
+}
+
+/// Response for POST /api/v1/watch/start and POST /api/v1/watch/stop
+#[derive(Debug, Serialize)]
+pub struct WatchActionResponse {
+    pub status: String,
+}
+
+/// Response for GET /api/v1/watch/status
+#[derive(Debug, Serialize)]
+pub struct WatchStatusResponse {
+    pub state: String,
+    pub active: bool,
+    pub last_full: Option<String>,
+    pub last_incr: Option<String>,
+    pub consecutive_errors: u32,
+    pub next_in: Option<String>,
+}
+
+/// Format a Duration as a human-readable string (e.g. "47m", "2h30m", "5s").
+fn format_duration(d: std::time::Duration) -> String {
+    let total_secs = d.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if hours > 0 && minutes > 0 {
+        format!("{}h{}m", hours, minutes)
+    } else if hours > 0 {
+        format!("{}h", hours)
+    } else if minutes > 0 {
+        format!("{}m", minutes)
+    } else {
+        format!("{}s", seconds)
+    }
 }
 
 /// GET /metrics -- Prometheus metrics endpoint
@@ -1350,30 +1476,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stub_endpoints_return_501() {
-        let (status, body) = reload_stub().await;
+    async fn test_remaining_stub_endpoints_return_501() {
+        let (status, _body) = restart_stub().await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("Phase 3d"));
 
-        let (status, body) = restart_stub().await;
+        let (status, _body) = tables_stub().await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("Phase 3d"));
+    }
 
-        let (status, body) = tables_stub().await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("Phase 4f"));
+    #[test]
+    fn test_watch_status_response_serialization() {
+        let response = WatchStatusResponse {
+            state: "sleeping".to_string(),
+            active: true,
+            last_full: Some("2025-02-15T02:00:00+00:00".to_string()),
+            last_incr: Some("2025-02-15T03:00:00+00:00".to_string()),
+            consecutive_errors: 0,
+            next_in: Some("47m".to_string()),
+        };
 
-        let (status, body) = watch_start_stub().await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("Phase 3d"));
+        let json = serde_json::to_string(&response).expect("WatchStatusResponse should serialize");
+        assert!(json.contains("\"state\":\"sleeping\""));
+        assert!(json.contains("\"active\":true"));
+        assert!(json.contains("\"next_in\":\"47m\""));
+    }
 
-        let (status, body) = watch_stop_stub().await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("Phase 3d"));
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(2820)), "47m");
+    }
 
-        let (status, body) = watch_status_stub().await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("Phase 3d"));
+    #[test]
+    fn test_format_duration_hours_and_minutes() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(9000)), "2h30m");
+    }
+
+    #[test]
+    fn test_format_duration_seconds() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(5)), "5s");
+    }
+
+    #[test]
+    fn test_format_duration_hours_only() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(3600)), "1h");
+    }
+
+    #[test]
+    fn test_reload_response_serialization() {
+        let response = ReloadResponse {
+            status: "reloaded".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).expect("ReloadResponse should serialize");
+        assert!(json.contains("\"status\":\"reloaded\""));
+    }
+
+    #[test]
+    fn test_watch_action_response_serialization() {
+        let response = WatchActionResponse {
+            status: "started".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).expect("WatchActionResponse should serialize");
+        assert!(json.contains("\"status\":\"started\""));
     }
 
     #[test]

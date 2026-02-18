@@ -4,6 +4,7 @@
 //! It provides operation lifecycle management with concurrency control
 //! via a semaphore (single-op when allow_parallel=false).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,6 +71,8 @@ pub struct AppState {
     pub watch_reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Shared watch status for API queries.
     pub watch_status: Arc<Mutex<WatchStatus>>,
+    /// Path to the config file, used for config reload.
+    pub config_path: PathBuf,
 }
 
 /// Tracks a currently running operation for cancellation support.
@@ -87,7 +90,7 @@ impl AppState {
     /// The semaphore permits are set based on `config.api.allow_parallel`:
     /// - `false` (default): 1 permit -- operations are serialized
     /// - `true`: effectively unlimited permits
-    pub fn new(config: Arc<Config>, ch: ChClient, s3: S3Client) -> Self {
+    pub fn new(config: Arc<Config>, ch: ChClient, s3: S3Client, config_path: PathBuf) -> Self {
         let permits = if config.api.allow_parallel {
             // Use a large number to approximate unlimited
             Semaphore::MAX_PERMITS
@@ -123,6 +126,7 @@ impl AppState {
             watch_shutdown_tx: None,
             watch_reload_tx: None,
             watch_status: Arc::new(Mutex::new(WatchStatus::default())),
+            config_path,
         }
     }
 

@@ -76,14 +76,16 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Kill
         .route("/api/v1/kill", post(routes::kill_op))
-        // Stub endpoints (not yet implemented)
+        // Clean endpoint
         .route("/api/v1/clean", post(routes::clean))
-        .route("/api/v1/reload", post(routes::reload_stub))
+        // Watch lifecycle endpoints
+        .route("/api/v1/reload", post(routes::reload))
+        .route("/api/v1/watch/start", post(routes::watch_start))
+        .route("/api/v1/watch/stop", post(routes::watch_stop))
+        .route("/api/v1/watch/status", get(routes::watch_status))
+        // Stub endpoints (not yet implemented)
         .route("/api/v1/restart", post(routes::restart_stub))
         .route("/api/v1/tables", get(routes::tables_stub))
-        .route("/api/v1/watch/start", post(routes::watch_start_stub))
-        .route("/api/v1/watch/stop", post(routes::watch_stop_stub))
-        .route("/api/v1/watch/status", get(routes::watch_status_stub))
         .route("/metrics", get(routes::metrics));
 
     // Conditionally apply auth middleware
@@ -119,7 +121,7 @@ pub async fn start_server(
     watch: bool,
     config_path: PathBuf,
 ) -> Result<()> {
-    let mut state = AppState::new(config.clone(), ch.clone(), s3.clone());
+    let mut state = AppState::new(config.clone(), ch.clone(), s3.clone(), config_path.clone());
 
     // Determine if watch should be enabled (CLI flag or config)
     let watch_enabled = watch || config.watch.enabled;
