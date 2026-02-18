@@ -81,7 +81,7 @@ src/
   rate_limiter.rs    -- Token-bucket rate limiter (shared via Arc, 0 = unlimited)
   resume.rs          -- Resume state types (UploadState, DownloadState, RestoreState), atomic save/load, graceful degradation
   table_filter.rs    -- Glob pattern matching for -t flag, disk exclusion checks
-  list.rs            -- list + delete + clean_broken commands (local dir scan + S3)
+  list.rs            -- list + delete + clean_broken + retention + GC + clean_shadow (local dir scan + S3)
   backup/            -- create command: parallel FREEZE, disk-aware shadow walk, hardlink/S3 metadata, CRC64, UNFREEZE
   upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart, CopyObject for S3 disk parts
   download/          -- download command: parallel S3 GetObject, LZ4+untar decompress, metadata-only for S3 disk parts
@@ -102,6 +102,9 @@ restore:  BackupManifest(JSON) -> [load resume state + query system.parts] -> CR
 list:     scan local dirs + S3Client.list -> display (with broken backup detection)
 delete:   rm local dir or S3Client.delete_objects
 clean_broken: list -> filter is_broken -> delete each
+retention_local: list_local -> filter out broken -> sort by timestamp asc -> delete oldest exceeding keep count
+retention_remote: list_remote -> filter out broken -> sort by timestamp asc -> for each to delete: gc_collect_referenced_keys (load all surviving manifests) -> gc_delete_backup (delete unreferenced keys, manifest last)
+clean_shadow: ChClient.get_disks -> filter out backup-type disks -> for each disk: scan shadow/ for chbackup_* dirs -> remove_dir_all
 ```
 
 ## Key Implementation Patterns
@@ -127,6 +130,10 @@ clean_broken: list -> filter is_broken -> delete each
 - **Partition-level FREEZE**: `--partitions` flag triggers `ALTER TABLE FREEZE PARTITION` per partition instead of whole-table FREEZE
 - **Parts column consistency check**: Pre-flight check queries `system.parts_columns` for type inconsistencies before FREEZE; filters benign Enum/Tuple/Nullable drift
 - **Broken backup cleanup**: `clean_broken` command deletes broken backups (missing/corrupt metadata.json) from local or remote storage
+- **Local retention**: `retention_local()` follows the list->filter->sort->delete pattern; broken backups are excluded from counting; `keep=0` means unlimited, `keep=-1` is upload module's concern
+- **Remote retention with GC**: `retention_remote()` calls `gc_collect_referenced_keys()` fresh per-backup-deletion to build a set of all S3 keys referenced by surviving backups, then `gc_delete_backup()` only deletes unreferenced keys (manifest deleted last). Design 8.2 race protection satisfied by fresh key collection each iteration.
+- **Config resolution for retention**: `effective_retention_local/remote()` resolves `retention.*` vs `general.*` config -- `retention.*` overrides when non-zero, else falls back to `general.*`
+- **Shadow directory cleanup**: `clean_shadow()` queries `get_disks()`, filters out backup-type disks, then removes `chbackup_*` directories from each disk's `shadow/` path; optional name filter matches `chbackup_{sanitized_name}_*`
 
 ## Remaining Limitations
 

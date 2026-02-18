@@ -100,7 +100,7 @@ Listens for Ctrl+C (SIGINT). On shutdown:
 A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 metric families, all prefixed with `chbackup_`. Created conditionally in `AppState::new()` based on `config.api.enable_metrics`.
 
 **Metric families:**
-- `chbackup_backup_duration_seconds` -- HistogramVec with `operation` label (create, upload, download, restore, create_remote, restore_remote, delete, clean_broken_remote, clean_broken_local)
+- `chbackup_backup_duration_seconds` -- HistogramVec with `operation` label (create, upload, download, restore, create_remote, restore_remote, delete, clean_broken_remote, clean_broken_local, clean)
 - `chbackup_backup_size_bytes` -- Gauge (last backup compressed size)
 - `chbackup_backup_last_success_timestamp` -- Gauge (Unix timestamp)
 - `chbackup_parts_uploaded_total` -- IntCounter
@@ -123,9 +123,11 @@ A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 met
 - Failure via `errors_total.with_label_values(&[op]).inc()`
 - For create: `backup_size_bytes.set(manifest.compressed_size)` and `backup_last_success_timestamp.set(now)`
 
+### Clean Endpoint (routes.rs)
+`POST /api/v1/clean` -- Shadow directory cleanup. Follows the standard operation lifecycle pattern (try_start_op -> spawn -> finish_op/fail_op). Calls `list::clean_shadow(&ch, &data_path, None)` to remove `chbackup_*` directories from all disk shadow paths. Records `clean` operation label for duration, success, and error metrics.
+
 ### Stub Endpoints
 Endpoints for future phases return 501 Not Implemented:
-- `/api/v1/clean` (Phase 3c -- retention)
 - `/api/v1/reload`, `/api/v1/restart` (Phase 3d -- watch mode)
 - `/api/v1/tables` (Phase 4f)
 - `/api/v1/watch/*` (Phase 3d)
