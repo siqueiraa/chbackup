@@ -5,12 +5,13 @@
 //! background tasks and return immediately with an action ID.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::list;
 
@@ -287,6 +288,420 @@ fn summary_to_list_response(s: list::BackupSummary, location: &str) -> ListRespo
 }
 
 // ---------------------------------------------------------------------------
+// Backup operation endpoints (Task 6)
+// ---------------------------------------------------------------------------
+
+/// POST /api/v1/create -- create a local backup
+pub async fn create_backup(
+    State(state): State<AppState>,
+    body: Option<Json<CreateRequest>>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let (id, _token) = state.try_start_op("create").await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let backup_name = req
+            .backup_name
+            .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
+
+        info!(backup_name = %backup_name, "Starting create operation");
+
+        let result = crate::backup::create(
+            &state_clone.config,
+            &state_clone.ch,
+            &backup_name,
+            req.tables.as_deref(),
+            req.schema.unwrap_or(false),
+            req.diff_from.as_deref(),
+            req.partitions.as_deref(),
+            req.skip_check_parts_columns.unwrap_or(false),
+        )
+        .await;
+
+        match result {
+            Ok(_) => {
+                info!(backup_name = %backup_name, "Create operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                warn!(backup_name = %backup_name, error = %e, "Create operation failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
+}
+
+/// Request body for POST /api/v1/create
+#[derive(Debug, Deserialize, Default)]
+pub struct CreateRequest {
+    pub tables: Option<String>,
+    pub diff_from: Option<String>,
+    pub schema: Option<bool>,
+    pub partitions: Option<String>,
+    pub backup_name: Option<String>,
+    pub skip_check_parts_columns: Option<bool>,
+}
+
+/// POST /api/v1/upload/{name} -- upload a local backup to S3
+pub async fn upload_backup(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<UploadRequest>>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let (id, _token) = state.try_start_op("upload").await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        info!(backup_name = %name, "Starting upload operation");
+
+        let backup_dir = std::path::PathBuf::from(&state_clone.config.clickhouse.data_path)
+            .join("backup")
+            .join(&name);
+
+        let effective_resume = state_clone.config.general.use_resumable_state;
+        let result = crate::upload::upload(
+            &state_clone.config,
+            &state_clone.s3,
+            &name,
+            &backup_dir,
+            req.delete_local.unwrap_or(false),
+            req.diff_from_remote.as_deref(),
+            effective_resume,
+        )
+        .await;
+
+        match result {
+            Ok(_) => {
+                info!(backup_name = %name, "Upload operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                warn!(backup_name = %name, error = %e, "Upload operation failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
+}
+
+/// Request body for POST /api/v1/upload/{name}
+#[derive(Debug, Deserialize, Default)]
+pub struct UploadRequest {
+    pub delete_local: Option<bool>,
+    pub diff_from_remote: Option<String>,
+}
+
+/// POST /api/v1/download/{name} -- download a backup from S3
+pub async fn download_backup(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<DownloadRequest>>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let (id, _token) = state.try_start_op("download").await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        if req.hardlink_exists_files.unwrap_or(false) {
+            warn!("hardlink_exists_files flag is not yet implemented, ignoring");
+        }
+
+        info!(backup_name = %name, "Starting download operation");
+
+        let effective_resume = state_clone.config.general.use_resumable_state;
+        let result = crate::download::download(
+            &state_clone.config,
+            &state_clone.s3,
+            &name,
+            effective_resume,
+        )
+        .await;
+
+        match result {
+            Ok(_backup_dir) => {
+                info!(backup_name = %name, "Download operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                warn!(backup_name = %name, error = %e, "Download operation failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
+}
+
+/// Request body for POST /api/v1/download/{name}
+#[derive(Debug, Deserialize, Default)]
+pub struct DownloadRequest {
+    pub hardlink_exists_files: Option<bool>,
+}
+
+/// POST /api/v1/restore/{name} -- restore a downloaded backup
+pub async fn restore_backup(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<RestoreRequest>>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let (id, _token) = state.try_start_op("restore").await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        if req.database_mapping.is_some() {
+            warn!("database_mapping is not yet implemented (Phase 4a), ignoring");
+        }
+        if req.rm.unwrap_or(false) {
+            warn!("rm flag is not yet implemented (Phase 4d), ignoring");
+        }
+
+        info!(backup_name = %name, "Starting restore operation");
+
+        let effective_resume = state_clone.config.general.use_resumable_state;
+        let result = crate::restore::restore(
+            &state_clone.config,
+            &state_clone.ch,
+            &name,
+            req.tables.as_deref(),
+            req.schema.unwrap_or(false),
+            req.data_only.unwrap_or(false),
+            effective_resume,
+        )
+        .await;
+
+        match result {
+            Ok(_) => {
+                info!(backup_name = %name, "Restore operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                warn!(backup_name = %name, error = %e, "Restore operation failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
+}
+
+/// Request body for POST /api/v1/restore/{name}
+#[derive(Debug, Deserialize, Default)]
+pub struct RestoreRequest {
+    pub tables: Option<String>,
+    pub schema: Option<bool>,
+    pub data_only: Option<bool>,
+    pub database_mapping: Option<String>,
+    pub rm: Option<bool>,
+}
+
+/// POST /api/v1/create_remote -- create local backup then upload to S3
+pub async fn create_remote(
+    State(state): State<AppState>,
+    body: Option<Json<CreateRemoteRequest>>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let (id, _token) = state.try_start_op("create_remote").await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let backup_name = req
+            .backup_name
+            .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
+
+        info!(backup_name = %backup_name, "Starting create_remote operation");
+
+        // Step 1: Create local backup
+        let create_result = crate::backup::create(
+            &state_clone.config,
+            &state_clone.ch,
+            &backup_name,
+            req.tables.as_deref(),
+            false, // schema_only
+            None,  // diff_from (create_remote uses diff_from_remote on upload side)
+            None,  // partitions (create_remote doesn't support --partitions)
+            req.skip_check_parts_columns.unwrap_or(false),
+        )
+        .await;
+
+        if let Err(e) = create_result {
+            warn!(backup_name = %backup_name, error = %e, "create_remote: create step failed");
+            state_clone.fail_op(id, e.to_string()).await;
+            return;
+        }
+
+        // Step 2: Upload to S3
+        let backup_dir = std::path::PathBuf::from(&state_clone.config.clickhouse.data_path)
+            .join("backup")
+            .join(&backup_name);
+
+        let effective_resume = state_clone.config.general.use_resumable_state;
+        let upload_result = crate::upload::upload(
+            &state_clone.config,
+            &state_clone.s3,
+            &backup_name,
+            &backup_dir,
+            req.delete_source.unwrap_or(false),
+            req.diff_from_remote.as_deref(),
+            effective_resume,
+        )
+        .await;
+
+        match upload_result {
+            Ok(_) => {
+                info!(backup_name = %backup_name, "create_remote operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                warn!(backup_name = %backup_name, error = %e, "create_remote: upload step failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
+}
+
+/// Request body for POST /api/v1/create_remote
+#[derive(Debug, Deserialize, Default)]
+pub struct CreateRemoteRequest {
+    pub tables: Option<String>,
+    pub diff_from_remote: Option<String>,
+    pub backup_name: Option<String>,
+    pub delete_source: Option<bool>,
+    pub skip_check_parts_columns: Option<bool>,
+}
+
+/// POST /api/v1/restore_remote/{name} -- download then restore
+pub async fn restore_remote(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<RestoreRemoteRequest>>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let (id, _token) = state.try_start_op("restore_remote").await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        info!(backup_name = %name, "Starting restore_remote operation");
+
+        // Step 1: Download from S3
+        let effective_resume = state_clone.config.general.use_resumable_state;
+        let download_result = crate::download::download(
+            &state_clone.config,
+            &state_clone.s3,
+            &name,
+            effective_resume,
+        )
+        .await;
+
+        if let Err(e) = download_result {
+            warn!(backup_name = %name, error = %e, "restore_remote: download step failed");
+            state_clone.fail_op(id, e.to_string()).await;
+            return;
+        }
+
+        // Step 2: Restore
+        let restore_result = crate::restore::restore(
+            &state_clone.config,
+            &state_clone.ch,
+            &name,
+            req.tables.as_deref(),
+            req.schema.unwrap_or(false),
+            req.data_only.unwrap_or(false),
+            effective_resume,
+        )
+        .await;
+
+        match restore_result {
+            Ok(_) => {
+                info!(backup_name = %name, "restore_remote operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                warn!(backup_name = %name, error = %e, "restore_remote: restore step failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
+}
+
+/// Request body for POST /api/v1/restore_remote/{name}
+#[derive(Debug, Deserialize, Default)]
+pub struct RestoreRemoteRequest {
+    pub tables: Option<String>,
+    pub schema: Option<bool>,
+    pub data_only: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -365,5 +780,67 @@ mod tests {
         let parts: Vec<&str> = req.command.split_whitespace().collect();
         assert_eq!(parts[0], "create_remote");
         assert_eq!(parts[1], "daily_backup");
+    }
+
+    #[test]
+    fn test_create_request_deserialization() {
+        let json = r#"{
+            "tables": "default.*",
+            "diff_from": "previous",
+            "schema": true,
+            "partitions": "202401",
+            "backup_name": "my-backup",
+            "skip_check_parts_columns": true
+        }"#;
+        let req: CreateRequest = serde_json::from_str(json).expect("Should parse CreateRequest");
+        assert_eq!(req.tables.as_deref(), Some("default.*"));
+        assert_eq!(req.diff_from.as_deref(), Some("previous"));
+        assert_eq!(req.schema, Some(true));
+        assert_eq!(req.partitions.as_deref(), Some("202401"));
+        assert_eq!(req.backup_name.as_deref(), Some("my-backup"));
+        assert_eq!(req.skip_check_parts_columns, Some(true));
+    }
+
+    #[test]
+    fn test_create_request_default() {
+        let json = r#"{}"#;
+        let req: CreateRequest =
+            serde_json::from_str(json).expect("Should parse empty CreateRequest");
+        assert!(req.tables.is_none());
+        assert!(req.diff_from.is_none());
+        assert!(req.schema.is_none());
+    }
+
+    #[test]
+    fn test_operation_started_response() {
+        let response = OperationStarted {
+            id: 42,
+            status: "started".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).expect("OperationStarted should serialize");
+        assert!(json.contains("\"id\":42"));
+        assert!(json.contains("\"status\":\"started\""));
+    }
+
+    #[test]
+    fn test_restore_request_accepts_unimplemented_fields() {
+        let json = r#"{
+            "tables": "default.*",
+            "schema": false,
+            "data_only": true,
+            "database_mapping": "source_db:target_db",
+            "rm": true
+        }"#;
+        let req: RestoreRequest =
+            serde_json::from_str(json).expect("Should parse RestoreRequest with all fields");
+        assert_eq!(req.tables.as_deref(), Some("default.*"));
+        assert_eq!(req.schema, Some(false));
+        assert_eq!(req.data_only, Some(true));
+        assert_eq!(
+            req.database_mapping.as_deref(),
+            Some("source_db:target_db")
+        );
+        assert_eq!(req.rm, Some(true));
     }
 }
