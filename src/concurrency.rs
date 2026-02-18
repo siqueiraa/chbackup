@@ -40,6 +40,24 @@ pub fn effective_max_connections(config: &Config) -> u32 {
     config.clickhouse.max_connections
 }
 
+/// Resolve the effective object disk copy concurrency for backup/upload.
+///
+/// Returns `backup.object_disk_copy_concurrency` directly (default 8).
+/// Used to bound CopyObject operations during upload (Task 6).
+/// Conservative default since backup runs alongside FREEZE.
+pub fn effective_object_disk_copy_concurrency(config: &Config) -> u32 {
+    config.backup.object_disk_copy_concurrency
+}
+
+/// Resolve the effective object disk server-side copy concurrency for restore.
+///
+/// Returns `general.object_disk_server_side_copy_concurrency` directly (default 32).
+/// Used to bound CopyObject operations during restore (Task 8).
+/// More aggressive default since restore typically has the cluster to itself.
+pub fn effective_object_disk_server_side_copy_concurrency(config: &Config) -> u32 {
+    config.general.object_disk_server_side_copy_concurrency
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +100,35 @@ mod tests {
         // Default value is 1
         let config = Config::default();
         assert_eq!(effective_max_connections(&config), 1);
+    }
+
+    #[test]
+    fn test_effective_object_disk_copy_concurrency() {
+        // Default is 8
+        let config = Config::default();
+        assert_eq!(effective_object_disk_copy_concurrency(&config), 8);
+
+        // Custom value
+        let mut config = Config::default();
+        config.backup.object_disk_copy_concurrency = 16;
+        assert_eq!(effective_object_disk_copy_concurrency(&config), 16);
+    }
+
+    #[test]
+    fn test_effective_object_disk_server_side_copy_concurrency() {
+        // Default is 32
+        let config = Config::default();
+        assert_eq!(
+            effective_object_disk_server_side_copy_concurrency(&config),
+            32
+        );
+
+        // Custom value
+        let mut config = Config::default();
+        config.general.object_disk_server_side_copy_concurrency = 64;
+        assert_eq!(
+            effective_object_disk_server_side_copy_concurrency(&config),
+            64
+        );
     }
 }
