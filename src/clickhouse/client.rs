@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
@@ -71,6 +73,13 @@ pub struct ColumnInconsistency {
     pub table: String,
     pub column: String,
     pub types: Vec<String>,
+}
+
+/// Row from `system.macros` query.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub struct MacroRow {
+    pub macro_name: String,
+    pub substitution: String,
 }
 
 /// Row from `system.disks` query with free_space information.
@@ -390,6 +399,40 @@ impl ChClient {
             .context("Failed to get disks from system.disks")?;
 
         Ok(rows)
+    }
+
+    /// Get ClickHouse macros from system.macros.
+    ///
+    /// Returns a HashMap mapping macro names to their substitution values.
+    /// On error (e.g., system.macros does not exist), logs a warning and returns
+    /// an empty HashMap for graceful degradation.
+    pub async fn get_macros(&self) -> Result<HashMap<String, String>> {
+        let sql = "SELECT macro AS macro_name, substitution FROM system.macros";
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing get_macros");
+        } else {
+            debug!(sql = %sql, "Executing get_macros");
+        }
+
+        let rows = match self.inner.query(sql).fetch_all::<MacroRow>().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to query system.macros, using empty macros (table may not exist)"
+                );
+                return Ok(HashMap::new());
+            }
+        };
+
+        let macros: HashMap<String, String> = rows
+            .into_iter()
+            .map(|r| (r.macro_name, r.substitution))
+            .collect();
+
+        info!(macro_count = macros.len(), "Loaded ClickHouse macros");
+        Ok(macros)
     }
 
     // -- DDL execution --
@@ -1051,5 +1094,30 @@ mod tests {
         let (list_ddl, actions_ddl) = integration_table_ddl("backup-server", "8080");
         assert!(list_ddl.contains("http://backup-server:8080/api/v1/list"));
         assert!(actions_ddl.contains("http://backup-server:8080/api/v1/actions"));
+    }
+
+    #[test]
+    fn test_macro_row_deserializable() {
+        // Verify MacroRow can be deserialized from JSON (simulating system.macros columns)
+        let json = r#"{"macro_name":"shard","substitution":"01"}"#;
+        let row: MacroRow = serde_json::from_str(json).unwrap();
+        assert_eq!(row.macro_name, "shard");
+        assert_eq!(row.substitution, "01");
+
+        // Verify multiple rows can form a HashMap
+        let rows = vec![
+            MacroRow {
+                macro_name: "shard".to_string(),
+                substitution: "01".to_string(),
+            },
+            MacroRow {
+                macro_name: "replica".to_string(),
+                substitution: "r1".to_string(),
+            },
+        ];
+        let macros: std::collections::HashMap<String, String> =
+            rows.into_iter().map(|r| (r.macro_name, r.substitution)).collect();
+        assert_eq!(macros.get("shard"), Some(&"01".to_string()));
+        assert_eq!(macros.get("replica"), Some(&"r1".to_string()));
     }
 }
