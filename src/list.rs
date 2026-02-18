@@ -544,6 +544,147 @@ pub async fn gc_collect_referenced_keys(
     Ok(all_keys)
 }
 
+/// Delete a remote backup with GC-safe key filtering.
+///
+/// Lists all S3 keys under the backup prefix, partitions them into manifest
+/// key and data keys, filters out data keys that are still referenced by other
+/// backups, deletes unreferenced data keys first, then deletes the manifest last.
+///
+/// The `referenced_keys` set should be produced by `gc_collect_referenced_keys()`.
+/// Keys are compared as relative keys (matching `PartInfo.backup_key` format).
+pub async fn gc_delete_backup(
+    s3: &S3Client,
+    backup_name: &str,
+    referenced_keys: &HashSet<String>,
+) -> Result<()> {
+    let prefix = format!("{}/", backup_name);
+    let objects = s3.list_objects(&prefix).await?;
+
+    if objects.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Remote backup '{}' not found (no objects under prefix '{}')",
+            backup_name,
+            prefix
+        ));
+    }
+
+    let s3_prefix = s3.prefix();
+
+    // Partition keys: manifest key vs data keys
+    let manifest_relative = format!("{}/metadata.json", backup_name);
+    let mut manifest_key: Option<String> = None;
+    let mut unreferenced_keys: Vec<String> = Vec::new();
+    let mut referenced_count: usize = 0;
+
+    for obj in &objects {
+        let relative_key = strip_s3_prefix(&obj.key, s3_prefix);
+
+        if relative_key == manifest_relative {
+            manifest_key = Some(relative_key);
+            continue;
+        }
+
+        // Check if this data key is referenced by another surviving backup
+        if referenced_keys.contains(&relative_key) {
+            referenced_count += 1;
+        } else {
+            unreferenced_keys.push(relative_key);
+        }
+    }
+
+    info!(
+        total_keys = objects.len(),
+        unreferenced = unreferenced_keys.len(),
+        referenced = referenced_count,
+        "gc: deleting N unreferenced keys, preserving N referenced"
+    );
+
+    // Delete unreferenced data keys first
+    if !unreferenced_keys.is_empty() {
+        s3.delete_objects(unreferenced_keys).await?;
+    }
+
+    // Delete the manifest key last (makes the backup "broken" first, then gone)
+    if let Some(mk) = manifest_key {
+        s3.delete_objects(vec![mk]).await?;
+    }
+
+    info!(backup = %backup_name, "gc: remote backup deleted");
+    Ok(())
+}
+
+/// Delete oldest remote backups exceeding the `keep` count with GC-safe deletion.
+///
+/// For each backup to delete, collects referenced keys from all surviving
+/// manifests fresh (per design 8.2 race protection), then uses `gc_delete_backup`
+/// to only delete unreferenced keys.
+///
+/// Broken backups are excluded from retention counting (not deleted by retention).
+/// Errors on individual backup deletions are logged as warnings, not fatal.
+///
+/// - `keep == 0`: unlimited, no retention action.
+/// - `keep > 0`: keep the N newest valid backups, delete the rest.
+///
+/// Returns the number of successfully deleted backups.
+pub async fn retention_remote(s3: &S3Client, keep: i32) -> Result<usize> {
+    if keep <= 0 {
+        return Ok(0);
+    }
+
+    let backups = list_remote(s3).await?;
+
+    // Filter to valid (non-broken) backups
+    let mut valid: Vec<&BackupSummary> = backups.iter().filter(|b| !b.is_broken).collect();
+
+    let keep = keep as usize;
+    if valid.len() <= keep {
+        return Ok(0);
+    }
+
+    // Sort by timestamp ascending (oldest first)
+    valid.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    let to_delete = valid.len() - keep;
+    let total = backups.len();
+    let mut deleted = 0;
+
+    for b in valid.iter().take(to_delete) {
+        // Collect referenced keys fresh for each deletion (design 8.2 race protection)
+        let referenced_keys = match gc_collect_referenced_keys(s3, &b.name).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!(
+                    backup = %b.name,
+                    error = %e,
+                    "retention_remote: failed to collect referenced keys, skipping backup"
+                );
+                continue;
+            }
+        };
+
+        match gc_delete_backup(s3, &b.name, &referenced_keys).await {
+            Ok(()) => {
+                info!(backup = %b.name, "retention_remote: deleted old remote backup");
+                deleted += 1;
+            }
+            Err(e) => {
+                warn!(
+                    backup = %b.name,
+                    error = %e,
+                    "retention_remote: failed to delete remote backup"
+                );
+            }
+        }
+    }
+
+    info!(
+        deleted = deleted,
+        total = total,
+        "retention_remote: deleted N of M remote backups"
+    );
+    Ok(deleted)
+}
+
 // -- Shadow cleanup functions --
 
 /// Remove `chbackup_*` directories from a single disk's shadow path (sync helper).
@@ -1462,5 +1603,55 @@ mod tests {
 
         let keys = collect_keys_from_manifest(&manifest);
         assert!(keys.is_empty(), "Empty manifest should produce no keys");
+    }
+
+    // -- GC filtering tests --
+
+    #[test]
+    fn test_gc_filter_unreferenced_keys() {
+        // Simulate the GC filtering logic from gc_delete_backup:
+        // Given a set of S3 keys for a backup and a referenced set from other backups,
+        // only unreferenced data keys should be candidates for deletion.
+
+        let all_keys = vec![
+            "backup-a/data/default/trades/default/part1.tar.lz4".to_string(),
+            "backup-a/data/default/trades/default/part2.tar.lz4".to_string(),
+            "backup-a/objects/store/abc/data.bin".to_string(),
+            "backup-a/metadata.json".to_string(),
+        ];
+
+        // part1 is referenced by another backup (shared via incremental)
+        let mut referenced = HashSet::new();
+        referenced.insert("backup-a/data/default/trades/default/part1.tar.lz4".to_string());
+
+        let manifest_key = "backup-a/metadata.json";
+
+        // Apply the same filtering logic as gc_delete_backup
+        let mut unreferenced: Vec<&String> = Vec::new();
+        let mut referenced_count = 0;
+        let mut found_manifest = false;
+
+        for key in &all_keys {
+            if key == manifest_key {
+                found_manifest = true;
+                continue;
+            }
+            if referenced.contains(key.as_str()) {
+                referenced_count += 1;
+            } else {
+                unreferenced.push(key);
+            }
+        }
+
+        // part1 is referenced, so only part2 and objects/store/abc/data.bin are unreferenced
+        assert_eq!(unreferenced.len(), 2, "Should have 2 unreferenced keys");
+        assert_eq!(referenced_count, 1, "Should have 1 referenced key");
+        assert!(found_manifest, "Should have found the manifest key");
+
+        assert!(unreferenced.contains(&&"backup-a/data/default/trades/default/part2.tar.lz4".to_string()));
+        assert!(unreferenced.contains(&&"backup-a/objects/store/abc/data.bin".to_string()));
+
+        // part1 should NOT be in unreferenced (it's still needed by another backup)
+        assert!(!unreferenced.contains(&&"backup-a/data/default/trades/default/part1.tar.lz4".to_string()));
     }
 }
