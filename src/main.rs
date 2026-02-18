@@ -1,6 +1,7 @@
 mod cli;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use chbackup::clickhouse::ChClient;
@@ -384,7 +385,12 @@ async fn main() -> Result<()> {
         }
 
         Command::Server { watch } => {
-            info!(watch = watch, "server: not implemented in Phase 1");
+            if watch {
+                warn!("--watch flag is not yet implemented (Phase 3d), running server without watch");
+            }
+            let ch = ChClient::new(&config.clickhouse)?;
+            let s3 = S3Client::new(&config.s3).await?;
+            chbackup::server::start_server(Arc::new(config), ch, s3).await?;
         }
 
         // default-config and print-config handled above (early return).
