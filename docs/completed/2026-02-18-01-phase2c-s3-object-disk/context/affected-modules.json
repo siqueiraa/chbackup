@@ -1,0 +1,61 @@
+{
+  "git_base": "b241320",
+  "modules": [
+    {
+      "path": "src/backup",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "notes": "collect.rs gains disk-aware shadow walk; mod.rs gains disk_type_map routing"
+    },
+    {
+      "path": "src/upload",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "notes": "mod.rs gains S3 disk work items (CopyObject instead of compress+upload)"
+    },
+    {
+      "path": "src/download",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "notes": "mod.rs gains S3 disk part handling (skip download for s3 disk parts, save metadata only)"
+    },
+    {
+      "path": "src/restore",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "notes": "attach.rs gains S3 disk restore path: CopyObject + metadata rewrite instead of hardlink"
+    },
+    {
+      "path": "src/storage",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "notes": "s3.rs gains copy_object and copy_object_streaming methods"
+    }
+  ],
+  "new_files": [
+    {
+      "path": "src/object_disk.rs",
+      "notes": "New module for ClickHouse object disk metadata parsing (5 format versions)"
+    }
+  ],
+  "modified_root_files": [
+    {
+      "path": "src/lib.rs",
+      "notes": "Add pub mod object_disk"
+    },
+    {
+      "path": "src/concurrency.rs",
+      "notes": "Add effective_object_disk_copy_concurrency()"
+    }
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": ["src/backup", "src/upload", "src/download", "src/restore", "src/storage"],
+    "total_affected": 5
+  }
+}

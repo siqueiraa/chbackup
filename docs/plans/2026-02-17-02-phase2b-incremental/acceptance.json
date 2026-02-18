@@ -1,0 +1,211 @@
+{
+  "plan": "2026-02-17-02-phase2b-incremental",
+  "status": {"pass": 5, "fail": 0, "total": 5},
+  "last_updated": "2026-02-17T00:00:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "feature",
+      "description": "diff_parts() pure function correctly compares current vs base manifest parts by (table_key, disk_name, part_name, crc64) and marks matching parts as carried",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub fn diff_parts' src/backup/diff.rs | head -1",
+            "expected_pattern": "pub fn diff_parts",
+            "fail_message": "diff_parts() function not found in src/backup/diff.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding backup::diff module"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib backup::diff 2>&1 | tail -5",
+            "expected_pattern": "test result: ok",
+            "fail_message": "diff_parts unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Pure function with no I/O -- fully covered by unit tests in behavioral layer",
+            "alternative_verification": {
+              "command": "cargo test --lib backup::diff 2>&1 | tail -5",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F001"]
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": null
+    },
+    {
+      "id": "F002",
+      "category": "feature",
+      "description": "backup::create() accepts diff_from parameter and applies incremental diff when provided",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'diff_from: Option<&str>' src/backup/mod.rs | head -1",
+            "expected_pattern": "diff_from: Option<&str>",
+            "fail_message": "diff_from parameter not found in backup::create() signature"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after modifying backup::create() signature"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test 2>&1 | tail -5",
+            "expected_pattern": "test result: ok",
+            "fail_message": "Tests failed after backup::create() signature change"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Requires real ClickHouse for integration test. Diff logic verified by F001 unit tests. Wiring verified by compilation.",
+            "alternative_verification": {
+              "command": "cargo test 2>&1 | tail -5",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F001"]
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": null
+    },
+    {
+      "id": "F003",
+      "category": "feature",
+      "description": "upload::upload() accepts diff_from_remote parameter, loads remote base manifest from S3, and skips carried parts in upload work queue",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'diff_from_remote: Option<&str>' src/upload/mod.rs | head -1",
+            "expected_pattern": "diff_from_remote: Option<&str>",
+            "fail_message": "diff_from_remote parameter not found in upload::upload() signature"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after modifying upload::upload() signature"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib upload 2>&1 | tail -5",
+            "expected_pattern": "test result: ok",
+            "fail_message": "Upload module tests failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Requires real S3 for integration test. Diff logic verified by F001 unit tests. Skip logic is a simple starts_with check verified by compilation.",
+            "alternative_verification": {
+              "command": "cargo test --lib upload 2>&1 | tail -5",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F001"]
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": null
+    },
+    {
+      "id": "F004",
+      "category": "feature",
+      "description": "create_remote command implemented as create() + upload() composition, --diff-from and --diff-from-remote wired in main.rs, Phase 1 warnings removed",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'diff.*not implemented in Phase 1' src/main.rs || echo 0",
+            "expected": "0",
+            "fail_message": "Phase 1 diff-from warnings still present in main.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors in main.rs after wiring"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test 2>&1 | tail -5",
+            "expected_pattern": "test result: ok",
+            "fail_message": "Tests failed after main.rs wiring"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Requires real ClickHouse + S3 for integration test. CLI wiring verified by compilation. create_remote is composition of create() + upload() which are independently tested.",
+            "alternative_verification": {
+              "command": "cargo test 2>&1 | tail -5",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F001", "F002", "F003"]
+          }
+        ]
+      },
+      "related_tasks": [4, 5],
+      "verified_at": null
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for all modified modules (src/backup, src/upload)",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f src/backup/CLAUDE.md && test -f src/upload/CLAUDE.md && echo PASS || echo FAIL",
+            "expected": "PASS",
+            "fail_message": "One or more CLAUDE.md files missing"
+          },
+          {
+            "name": "compilation",
+            "not_applicable": true,
+            "justification": "Documentation only"
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -q 'diff.rs' src/backup/CLAUDE.md && grep -q 'diff_from_remote' src/upload/CLAUDE.md && grep -q 'Parent Context' src/backup/CLAUDE.md && grep -q 'Parent Context' src/upload/CLAUDE.md && echo VALID || echo INVALID",
+            "expected": "VALID",
+            "fail_message": "CLAUDE.md files missing required sections or new pattern documentation"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Documentation file - no runtime behavior",
+            "alternative_verification": {
+              "command": "test -f src/backup/CLAUDE.md && test -f src/upload/CLAUDE.md && echo PASS || echo FAIL",
+              "expected": "PASS"
+            },
+            "covered_by": ["FDOC"]
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": null
+    }
+  ]
+}
