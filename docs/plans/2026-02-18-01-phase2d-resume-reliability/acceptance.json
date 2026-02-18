@@ -1,6 +1,6 @@
 {
   "plan": "2026-02-18-01-phase2d-resume-reliability",
-  "status": {"pass": 7, "fail": 5, "total": 12},
+  "status": {"pass": 10, "fail": 2, "total": 12},
   "last_updated": "2026-02-18T13:30:00Z",
   "features": [
     {
@@ -301,7 +301,7 @@
       "id": "F008",
       "category": "feature",
       "description": "Broken backup detection enhancement + clean_broken implementation",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -336,13 +336,13 @@
         ]
       },
       "related_tasks": [8],
-      "verified_at": null
+      "verified_at": "2026-02-18T14:00:00Z"
     },
     {
       "id": "F009",
       "category": "feature",
       "description": "Partition-level backup (--partitions flag)",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -378,13 +378,13 @@
         ]
       },
       "related_tasks": [9],
-      "verified_at": null
+      "verified_at": "2026-02-18T14:10:00Z"
     },
     {
       "id": "F010",
       "category": "feature",
       "description": "Parts column consistency check (check_parts_columns config)",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -420,7 +420,7 @@
         ]
       },
       "related_tasks": [10],
-      "verified_at": null
+      "verified_at": "2026-02-18T14:20:00Z"
     },
     {
       "id": "F011",

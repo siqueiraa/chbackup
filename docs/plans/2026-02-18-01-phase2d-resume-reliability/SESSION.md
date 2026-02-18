@@ -126,9 +126,9 @@ Group D (Wiring -- depends on all above):
 | 5 | Upload resume + manifest atomicity | done | 8d63844 | F005 |
 | 6 | Download resume + CRC64 + disk space | done | 79a5d85 | F006 |
 | 7 | Restore resume | done | 1e44ff6 | F007 |
-| 8 | Broken backup + clean_broken | pending | - | F008 |
-| 9 | Partition-level backup | pending | - | F009 |
-| 10 | Parts column check | pending | - | F010 |
+| 8 | Broken backup + clean_broken | done | de99468 | F008 |
+| 9 | Partition-level backup | done | bb1c0e3 | F009 |
+| 10 | Parts column check | done | c905417 | F010 |
 | 11 | Wire flags in main.rs | pending | - | F011 |
 | 12 | Update CLAUDE.md | pending | - | FDOC |
 
@@ -157,7 +157,7 @@ Group D (Wiring -- depends on all above):
 
 ## Acceptance Summary
 
-7/12 PASS
+10/12 PASS
 
 ---
 
