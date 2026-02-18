@@ -1115,8 +1115,10 @@ mod tests {
                 substitution: "r1".to_string(),
             },
         ];
-        let macros: std::collections::HashMap<String, String> =
-            rows.into_iter().map(|r| (r.macro_name, r.substitution)).collect();
+        let macros: std::collections::HashMap<String, String> = rows
+            .into_iter()
+            .map(|r| (r.macro_name, r.substitution))
+            .collect();
         assert_eq!(macros.get("shard"), Some(&"01".to_string()));
         assert_eq!(macros.get("replica"), Some(&"r1".to_string()));
     }

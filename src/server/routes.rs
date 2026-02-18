@@ -1196,9 +1196,7 @@ pub async fn watch_stop(
 }
 
 /// GET /api/v1/watch/status -- return current watch loop status
-pub async fn watch_status(
-    State(state): State<AppState>,
-) -> Json<WatchStatusResponse> {
+pub async fn watch_status(State(state): State<AppState>) -> Json<WatchStatusResponse> {
     let ws = state.watch_status.lock().await;
 
     let next_in = ws.next_backup_in.map(format_duration);
@@ -1508,7 +1506,10 @@ mod tests {
 
     #[test]
     fn test_format_duration_hours_and_minutes() {
-        assert_eq!(format_duration(std::time::Duration::from_secs(9000)), "2h30m");
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(9000)),
+            "2h30m"
+        );
     }
 
     #[test]

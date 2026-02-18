@@ -172,7 +172,11 @@ pub fn resume_state(
             Some(ts) => ts,
             None => full_ts,
         };
-        if incr_ts > full_ts { incr_ts } else { full_ts }
+        if incr_ts > full_ts {
+            incr_ts
+        } else {
+            full_ts
+        }
     } else {
         full_ts
     };
@@ -321,18 +325,13 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
         let retry_interval = std::time::Duration::from_secs(retry_interval_secs);
 
         // Resolve tables filter: CLI > config.watch.tables > config.backup.tables > None
-        let tables_filter: Option<String> = ctx
-            .config
-            .watch
-            .tables
-            .clone()
-            .or_else(|| {
-                if !ctx.config.backup.tables.is_empty() {
-                    Some(ctx.config.backup.tables.clone())
-                } else {
-                    None
-                }
-            });
+        let tables_filter: Option<String> = ctx.config.watch.tables.clone().or_else(|| {
+            if !ctx.config.backup.tables.is_empty() {
+                Some(ctx.config.backup.tables.clone())
+            } else {
+                None
+            }
+        });
 
         // Step 1: Resume -- query remote backups and determine next action
         ctx.set_state(WatchState::Idle);
@@ -391,8 +390,12 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
 
         // Step 3: Create backup
         let now = Utc::now();
-        let backup_name =
-            resolve_name_template(&ctx.config.watch.name_template, &backup_type, now, &ctx.macros);
+        let backup_name = resolve_name_template(
+            &ctx.config.watch.name_template,
+            &backup_type,
+            now,
+            &ctx.macros,
+        );
 
         if backup_type == "full" {
             ctx.set_state(WatchState::CreatingFull);
@@ -413,7 +416,7 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             tables_filter.as_deref(),
             false, // schema_only
             diff_from.as_deref(),
-            None, // partitions
+            None,  // partitions
             false, // skip_check_parts_columns (let config.clickhouse.check_parts_columns control)
         )
         .await;
@@ -892,7 +895,10 @@ mod tests {
         let new_errors = initial_errors + 1;
         let force_next_full = true; // handle_error always sets this
 
-        assert!(force_next_full, "force_next_full should be true after error");
+        assert!(
+            force_next_full,
+            "force_next_full should be true after error"
+        );
         assert_eq!(new_errors, 1, "consecutive_errors should increment by 1");
     }
 
@@ -907,8 +913,14 @@ mod tests {
         let errors_after: u32 = 0; // success resets to 0
         let force_after_full = false; // cleared after successful full
 
-        assert_eq!(errors_after, 0, "consecutive_errors should reset to 0 on success");
-        assert!(!force_after_full, "force_next_full should be cleared after successful full");
+        assert_eq!(
+            errors_after, 0,
+            "consecutive_errors should reset to 0 on success"
+        );
+        assert!(
+            !force_after_full,
+            "force_next_full should be cleared after successful full"
+        );
     }
 
     #[test]
@@ -916,8 +928,8 @@ mod tests {
         let consecutive_errors: u32 = 5;
         let max_consecutive_errors: u32 = 5;
 
-        let should_abort = consecutive_errors >= max_consecutive_errors
-            && max_consecutive_errors > 0;
+        let should_abort =
+            consecutive_errors >= max_consecutive_errors && max_consecutive_errors > 0;
 
         assert!(should_abort, "should abort when consecutive_errors >= max");
         // verify the exit reason would be MaxErrors
@@ -930,9 +942,12 @@ mod tests {
         let consecutive_errors: u32 = 100;
         let max_consecutive_errors: u32 = 0;
 
-        let should_abort = consecutive_errors >= max_consecutive_errors
-            && max_consecutive_errors > 0;
+        let should_abort =
+            consecutive_errors >= max_consecutive_errors && max_consecutive_errors > 0;
 
-        assert!(!should_abort, "should NOT abort when max_consecutive_errors is 0 (unlimited)");
+        assert!(
+            !should_abort,
+            "should NOT abort when max_consecutive_errors is 0 (unlimited)"
+        );
     }
 }
