@@ -56,6 +56,7 @@ pub fn diff_parts(current: &mut BackupManifest, base: &BackupManifest) -> DiffRe
                     if part.checksum_crc64 == base_part.checksum_crc64 {
                         part.source = format!("carried:{}", base_name);
                         part.backup_key = base_part.backup_key.clone();
+                        part.s3_objects = base_part.s3_objects.clone();
                         carried += 1;
                     } else {
                         warn!(
@@ -415,5 +416,91 @@ mod tests {
         // The matching part should be carried
         let parts = &current.tables["default.trades"].parts["default"];
         assert_eq!(parts[0].source, "carried:base-backup");
+    }
+
+    #[test]
+    fn test_diff_parts_carries_s3_objects() {
+        // Base manifest has a part on "s3disk" with s3_objects populated.
+        // Current has same part with s3_objects: None (just created by collect_parts).
+        // After diff_parts(), current part should have s3_objects copied from base.
+        use crate::manifest::S3ObjectInfo;
+
+        let s3_objects = vec![S3ObjectInfo {
+            path: "store/abc/data.bin".to_string(),
+            size: 100,
+            backup_key: "chbackup/base/objects/data.bin".to_string(),
+        }];
+
+        let mut base_part = make_part("202401_1_50_3", 111, "s3://bucket/base/part.tar.lz4");
+        base_part.s3_objects = Some(s3_objects.clone());
+
+        let mut base_tables = HashMap::new();
+        base_tables.insert(
+            "default.trades".to_string(),
+            make_table("s3disk", vec![base_part]),
+        );
+        let base = make_manifest("base-backup", base_tables);
+
+        // Current has same part but with s3_objects: None
+        let current_part = make_part("202401_1_50_3", 111, "");
+        assert!(current_part.s3_objects.is_none()); // verify None before diff
+
+        let mut current_tables = HashMap::new();
+        current_tables.insert(
+            "default.trades".to_string(),
+            make_table("s3disk", vec![current_part]),
+        );
+        let mut current = make_manifest("new-backup", current_tables);
+
+        let result = diff_parts(&mut current, &base);
+
+        assert_eq!(result.carried, 1);
+        assert_eq!(result.uploaded, 0);
+        assert_eq!(result.crc_mismatches, 0);
+
+        // Verify s3_objects was carried forward
+        let parts = &current.tables["default.trades"].parts["s3disk"];
+        assert_eq!(parts[0].source, "carried:base-backup");
+        assert_eq!(
+            parts[0].backup_key,
+            "s3://bucket/base/part.tar.lz4"
+        );
+        assert!(parts[0].s3_objects.is_some());
+        let carried_objects = parts[0].s3_objects.as_ref().unwrap();
+        assert_eq!(carried_objects.len(), 1);
+        assert_eq!(carried_objects[0].path, "store/abc/data.bin");
+        assert_eq!(carried_objects[0].size, 100);
+        assert_eq!(
+            carried_objects[0].backup_key,
+            "chbackup/base/objects/data.bin"
+        );
+    }
+
+    #[test]
+    fn test_diff_parts_local_parts_s3_objects_none_unchanged() {
+        // Local disk parts have s3_objects: None in both base and current.
+        // After diff_parts, s3_objects should remain None (cloning None is a no-op).
+        let base_key = "s3://bucket/base/data/default/trades/part1.tar.lz4";
+
+        let mut base_tables = HashMap::new();
+        base_tables.insert(
+            "default.trades".to_string(),
+            make_table("default", vec![make_part("part1", 111, base_key)]),
+        );
+        let base = make_manifest("base-backup", base_tables);
+
+        let mut current_tables = HashMap::new();
+        current_tables.insert(
+            "default.trades".to_string(),
+            make_table("default", vec![make_part("part1", 111, "")]),
+        );
+        let mut current = make_manifest("new-backup", current_tables);
+
+        let result = diff_parts(&mut current, &base);
+
+        assert_eq!(result.carried, 1);
+
+        let parts = &current.tables["default.trades"].parts["default"];
+        assert!(parts[0].s3_objects.is_none()); // Still None for local parts
     }
 }
