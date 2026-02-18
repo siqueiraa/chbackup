@@ -335,9 +335,6 @@ pub async fn create_backup(
                     m.successful_operations_total.with_label_values(&["create"]).inc();
                     m.backup_last_success_timestamp.set(Utc::now().timestamp() as f64);
                     m.backup_size_bytes.set(manifest.compressed_size as f64);
-                    // DEBUG_MARKER:F003 - verify duration recorded for create
-                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=create duration={}", duration);
-                    // END_DEBUG_MARKER:F003
                 }
                 info!(backup_name = %backup_name, "Create operation completed");
                 state_clone.finish_op(id).await;
@@ -346,9 +343,6 @@ pub async fn create_backup(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["create"]).observe(duration);
                     m.errors_total.with_label_values(&["create"]).inc();
-                    // DEBUG_MARKER:F004 - verify error counted for create
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=create");
-                    // END_DEBUG_MARKER:F004
                 }
                 warn!(backup_name = %backup_name, error = %e, "Create operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -417,7 +411,6 @@ pub async fn upload_backup(
                     m.backup_duration_seconds.with_label_values(&["upload"]).observe(duration);
                     m.successful_operations_total.with_label_values(&["upload"]).inc();
                     m.backup_last_success_timestamp.set(Utc::now().timestamp() as f64);
-                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=upload duration={}", duration);
                 }
                 info!(backup_name = %name, "Upload operation completed");
                 state_clone.finish_op(id).await;
@@ -426,7 +419,6 @@ pub async fn upload_backup(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["upload"]).observe(duration);
                     m.errors_total.with_label_values(&["upload"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=upload");
                 }
                 warn!(backup_name = %name, error = %e, "Upload operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -487,7 +479,6 @@ pub async fn download_backup(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["download"]).observe(duration);
                     m.successful_operations_total.with_label_values(&["download"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=download duration={}", duration);
                 }
                 info!(backup_name = %name, "Download operation completed");
                 state_clone.finish_op(id).await;
@@ -496,7 +487,6 @@ pub async fn download_backup(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["download"]).observe(duration);
                     m.errors_total.with_label_values(&["download"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=download");
                 }
                 warn!(backup_name = %name, error = %e, "Download operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -562,7 +552,6 @@ pub async fn restore_backup(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["restore"]).observe(duration);
                     m.successful_operations_total.with_label_values(&["restore"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=restore duration={}", duration);
                 }
                 info!(backup_name = %name, "Restore operation completed");
                 state_clone.finish_op(id).await;
@@ -571,7 +560,6 @@ pub async fn restore_backup(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["restore"]).observe(duration);
                     m.errors_total.with_label_values(&["restore"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=restore");
                 }
                 warn!(backup_name = %name, error = %e, "Restore operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -640,7 +628,6 @@ pub async fn create_remote(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["create_remote"]).observe(duration);
                     m.errors_total.with_label_values(&["create_remote"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=create_remote");
                 }
                 warn!(backup_name = %backup_name, error = %e, "create_remote: create step failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -673,7 +660,6 @@ pub async fn create_remote(
                     m.successful_operations_total.with_label_values(&["create_remote"]).inc();
                     m.backup_last_success_timestamp.set(Utc::now().timestamp() as f64);
                     m.backup_size_bytes.set(manifest.compressed_size as f64);
-                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=create_remote duration={}", duration);
                 }
                 info!(backup_name = %backup_name, "create_remote operation completed");
                 state_clone.finish_op(id).await;
@@ -682,7 +668,6 @@ pub async fn create_remote(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["create_remote"]).observe(duration);
                     m.errors_total.with_label_values(&["create_remote"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=create_remote");
                 }
                 warn!(backup_name = %backup_name, error = %e, "create_remote: upload step failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -743,7 +728,6 @@ pub async fn restore_remote(
             if let Some(m) = &state_clone.metrics {
                 m.backup_duration_seconds.with_label_values(&["restore_remote"]).observe(duration);
                 m.errors_total.with_label_values(&["restore_remote"]).inc();
-                info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=restore_remote");
             }
             warn!(backup_name = %name, error = %e, "restore_remote: download step failed");
             state_clone.fail_op(id, e.to_string()).await;
@@ -768,7 +752,6 @@ pub async fn restore_remote(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["restore_remote"]).observe(duration);
                     m.successful_operations_total.with_label_values(&["restore_remote"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=restore_remote duration={}", duration);
                 }
                 info!(backup_name = %name, "restore_remote operation completed");
                 state_clone.finish_op(id).await;
@@ -777,7 +760,6 @@ pub async fn restore_remote(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["restore_remote"]).observe(duration);
                     m.errors_total.with_label_values(&["restore_remote"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=restore_remote");
                 }
                 warn!(backup_name = %name, error = %e, "restore_remote: restore step failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -853,7 +835,6 @@ pub async fn delete_backup(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["delete"]).observe(duration);
                     m.successful_operations_total.with_label_values(&["delete"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=delete duration={}", duration);
                 }
                 info!(backup_name = %name, "Delete operation completed");
                 state_clone.finish_op(id).await;
@@ -862,7 +843,6 @@ pub async fn delete_backup(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["delete"]).observe(duration);
                     m.errors_total.with_label_values(&["delete"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=delete");
                 }
                 warn!(backup_name = %name, error = %e, "Delete operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -905,7 +885,6 @@ pub async fn clean_remote_broken(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["clean_broken_remote"]).observe(duration);
                     m.successful_operations_total.with_label_values(&["clean_broken_remote"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=clean_broken_remote duration={}", duration);
                 }
                 info!(count = count, "clean_broken_remote operation completed");
                 state_clone.finish_op(id).await;
@@ -914,7 +893,6 @@ pub async fn clean_remote_broken(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["clean_broken_remote"]).observe(duration);
                     m.errors_total.with_label_values(&["clean_broken_remote"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=clean_broken_remote");
                 }
                 warn!(error = %e, "clean_broken_remote operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -960,7 +938,6 @@ pub async fn clean_local_broken(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["clean_broken_local"]).observe(duration);
                     m.successful_operations_total.with_label_values(&["clean_broken_local"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=clean_broken_local duration={}", duration);
                 }
                 info!(count = count, "clean_broken_local operation completed");
                 state_clone.finish_op(id).await;
@@ -969,7 +946,6 @@ pub async fn clean_local_broken(
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds.with_label_values(&["clean_broken_local"]).observe(duration);
                     m.errors_total.with_label_values(&["clean_broken_local"]).inc();
-                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=clean_broken_local");
                 }
                 warn!(error = %e, "clean_broken_local operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -1048,12 +1024,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     refresh_backup_counts(&state, metrics).await;
 
     match metrics.encode() {
-        Ok(text) => {
-            // DEBUG_MARKER:F002 - verify /metrics returns prometheus text
-            info!(target: "debug", "DEBUG_VERIFY:F002_scrape_ok");
-            // END_DEBUG_MARKER:F002
-            (StatusCode::OK, text)
-        }
+        Ok(text) => (StatusCode::OK, text),
         Err(e) => {
             warn!(error = %e, "Failed to encode metrics");
             (

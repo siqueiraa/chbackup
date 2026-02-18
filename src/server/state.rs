@@ -62,9 +62,6 @@ impl AppState {
             match Metrics::new() {
                 Ok(m) => {
                     let count = m.registry.gather().len();
-                    // DEBUG_MARKER:F001 - verify metrics registered in AppState
-                    info!(target: "debug", "DEBUG_VERIFY:F001_metrics_registered count={}", count);
-                    // END_DEBUG_MARKER:F001
                     info!("Metrics registry created with {} metric families", count);
                     Some(Arc::new(m))
                 }
