@@ -214,6 +214,8 @@ pub async fn create(
         let ignore_not_exists = config.clickhouse.ignore_not_exists_error_during_freeze;
         let all_mutations_clone = all_mutations.clone();
         let table_row_clone = table_row.clone();
+        let disk_type_map_clone = disk_type_map.clone();
+        let disk_map_clone = disk_map.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -279,18 +281,23 @@ pub async fn create(
                     &fname_for_collect,
                     &backup_dir_clone,
                     &tables_for_collect,
+                    &disk_type_map_clone,
+                    &disk_map_clone,
                 )
             })
             .await
             .context("spawn_blocking panicked during collect_parts")??;
 
-            // Build TableManifest
-            let parts_for_table = parts_map.get(&full_name).cloned().unwrap_or_default();
-            let total_bytes = parts_for_table.iter().map(|p| p.size).sum();
+            // Build TableManifest: group collected parts by actual disk name
+            let collected = parts_map.get(&full_name).cloned().unwrap_or_default();
+            let total_bytes: u64 = collected.iter().map(|cp| cp.part_info.size).sum();
 
             let mut parts_by_disk: HashMap<String, Vec<_>> = HashMap::new();
-            if !parts_for_table.is_empty() {
-                parts_by_disk.insert("default".to_string(), parts_for_table);
+            for cp in collected {
+                parts_by_disk
+                    .entry(cp.disk_name)
+                    .or_default()
+                    .push(cp.part_info);
             }
 
             let table_manifest = TableManifest {
