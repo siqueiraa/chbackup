@@ -62,6 +62,7 @@ Things that are easy to get wrong when reading the design doc:
 **Phase 2a** (parallelism): Complete -- Parallel operations for all four command pipelines (create, upload, download, restore), multipart S3 upload for large parts, byte-level rate limiting.
 **Phase 2b** (incremental): Complete -- Incremental backups via --diff-from/--diff-from-remote, diff_parts() comparison, create_remote command.
 **Phase 2c** (S3 object disk): Complete -- S3 disk metadata parser (5 format versions), disk-aware shadow walk, CopyObject with retry+streaming fallback, mixed disk upload/download, UUID-isolated S3 restore with same-name optimization.
+**Phase 2d** (resume & reliability): Complete -- Resumable upload/download/restore via state files, atomic manifest upload (.tmp+CopyObject+delete), post-download CRC64 verification with retry, disk space pre-flight check, partition-level FREEZE, disk filtering (skip_disks/skip_disk_types), parts column consistency check, broken backup cleanup (clean_broken), ClickHouse TLS support.
 
 ## Source Module Map
 
@@ -78,8 +79,9 @@ src/
   manifest.rs        -- BackupManifest, TableManifest, PartInfo, S3ObjectInfo, DatabaseInfo (serde JSON)
   object_disk.rs     -- ClickHouse S3 object disk metadata parser (5 format versions)
   rate_limiter.rs    -- Token-bucket rate limiter (shared via Arc, 0 = unlimited)
-  table_filter.rs    -- Glob pattern matching for -t flag
-  list.rs            -- list + delete commands (local dir scan + S3)
+  resume.rs          -- Resume state types (UploadState, DownloadState, RestoreState), atomic save/load, graceful degradation
+  table_filter.rs    -- Glob pattern matching for -t flag, disk exclusion checks
+  list.rs            -- list + delete + clean_broken commands (local dir scan + S3)
   backup/            -- create command: parallel FREEZE, disk-aware shadow walk, hardlink/S3 metadata, CRC64, UNFREEZE
   upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart, CopyObject for S3 disk parts
   download/          -- download command: parallel S3 GetObject, LZ4+untar decompress, metadata-only for S3 disk parts
@@ -93,12 +95,13 @@ Each directory module has its own `CLAUDE.md` with detailed API and pattern docu
 ## Data Flow
 
 ```
-create:   Config -> ChClient -> FREEZE -> walk shadow (all disks) -> hardlink (local) / parse metadata (S3 disk) -> CRC64 -> UNFREEZE -> BackupManifest -> JSON
-upload:   BackupManifest(JSON) -> local parts: tar+lz4 compress -> S3Client.put_object | S3 disk parts: S3Client.copy_object -> manifest last
-download: S3Client.get_object(manifest) -> BackupManifest -> local parts: S3Client.get_object -> lz4+untar | S3 disk parts: metadata only
-restore:  BackupManifest(JSON) -> CREATE DB/TABLE -> local parts: hardlink to detached/ | S3 disk parts: CopyObject to UUID paths + rewrite metadata -> ATTACH PART -> chown
-list:     scan local dirs + S3Client.list -> display
+create:   Config -> ChClient -> [parts_columns check] -> FREEZE (whole-table or per-partition) -> walk shadow (all disks, with disk filtering) -> hardlink (local) / parse metadata (S3 disk) -> CRC64 -> UNFREEZE -> BackupManifest -> JSON
+upload:   BackupManifest(JSON) -> [load resume state] -> local parts: tar+lz4 compress -> S3Client.put_object | S3 disk parts: S3Client.copy_object -> [save state per-part] -> manifest atomic upload (.tmp+copy+delete) -> [delete state]
+download: S3Client.get_object(manifest) -> [disk space pre-flight] -> BackupManifest -> [load resume state] -> local parts: S3Client.get_object -> lz4+untar -> [CRC64 verify] | S3 disk parts: metadata only -> [save state per-part] -> [delete state]
+restore:  BackupManifest(JSON) -> [load resume state + query system.parts] -> CREATE DB/TABLE -> local parts: hardlink to detached/ | S3 disk parts: CopyObject to UUID paths + rewrite metadata -> ATTACH PART -> [save state per-part] -> chown -> [delete state]
+list:     scan local dirs + S3Client.list -> display (with broken backup detection)
 delete:   rm local dir or S3Client.delete_objects
+clean_broken: list -> filter is_broken -> delete each
 ```
 
 ## Key Implementation Patterns
@@ -117,10 +120,16 @@ delete:   rm local dir or S3Client.delete_objects
 - **Disk-aware routing**: Each command pipeline checks `disk_type_map` to route parts: local disks use hardlink+compress, S3 disks ("s3"/"object_storage") use CopyObject
 - **CopyObject with retry+fallback**: `S3Client.copy_object_with_retry()` retries 3x with exponential backoff; conditional streaming fallback gated by `allow_object_disk_streaming` config
 - **UUID-isolated S3 restore**: Copies S3 objects to `store/{3char}/{uuid_with_dashes}/` paths derived from destination table UUID; same-name optimization skips objects that already exist with matching size
+- **Resume state tracking**: `UploadState`/`DownloadState`/`RestoreState` in `resume.rs` with atomic write (write to `.tmp`, rename), graceful degradation on write failure (warn + continue per design 16.1), params_hash invalidation on parameter change
+- **Manifest atomicity**: Upload to `.tmp` key, CopyObject to final key, delete `.tmp`. Crash between steps produces "broken" backup cleaned by `clean_broken`
+- **Post-download CRC64 verification**: After decompressing each part, recomputes CRC64 from `checksums.txt` and compares against manifest; mismatch triggers retry up to `retries_on_failure`
+- **Disk filtering**: `is_disk_excluded()` in `table_filter.rs` checks parts against `skip_disks` and `skip_disk_types` config before processing
+- **Partition-level FREEZE**: `--partitions` flag triggers `ALTER TABLE FREEZE PARTITION` per partition instead of whole-table FREEZE
+- **Parts column consistency check**: Pre-flight check queries `system.parts_columns` for type inconsistencies before FREEZE; filters benign Enum/Tuple/Nullable drift
+- **Broken backup cleanup**: `clean_broken` command deletes broken backups (missing/corrupt metadata.json) from local or remote storage
 
 ## Remaining Limitations
 
-- No resume (Phase 2d)
 - No Mode A restore / --rm (Phase 4d)
 - No table remap / --as (Phase 4a)
 - No RBAC/config backup (Phase 4e)

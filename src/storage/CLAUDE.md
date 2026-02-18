@@ -78,6 +78,13 @@ pub struct S3Object {
 - `copy_object_with_retry(source_bucket, source_key, dest_key, allow_streaming) -> Result<()>` -- Retry wrapper: retries `copy_object()` up to 3 times with exponential backoff (100ms, 400ms, 1600ms). On final failure: if `allow_streaming=true`, falls back to `copy_object_streaming()` with `warn!()` about high network traffic; if `false`, returns the error.
 - Used by upload (Task 6) and restore (Task 8) for S3 disk parts.
 
+### Manifest Atomicity Support (Phase 2d)
+- Upload module uses existing `copy_object()` and `delete_object()` for atomic manifest upload:
+  1. Upload manifest to `{backup_name}/metadata.json.tmp`
+  2. `copy_object(bucket, tmp_key, final_key)` to atomically make it visible
+  3. `delete_object(tmp_key)` to clean up
+- No new S3Client methods needed; existing API is sufficient
+
 ### Error Handling
 - All methods return `anyhow::Result` with `.context()` annotations
 - `list_objects` handles continuation tokens for pagination automatically

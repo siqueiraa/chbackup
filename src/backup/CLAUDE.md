@@ -62,8 +62,28 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
   shadow/{db}/{table}/{part_name}/...   -- Hardlinked data files
 ```
 
+### Partition-Level Freeze (Phase 2d)
+- When `--partitions` flag is set, `create()` calls `ch.freeze_partition(db, table, partition, freeze_name)` for each comma-separated partition ID instead of `ch.freeze_table()`
+- Partition IDs are parsed from the comma-separated `--partitions` string and trimmed
+- Multiple partitions are frozen sequentially within a single table task (partition-level parallelism not needed)
+- The freeze_name is the same regardless of whether whole-table or per-partition
+- Shadow walk proceeds identically (frozen parts end up in same shadow directory)
+
+### Disk Filtering (Phase 2d)
+- Before processing collected parts, each part is checked against `config.clickhouse.skip_disks` and `config.clickhouse.skip_disk_types`
+- Uses `table_filter::is_disk_excluded(disk_name, disk_type, skip_disks, skip_disk_types)` for exclusion check
+- Excluded parts are logged at info level and skipped from the backup
+
+### Parts Column Consistency Check (Phase 2d)
+- After listing tables, if `config.clickhouse.check_parts_columns` is true AND `!skip_check_parts_columns` CLI flag:
+  - Builds `Vec<(String, String)>` of (database, table) pairs from filtered tables
+  - Calls `ch.check_parts_columns(&targets)` to find column type inconsistencies
+  - Filters out benign drift: types containing "Enum", "Tuple", "Nullable", or "Array(Tuple"
+  - Remaining inconsistencies are logged as warnings per table/column
+- The check runs BEFORE FREEZE to avoid wasting time on tables that will fail on restore
+
 ### Public API
-- `create(config, ch, backup_name, table_pattern, schema_only, diff_from: Option<&str>) -> Result<BackupManifest>` -- Main entry point; when `diff_from` is provided, loads base manifest from local disk and applies `diff_parts()` before saving
+- `create(config, ch, backup_name, table_pattern, schema_only, diff_from: Option<&str>, partitions: Option<&str>, skip_check_parts_columns: bool) -> Result<BackupManifest>` -- Main entry point; supports partition-level freeze and parts column check (Phase 2d)
 - `diff_parts(current, base) -> DiffResult` -- Incremental comparison of current vs base manifest parts
 - `compute_crc64(path) -> Result<u64>` -- File-level CRC64
 - `compute_crc64_bytes(data) -> u64` -- In-memory CRC64

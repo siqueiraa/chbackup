@@ -46,16 +46,29 @@ Parts are sorted by `(partition, min_block)` for correct merge behavior. Part na
 - InlineData (v4+): no CopyObject needed for inline objects; preserved during rewrite
 - `OwnedAttachParams` extended with S3-related fields: `s3_client`, `disk_type_map`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming`, `disk_remote_paths`
 
+### Resume State Tracking (Phase 2d)
+- When `resume=true` (gated by both `--resume` CLI flag AND `config.general.use_resumable_state`):
+  - Loads `RestoreState` from `{backup_dir}/restore.state.json` at start
+  - For each table in manifest, queries `ch.query_system_parts(db, table)` to get currently active parts in ClickHouse
+  - Merges state file info with live system.parts data (system.parts is authoritative)
+  - The already-attached set is the union of (state file parts) and (system.parts active parts)
+  - Parts whose name is in the already-attached set are skipped during ATTACH
+  - After each successful ATTACH PART: adds to state, calls `save_state_graceful()` (non-fatal on failure per design 16.1)
+  - On successful completion: `restore.state.json` is deleted
+  - If `query_system_parts` fails (e.g., ClickHouse down): logs warning, falls back to state file only
+- `RestoreState.attached_parts` is keyed by `"db.table"` -> `Vec<part_name>`
+- `OwnedAttachParams` extended with `already_attached: HashSet<String>` and `restore_state_path: Option<PathBuf>` fields
+
 ### Detached Path Resolution
 Queries `system.tables` for `data_paths` column to find the table's data directory, then appends `detached/{part_name}/`.
 
 ### Public API
-- `restore(config, ch, backup_name, table_pattern, schema_only, data_only) -> Result<()>` -- Main entry point
+- `restore(config, ch, backup_name, table_pattern, schema_only, data_only, resume: bool) -> Result<()>` -- Main entry point with resume support (Phase 2d)
 - `create_databases(ch, manifest) -> Result<()>` -- DDL for databases
 - `create_tables(ch, manifest, filter) -> Result<()>` -- DDL for tables
 - `attach_parts(params) -> Result<u64>` -- Hardlink + ATTACH PART (borrowed params), returns count
-- `attach_parts_owned(params) -> Result<u64>` -- Hardlink + ATTACH PART (owned params for tokio::spawn); handles both local and S3 disk parts
-- `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries; includes `s3_client`, `disk_type_map`, `disk_remote_paths`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming` for Phase 2c
+- `attach_parts_owned(params) -> Result<u64>` -- Hardlink + ATTACH PART (owned params for tokio::spawn); handles both local and S3 disk parts; skips already-attached parts when resume is active (Phase 2d)
+- `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries; includes `s3_client`, `disk_type_map`, `disk_remote_paths`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming` for Phase 2c; `already_attached`, `restore_state_path` for Phase 2d
 - `uuid_s3_prefix(uuid) -> String` -- Generate `store/{3char}/{uuid_with_dashes}/` prefix for S3 restore paths
 - `detect_clickhouse_ownership(data_path) -> Result<(Option<u32>, Option<u32>)>` -- UID/GID detection
 - `get_table_data_path(ch, db, table) -> Result<PathBuf>` -- Query data_paths

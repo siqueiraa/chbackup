@@ -23,10 +23,21 @@ src/clickhouse/
 - `log_sql_queries` flag: logs SQL at `info!` when true, `debug!` when false
 - `log_and_execute()` internal helper for conditional SQL logging
 
+### TLS Support (Phase 2d)
+- When `secure: true`, URL scheme is `https://` (existing behavior)
+- When `tls_ca` is non-empty, sets `SSL_CERT_FILE` env var for `reqwest` native-tls backend
+- When `tls_cert` + `tls_key` are set, sets `SSL_CERT_FILE` and `SSL_KEY_FILE` env vars
+- When `skip_verify: true`, sets `SSL_NO_VERIFY=1` env var
+- Logs TLS configuration state at info level during client creation
+- Note: The `clickhouse-rs` crate uses `reqwest` internally; TLS cert config is via env vars, not direct API
+
 ### Row Types
 - `TableRow` -- From `system.tables`: database, name, engine, create_table_query, uuid, data_paths, total_bytes
 - `MutationRow` -- From `system.mutations`: database, table, mutation_id, command, parts_to_do_names, is_done
-- `DiskRow` -- From `system.disks`: name, path, type_field
+- `DiskRow` -- From `system.disks`: name, path, type_field, remote_path
+- `PartRow` -- From `system.parts`: name, partition_id, active (Phase 2d)
+- `ColumnInconsistency` -- Query result: database, table, column, types (Phase 2d)
+- `DiskSpaceRow` -- From `system.disks`: name, path, free_space (Phase 2d)
 
 All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 
@@ -35,16 +46,21 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `freeze_name(backup_name, db, table) -> String` -- Format: `chbackup_{backup}_{db}_{table}`
 - `freeze_sql(db, table, freeze_name) -> String` -- ALTER TABLE FREEZE WITH NAME
 - `unfreeze_sql(db, table, freeze_name) -> String` -- ALTER TABLE UNFREEZE WITH NAME
+- `freeze_partition_sql(db, table, partition, freeze_name) -> String` -- ALTER TABLE FREEZE PARTITION (Phase 2d)
 
 ### Public API
-- `new(config) -> Result<Self>` -- Build from ClickHouseConfig
+- `new(config) -> Result<Self>` -- Build from ClickHouseConfig (with TLS env var wiring)
 - `ping() -> Result<()>` -- Connectivity check
 - `inner() -> &clickhouse::Client` -- Access underlying client
 - `freeze_table(db, table, freeze_name) -> Result<()>` -- ALTER TABLE FREEZE
+- `freeze_partition(db, table, partition, freeze_name) -> Result<()>` -- ALTER TABLE FREEZE PARTITION (Phase 2d)
 - `unfreeze_table(db, table, freeze_name) -> Result<()>` -- ALTER TABLE UNFREEZE
 - `list_tables() -> Result<Vec<TableRow>>` -- Query system.tables (excludes system DBs)
 - `get_table_ddl(db, table) -> Result<String>` -- SHOW CREATE TABLE
 - `check_pending_mutations(targets) -> Result<Vec<MutationRow>>` -- Query system.mutations
+- `query_system_parts(db, table) -> Result<Vec<PartRow>>` -- Query system.parts for active parts (Phase 2d)
+- `check_parts_columns(targets) -> Result<Vec<ColumnInconsistency>>` -- Batch column consistency check (Phase 2d, design 3.3)
+- `query_disk_free_space() -> Result<Vec<DiskSpaceRow>>` -- Query system.disks with free_space (Phase 2d)
 - `sync_replica(db, table) -> Result<()>` -- SYSTEM SYNC REPLICA
 - `attach_part(db, table, part_name) -> Result<()>` -- ALTER TABLE ATTACH PART
 - `get_version() -> Result<String>` -- SELECT version()
