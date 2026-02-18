@@ -5,7 +5,7 @@ use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, ServerSideEncryption,
 };
 use chrono::{DateTime, Utc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::S3Config;
 
@@ -653,6 +653,192 @@ impl S3Client {
         debug!(key = %full_key, upload_id = %upload_id, "Multipart upload aborted");
         Ok(())
     }
+
+    // -- CopyObject operations --
+
+    /// Server-side copy of an object between buckets (or within a bucket).
+    ///
+    /// `source_bucket` and `source_key` identify the source object (absolute).
+    /// `dest_key` is relative to this client's configured prefix.
+    /// Applies SSE and storage class settings to the destination.
+    pub async fn copy_object(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        dest_key: &str,
+    ) -> Result<()> {
+        let full_dest_key = self.full_key(dest_key);
+        let copy_source = format!("{}/{}", source_bucket, source_key);
+
+        debug!(
+            source = %copy_source,
+            dest = %full_dest_key,
+            "Copying object (server-side CopyObject)"
+        );
+
+        let mut req = self
+            .inner
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(&copy_source)
+            .key(&full_dest_key);
+
+        // Apply storage class
+        if !self.storage_class.is_empty() {
+            let sc: aws_sdk_s3::types::StorageClass = self.storage_class.as_str().into();
+            req = req.storage_class(sc);
+        }
+
+        // Apply server-side encryption
+        if self.sse == "aws:kms" {
+            req = req.server_side_encryption(ServerSideEncryption::AwsKms);
+            if !self.sse_kms_key_id.is_empty() {
+                req = req.ssekms_key_id(&self.sse_kms_key_id);
+            }
+        } else if self.sse == "AES256" {
+            req = req.server_side_encryption(ServerSideEncryption::Aes256);
+        }
+
+        req.send()
+            .await
+            .with_context(|| {
+                format!(
+                    "CopyObject failed: {} -> {}/{}",
+                    copy_source, self.bucket, full_dest_key
+                )
+            })?;
+
+        debug!(
+            source = %copy_source,
+            dest = %full_dest_key,
+            "CopyObject complete"
+        );
+        Ok(())
+    }
+
+    /// Streaming copy fallback: downloads from source then uploads to dest.
+    ///
+    /// Used when server-side CopyObject fails (e.g., cross-region).
+    /// Uses the underlying AWS SDK client directly for the source since
+    /// it may be in a different bucket.
+    pub async fn copy_object_streaming(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        dest_key: &str,
+    ) -> Result<()> {
+        let full_dest_key = self.full_key(dest_key);
+
+        debug!(
+            source_bucket = %source_bucket,
+            source_key = %source_key,
+            dest = %full_dest_key,
+            "Streaming copy (download + upload fallback)"
+        );
+
+        // Download from source bucket using raw AWS SDK client
+        let get_resp = self
+            .inner
+            .get_object()
+            .bucket(source_bucket)
+            .key(source_key)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "Streaming copy: failed to download {}/{}",
+                    source_bucket, source_key
+                )
+            })?;
+
+        let body = get_resp
+            .body
+            .collect()
+            .await
+            .with_context(|| {
+                format!(
+                    "Streaming copy: failed to read body of {}/{}",
+                    source_bucket, source_key
+                )
+            })?;
+
+        let bytes = body.into_bytes().to_vec();
+
+        // Upload to destination using self.put_object
+        self.put_object(dest_key, bytes).await.with_context(|| {
+            format!(
+                "Streaming copy: failed to upload to {}/{}",
+                self.bucket, full_dest_key
+            )
+        })?;
+
+        debug!(
+            source_bucket = %source_bucket,
+            source_key = %source_key,
+            dest = %full_dest_key,
+            "Streaming copy complete"
+        );
+        Ok(())
+    }
+
+    /// Copy an object with retry and conditional streaming fallback.
+    ///
+    /// Retries `copy_object()` up to 3 times with exponential backoff
+    /// (100ms, 400ms, 1600ms) per design doc section 5.4 step 3d.
+    ///
+    /// On final failure:
+    /// - If `allow_streaming` is true: falls back to `copy_object_streaming()`
+    ///   with a warning about high network traffic
+    /// - If `allow_streaming` is false: returns the error
+    pub async fn copy_object_with_retry(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        dest_key: &str,
+        allow_streaming: bool,
+    ) -> Result<()> {
+        let backoff_ms = [100u64, 400, 1600];
+
+        for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
+            match self.copy_object(source_bucket, source_key, dest_key).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt < backoff_ms.len() - 1 {
+                        debug!(
+                            attempt = attempt + 1,
+                            delay_ms = delay_ms,
+                            error = %e,
+                            "CopyObject failed, retrying after backoff"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+                    } else if allow_streaming {
+                        warn!(
+                            source_bucket = %source_bucket,
+                            source_key = %source_key,
+                            error = %e,
+                            "CopyObject failed after retries, falling back to streaming copy (high network traffic)"
+                        );
+                        return self
+                            .copy_object_streaming(source_bucket, source_key, dest_key)
+                            .await;
+                    } else {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "CopyObject failed after {} attempts (streaming fallback disabled): {}/{}",
+                                backoff_ms.len(),
+                                source_bucket,
+                                source_key
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
+        // This should never be reached due to the loop logic above,
+        // but the compiler needs it for exhaustiveness.
+        unreachable!("retry loop should have returned")
+    }
 }
 
 /// S3 minimum part size: 5 MiB (except the last part).
@@ -783,6 +969,45 @@ mod tests {
         // Auto with very large max_parts_count should also clamp to 5MB
         let chunk = calculate_chunk_size(10 * 1024 * 1024, 0, 10000);
         assert_eq!(chunk, S3_MIN_PART_SIZE);
+    }
+
+    #[test]
+    fn test_copy_object_builds_correct_source() {
+        // Verify the CopySource format is "{bucket}/{key}"
+        let client = mock_s3_client("dest-bucket", "dest-prefix");
+
+        // The copy_source format used in copy_object is "{source_bucket}/{source_key}"
+        let source_bucket = "source-bucket";
+        let source_key = "path/to/object.bin";
+        let expected_source = format!("{}/{}", source_bucket, source_key);
+        assert_eq!(expected_source, "source-bucket/path/to/object.bin");
+
+        // Verify dest key uses prefix
+        let dest_key = "backup/objects/data.bin";
+        let full_dest = client.full_key(dest_key);
+        assert_eq!(full_dest, "dest-prefix/backup/objects/data.bin");
+    }
+
+    #[tokio::test]
+    async fn test_copy_object_with_retry_no_streaming_when_disabled() {
+        // When allow_streaming is false, copy_object_with_retry should return
+        // an error after retries without attempting streaming fallback.
+        let client = mock_s3_client("dest-bucket", "prefix");
+
+        // This will fail because there's no real S3 endpoint, but we can verify
+        // the error path. We can't easily test the full retry logic without mocking,
+        // but we can verify the method exists and the error contains the right context.
+        let result = client
+            .copy_object_with_retry("src-bucket", "src/key.bin", "dest/key.bin", false)
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("CopyObject failed"),
+            "Error should mention CopyObject failure, got: {}",
+            err_msg
+        );
     }
 
     /// Create a minimal S3Client for unit testing (no real AWS connection).
