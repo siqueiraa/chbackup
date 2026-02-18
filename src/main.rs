@@ -368,7 +368,10 @@ async fn main() -> Result<()> {
         }
 
         Command::Clean { name } => {
-            info!(name = ?name, "clean: not implemented in Phase 1");
+            let ch = ChClient::new(&config.clickhouse)?;
+            let data_path = &config.clickhouse.data_path;
+            let count = list::clean_shadow(&ch, data_path, name.as_deref()).await?;
+            info!(removed = count, "Clean command complete");
         }
 
         Command::CleanBroken { location } => {

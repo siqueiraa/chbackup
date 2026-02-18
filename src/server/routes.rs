@@ -973,9 +973,58 @@ pub async fn kill_op(State(state): State<AppState>) -> Result<&'static str, Stat
 // Stub endpoints -- return 501 Not Implemented
 // ---------------------------------------------------------------------------
 
-/// POST /api/v1/clean -- retention cleanup (Phase 3c)
-pub async fn clean_stub() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3c)")
+/// POST /api/v1/clean -- shadow directory cleanup
+pub async fn clean(
+    State(state): State<AppState>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let (id, _token) = state.try_start_op("clean").await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        info!("Starting clean operation");
+
+        let start_time = std::time::Instant::now();
+        let data_path = state_clone.config.clickhouse.data_path.clone();
+        let result = list::clean_shadow(&state_clone.ch, &data_path, None).await;
+        let duration = start_time.elapsed().as_secs_f64();
+
+        match result {
+            Ok(count) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds
+                        .with_label_values(&["clean"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["clean"])
+                        .inc();
+                }
+                info!(count = count, "clean operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds
+                        .with_label_values(&["clean"])
+                        .observe(duration);
+                    m.errors_total.with_label_values(&["clean"]).inc();
+                }
+                warn!(error = %e, "clean operation failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
 }
 
 /// POST /api/v1/reload -- config hot-reload (Phase 3d)
@@ -1237,10 +1286,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_stub_endpoints_return_501() {
-        let (status, body) = clean_stub().await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("Phase 3c"));
-
         let (status, body) = reload_stub().await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert!(body.contains("Phase 3d"));

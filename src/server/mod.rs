@@ -74,7 +74,7 @@ pub fn build_router(state: AppState) -> Router {
         // Kill
         .route("/api/v1/kill", post(routes::kill_op))
         // Stub endpoints (not yet implemented)
-        .route("/api/v1/clean", post(routes::clean_stub))
+        .route("/api/v1/clean", post(routes::clean))
         .route("/api/v1/reload", post(routes::reload_stub))
         .route("/api/v1/restart", post(routes::restart_stub))
         .route("/api/v1/tables", get(routes::tables_stub))
