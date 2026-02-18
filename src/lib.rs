@@ -8,6 +8,7 @@ pub mod list;
 pub mod lock;
 pub mod logging;
 pub mod manifest;
+pub mod object_disk;
 pub mod rate_limiter;
 pub mod restore;
 pub mod storage;
