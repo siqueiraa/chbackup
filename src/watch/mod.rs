@@ -145,7 +145,11 @@ pub fn resume_state(
         None => return ResumeDecision::FullNow,
     };
 
-    let full_ts = last_full.timestamp.unwrap();
+    // Safety: all entries in `matching` have been filtered for timestamp.is_some()
+    let full_ts = match last_full.timestamp {
+        Some(ts) => ts,
+        None => return ResumeDecision::FullNow,
+    };
     let full_elapsed = (now - full_ts)
         .to_std()
         .unwrap_or(std::time::Duration::ZERO);
@@ -157,7 +161,10 @@ pub fn resume_state(
 
     // Determine the most recent backup timestamp (full or incr) for watch_interval check
     let last_backup_ts = if let Some(incr) = last_incr {
-        let incr_ts = incr.timestamp.unwrap();
+        let incr_ts = match incr.timestamp {
+            Some(ts) => ts,
+            None => full_ts,
+        };
         if incr_ts > full_ts { incr_ts } else { full_ts }
     } else {
         full_ts
