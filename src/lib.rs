@@ -12,6 +12,7 @@ pub mod object_disk;
 pub mod rate_limiter;
 pub mod restore;
 pub mod resume;
+pub mod server;
 pub mod storage;
 pub mod table_filter;
 pub mod upload;
