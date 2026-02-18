@@ -700,12 +700,8 @@ fn clean_shadow_dir(disk_path: &str, name: Option<&str>) -> Result<usize> {
         return Ok(0);
     }
 
-    let entries = std::fs::read_dir(&shadow_path).with_context(|| {
-        format!(
-            "Failed to read shadow directory: {}",
-            shadow_path.display()
-        )
-    })?;
+    let entries = std::fs::read_dir(&shadow_path)
+        .with_context(|| format!("Failed to read shadow directory: {}", shadow_path.display()))?;
 
     let prefix_filter = name.map(|n| format!("chbackup_{}_", sanitize_name(n)));
 
@@ -795,11 +791,10 @@ pub async fn clean_shadow(ch: &ChClient, data_path: &str, name: Option<&str>) ->
     if !data_path_in_disks {
         let dp = data_path.to_string();
         let name_owned = name.map(|n| n.to_string());
-        let count = tokio::task::spawn_blocking(move || {
-            clean_shadow_dir(&dp, name_owned.as_deref())
-        })
-        .await
-        .context("Shadow cleanup task panicked")??;
+        let count =
+            tokio::task::spawn_blocking(move || clean_shadow_dir(&dp, name_owned.as_deref()))
+                .await
+                .context("Shadow cleanup task panicked")??;
         total += count;
     }
 
@@ -1287,8 +1282,7 @@ mod tests {
         std::fs::create_dir_all(&chbackup2).unwrap();
 
         // Filter by backup name "daily-mon" -> sanitized to "daily_mon"
-        let count =
-            clean_shadow_dir(dir.path().to_str().unwrap(), Some("daily-mon")).unwrap();
+        let count = clean_shadow_dir(dir.path().to_str().unwrap(), Some("daily-mon")).unwrap();
 
         assert_eq!(count, 1, "Should have removed 1 matching shadow dir");
         assert!(!chbackup1.exists(), "chbackup_daily_mon should be removed");
@@ -1648,10 +1642,12 @@ mod tests {
         assert_eq!(referenced_count, 1, "Should have 1 referenced key");
         assert!(found_manifest, "Should have found the manifest key");
 
-        assert!(unreferenced.contains(&&"backup-a/data/default/trades/default/part2.tar.lz4".to_string()));
+        assert!(unreferenced
+            .contains(&&"backup-a/data/default/trades/default/part2.tar.lz4".to_string()));
         assert!(unreferenced.contains(&&"backup-a/objects/store/abc/data.bin".to_string()));
 
         // part1 should NOT be in unreferenced (it's still needed by another backup)
-        assert!(!unreferenced.contains(&&"backup-a/data/default/trades/default/part1.tar.lz4".to_string()));
+        assert!(!unreferenced
+            .contains(&&"backup-a/data/default/trades/default/part1.tar.lz4".to_string()));
     }
 }

@@ -331,9 +331,14 @@ pub async fn create_backup(
         match result {
             Ok(manifest) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["create"]).observe(duration);
-                    m.successful_operations_total.with_label_values(&["create"]).inc();
-                    m.backup_last_success_timestamp.set(Utc::now().timestamp() as f64);
+                    m.backup_duration_seconds
+                        .with_label_values(&["create"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["create"])
+                        .inc();
+                    m.backup_last_success_timestamp
+                        .set(Utc::now().timestamp() as f64);
                     m.backup_size_bytes.set(manifest.compressed_size as f64);
                 }
                 info!(backup_name = %backup_name, "Create operation completed");
@@ -341,7 +346,9 @@ pub async fn create_backup(
             }
             Err(e) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["create"]).observe(duration);
+                    m.backup_duration_seconds
+                        .with_label_values(&["create"])
+                        .observe(duration);
                     m.errors_total.with_label_values(&["create"]).inc();
                 }
                 warn!(backup_name = %backup_name, error = %e, "Create operation failed");
@@ -408,16 +415,23 @@ pub async fn upload_backup(
         match result {
             Ok(_) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["upload"]).observe(duration);
-                    m.successful_operations_total.with_label_values(&["upload"]).inc();
-                    m.backup_last_success_timestamp.set(Utc::now().timestamp() as f64);
+                    m.backup_duration_seconds
+                        .with_label_values(&["upload"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["upload"])
+                        .inc();
+                    m.backup_last_success_timestamp
+                        .set(Utc::now().timestamp() as f64);
                 }
                 info!(backup_name = %name, "Upload operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["upload"]).observe(duration);
+                    m.backup_duration_seconds
+                        .with_label_values(&["upload"])
+                        .observe(duration);
                     m.errors_total.with_label_values(&["upload"]).inc();
                 }
                 warn!(backup_name = %name, error = %e, "Upload operation failed");
@@ -477,15 +491,21 @@ pub async fn download_backup(
         match result {
             Ok(_backup_dir) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["download"]).observe(duration);
-                    m.successful_operations_total.with_label_values(&["download"]).inc();
+                    m.backup_duration_seconds
+                        .with_label_values(&["download"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["download"])
+                        .inc();
                 }
                 info!(backup_name = %name, "Download operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["download"]).observe(duration);
+                    m.backup_duration_seconds
+                        .with_label_values(&["download"])
+                        .observe(duration);
                     m.errors_total.with_label_values(&["download"]).inc();
                 }
                 warn!(backup_name = %name, error = %e, "Download operation failed");
@@ -550,15 +570,21 @@ pub async fn restore_backup(
         match result {
             Ok(_) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["restore"]).observe(duration);
-                    m.successful_operations_total.with_label_values(&["restore"]).inc();
+                    m.backup_duration_seconds
+                        .with_label_values(&["restore"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["restore"])
+                        .inc();
                 }
                 info!(backup_name = %name, "Restore operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["restore"]).observe(duration);
+                    m.backup_duration_seconds
+                        .with_label_values(&["restore"])
+                        .observe(duration);
                     m.errors_total.with_label_values(&["restore"]).inc();
                 }
                 warn!(backup_name = %name, error = %e, "Restore operation failed");
@@ -626,7 +652,9 @@ pub async fn create_remote(
             Err(e) => {
                 let duration = start_time.elapsed().as_secs_f64();
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["create_remote"]).observe(duration);
+                    m.backup_duration_seconds
+                        .with_label_values(&["create_remote"])
+                        .observe(duration);
                     m.errors_total.with_label_values(&["create_remote"]).inc();
                 }
                 warn!(backup_name = %backup_name, error = %e, "create_remote: create step failed");
@@ -656,9 +684,14 @@ pub async fn create_remote(
         match upload_result {
             Ok(_) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["create_remote"]).observe(duration);
-                    m.successful_operations_total.with_label_values(&["create_remote"]).inc();
-                    m.backup_last_success_timestamp.set(Utc::now().timestamp() as f64);
+                    m.backup_duration_seconds
+                        .with_label_values(&["create_remote"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["create_remote"])
+                        .inc();
+                    m.backup_last_success_timestamp
+                        .set(Utc::now().timestamp() as f64);
                     m.backup_size_bytes.set(manifest.compressed_size as f64);
                 }
                 info!(backup_name = %backup_name, "create_remote operation completed");
@@ -666,7 +699,9 @@ pub async fn create_remote(
             }
             Err(e) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["create_remote"]).observe(duration);
+                    m.backup_duration_seconds
+                        .with_label_values(&["create_remote"])
+                        .observe(duration);
                     m.errors_total.with_label_values(&["create_remote"]).inc();
                 }
                 warn!(backup_name = %backup_name, error = %e, "create_remote: upload step failed");
@@ -726,7 +761,9 @@ pub async fn restore_remote(
         if let Err(e) = download_result {
             let duration = start_time.elapsed().as_secs_f64();
             if let Some(m) = &state_clone.metrics {
-                m.backup_duration_seconds.with_label_values(&["restore_remote"]).observe(duration);
+                m.backup_duration_seconds
+                    .with_label_values(&["restore_remote"])
+                    .observe(duration);
                 m.errors_total.with_label_values(&["restore_remote"]).inc();
             }
             warn!(backup_name = %name, error = %e, "restore_remote: download step failed");
@@ -750,15 +787,21 @@ pub async fn restore_remote(
         match restore_result {
             Ok(_) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["restore_remote"]).observe(duration);
-                    m.successful_operations_total.with_label_values(&["restore_remote"]).inc();
+                    m.backup_duration_seconds
+                        .with_label_values(&["restore_remote"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["restore_remote"])
+                        .inc();
                 }
                 info!(backup_name = %name, "restore_remote operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["restore_remote"]).observe(duration);
+                    m.backup_duration_seconds
+                        .with_label_values(&["restore_remote"])
+                        .observe(duration);
                     m.errors_total.with_label_values(&["restore_remote"]).inc();
                 }
                 warn!(backup_name = %name, error = %e, "restore_remote: restore step failed");
@@ -833,15 +876,21 @@ pub async fn delete_backup(
         match result {
             Ok(_) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["delete"]).observe(duration);
-                    m.successful_operations_total.with_label_values(&["delete"]).inc();
+                    m.backup_duration_seconds
+                        .with_label_values(&["delete"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["delete"])
+                        .inc();
                 }
                 info!(backup_name = %name, "Delete operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["delete"]).observe(duration);
+                    m.backup_duration_seconds
+                        .with_label_values(&["delete"])
+                        .observe(duration);
                     m.errors_total.with_label_values(&["delete"]).inc();
                 }
                 warn!(backup_name = %name, error = %e, "Delete operation failed");
@@ -883,16 +932,24 @@ pub async fn clean_remote_broken(
         match result {
             Ok(count) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["clean_broken_remote"]).observe(duration);
-                    m.successful_operations_total.with_label_values(&["clean_broken_remote"]).inc();
+                    m.backup_duration_seconds
+                        .with_label_values(&["clean_broken_remote"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["clean_broken_remote"])
+                        .inc();
                 }
                 info!(count = count, "clean_broken_remote operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["clean_broken_remote"]).observe(duration);
-                    m.errors_total.with_label_values(&["clean_broken_remote"]).inc();
+                    m.backup_duration_seconds
+                        .with_label_values(&["clean_broken_remote"])
+                        .observe(duration);
+                    m.errors_total
+                        .with_label_values(&["clean_broken_remote"])
+                        .inc();
                 }
                 warn!(error = %e, "clean_broken_remote operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -936,16 +993,24 @@ pub async fn clean_local_broken(
         match result {
             Ok(count) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["clean_broken_local"]).observe(duration);
-                    m.successful_operations_total.with_label_values(&["clean_broken_local"]).inc();
+                    m.backup_duration_seconds
+                        .with_label_values(&["clean_broken_local"])
+                        .observe(duration);
+                    m.successful_operations_total
+                        .with_label_values(&["clean_broken_local"])
+                        .inc();
                 }
                 info!(count = count, "clean_broken_local operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
                 if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds.with_label_values(&["clean_broken_local"]).observe(duration);
-                    m.errors_total.with_label_values(&["clean_broken_local"]).inc();
+                    m.backup_duration_seconds
+                        .with_label_values(&["clean_broken_local"])
+                        .observe(duration);
+                    m.errors_total
+                        .with_label_values(&["clean_broken_local"])
+                        .inc();
                 }
                 warn!(error = %e, "clean_broken_local operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
@@ -1315,8 +1380,7 @@ mod tests {
     fn test_metrics_handler_returns_prometheus_text() {
         // Verify that Metrics::encode() produces valid prometheus text format
         // that the handler returns on the success path.
-        let metrics =
-            super::Metrics::new().expect("Metrics::new() should succeed");
+        let metrics = super::Metrics::new().expect("Metrics::new() should succeed");
         let text = metrics.encode().expect("encode() should succeed");
 
         // Handler returns (StatusCode::OK, text) when metrics is Some
@@ -1350,10 +1414,7 @@ mod tests {
         let result = if metrics.is_some() {
             (StatusCode::OK, "has metrics".to_string())
         } else {
-            (
-                StatusCode::NOT_IMPLEMENTED,
-                "metrics disabled".to_string(),
-            )
+            (StatusCode::NOT_IMPLEMENTED, "metrics disabled".to_string())
         };
 
         assert_eq!(result.0, StatusCode::NOT_IMPLEMENTED);

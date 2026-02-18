@@ -304,10 +304,7 @@ mod tests {
         let metrics = Metrics::new().expect("Metrics::new() should succeed");
 
         // Increment the errors_total counter for "create" operation
-        metrics
-            .errors_total
-            .with_label_values(&["create"])
-            .inc();
+        metrics.errors_total.with_label_values(&["create"]).inc();
 
         let text = metrics.encode().expect("encode() should succeed");
 
@@ -319,10 +316,7 @@ mod tests {
         );
 
         // Increment again
-        metrics
-            .errors_total
-            .with_label_values(&["create"])
-            .inc();
+        metrics.errors_total.with_label_values(&["create"]).inc();
 
         let text2 = metrics.encode().expect("encode() should succeed");
         assert!(
@@ -362,10 +356,7 @@ mod tests {
         let metrics = Metrics::new().expect("Metrics::new() should succeed");
 
         // Increment error counter for "create"
-        metrics
-            .errors_total
-            .with_label_values(&["create"])
-            .inc();
+        metrics.errors_total.with_label_values(&["create"]).inc();
 
         let text = metrics.encode().expect("encode() should succeed");
 
@@ -389,9 +380,7 @@ mod tests {
         let text = metrics.encode().expect("encode() should succeed");
 
         assert!(
-            text.contains(
-                "chbackup_successful_operations_total{operation=\"upload\"} 1"
-            ),
+            text.contains("chbackup_successful_operations_total{operation=\"upload\"} 1"),
             "successful_operations_total for upload should be 1, got:\n{}",
             text
         );

@@ -527,7 +527,10 @@ mod tests {
     fn test_app_state_with_metrics_enabled() {
         // Verify that when enable_metrics=true (default), Metrics is created
         let config = test_config(false);
-        assert!(config.api.enable_metrics, "Default config should have enable_metrics=true");
+        assert!(
+            config.api.enable_metrics,
+            "Default config should have enable_metrics=true"
+        );
 
         // Create metrics the same way AppState::new() does
         let metrics = if config.api.enable_metrics {
