@@ -48,6 +48,9 @@ pub struct DiskRow {
     pub path: String,
     #[serde(rename = "type")]
     pub disk_type: String,
+    /// Remote path for S3 disks (S3 URI or path prefix). Empty for local disks.
+    #[serde(default)]
+    pub remote_path: String,
 }
 
 impl ChClient {
@@ -306,7 +309,7 @@ impl ChClient {
 
     /// Get disk information from system.disks.
     pub async fn get_disks(&self) -> Result<Vec<DiskRow>> {
-        let sql = "SELECT name, path, type FROM system.disks";
+        let sql = "SELECT name, path, type, ifNull(remote_path, '') as remote_path FROM system.disks";
 
         if self.log_sql_queries {
             info!(sql = %sql, "Executing get_disks");
@@ -497,6 +500,37 @@ mod tests {
 
         let name = freeze_name("backup.v2", "my-db", "my.table");
         assert_eq!(name, "chbackup_backup_v2_my_db_my_table");
+    }
+
+    #[test]
+    fn test_disk_row_has_remote_path() {
+        // DiskRow should have remote_path field with serde(default) for backward compat
+        let disk = DiskRow {
+            name: "s3disk".to_string(),
+            path: "/var/lib/clickhouse/disks/s3".to_string(),
+            disk_type: "s3".to_string(),
+            remote_path: "s3://data-bucket/ch-data/".to_string(),
+        };
+        assert_eq!(disk.remote_path, "s3://data-bucket/ch-data/");
+
+        // Local disk has empty remote_path
+        let local_disk = DiskRow {
+            name: "default".to_string(),
+            path: "/var/lib/clickhouse".to_string(),
+            disk_type: "local".to_string(),
+            remote_path: String::new(),
+        };
+        assert!(local_disk.remote_path.is_empty());
+    }
+
+    #[test]
+    fn test_disk_row_remote_path_serde_default() {
+        // Verify that remote_path defaults to empty string when missing from JSON
+        // This simulates older ClickHouse versions that may not have the column
+        let json = r#"{"name":"default","path":"/var/lib/clickhouse","type":"local"}"#;
+        let disk: DiskRow = serde_json::from_str(json).unwrap();
+        assert_eq!(disk.name, "default");
+        assert!(disk.remote_path.is_empty());
     }
 
     #[test]
