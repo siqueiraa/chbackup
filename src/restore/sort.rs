@@ -81,9 +81,7 @@ pub fn sort_parts_by_min_block(parts: &[PartInfo]) -> Vec<PartInfo> {
 /// Engines containing "Replacing", "Collapsing", or "Versioned" need parts
 /// attached in the correct order so that the merge semantics work properly.
 pub fn needs_sequential_attach(engine: &str) -> bool {
-    engine.contains("Replacing")
-        || engine.contains("Collapsing")
-        || engine.contains("Versioned")
+    engine.contains("Replacing") || engine.contains("Collapsing") || engine.contains("Versioned")
 }
 
 #[cfg(test)]

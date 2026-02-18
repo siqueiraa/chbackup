@@ -197,7 +197,11 @@ pub fn rewrite_metadata(metadata: &ObjectDiskMetadata, new_prefix: &str) -> Stri
     result.push('\n');
 
     // Object count and total size
-    result.push_str(&format!("{}\t{}\n", metadata.objects.len(), metadata.total_size));
+    result.push_str(&format!(
+        "{}\t{}\n",
+        metadata.objects.len(),
+        metadata.total_size
+    ));
 
     // Object lines with rewritten paths
     for obj in &metadata.objects {
@@ -237,7 +241,11 @@ pub fn serialize_metadata(metadata: &ObjectDiskMetadata) -> String {
     result.push('\n');
 
     // Object count and total size
-    result.push_str(&format!("{}\t{}\n", metadata.objects.len(), metadata.total_size));
+    result.push_str(&format!(
+        "{}\t{}\n",
+        metadata.objects.len(),
+        metadata.total_size
+    ));
 
     // Object lines
     for obj in &metadata.objects {
@@ -288,9 +296,15 @@ mod tests {
         assert_eq!(meta.version, 1);
         assert_eq!(meta.objects.len(), 2);
         assert_eq!(meta.total_size, 300);
-        assert_eq!(meta.objects[0].relative_path, "s3://mybucket/store/abc/data.bin");
+        assert_eq!(
+            meta.objects[0].relative_path,
+            "s3://mybucket/store/abc/data.bin"
+        );
         assert_eq!(meta.objects[0].size, 100);
-        assert_eq!(meta.objects[1].relative_path, "s3://mybucket/store/abc/index.mrk");
+        assert_eq!(
+            meta.objects[1].relative_path,
+            "s3://mybucket/store/abc/index.mrk"
+        );
         assert_eq!(meta.objects[1].size, 200);
         assert_eq!(meta.ref_count, 1);
         assert!(!meta.read_only);
@@ -385,10 +399,7 @@ mod tests {
         let meta = parse_metadata(content).unwrap();
         assert_eq!(meta.version, 5);
         // Last 2 components: 202401_1_50_3/data.bin
-        assert_eq!(
-            meta.objects[0].relative_path,
-            "202401_1_50_3/data.bin"
-        );
+        assert_eq!(meta.objects[0].relative_path, "202401_1_50_3/data.bin");
     }
 
     #[test]

@@ -42,11 +42,7 @@ pub struct BackupSummary {
 /// If `location` is `None`, shows both local and remote backups.
 /// If `Some(Local)`, shows only local backups.
 /// If `Some(Remote)`, shows only remote backups.
-pub async fn list(
-    data_path: &str,
-    s3: &S3Client,
-    location: Option<&Location>,
-) -> Result<()> {
+pub async fn list(data_path: &str, s3: &S3Client, location: Option<&Location>) -> Result<()> {
     let show_local = location.is_none() || location == Some(&Location::Local);
     let show_remote = location.is_none() || location == Some(&Location::Remote);
 
@@ -325,11 +321,7 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
 
 /// Compute total uncompressed size from all table parts.
 fn total_uncompressed_size(manifest: &BackupManifest) -> u64 {
-    manifest
-        .tables
-        .values()
-        .map(|t| t.total_bytes)
-        .sum()
+    manifest.tables.values().map(|t| t.total_bytes).sum()
 }
 
 /// Extract backup name from an S3 common prefix.
@@ -441,7 +433,10 @@ mod tests {
         assert_eq!(summaries.len(), 2);
 
         // Results are sorted by name
-        let broken = summaries.iter().find(|s| s.name == "broken-backup").unwrap();
+        let broken = summaries
+            .iter()
+            .find(|s| s.name == "broken-backup")
+            .unwrap();
         assert!(broken.is_broken);
         assert!(broken.timestamp.is_none());
 
@@ -563,7 +558,10 @@ mod tests {
             "daily-2024-01-15"
         );
         assert_eq!(
-            extract_backup_name_from_prefix("prod/region1/chbackup/daily/", "prod/region1/chbackup"),
+            extract_backup_name_from_prefix(
+                "prod/region1/chbackup/daily/",
+                "prod/region1/chbackup"
+            ),
             "daily"
         );
     }
@@ -578,9 +576,6 @@ mod tests {
             strip_s3_prefix("daily/metadata.json", ""),
             "daily/metadata.json"
         );
-        assert_eq!(
-            strip_s3_prefix("other/key", "chbackup"),
-            "other/key"
-        );
+        assert_eq!(strip_s3_prefix("other/key", "chbackup"), "other/key");
     }
 }

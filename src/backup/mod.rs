@@ -128,12 +128,9 @@ pub async fn create(
         .map(|t| (t.database.clone(), t.name.clone()))
         .collect();
 
-    let all_mutations = mutations::check_mutations(
-        ch,
-        &mutation_targets,
-        config.clickhouse.backup_mutations,
-    )
-    .await?;
+    let all_mutations =
+        mutations::check_mutations(ch, &mutation_targets, config.clickhouse.backup_mutations)
+            .await?;
 
     // 7. Sync replicas (design 3.2)
     if config.clickhouse.sync_replicated_tables {
@@ -146,8 +143,12 @@ pub async fn create(
         .join("backup")
         .join(backup_name);
 
-    std::fs::create_dir_all(&backup_dir)
-        .with_context(|| format!("Failed to create backup directory: {}", backup_dir.display()))?;
+    std::fs::create_dir_all(&backup_dir).with_context(|| {
+        format!(
+            "Failed to create backup directory: {}",
+            backup_dir.display()
+        )
+    })?;
 
     // 9. FREEZE tables and collect parts (parallel, bounded by max_connections)
     let mut table_manifests: HashMap<String, TableManifest> = HashMap::new();
@@ -329,9 +330,9 @@ pub async fn create(
     }
 
     // Await all tasks, collecting results
-    let results = try_join_all(handles).await.context(
-        "A FREEZE+collect task panicked",
-    )?;
+    let results = try_join_all(handles)
+        .await
+        .context("A FREEZE+collect task panicked")?;
 
     // Build FreezeGuard from successful results for cleanup, and aggregate table manifests
     let mut freeze_guard = FreezeGuard::new();
@@ -414,8 +415,9 @@ pub async fn create(
             .join("backup")
             .join(base_name)
             .join("metadata.json");
-        let base = BackupManifest::load_from_file(&base_manifest_path)
-            .with_context(|| format!("Failed to load base backup '{}' for --diff-from", base_name))?;
+        let base = BackupManifest::load_from_file(&base_manifest_path).with_context(|| {
+            format!("Failed to load base backup '{}' for --diff-from", base_name)
+        })?;
         let result = diff_parts(&mut manifest, &base);
         info!(
             carried = result.carried,
@@ -476,8 +478,8 @@ fn is_metadata_only_engine(engine: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use self::freeze::FreezeInfo;
+    use super::*;
 
     #[test]
     fn test_freeze_info_send_sync() {
@@ -491,7 +493,8 @@ mod tests {
             database: "default".to_string(),
             name: "trades".to_string(),
             engine: "MergeTree".to_string(),
-            create_table_query: "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id".to_string(),
+            create_table_query:
+                "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id".to_string(),
             uuid: "abc-123".to_string(),
             data_paths: vec!["/var/lib/clickhouse/store/abc/abc123/".to_string()],
             total_bytes: Some(1000),

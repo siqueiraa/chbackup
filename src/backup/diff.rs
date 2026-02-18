@@ -48,11 +48,9 @@ pub fn diff_parts(current: &mut BackupManifest, base: &BackupManifest) -> DiffRe
     for (table_key, table_manifest) in &mut current.tables {
         for (disk_name, parts) in &mut table_manifest.parts {
             for part in parts.iter_mut() {
-                if let Some(base_part) = base_lookup.get(&(
-                    table_key.as_str(),
-                    disk_name.as_str(),
-                    part.name.as_str(),
-                )) {
+                if let Some(base_part) =
+                    base_lookup.get(&(table_key.as_str(), disk_name.as_str(), part.name.as_str()))
+                {
                     if part.checksum_crc64 == base_part.checksum_crc64 {
                         part.source = format!("carried:{}", base_name);
                         part.backup_key = base_part.backup_key.clone();
@@ -237,10 +235,7 @@ mod tests {
         let mut base_tables = HashMap::new();
         base_tables.insert(
             "default.trades".to_string(),
-            make_table(
-                "default",
-                vec![make_part("202401_1_50_3", 111, base_key)],
-            ),
+            make_table("default", vec![make_part("202401_1_50_3", 111, base_key)]),
         );
         let base = make_manifest("base-backup", base_tables);
 
@@ -282,10 +277,7 @@ mod tests {
         let mut base_tables = HashMap::new();
         base_tables.insert(
             "default.trades".to_string(),
-            make_table(
-                "default",
-                vec![make_part("202401_1_50_3", 111, base_key)],
-            ),
+            make_table("default", vec![make_part("202401_1_50_3", 111, base_key)]),
         );
         let base = make_manifest("base-backup", base_tables);
 
@@ -393,7 +385,11 @@ mod tests {
             "default.orders".to_string(), // extra table in base, not in current
             make_table(
                 "default",
-                vec![make_part("part_orders", 999, "s3://bucket/base/orders.tar.lz4")],
+                vec![make_part(
+                    "part_orders",
+                    999,
+                    "s3://bucket/base/orders.tar.lz4",
+                )],
             ),
         );
         let base = make_manifest("base-backup", base_tables);
@@ -462,10 +458,7 @@ mod tests {
         // Verify s3_objects was carried forward
         let parts = &current.tables["default.trades"].parts["s3disk"];
         assert_eq!(parts[0].source, "carried:base-backup");
-        assert_eq!(
-            parts[0].backup_key,
-            "s3://bucket/base/part.tar.lz4"
-        );
+        assert_eq!(parts[0].backup_key, "s3://bucket/base/part.tar.lz4");
         assert!(parts[0].s3_objects.is_some());
         let carried_objects = parts[0].s3_objects.as_ref().unwrap();
         assert_eq!(carried_objects.len(), 1);

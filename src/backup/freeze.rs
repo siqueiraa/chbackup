@@ -33,9 +33,7 @@ impl Default for FreezeGuard {
 impl FreezeGuard {
     /// Create a new empty FreezeGuard.
     pub fn new() -> Self {
-        Self {
-            frozen: Vec::new(),
-        }
+        Self { frozen: Vec::new() }
     }
 
     /// Record that a table has been frozen.
@@ -69,9 +67,9 @@ impl FreezeGuard {
                 "Unfreezing table"
             );
 
-            if let Err(e) =
-                ch.unfreeze_table(&info.database, &info.table, &info.freeze_name)
-                    .await
+            if let Err(e) = ch
+                .unfreeze_table(&info.database, &info.table, &info.freeze_name)
+                .await
             {
                 warn!(
                     db = %info.database,

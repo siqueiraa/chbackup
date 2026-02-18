@@ -189,15 +189,12 @@ pub async fn upload(
     if let Some(base_name) = diff_from_remote {
         info!(base = %base_name, "Loading remote base manifest for diff-from-remote");
         let base_manifest_key = format!("{}/metadata.json", base_name);
-        let base_bytes = s3
-            .get_object(&base_manifest_key)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to download base manifest for --diff-from-remote '{}'",
-                    base_name
-                )
-            })?;
+        let base_bytes = s3.get_object(&base_manifest_key).await.with_context(|| {
+            format!(
+                "Failed to download base manifest for --diff-from-remote '{}'",
+                base_name
+            )
+        })?;
         let base = BackupManifest::from_json_bytes(&base_bytes).with_context(|| {
             format!(
                 "Failed to parse base manifest for --diff-from-remote '{}'",
@@ -233,9 +230,7 @@ pub async fn upload(
     let table_keys: Vec<String> = manifest.tables.keys().cloned().collect();
 
     for table_key in &table_keys {
-        let (db, table) = table_key
-            .split_once('.')
-            .unwrap_or(("default", table_key));
+        let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
 
         let table_manifest = match manifest.tables.get(table_key) {
             Some(tm) => tm,
@@ -369,8 +364,7 @@ pub async fn upload(
 
     // Result type: (table_key, disk_name, updated_part, compressed_size)
     type UploadResult = Result<(String, String, PartInfo, u64)>;
-    let mut handles: Vec<tokio::task::JoinHandle<UploadResult>> =
-        Vec::with_capacity(total_parts);
+    let mut handles: Vec<tokio::task::JoinHandle<UploadResult>> = Vec::with_capacity(total_parts);
 
     // 3a. Spawn local disk upload tasks
     for item in local_work_items {
@@ -454,9 +448,7 @@ pub async fn upload(
                 // Single PutObject
                 s3.put_object(&item.s3_key, compressed)
                     .await
-                    .with_context(|| {
-                        format!("Failed to upload part {} to S3", item.part.name)
-                    })?;
+                    .with_context(|| format!("Failed to upload part {} to S3", item.part.name))?;
             }
 
             // Rate limit after upload
@@ -474,7 +466,12 @@ pub async fn upload(
                 "Part uploaded"
             );
 
-            Ok((item.table_key, item.disk_name, updated_part, compressed_size))
+            Ok((
+                item.table_key,
+                item.disk_name,
+                updated_part,
+                compressed_size,
+            ))
         });
 
         handles.push(handle);
@@ -499,7 +496,8 @@ pub async fn upload(
                 "Copying S3 disk part objects via CopyObject"
             );
 
-            let mut updated_s3_objects: Vec<S3ObjectInfo> = Vec::with_capacity(item.s3_objects.len());
+            let mut updated_s3_objects: Vec<S3ObjectInfo> =
+                Vec::with_capacity(item.s3_objects.len());
 
             // CopyObject for each S3 object in the part
             for s3_obj in &item.s3_objects {
@@ -673,11 +671,7 @@ pub async fn upload(
 /// Walks the part directory and uploads each file under the given S3 key prefix.
 /// Used for S3 disk parts whose metadata files need to be stored alongside
 /// the CopyObject-ed data objects.
-async fn upload_metadata_files(
-    s3: &S3Client,
-    part_dir: &Path,
-    key_prefix: &str,
-) -> Result<()> {
+async fn upload_metadata_files(s3: &S3Client, part_dir: &Path, key_prefix: &str) -> Result<()> {
     // Read directory entries synchronously (small number of metadata files)
     let part_dir_owned = part_dir.to_path_buf();
     let entries: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
@@ -927,10 +921,16 @@ mod tests {
             .unwrap_or(false);
 
         assert!(disk_is_s3, "s3disk should be detected as S3");
-        assert!(s3_part.s3_objects.is_some(), "s3_part should have s3_objects");
+        assert!(
+            s3_part.s3_objects.is_some(),
+            "s3_part should have s3_objects"
+        );
 
         // S3 disk routing: parse remote_path
-        let remote_path = disk_remote_paths.get(disk_name).cloned().unwrap_or_default();
+        let remote_path = disk_remote_paths
+            .get(disk_name)
+            .cloned()
+            .unwrap_or_default();
         let (source_bucket, source_prefix) = parse_s3_uri(&remote_path);
         assert_eq!(source_bucket, "data-bucket");
         assert_eq!(source_prefix, "ch-data");
@@ -939,10 +939,7 @@ mod tests {
         let backup_name = "daily-2024-01-15";
         let obj_path = &s3_part.s3_objects.as_ref().unwrap()[0].path;
         let dest_key = format!("{}/objects/{}", backup_name, obj_path);
-        assert_eq!(
-            dest_key,
-            "daily-2024-01-15/objects/store/abc/def/data.bin"
-        );
+        assert_eq!(dest_key, "daily-2024-01-15/objects/store/abc/def/data.bin");
 
         // Verify source key format: {source_prefix}/{relative_path}
         let source_key = format!("{}/{}", source_prefix, obj_path);
@@ -971,7 +968,10 @@ mod tests {
             .unwrap_or(false);
 
         assert!(!disk_is_s3, "default disk should not be S3");
-        assert!(local_part.s3_objects.is_none(), "local part should not have s3_objects");
+        assert!(
+            local_part.s3_objects.is_none(),
+            "local part should not have s3_objects"
+        );
 
         // Local disk part: should use standard S3 key format
         let s3_key = s3_key_for_part("daily-2024-01-15", "default", "trades", &local_part.name);

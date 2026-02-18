@@ -30,10 +30,7 @@ pub async fn check_mutations(
         return Ok(Vec::new());
     }
 
-    warn!(
-        count = mutations.len(),
-        "Found pending data mutations"
-    );
+    warn!(count = mutations.len(), "Found pending data mutations");
 
     for m in &mutations {
         warn!(

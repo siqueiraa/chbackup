@@ -70,15 +70,9 @@ struct DownloadWorkItem {
 /// * `config` - Application configuration (for data_path)
 /// * `s3` - S3 client for downloading objects
 /// * `backup_name` - Name of the backup to download
-pub async fn download(
-    config: &Config,
-    s3: &S3Client,
-    backup_name: &str,
-) -> Result<PathBuf> {
+pub async fn download(config: &Config, s3: &S3Client, backup_name: &str) -> Result<PathBuf> {
     let data_path = &config.clickhouse.data_path;
-    let backup_dir = Path::new(data_path)
-        .join("backup")
-        .join(backup_name);
+    let backup_dir = Path::new(data_path).join("backup").join(backup_name);
 
     info!(
         backup_name = %backup_name,
@@ -190,10 +184,8 @@ pub async fn download(
                 // compressed data archive. The actual S3 data objects remain
                 // in the backup bucket until restore copies them.
                 let metadata_prefix = &item.part.backup_key;
-                let metadata_objects = s3
-                    .list_objects(metadata_prefix)
-                    .await
-                    .with_context(|| {
+                let metadata_objects =
+                    s3.list_objects(metadata_prefix).await.with_context(|| {
                         format!(
                             "Failed to list metadata for S3 disk part {} of table {}",
                             item.part.name, item.table_key
@@ -230,9 +222,11 @@ pub async fn download(
                     }
 
                     let data = s3
-                        .get_object(
-                            &format!("{}/{}", metadata_prefix.trim_end_matches('/'), relative_name),
-                        )
+                        .get_object(&format!(
+                            "{}/{}",
+                            metadata_prefix.trim_end_matches('/'),
+                            relative_name
+                        ))
                         .await
                         .with_context(|| {
                             format!(
@@ -248,17 +242,11 @@ pub async fn download(
                     let file_path = shadow_dir.join(relative_name);
                     if let Some(parent) = file_path.parent() {
                         std::fs::create_dir_all(parent).with_context(|| {
-                            format!(
-                                "Failed to create parent dir: {}",
-                                parent.display()
-                            )
+                            format!("Failed to create parent dir: {}", parent.display())
                         })?;
                     }
                     std::fs::write(&file_path, &data).with_context(|| {
-                        format!(
-                            "Failed to write metadata file: {}",
-                            file_path.display()
-                        )
+                        format!("Failed to write metadata file: {}", file_path.display())
                     })?;
                 }
 
@@ -275,15 +263,15 @@ pub async fn download(
                 Ok::<(String, u64), anyhow::Error>((item.table_key, total_metadata_bytes))
             } else {
                 // Local disk part: full download + decompress
-                let compressed_data = s3
-                    .get_object(&item.part.backup_key)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to download part {} for table {}",
-                            item.part.name, item.table_key
-                        )
-                    })?;
+                let compressed_data =
+                    s3.get_object(&item.part.backup_key)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to download part {} for table {}",
+                                item.part.name, item.table_key
+                            )
+                        })?;
 
                 let compressed_size = compressed_data.len() as u64;
 
@@ -292,10 +280,7 @@ pub async fn download(
 
                 // Decompress and extract to local directory
                 // Target: {backup_dir}/shadow/{db}/{table}/
-                let shadow_dir = backup_dir
-                    .join("shadow")
-                    .join(&url_db)
-                    .join(&url_table);
+                let shadow_dir = backup_dir.join("shadow").join(&url_db).join(&url_table);
 
                 // Run decompression in a blocking task (sync I/O)
                 let shadow_dir_clone = shadow_dir.clone();
@@ -344,14 +329,9 @@ pub async fn download(
     for (table_key, table_manifest) in &manifest.tables {
         let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
 
-        let metadata_dir = backup_dir
-            .join("metadata")
-            .join(url_encode(db));
+        let metadata_dir = backup_dir.join("metadata").join(url_encode(db));
         std::fs::create_dir_all(&metadata_dir).with_context(|| {
-            format!(
-                "Failed to create metadata dir: {}",
-                metadata_dir.display()
-            )
+            format!("Failed to create metadata dir: {}", metadata_dir.display())
         })?;
 
         let table_metadata_path = metadata_dir.join(format!("{}.json", url_encode(table)));

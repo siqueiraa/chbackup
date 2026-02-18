@@ -14,10 +14,7 @@ use crate::manifest::{BackupManifest, DatabaseInfo};
 ///
 /// For each database in the manifest, checks if it already exists and
 /// creates it if not. The DDL is wrapped with IF NOT EXISTS for safety.
-pub async fn create_databases(
-    ch: &ChClient,
-    manifest: &BackupManifest,
-) -> Result<()> {
+pub async fn create_databases(ch: &ChClient, manifest: &BackupManifest) -> Result<()> {
     if manifest.databases.is_empty() {
         debug!("No databases to create");
         return Ok(());
@@ -51,9 +48,12 @@ async fn create_database(ch: &ChClient, db_info: &DatabaseInfo) -> Result<()> {
     let ddl = ensure_if_not_exists_database(&db_info.ddl);
 
     info!(database = %db_info.name, "Creating database");
-    ch.execute_ddl(&ddl)
-        .await
-        .with_context(|| format!("Failed to create database '{}' with DDL: {}", db_info.name, ddl))?;
+    ch.execute_ddl(&ddl).await.with_context(|| {
+        format!(
+            "Failed to create database '{}' with DDL: {}",
+            db_info.name, ddl
+        )
+    })?;
 
     Ok(())
 }
@@ -112,10 +112,7 @@ pub async fn create_tables(
             .with_context(|| format!("Failed to create table {} with DDL: {}", table_key, ddl))?;
     }
 
-    info!(
-        count = table_keys.len(),
-        "Table creation phase complete"
-    );
+    info!(count = table_keys.len(), "Table creation phase complete");
     Ok(())
 }
 
@@ -152,7 +149,10 @@ mod tests {
     fn test_ensure_if_not_exists_database() {
         let ddl = "CREATE DATABASE default ENGINE = Atomic";
         let result = ensure_if_not_exists_database(ddl);
-        assert_eq!(result, "CREATE DATABASE IF NOT EXISTS default ENGINE = Atomic");
+        assert_eq!(
+            result,
+            "CREATE DATABASE IF NOT EXISTS default ENGINE = Atomic"
+        );
     }
 
     #[test]

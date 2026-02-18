@@ -209,8 +209,8 @@ fn default_source() -> String {
 impl BackupManifest {
     /// Save the manifest as JSON to the given file path.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("Failed to serialize manifest to JSON")?;
+        let json =
+            serde_json::to_string_pretty(self).context("Failed to serialize manifest to JSON")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
@@ -231,8 +231,8 @@ impl BackupManifest {
 
     /// Deserialize a manifest from a JSON byte slice.
     pub fn from_json_bytes(data: &[u8]) -> Result<Self> {
-        let manifest: BackupManifest = serde_json::from_slice(data)
-            .context("Failed to parse manifest from JSON bytes")?;
+        let manifest: BackupManifest =
+            serde_json::from_slice(data).context("Failed to parse manifest from JSON bytes")?;
         Ok(manifest)
     }
 

@@ -24,14 +24,18 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::clickhouse::client::ChClient;
-use crate::concurrency::{effective_max_connections, effective_object_disk_server_side_copy_concurrency};
+use crate::concurrency::{
+    effective_max_connections, effective_object_disk_server_side_copy_concurrency,
+};
 use crate::config::Config;
 use crate::manifest::BackupManifest;
 use crate::object_disk::is_s3_disk;
 use crate::storage::S3Client;
 use crate::table_filter::TableFilter;
 
-use attach::{attach_parts_owned, detect_clickhouse_ownership, get_table_data_path, OwnedAttachParams};
+use attach::{
+    attach_parts_owned, detect_clickhouse_ownership, get_table_data_path, OwnedAttachParams,
+};
 use schema::{create_databases, create_tables};
 
 /// Restore a backup to ClickHouse.
@@ -69,14 +73,13 @@ pub async fn restore(
 
     // 1. Read manifest
     let manifest_path = backup_dir.join("metadata.json");
-    let manifest = BackupManifest::load_from_file(&manifest_path)
-        .with_context(|| {
-            format!(
-                "Failed to load manifest for backup '{}' at {}",
-                backup_name,
-                manifest_path.display()
-            )
-        })?;
+    let manifest = BackupManifest::load_from_file(&manifest_path).with_context(|| {
+        format!(
+            "Failed to load manifest for backup '{}' at {}",
+            backup_name,
+            manifest_path.display()
+        )
+    })?;
 
     info!(
         backup_name = %manifest.name,
@@ -127,11 +130,10 @@ pub async fn restore(
     }
 
     // Detect ClickHouse ownership for chown
-    let (ch_uid, ch_gid) = detect_clickhouse_ownership(Path::new(data_path))
-        .unwrap_or_else(|e| {
-            warn!(error = %e, "Failed to detect ClickHouse ownership");
-            (None, None)
-        });
+    let (ch_uid, ch_gid) = detect_clickhouse_ownership(Path::new(data_path)).unwrap_or_else(|e| {
+        warn!(error = %e, "Failed to detect ClickHouse ownership");
+        (None, None)
+    });
 
     // Get current table information from ClickHouse for data paths
     let live_tables = ch.list_tables().await.unwrap_or_else(|e| {
@@ -204,16 +206,11 @@ pub async fn restore(
         }
 
         // Find the table's data path from live table info
-        let table_data_path = find_table_data_path(
-            &live_tables,
-            db,
-            table,
-            data_path,
-        );
+        let table_data_path = find_table_data_path(&live_tables, db, table, data_path);
 
         // Find the table's UUID from live tables (needed for S3 restore path derivation)
-        let table_uuid = find_table_uuid(&live_tables, db, table)
-            .or_else(|| table_manifest.uuid.clone());
+        let table_uuid =
+            find_table_uuid(&live_tables, db, table).or_else(|| table_manifest.uuid.clone());
 
         info!(
             table = %table_key,
@@ -352,12 +349,7 @@ mod tests {
             total_bytes: Some(1000),
         }];
 
-        let result = find_table_data_path(
-            &live_tables,
-            "default",
-            "trades",
-            "/var/lib/clickhouse",
-        );
+        let result = find_table_data_path(&live_tables, "default", "trades", "/var/lib/clickhouse");
         assert_eq!(
             result,
             PathBuf::from("/var/lib/clickhouse/store/abc/abc123/")
@@ -367,12 +359,7 @@ mod tests {
     #[test]
     fn test_find_table_data_path_not_found() {
         let live_tables: Vec<TableRow> = vec![];
-        let result = find_table_data_path(
-            &live_tables,
-            "default",
-            "trades",
-            "/var/lib/clickhouse",
-        );
+        let result = find_table_data_path(&live_tables, "default", "trades", "/var/lib/clickhouse");
         assert_eq!(
             result,
             PathBuf::from("/var/lib/clickhouse/data/default/trades")

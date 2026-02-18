@@ -3,13 +3,13 @@ mod cli;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
-use chrono::Utc;
 use chbackup::clickhouse::ChClient;
 use chbackup::config::Config;
 use chbackup::lock::{lock_for_command, lock_path_for_scope, PidLock};
 use chbackup::logging;
 use chbackup::storage::S3Client;
 use chbackup::{backup, download, list, restore, upload};
+use chrono::Utc;
 use clap::Parser;
 use cli::{Cli, Command};
 use tracing::{info, warn};
@@ -267,15 +267,7 @@ async fn main() -> Result<()> {
             let name = backup_name_required(backup_name, "restore")?;
             let ch = ChClient::new(&config.clickhouse)?;
 
-            restore::restore(
-                &config,
-                &ch,
-                &name,
-                tables.as_deref(),
-                schema,
-                data_only,
-            )
-            .await?;
+            restore::restore(&config, &ch, &name, tables.as_deref(), schema, data_only).await?;
 
             info!(backup_name = %name, "Restore command complete");
         }
@@ -353,12 +345,7 @@ async fn main() -> Result<()> {
             let s3 = S3Client::new(&config.s3).await?;
             let loc = location.map(map_cli_location);
 
-            list::list(
-                &config.clickhouse.data_path,
-                &s3,
-                loc.as_ref(),
-            )
-            .await?;
+            list::list(&config.clickhouse.data_path, &s3, loc.as_ref()).await?;
 
             info!("List command complete");
         }
@@ -375,13 +362,7 @@ async fn main() -> Result<()> {
             let s3 = S3Client::new(&config.s3).await?;
             let loc = map_cli_location(location);
 
-            list::delete(
-                &config.clickhouse.data_path,
-                &s3,
-                &loc,
-                &name,
-            )
-            .await?;
+            list::delete(&config.clickhouse.data_path, &s3, &loc, &name).await?;
 
             info!(backup_name = %name, "Delete command complete");
         }

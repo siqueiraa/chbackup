@@ -79,9 +79,7 @@ fn build_uuid_map(tables: &[TableRow]) -> HashMap<String, (String, String)> {
             }
         }
         // Also map by the `uuid` column from system.tables
-        if !table.uuid.is_empty()
-            && table.uuid != "00000000-0000-0000-0000-000000000000"
-        {
+        if !table.uuid.is_empty() && table.uuid != "00000000-0000-0000-0000-000000000000" {
             map.insert(
                 table.uuid.clone(),
                 (table.database.clone(), table.name.clone()),
@@ -151,9 +149,7 @@ pub fn collect_parts(
     }
 
     for (disk_name, disk_path) in &paths_to_walk {
-        let shadow_dir = PathBuf::from(disk_path)
-            .join("shadow")
-            .join(freeze_name);
+        let shadow_dir = PathBuf::from(disk_path).join("shadow").join(freeze_name);
 
         if !shadow_dir.exists() {
             debug!(
@@ -189,9 +185,7 @@ pub fn collect_parts(
 
         // Iterate: store/{prefix_3}/{uuid_dir}/{part_name}
         for prefix_entry in std::fs::read_dir(&store_dir)
-            .with_context(|| {
-                format!("Failed to read shadow store dir: {}", store_dir.display())
-            })?
+            .with_context(|| format!("Failed to read shadow store dir: {}", store_dir.display()))?
         {
             let prefix_entry = prefix_entry?;
             if !prefix_entry.file_type()?.is_dir() {
@@ -204,10 +198,7 @@ pub fn collect_parts(
                     continue;
                 }
 
-                let uuid_dir_name = uuid_entry
-                    .file_name()
-                    .to_string_lossy()
-                    .to_string();
+                let uuid_dir_name = uuid_entry.file_name().to_string_lossy().to_string();
 
                 // Look up which table this UUID belongs to
                 let (db, table) = match uuid_map.get(&uuid_dir_name) {
@@ -230,10 +221,7 @@ pub fn collect_parts(
                         continue;
                     }
 
-                    let part_name = part_entry
-                        .file_name()
-                        .to_string_lossy()
-                        .to_string();
+                    let part_name = part_entry.file_name().to_string_lossy().to_string();
 
                     // Skip frozen_metadata.txt (not a part directory)
                     if part_name == "frozen_metadata.txt" {
@@ -251,18 +239,16 @@ pub fn collect_parts(
                     }
 
                     // Compute CRC64 of checksums.txt
-                    let crc64 = compute_crc64(&checksums_path)
-                        .with_context(|| {
-                            format!(
-                                "Failed to compute CRC64 for {}/{}",
-                                full_table_name, part_name
-                            )
-                        })?;
+                    let crc64 = compute_crc64(&checksums_path).with_context(|| {
+                        format!(
+                            "Failed to compute CRC64 for {}/{}",
+                            full_table_name, part_name
+                        )
+                    })?;
 
                     if is_s3 {
                         // S3 disk part: parse metadata files to extract object references
-                        let (s3_objects, part_size) =
-                            collect_s3_part_metadata(&part_entry.path())?;
+                        let (s3_objects, part_size) = collect_s3_part_metadata(&part_entry.path())?;
 
                         info!(
                             table = %full_table_name,
@@ -358,12 +344,8 @@ fn collect_s3_part_metadata(part_dir: &Path) -> Result<(Vec<S3ObjectInfo>, u64)>
         }
 
         // Try to parse this file as object disk metadata
-        let content = std::fs::read_to_string(entry.path()).with_context(|| {
-            format!(
-                "Failed to read metadata file: {}",
-                entry.path().display()
-            )
-        })?;
+        let content = std::fs::read_to_string(entry.path())
+            .with_context(|| format!("Failed to read metadata file: {}", entry.path().display()))?;
 
         match object_disk::parse_metadata(&content) {
             Ok(metadata) => {
@@ -400,8 +382,8 @@ fn hardlink_dir(src_dir: &Path, dst_dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to create staging dir: {}", dst_dir.display()))?;
 
     for entry in WalkDir::new(src_dir) {
-        let entry = entry
-            .with_context(|| format!("Failed to walk directory: {}", src_dir.display()))?;
+        let entry =
+            entry.with_context(|| format!("Failed to walk directory: {}", src_dir.display()))?;
 
         let relative = entry
             .path()
@@ -591,11 +573,7 @@ mod tests {
             engine: "MergeTree".to_string(),
             create_table_query: "CREATE TABLE ...".to_string(),
             uuid: uuid.to_string(),
-            data_paths: vec![format!(
-                "{}/store/abc/{}/",
-                data_path.display(),
-                uuid
-            )],
+            data_paths: vec![format!("{}/store/abc/{}/", data_path.display(), uuid)],
             total_bytes: Some(1000),
         }];
 
@@ -647,7 +625,14 @@ mod tests {
 
         // Create S3 disk shadow with metadata content
         let metadata = "2\n1\t500\n500\tstore/abc/def/data.bin\n0\n";
-        create_s3_shadow(&s3_disk_path, freeze, uuid, "abc", "202401_1_50_3", metadata);
+        create_s3_shadow(
+            &s3_disk_path,
+            freeze,
+            uuid,
+            "abc",
+            "202401_1_50_3",
+            metadata,
+        );
 
         let tables = vec![TableRow {
             database: "default".to_string(),
@@ -655,11 +640,7 @@ mod tests {
             engine: "MergeTree".to_string(),
             create_table_query: "CREATE TABLE ...".to_string(),
             uuid: uuid.to_string(),
-            data_paths: vec![format!(
-                "{}/store/abc/{}/",
-                s3_disk_path.display(),
-                uuid
-            )],
+            data_paths: vec![format!("{}/store/abc/{}/", s3_disk_path.display(), uuid)],
             total_bytes: Some(1000),
         }];
 
@@ -668,8 +649,14 @@ mod tests {
             ("s3disk".to_string(), "s3".to_string()),
         ]);
         let disk_paths = HashMap::from([
-            ("default".to_string(), local_data.to_string_lossy().to_string()),
-            ("s3disk".to_string(), s3_disk_path.to_string_lossy().to_string()),
+            (
+                "default".to_string(),
+                local_data.to_string_lossy().to_string(),
+            ),
+            (
+                "s3disk".to_string(),
+                s3_disk_path.to_string_lossy().to_string(),
+            ),
         ]);
 
         let result = collect_parts(

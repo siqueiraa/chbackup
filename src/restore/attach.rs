@@ -136,17 +136,14 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
 
     // Same-name optimization: list existing objects at the UUID prefix
     // This is a single ListObjectsV2 per table, not per-object HeadObject
-    let existing_objects = s3
-        .list_objects(&uuid_prefix)
-        .await
-        .unwrap_or_else(|e| {
-            debug!(
-                error = %e,
-                prefix = %uuid_prefix,
-                "Failed to list existing S3 objects for same-name optimization, will copy all"
-            );
-            Vec::new()
-        });
+    let existing_objects = s3.list_objects(&uuid_prefix).await.unwrap_or_else(|e| {
+        debug!(
+            error = %e,
+            prefix = %uuid_prefix,
+            "Failed to list existing S3 objects for same-name optimization, will copy all"
+        );
+        Vec::new()
+    });
 
     // Build lookup map: relative_key -> size for same-name optimization
     let existing_map: HashMap<String, i64> = existing_objects
@@ -166,7 +163,11 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
     let detached_dir = p.table_data_path.join("detached");
 
     for (disk_name, parts) in p.parts_by_disk {
-        let disk_type = p.disk_type_map.get(disk_name).map(|s| s.as_str()).unwrap_or("");
+        let disk_type = p
+            .disk_type_map
+            .get(disk_name)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         if !is_s3_disk(disk_type) {
             continue;
         }
@@ -242,10 +243,7 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                         )
                         .await
                         .with_context(|| {
-                            format!(
-                                "Failed to copy S3 object: {} -> {}",
-                                source_key, dest_key
-                            )
+                            format!("Failed to copy S3 object: {} -> {}", source_key, dest_key)
                         })?;
 
                     Ok::<(), anyhow::Error>(())
@@ -276,7 +274,8 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
             // Read metadata files from the backup shadow directory
             let url_db = url_encode(db);
             let url_table = url_encode(table);
-            let source_dir = p.backup_dir
+            let source_dir = p
+                .backup_dir
                 .join("shadow")
                 .join(&url_db)
                 .join(&url_table)
@@ -309,23 +308,18 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                             match parse_metadata(&text) {
                                 Ok(metadata) => {
                                     let rewritten = rewrite_metadata(&metadata, &uuid_prefix);
-                                    std::fs::write(&dest_path, &rewritten).with_context(
-                                        || {
-                                            format!(
-                                                "Failed to write rewritten metadata: {}",
-                                                dest_path.display()
-                                            )
-                                        },
-                                    )?;
+                                    std::fs::write(&dest_path, &rewritten).with_context(|| {
+                                        format!(
+                                            "Failed to write rewritten metadata: {}",
+                                            dest_path.display()
+                                        )
+                                    })?;
                                 }
                                 Err(_) => {
                                     // Not a metadata file -- copy as-is
                                     // (e.g. checksums.txt, columns.txt)
                                     std::fs::write(&dest_path, &text).with_context(|| {
-                                        format!(
-                                            "Failed to write file: {}",
-                                            dest_path.display()
-                                        )
+                                        format!("Failed to write file: {}", dest_path.display())
                                     })?;
                                 }
                             }
@@ -370,13 +364,20 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
     let has_s3_parts = params.s3_client.is_some()
         && params.table_uuid.is_some()
         && params.parts_by_disk.iter().any(|(disk_name, parts)| {
-            let disk_type = params.disk_type_map.get(disk_name).map(|s| s.as_str()).unwrap_or("");
+            let disk_type = params
+                .disk_type_map
+                .get(disk_name)
+                .map(|s| s.as_str())
+                .unwrap_or("");
             is_s3_disk(disk_type) && parts.iter().any(|p| p.s3_objects.is_some())
         });
 
     if has_s3_parts {
         let s3 = params.s3_client.as_ref().expect("s3_client checked above");
-        let uuid = params.table_uuid.as_ref().expect("table_uuid checked above");
+        let uuid = params
+            .table_uuid
+            .as_ref()
+            .expect("table_uuid checked above");
 
         let s3_params = S3RestoreParams {
             s3,
@@ -480,7 +481,8 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
             let url_table = url_encode(table);
 
             // Source: {backup_dir}/shadow/{db}/{table}/{part_name}/
-            let source_dir = params.backup_dir
+            let source_dir = params
+                .backup_dir
                 .join("shadow")
                 .join(&url_db)
                 .join(&url_table)
@@ -496,15 +498,14 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
             }
 
             // Hardlink or copy all files from source to dest
-            hardlink_or_copy_dir(&source_dir, &dest_dir)
-                .with_context(|| {
-                    format!(
-                        "Failed to hardlink/copy part {} from {} to {}",
-                        part.name,
-                        source_dir.display(),
-                        dest_dir.display()
-                    )
-                })?;
+            hardlink_or_copy_dir(&source_dir, &dest_dir).with_context(|| {
+                format!(
+                    "Failed to hardlink/copy part {} from {} to {}",
+                    part.name,
+                    source_dir.display(),
+                    dest_dir.display()
+                )
+            })?;
 
             // Chown to ClickHouse uid/gid
             chown_recursive(&dest_dir, params.clickhouse_uid, params.clickhouse_gid)?;
@@ -540,10 +541,7 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                     );
                 } else {
                     return Err(e).with_context(|| {
-                        format!(
-                            "Failed to ATTACH PART '{}' to {}.{}",
-                            part.name, db, table
-                        )
+                        format!("Failed to ATTACH PART '{}' to {}.{}", part.name, db, table)
                     });
                 }
             }
@@ -569,9 +567,8 @@ fn hardlink_or_copy_dir(src: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("Failed to create destination dir: {}", dst.display()))?;
 
     for entry in WalkDir::new(src).min_depth(1) {
-        let entry = entry.with_context(|| {
-            format!("Failed to read directory entry under: {}", src.display())
-        })?;
+        let entry = entry
+            .with_context(|| format!("Failed to read directory entry under: {}", src.display()))?;
 
         let relative = entry
             .path()
@@ -580,9 +577,8 @@ fn hardlink_or_copy_dir(src: &Path, dst: &Path) -> Result<()> {
         let dest_path = dst.join(relative);
 
         if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&dest_path).with_context(|| {
-                format!("Failed to create directory: {}", dest_path.display())
-            })?;
+            std::fs::create_dir_all(&dest_path)
+                .with_context(|| format!("Failed to create directory: {}", dest_path.display()))?;
         } else {
             // Try hardlink first
             match std::fs::hard_link(entry.path(), &dest_path) {
@@ -633,9 +629,8 @@ fn chown_recursive(path: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<()
     let nix_gid = gid.map(nix::unistd::Gid::from_raw);
 
     for entry in WalkDir::new(path) {
-        let entry = entry.with_context(|| {
-            format!("Failed to read directory entry under: {}", path.display())
-        })?;
+        let entry = entry
+            .with_context(|| format!("Failed to read directory entry under: {}", path.display()))?;
 
         match nix::unistd::chown(entry.path(), nix_uid, nix_gid) {
             Ok(()) => {}
@@ -845,10 +840,7 @@ mod tests {
         let prefix2 = uuid_s3_prefix(uuid2);
         // hex-only: abcdef0123456789abcdef0123456789
         // First 3 hex chars: "abc"
-        assert_eq!(
-            prefix2,
-            "store/abc/abcdef01-2345-6789-abcd-ef0123456789"
-        );
+        assert_eq!(prefix2, "store/abc/abcdef01-2345-6789-abcd-ef0123456789");
     }
 
     #[test]
@@ -931,10 +923,7 @@ mod tests {
         assert_eq!(params.object_disk_server_side_copy_concurrency, 32);
         assert!(!params.allow_object_disk_streaming);
         assert!(params.s3_client.is_none());
-        assert_eq!(
-            params.disk_type_map.get("s3disk"),
-            Some(&"s3".to_string())
-        );
+        assert_eq!(params.disk_type_map.get("s3disk"), Some(&"s3".to_string()));
         assert_eq!(
             params.table_uuid,
             Some("5f3a7b2c-1234-5678-9abc-def012345678".to_string())

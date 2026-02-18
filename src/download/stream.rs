@@ -40,16 +40,15 @@ pub fn compress_part(part_dir: &Path, archive_name: &str) -> Result<Vec<u8>> {
         let mut tar_builder = tar::Builder::new(&mut encoder);
         tar_builder
             .append_dir_all(archive_name, part_dir)
-            .with_context(|| {
-                format!(
-                    "Failed to add directory to tar: {}",
-                    part_dir.display()
-                )
-            })?;
-        tar_builder.finish().context("Failed to finish tar archive")?;
+            .with_context(|| format!("Failed to add directory to tar: {}", part_dir.display()))?;
+        tar_builder
+            .finish()
+            .context("Failed to finish tar archive")?;
     }
 
-    let compressed = encoder.finish().context("Failed to finish LZ4 compression")?;
+    let compressed = encoder
+        .finish()
+        .context("Failed to finish LZ4 compression")?;
     Ok(compressed)
 }
 

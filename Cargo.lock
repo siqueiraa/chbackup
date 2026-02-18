@@ -645,6 +645,7 @@ dependencies = [
  "clap",
  "clickhouse",
  "crc",
+ "futures",
  "glob",
  "libc",
  "lz4_flex",

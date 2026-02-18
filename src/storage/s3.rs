@@ -270,11 +270,7 @@ impl S3Client {
     /// List common prefixes (directories) under the given prefix with a delimiter.
     ///
     /// The `prefix` is relative to the configured prefix.
-    pub async fn list_common_prefixes(
-        &self,
-        prefix: &str,
-        delimiter: &str,
-    ) -> Result<Vec<String>> {
+    pub async fn list_common_prefixes(&self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
         let full_prefix = self.full_key(prefix);
         let mut prefixes = Vec::new();
         let mut continuation_token: Option<String> = None;
@@ -408,10 +404,7 @@ impl S3Client {
                 .build()
                 .context("Failed to build Delete request")?;
 
-            debug!(
-                count = chunk.len(),
-                "Batch deleting objects from S3"
-            );
+            debug!(count = chunk.len(), "Batch deleting objects from S3");
 
             self.inner
                 .delete_objects()
@@ -504,7 +497,9 @@ impl S3Client {
 
         let upload_id = resp
             .upload_id()
-            .ok_or_else(|| anyhow::anyhow!("No upload_id returned for multipart upload: {}", full_key))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("No upload_id returned for multipart upload: {}", full_key)
+            })?
             .to_string();
 
         debug!(key = %full_key, upload_id = %upload_id, "Multipart upload created");
@@ -699,14 +694,12 @@ impl S3Client {
             req = req.server_side_encryption(ServerSideEncryption::Aes256);
         }
 
-        req.send()
-            .await
-            .with_context(|| {
-                format!(
-                    "CopyObject failed: {} -> {}/{}",
-                    copy_source, self.bucket, full_dest_key
-                )
-            })?;
+        req.send().await.with_context(|| {
+            format!(
+                "CopyObject failed: {} -> {}/{}",
+                copy_source, self.bucket, full_dest_key
+            )
+        })?;
 
         debug!(
             source = %copy_source,
@@ -751,16 +744,12 @@ impl S3Client {
                 )
             })?;
 
-        let body = get_resp
-            .body
-            .collect()
-            .await
-            .with_context(|| {
-                format!(
-                    "Streaming copy: failed to read body of {}/{}",
-                    source_bucket, source_key
-                )
-            })?;
+        let body = get_resp.body.collect().await.with_context(|| {
+            format!(
+                "Streaming copy: failed to read body of {}/{}",
+                source_bucket, source_key
+            )
+        })?;
 
         let bytes = body.into_bytes().to_vec();
 

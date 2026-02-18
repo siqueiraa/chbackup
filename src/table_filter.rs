@@ -147,10 +147,7 @@ mod tests {
 
     #[test]
     fn test_is_excluded() {
-        let skip = vec![
-            "system.*".to_string(),
-            "default.internal_*".to_string(),
-        ];
+        let skip = vec!["system.*".to_string(), "default.internal_*".to_string()];
         assert!(is_excluded("system", "tables", &skip));
         assert!(is_excluded("system", "parts", &skip));
         assert!(is_excluded("default", "internal_queue", &skip));

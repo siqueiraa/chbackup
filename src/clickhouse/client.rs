@@ -139,12 +139,7 @@ impl ChClient {
     // -- FREEZE / UNFREEZE --
 
     /// Execute ALTER TABLE FREEZE WITH NAME for the given table.
-    pub async fn freeze_table(
-        &self,
-        db: &str,
-        table: &str,
-        freeze_name: &str,
-    ) -> Result<()> {
+    pub async fn freeze_table(&self, db: &str, table: &str, freeze_name: &str) -> Result<()> {
         let sql = format!(
             "ALTER TABLE `{}`.`{}` FREEZE WITH NAME '{}'",
             db, table, freeze_name
@@ -153,12 +148,7 @@ impl ChClient {
     }
 
     /// Execute ALTER TABLE UNFREEZE WITH NAME for the given table.
-    pub async fn unfreeze_table(
-        &self,
-        db: &str,
-        table: &str,
-        freeze_name: &str,
-    ) -> Result<()> {
+    pub async fn unfreeze_table(&self, db: &str, table: &str, freeze_name: &str) -> Result<()> {
         let sql = format!(
             "ALTER TABLE `{}`.`{}` UNFREEZE WITH NAME '{}'",
             db, table, freeze_name
@@ -275,12 +265,7 @@ impl ChClient {
     // -- Part attachment --
 
     /// Execute ALTER TABLE ATTACH PART for the given part name.
-    pub async fn attach_part(
-        &self,
-        db: &str,
-        table: &str,
-        part_name: &str,
-    ) -> Result<()> {
+    pub async fn attach_part(&self, db: &str, table: &str, part_name: &str) -> Result<()> {
         let sql = format!(
             "ALTER TABLE `{}`.`{}` ATTACH PART '{}'",
             db, table, part_name
@@ -309,7 +294,8 @@ impl ChClient {
 
     /// Get disk information from system.disks.
     pub async fn get_disks(&self) -> Result<Vec<DiskRow>> {
-        let sql = "SELECT name, path, type, ifNull(remote_path, '') as remote_path FROM system.disks";
+        let sql =
+            "SELECT name, path, type, ifNull(remote_path, '') as remote_path FROM system.disks";
 
         if self.log_sql_queries {
             info!(sql = %sql, "Executing get_disks");
@@ -385,7 +371,13 @@ impl ChClient {
 /// Replaces all non-alphanumeric characters (except underscore) with underscore.
 pub fn sanitize_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
