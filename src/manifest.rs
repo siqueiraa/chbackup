@@ -55,6 +55,11 @@ pub struct BackupManifest {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub disk_types: HashMap<String, String>,
 
+    /// Disk name -> remote_path mapping for S3 disks (e.g. "s3disk" -> "s3://bucket/prefix/").
+    /// Empty for local disks. Used by upload to determine CopyObject source.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub disk_remote_paths: HashMap<String, String>,
+
     /// Tables included in this backup. Key is "db.table".
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tables: HashMap<String, TableManifest>,
@@ -296,6 +301,7 @@ mod tests {
             metadata_size: 524_288,
             disks: HashMap::from([("default".to_string(), "/var/lib/clickhouse".to_string())]),
             disk_types: HashMap::from([("default".to_string(), "local".to_string())]),
+            disk_remote_paths: HashMap::new(),
             tables,
             databases: vec![DatabaseInfo {
                 name: "default".to_string(),

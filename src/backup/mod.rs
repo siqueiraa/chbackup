@@ -88,6 +88,11 @@ pub async fn create(
         .iter()
         .map(|d| (d.name.clone(), d.disk_type.clone()))
         .collect();
+    let disk_remote_paths: HashMap<String, String> = disks
+        .iter()
+        .filter(|d| !d.remote_path.is_empty())
+        .map(|d| (d.name.clone(), d.remote_path.clone()))
+        .collect();
 
     // 3. List all user tables
     let all_tables = ch.list_tables().await?;
@@ -394,6 +399,7 @@ pub async fn create(
         metadata_size: 0,
         disks: disk_map,
         disk_types: disk_type_map,
+        disk_remote_paths,
         tables: table_manifests,
         databases,
         functions: Vec::new(),
@@ -522,6 +528,7 @@ mod tests {
             metadata_size: 0,
             disks: HashMap::new(),
             disk_types: HashMap::new(),
+            disk_remote_paths: HashMap::new(),
             tables: HashMap::new(),
             databases: Vec::new(),
             functions: Vec::new(),

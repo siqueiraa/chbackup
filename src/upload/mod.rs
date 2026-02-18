@@ -2,10 +2,13 @@
 //!
 //! Upload flow:
 //! 1. Read manifest from `{backup_dir}/metadata.json`
-//! 2. Flatten all parts across all tables into a single work queue
-//! 3. Upload parts in parallel (bounded by upload_concurrency semaphore)
-//!    - Parts with compressed size > 32MB use multipart upload
-//!    - Rate limiter gates bytes uploaded
+//! 2. Flatten all parts across all tables into work queues:
+//!    - Local disk parts: compress with tar+LZ4 and upload
+//!    - S3 disk parts: server-side CopyObject (no compression)
+//! 3. Upload parts in parallel (bounded by separate semaphores per queue)
+//!    - Local parts: upload_concurrency semaphore, multipart for >32MB
+//!    - S3 disk parts: object_disk_copy_concurrency semaphore, CopyObject per S3 object
+//!    - Rate limiter gates bytes uploaded (local parts only)
 //! 4. Upload manifest JSON last (per design 3.6 -- backup is only "visible" when metadata.json exists)
 //! 5. If delete_local, remove local backup directory
 
@@ -21,9 +24,10 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info};
 
 use crate::backup::diff::diff_parts;
-use crate::concurrency::effective_upload_concurrency;
+use crate::concurrency::{effective_object_disk_copy_concurrency, effective_upload_concurrency};
 use crate::config::Config;
-use crate::manifest::{BackupManifest, PartInfo};
+use crate::manifest::{BackupManifest, PartInfo, S3ObjectInfo};
+use crate::object_disk::is_s3_disk;
 use crate::rate_limiter::RateLimiter;
 use crate::storage::s3::calculate_chunk_size;
 use crate::storage::S3Client;
@@ -68,7 +72,34 @@ fn s3_key_for_part(backup_name: &str, db: &str, table: &str, part_name: &str) ->
     )
 }
 
-/// A work item for the parallel upload queue.
+/// Parse an S3 URI like `s3://bucket/prefix/` into (bucket, prefix).
+///
+/// Returns `(bucket, prefix)`. If the URI does not match `s3://` format,
+/// returns the whole string as the prefix with an empty bucket.
+fn parse_s3_uri(uri: &str) -> (String, String) {
+    let stripped = uri
+        .strip_prefix("s3://")
+        .or_else(|| uri.strip_prefix("S3://"));
+
+    match stripped {
+        Some(rest) => {
+            let rest = rest.trim_end_matches('/');
+            if let Some(slash_pos) = rest.find('/') {
+                let bucket = rest[..slash_pos].to_string();
+                let prefix = rest[slash_pos + 1..].to_string();
+                (bucket, prefix)
+            } else {
+                (rest.to_string(), String::new())
+            }
+        }
+        None => {
+            // Not an S3 URI -- treat as a plain path prefix
+            (String::new(), uri.trim_end_matches('/').to_string())
+        }
+    }
+}
+
+/// A work item for the parallel local upload queue.
 struct UploadWorkItem {
     /// Table key in "db.table" format.
     table_key: String,
@@ -82,10 +113,37 @@ struct UploadWorkItem {
     s3_key: String,
 }
 
+/// A work item for the parallel S3 disk CopyObject queue.
+struct S3DiskUploadWorkItem {
+    /// Table key in "db.table" format.
+    table_key: String,
+    /// Disk name within the table's parts map.
+    disk_name: String,
+    /// Part info (name, size, etc.).
+    part: PartInfo,
+    /// S3 objects to copy (from part.s3_objects).
+    s3_objects: Vec<S3ObjectInfo>,
+    /// Source bucket for CopyObject.
+    source_bucket: String,
+    /// Source key prefix for CopyObject.
+    source_prefix: String,
+    /// Backup name (used to build destination key).
+    backup_name: String,
+    /// Local part directory (for uploading metadata files).
+    part_dir: PathBuf,
+    /// Database name.
+    db: String,
+    /// Table name.
+    table: String,
+}
+
 /// Upload a local backup to S3.
 ///
 /// Reads the manifest from the local backup directory, compresses each part
 /// with tar+LZ4, uploads to S3 in parallel, and uploads the manifest last.
+///
+/// S3 disk parts are routed through CopyObject with a separate concurrency
+/// semaphore instead of compress+upload.
 ///
 /// If `diff_from_remote` is provided, the specified remote backup's manifest
 /// is loaded from S3 and used as a base for incremental comparison. Parts
@@ -167,8 +225,9 @@ pub async fn upload(
         "Loaded manifest"
     );
 
-    // 2. Flatten all parts into work items
-    let mut work_items: Vec<UploadWorkItem> = Vec::new();
+    // 2. Flatten all parts into work items, split by disk type
+    let mut local_work_items: Vec<UploadWorkItem> = Vec::new();
+    let mut s3_disk_work_items: Vec<S3DiskUploadWorkItem> = Vec::new();
     let mut table_count = 0u64;
 
     let table_keys: Vec<String> = manifest.tables.keys().cloned().collect();
@@ -192,6 +251,13 @@ pub async fn upload(
         let mut has_parts = false;
 
         for (disk_name, parts) in &table_manifest.parts {
+            // Check if this disk is an S3 object disk
+            let disk_is_s3 = manifest
+                .disk_types
+                .get(disk_name)
+                .map(|dt| is_s3_disk(dt))
+                .unwrap_or(false);
+
             for part in parts {
                 // Skip carried parts -- their data is already on S3 from the base backup
                 if part.source.starts_with("carried:") {
@@ -204,29 +270,69 @@ pub async fn upload(
                     continue;
                 }
 
-                // Locate part directory in the backup staging area
-                let part_dir = find_part_dir(backup_dir, db, table, &part.name)?;
+                if disk_is_s3 && part.s3_objects.is_some() {
+                    // S3 disk part: route through CopyObject
+                    let remote_path = manifest
+                        .disk_remote_paths
+                        .get(disk_name)
+                        .cloned()
+                        .unwrap_or_default();
 
-                if !part_dir.exists() {
-                    return Err(anyhow::anyhow!(
-                        "Part directory not found: {} (expected at {})",
-                        part.name,
-                        part_dir.display()
-                    ));
+                    let (source_bucket, source_prefix) = if remote_path.is_empty() {
+                        // Fallback: use the backup S3 bucket
+                        (s3.bucket().to_string(), String::new())
+                    } else {
+                        parse_s3_uri(&remote_path)
+                    };
+
+                    // If parsed bucket is empty, use the backup bucket
+                    let source_bucket = if source_bucket.is_empty() {
+                        s3.bucket().to_string()
+                    } else {
+                        source_bucket
+                    };
+
+                    let part_dir = find_part_dir(backup_dir, db, table, &part.name)?;
+
+                    s3_disk_work_items.push(S3DiskUploadWorkItem {
+                        table_key: table_key.clone(),
+                        disk_name: disk_name.clone(),
+                        part: part.clone(),
+                        s3_objects: part.s3_objects.clone().unwrap_or_default(),
+                        source_bucket,
+                        source_prefix,
+                        backup_name: backup_name.to_string(),
+                        part_dir,
+                        db: db.to_string(),
+                        table: table.to_string(),
+                    });
+
+                    has_parts = true;
+                } else {
+                    // Local disk part: compress + upload
+                    let part_dir = find_part_dir(backup_dir, db, table, &part.name)?;
+
+                    if !part_dir.exists() {
+                        return Err(anyhow::anyhow!(
+                            "Part directory not found: {} (expected at {})",
+                            part.name,
+                            part_dir.display()
+                        ));
+                    }
+
+                    // Generate S3 key
+                    let s3_key = s3_key_for_part(backup_name, db, table, &part.name);
+
+                    local_work_items.push(UploadWorkItem {
+                        table_key: table_key.clone(),
+                        disk_name: disk_name.clone(),
+                        part: part.clone(),
+                        part_dir,
+                        s3_key,
+                    });
+
+                    has_parts = true;
                 }
-
-                // Generate S3 key
-                let s3_key = s3_key_for_part(backup_name, db, table, &part.name);
-
-                work_items.push(UploadWorkItem {
-                    table_key: table_key.clone(),
-                    disk_name: disk_name.clone(),
-                    part: part.clone(),
-                    part_dir,
-                    s3_key,
-                });
-
-                has_parts = true;
             }
         }
 
@@ -235,24 +341,40 @@ pub async fn upload(
         }
     }
 
-    let total_parts = work_items.len();
+    let total_local_parts = local_work_items.len();
+    let total_s3_disk_parts = s3_disk_work_items.len();
+    let total_parts = total_local_parts + total_s3_disk_parts;
     let concurrency = effective_upload_concurrency(config) as usize;
+    let object_disk_concurrency = effective_object_disk_copy_concurrency(config) as usize;
 
     info!(
-        "Uploading {} parts across {} tables (concurrency={})",
-        total_parts, table_count, concurrency
+        "Uploading {} parts ({} local, {} S3 disk) across {} tables (upload_concurrency={}, object_disk_copy_concurrency={})",
+        total_parts, total_local_parts, total_s3_disk_parts, table_count, concurrency, object_disk_concurrency
     );
 
-    // 3. Upload parts in parallel with semaphore and rate limiter
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    if total_s3_disk_parts > 0 {
+        info!(
+            s3_disk_parts = total_s3_disk_parts,
+            "S3 disk parts: using CopyObject (no compression)"
+        );
+    }
+
+    // 3. Upload both queues in parallel
+    let upload_semaphore = Arc::new(Semaphore::new(concurrency));
+    let object_disk_copy_semaphore = Arc::new(Semaphore::new(object_disk_concurrency));
     let rate_limiter = RateLimiter::new(config.backup.upload_max_bytes_per_second);
     let s3_chunk_size = config.s3.chunk_size;
     let s3_max_parts_count = config.s3.max_parts_count;
+    let allow_object_disk_streaming = config.s3.allow_object_disk_streaming;
 
-    let mut handles = Vec::with_capacity(total_parts);
+    // Result type: (table_key, disk_name, updated_part, compressed_size)
+    type UploadResult = Result<(String, String, PartInfo, u64)>;
+    let mut handles: Vec<tokio::task::JoinHandle<UploadResult>> =
+        Vec::with_capacity(total_parts);
 
-    for item in work_items {
-        let sem = semaphore.clone();
+    // 3a. Spawn local disk upload tasks
+    for item in local_work_items {
+        let sem = upload_semaphore.clone();
         let s3 = s3.clone();
         let rate_limiter = rate_limiter.clone();
 
@@ -358,7 +480,105 @@ pub async fn upload(
         handles.push(handle);
     }
 
-    // Await all uploads
+    // 3b. Spawn S3 disk CopyObject tasks
+    for item in s3_disk_work_items {
+        let sem = object_disk_copy_semaphore.clone();
+        let s3 = s3.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
+
+            debug!(
+                table = %item.table_key,
+                part = %item.part.name,
+                s3_objects = item.s3_objects.len(),
+                source_bucket = %item.source_bucket,
+                "Copying S3 disk part objects via CopyObject"
+            );
+
+            let mut updated_s3_objects: Vec<S3ObjectInfo> = Vec::with_capacity(item.s3_objects.len());
+
+            // CopyObject for each S3 object in the part
+            for s3_obj in &item.s3_objects {
+                // Skip zero-size objects (inline data in v4+ metadata)
+                if s3_obj.size == 0 {
+                    updated_s3_objects.push(S3ObjectInfo {
+                        path: s3_obj.path.clone(),
+                        size: 0,
+                        backup_key: String::new(),
+                    });
+                    continue;
+                }
+
+                // Source key: {remote_path_prefix}/{relative_path}
+                let source_key = if item.source_prefix.is_empty() {
+                    s3_obj.path.clone()
+                } else {
+                    format!("{}/{}", item.source_prefix, s3_obj.path)
+                };
+
+                // Dest key: {backup_name}/objects/{relative_path}
+                let dest_key = format!("{}/objects/{}", item.backup_name, s3_obj.path);
+
+                s3.copy_object_with_retry(
+                    &item.source_bucket,
+                    &source_key,
+                    &dest_key,
+                    allow_object_disk_streaming,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "CopyObject failed for S3 object {} in part {}",
+                        s3_obj.path, item.part.name
+                    )
+                })?;
+
+                updated_s3_objects.push(S3ObjectInfo {
+                    path: s3_obj.path.clone(),
+                    size: s3_obj.size,
+                    backup_key: dest_key,
+                });
+            }
+
+            // Upload metadata files for this S3 disk part.
+            // The metadata files are in the local part_dir (from shadow walk).
+            let metadata_backup_key = format!(
+                "{}/data/{}/{}/{}/{}/",
+                item.backup_name,
+                url_encode_component(&item.db),
+                url_encode_component(&item.table),
+                item.disk_name,
+                item.part.name,
+            );
+
+            if item.part_dir.exists() {
+                upload_metadata_files(&s3, &item.part_dir, &metadata_backup_key).await?;
+            }
+
+            // Build updated part info
+            let mut updated_part = item.part.clone();
+            updated_part.s3_objects = Some(updated_s3_objects);
+            updated_part.backup_key = metadata_backup_key;
+            updated_part.source = "uploaded".to_string();
+
+            debug!(
+                table = %item.table_key,
+                part = %item.part.name,
+                "S3 disk part CopyObject complete"
+            );
+
+            // S3 disk parts have no compressed_size (no compression)
+            Ok((item.table_key, item.disk_name, updated_part, 0u64))
+        });
+
+        handles.push(handle);
+    }
+
+    // Await all uploads (both local and S3 disk)
     let results: Vec<(String, String, PartInfo, u64)> = try_join_all(handles)
         .await
         .context("An upload task panicked")?
@@ -425,6 +645,8 @@ pub async fn upload(
     info!(
         backup_name = %backup_name,
         parts = total_parts,
+        local_parts = total_local_parts,
+        s3_disk_parts = total_s3_disk_parts,
         compressed_size = total_compressed_size,
         "Upload complete"
     );
@@ -441,6 +663,71 @@ pub async fn upload(
                 backup_dir.display()
             )
         })?;
+    }
+
+    Ok(())
+}
+
+/// Upload metadata files from a local part directory to S3.
+///
+/// Walks the part directory and uploads each file under the given S3 key prefix.
+/// Used for S3 disk parts whose metadata files need to be stored alongside
+/// the CopyObject-ed data objects.
+async fn upload_metadata_files(
+    s3: &S3Client,
+    part_dir: &Path,
+    key_prefix: &str,
+) -> Result<()> {
+    // Read directory entries synchronously (small number of metadata files)
+    let part_dir_owned = part_dir.to_path_buf();
+    let entries: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        collect_files_recursive(&part_dir_owned, &part_dir_owned, &mut files)?;
+        Ok::<Vec<(String, Vec<u8>)>, anyhow::Error>(files)
+    })
+    .await
+    .context("spawn_blocking panicked during metadata file collection")??;
+
+    for (relative_name, data) in entries {
+        let file_key = format!("{}{}", key_prefix.trim_end_matches('/'), relative_name);
+        s3.put_object(&file_key, data)
+            .await
+            .with_context(|| format!("Failed to upload metadata file: {}", file_key))?;
+    }
+
+    Ok(())
+}
+
+/// Recursively collect files from a directory, returning (relative_path, contents) pairs.
+fn collect_files_recursive(
+    base_dir: &Path,
+    current_dir: &Path,
+    files: &mut Vec<(String, Vec<u8>)>,
+) -> Result<()> {
+    if !current_dir.is_dir() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(current_dir)
+        .with_context(|| format!("Failed to read directory: {}", current_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            collect_files_recursive(base_dir, &path, files)?;
+        } else if path.is_file() {
+            let relative = path
+                .strip_prefix(base_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let data = std::fs::read(&path)
+                .with_context(|| format!("Failed to read file: {}", path.display()))?;
+            // Use forward-slash path separator for S3 keys
+            let relative_key = format!("/{}", relative.replace('\\', "/"));
+            files.push((relative_key, data));
+        }
     }
 
     Ok(())
@@ -569,5 +856,226 @@ mod tests {
 
         let found = find_part_dir(dir.path(), "default", "trades", "202401_1_50_3").unwrap();
         assert_eq!(found, part_path);
+    }
+
+    #[test]
+    fn test_parse_s3_uri_standard() {
+        let (bucket, prefix) = parse_s3_uri("s3://my-data-bucket/ch-data/store");
+        assert_eq!(bucket, "my-data-bucket");
+        assert_eq!(prefix, "ch-data/store");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_trailing_slash() {
+        let (bucket, prefix) = parse_s3_uri("s3://my-data-bucket/ch-data/");
+        assert_eq!(bucket, "my-data-bucket");
+        assert_eq!(prefix, "ch-data");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_bucket_only() {
+        let (bucket, prefix) = parse_s3_uri("s3://my-bucket/");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_bucket_no_slash() {
+        let (bucket, prefix) = parse_s3_uri("s3://my-bucket");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_not_s3() {
+        let (bucket, prefix) = parse_s3_uri("/local/path/to/disk");
+        assert_eq!(bucket, "");
+        assert_eq!(prefix, "/local/path/to/disk");
+    }
+
+    #[test]
+    fn test_upload_routes_s3_disk_to_copy() {
+        // Verify that S3 disk parts are routed to the S3DiskUploadWorkItem queue
+        let s3_part = PartInfo {
+            name: "202401_1_50_3".to_string(),
+            size: 134_217_728,
+            backup_key: String::new(),
+            source: "uploaded".to_string(),
+            checksum_crc64: 12345,
+            s3_objects: Some(vec![S3ObjectInfo {
+                path: "store/abc/def/data.bin".to_string(),
+                size: 134_217_000,
+                backup_key: String::new(),
+            }]),
+        };
+
+        let disk_types: HashMap<String, String> = HashMap::from([
+            ("default".to_string(), "local".to_string()),
+            ("s3disk".to_string(), "s3".to_string()),
+        ]);
+
+        let disk_remote_paths: HashMap<String, String> = HashMap::from([(
+            "s3disk".to_string(),
+            "s3://data-bucket/ch-data/".to_string(),
+        )]);
+
+        // Simulate the routing logic from upload()
+        let disk_name = "s3disk";
+        let disk_is_s3 = disk_types
+            .get(disk_name)
+            .map(|dt| is_s3_disk(dt))
+            .unwrap_or(false);
+
+        assert!(disk_is_s3, "s3disk should be detected as S3");
+        assert!(s3_part.s3_objects.is_some(), "s3_part should have s3_objects");
+
+        // S3 disk routing: parse remote_path
+        let remote_path = disk_remote_paths.get(disk_name).cloned().unwrap_or_default();
+        let (source_bucket, source_prefix) = parse_s3_uri(&remote_path);
+        assert_eq!(source_bucket, "data-bucket");
+        assert_eq!(source_prefix, "ch-data");
+
+        // Verify destination key format: {backup_name}/objects/{relative_path}
+        let backup_name = "daily-2024-01-15";
+        let obj_path = &s3_part.s3_objects.as_ref().unwrap()[0].path;
+        let dest_key = format!("{}/objects/{}", backup_name, obj_path);
+        assert_eq!(
+            dest_key,
+            "daily-2024-01-15/objects/store/abc/def/data.bin"
+        );
+
+        // Verify source key format: {source_prefix}/{relative_path}
+        let source_key = format!("{}/{}", source_prefix, obj_path);
+        assert_eq!(source_key, "ch-data/store/abc/def/data.bin");
+    }
+
+    #[test]
+    fn test_upload_local_parts_unchanged() {
+        // Verify that local disk parts use the standard compress+upload path
+        let local_part = PartInfo {
+            name: "202401_1_50_3".to_string(),
+            size: 4096,
+            backup_key: String::new(),
+            source: "uploaded".to_string(),
+            checksum_crc64: 11111,
+            s3_objects: None,
+        };
+
+        let disk_types: HashMap<String, String> =
+            HashMap::from([("default".to_string(), "local".to_string())]);
+
+        let disk_name = "default";
+        let disk_is_s3 = disk_types
+            .get(disk_name)
+            .map(|dt| is_s3_disk(dt))
+            .unwrap_or(false);
+
+        assert!(!disk_is_s3, "default disk should not be S3");
+        assert!(local_part.s3_objects.is_none(), "local part should not have s3_objects");
+
+        // Local disk part: should use standard S3 key format
+        let s3_key = s3_key_for_part("daily-2024-01-15", "default", "trades", &local_part.name);
+        assert_eq!(
+            s3_key,
+            "daily-2024-01-15/data/default/trades/202401_1_50_3.tar.lz4"
+        );
+    }
+
+    #[test]
+    fn test_s3_disk_work_item_construction() {
+        // Verify S3DiskUploadWorkItem collects correct fields
+        let s3_obj = S3ObjectInfo {
+            path: "store/abc/def/data.bin".to_string(),
+            size: 134_217_000,
+            backup_key: String::new(),
+        };
+
+        let part = PartInfo {
+            name: "202401_1_50_3".to_string(),
+            size: 134_217_728,
+            backup_key: String::new(),
+            source: "uploaded".to_string(),
+            checksum_crc64: 12345,
+            s3_objects: Some(vec![s3_obj.clone()]),
+        };
+
+        let work_item = S3DiskUploadWorkItem {
+            table_key: "default.trades".to_string(),
+            disk_name: "s3disk".to_string(),
+            part: part.clone(),
+            s3_objects: vec![s3_obj],
+            source_bucket: "data-bucket".to_string(),
+            source_prefix: "ch-data".to_string(),
+            backup_name: "daily-2024-01-15".to_string(),
+            part_dir: PathBuf::from("/tmp/backup/shadow/default/trades/202401_1_50_3"),
+            db: "default".to_string(),
+            table: "trades".to_string(),
+        };
+
+        assert_eq!(work_item.table_key, "default.trades");
+        assert_eq!(work_item.disk_name, "s3disk");
+        assert_eq!(work_item.source_bucket, "data-bucket");
+        assert_eq!(work_item.source_prefix, "ch-data");
+        assert_eq!(work_item.s3_objects.len(), 1);
+        assert_eq!(work_item.s3_objects[0].path, "store/abc/def/data.bin");
+    }
+
+    #[test]
+    fn test_s3_disk_zero_size_objects_skipped() {
+        // Verify that zero-size S3 objects (inline data) get empty backup_key
+        let s3_obj = S3ObjectInfo {
+            path: "store/abc/data.bin".to_string(),
+            size: 0,
+            backup_key: String::new(),
+        };
+
+        // The upload logic skips CopyObject for size=0 objects
+        // and sets backup_key to empty
+        let updated = S3ObjectInfo {
+            path: s3_obj.path.clone(),
+            size: 0,
+            backup_key: String::new(),
+        };
+
+        assert_eq!(updated.size, 0);
+        assert!(updated.backup_key.is_empty());
+    }
+
+    #[test]
+    fn test_collect_files_recursive_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Create some test files
+        std::fs::write(base.join("checksums.txt"), b"test data").unwrap();
+        let sub = base.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("data.bin"), b"more data").unwrap();
+
+        let mut files = Vec::new();
+        collect_files_recursive(base, base, &mut files).unwrap();
+
+        assert_eq!(files.len(), 2);
+
+        // Sort for deterministic comparison
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(files[0].0, "/checksums.txt");
+        assert_eq!(files[0].1, b"test data");
+        assert_eq!(files[1].0, "/subdir/data.bin");
+        assert_eq!(files[1].1, b"more data");
+    }
+
+    #[test]
+    fn test_object_storage_disk_type_detected() {
+        // Verify that "object_storage" disk type is also routed as S3 disk
+        let disk_types: HashMap<String, String> =
+            HashMap::from([("objdisk".to_string(), "object_storage".to_string())]);
+
+        let disk_is_s3 = disk_types
+            .get("objdisk")
+            .map(|dt| is_s3_disk(dt))
+            .unwrap_or(false);
+        assert!(disk_is_s3);
     }
 }

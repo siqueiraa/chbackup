@@ -139,6 +139,7 @@ mod tests {
             metadata_size: 0,
             disks: HashMap::new(),
             disk_types: HashMap::new(),
+            disk_remote_paths: HashMap::new(),
             tables,
             databases: vec![DatabaseInfo {
                 name: "default".to_string(),
