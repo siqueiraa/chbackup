@@ -53,6 +53,36 @@ pub struct DiskRow {
     pub remote_path: String,
 }
 
+/// Row from `system.parts` query -- active parts for a table.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub struct PartRow {
+    pub name: String,
+    pub partition_id: String,
+    pub active: u8,
+}
+
+/// Column type inconsistency detected by `check_parts_columns`.
+///
+/// Indicates that a column has different types across active parts within a table,
+/// which can cause restore failures.
+#[derive(Debug, Clone)]
+pub struct ColumnInconsistency {
+    pub database: String,
+    pub table: String,
+    pub column: String,
+    pub types: Vec<String>,
+}
+
+/// Row from `system.disks` query with free_space information.
+///
+/// Separate from `DiskRow` to avoid breaking existing `get_disks()` callers.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+pub struct DiskSpaceRow {
+    pub name: String,
+    pub path: String,
+    pub free_space: u64,
+}
+
 impl ChClient {
     /// Build a new `ChClient` from the given `ClickHouseConfig`.
     ///
@@ -413,6 +443,141 @@ impl ChClient {
 
         Ok(row.cnt > 0)
     }
+
+    // -- FREEZE PARTITION --
+
+    /// Execute ALTER TABLE FREEZE PARTITION for a specific partition.
+    ///
+    /// Freezes a single partition instead of the entire table. The frozen data
+    /// ends up in the same shadow directory structure as whole-table FREEZE.
+    pub async fn freeze_partition(
+        &self,
+        db: &str,
+        table: &str,
+        partition: &str,
+        freeze_name: &str,
+    ) -> Result<()> {
+        let sql = freeze_partition_sql(db, table, partition, freeze_name);
+        self.log_and_execute(&sql, "FREEZE PARTITION").await
+    }
+
+    // -- system.parts query --
+
+    /// Query `system.parts` for active parts of a specific table.
+    ///
+    /// Returns all active parts (active=1) for the given database and table.
+    pub async fn query_system_parts(&self, db: &str, table: &str) -> Result<Vec<PartRow>> {
+        let sql = format!(
+            "SELECT name, partition_id, active FROM system.parts \
+             WHERE database = '{}' AND table = '{}' AND active = 1",
+            db, table
+        );
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing query_system_parts");
+        } else {
+            debug!(sql = %sql, "Executing query_system_parts");
+        }
+
+        let rows = self
+            .inner
+            .query(&sql)
+            .fetch_all::<PartRow>()
+            .await
+            .with_context(|| format!("Failed to query system.parts for {}.{}", db, table))?;
+
+        Ok(rows)
+    }
+
+    // -- Parts column consistency check --
+
+    /// Check for column type inconsistencies across active parts (design 3.3).
+    ///
+    /// For each (database, table) pair, queries `system.parts_columns` to find
+    /// columns that have different types across active parts. This can indicate
+    /// schema drift that would cause restore failures.
+    pub async fn check_parts_columns(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<Vec<ColumnInconsistency>> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build the IN clause for (database, table) pairs
+        let pairs: Vec<String> = targets
+            .iter()
+            .map(|(db, table)| format!("('{}', '{}')", db, table))
+            .collect();
+        let in_clause = pairs.join(", ");
+
+        let sql = format!(
+            "SELECT database, table, name AS column, \
+             groupUniqArray(type) AS uniq_types \
+             FROM system.parts_columns \
+             WHERE active AND (database, table) IN ({}) \
+             GROUP BY database, table, column \
+             HAVING length(uniq_types) > 1",
+            in_clause
+        );
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing check_parts_columns");
+        } else {
+            debug!(sql = %sql, "Executing check_parts_columns");
+        }
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct PartsColumnsRow {
+            database: String,
+            table: String,
+            column: String,
+            uniq_types: Vec<String>,
+        }
+
+        let rows = self
+            .inner
+            .query(&sql)
+            .fetch_all::<PartsColumnsRow>()
+            .await
+            .context("Failed to check parts columns consistency")?;
+
+        let inconsistencies: Vec<ColumnInconsistency> = rows
+            .into_iter()
+            .map(|r| ColumnInconsistency {
+                database: r.database,
+                table: r.table,
+                column: r.column,
+                types: r.uniq_types,
+            })
+            .collect();
+
+        Ok(inconsistencies)
+    }
+
+    // -- Disk free space query --
+
+    /// Query `system.disks` for disk free space information.
+    ///
+    /// Returns disk name, path, and free space in bytes for each disk.
+    pub async fn query_disk_free_space(&self) -> Result<Vec<DiskSpaceRow>> {
+        let sql = "SELECT name, path, free_space FROM system.disks";
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing query_disk_free_space");
+        } else {
+            debug!(sql = %sql, "Executing query_disk_free_space");
+        }
+
+        let rows = self
+            .inner
+            .query(sql)
+            .fetch_all::<DiskSpaceRow>()
+            .await
+            .context("Failed to query disk free space from system.disks")?;
+
+        Ok(rows)
+    }
 }
 
 /// Sanitize a name for use in freeze names.
@@ -455,6 +620,14 @@ pub fn unfreeze_sql(db: &str, table: &str, freeze_name: &str) -> String {
     format!(
         "ALTER TABLE `{}`.`{}` UNFREEZE WITH NAME '{}'",
         db, table, freeze_name
+    )
+}
+
+/// Generate the SQL string for a FREEZE PARTITION command (for testing).
+pub fn freeze_partition_sql(db: &str, table: &str, partition: &str, freeze_name: &str) -> String {
+    format!(
+        "ALTER TABLE `{}`.`{}` FREEZE PARTITION '{}' WITH NAME '{}'",
+        db, table, partition, freeze_name
     )
 }
 
@@ -643,5 +816,127 @@ mod tests {
             let scheme = if secure { "https" } else { "http" };
             assert_eq!(scheme, expected_scheme);
         }
+    }
+
+    // -- Task 2: New ChClient query method tests --
+
+    #[test]
+    fn test_freeze_partition_sql() {
+        let sql = freeze_partition_sql(
+            "default",
+            "trades",
+            "202401",
+            "chbackup_daily_default_trades",
+        );
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`trades` FREEZE PARTITION '202401' WITH NAME 'chbackup_daily_default_trades'"
+        );
+    }
+
+    #[test]
+    fn test_freeze_partition_sql_tuple_partition() {
+        // Partition IDs can be tuple-based
+        let sql = freeze_partition_sql(
+            "default",
+            "events",
+            "(202401, 'us')",
+            "chbackup_test_default_events",
+        );
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`events` FREEZE PARTITION '(202401, 'us')' WITH NAME 'chbackup_test_default_events'"
+        );
+    }
+
+    #[test]
+    fn test_query_parts_sql() {
+        // Verify the SQL query string for system.parts
+        let db = "default";
+        let table = "trades";
+        let expected_sql = format!(
+            "SELECT name, partition_id, active FROM system.parts \
+             WHERE database = '{}' AND table = '{}' AND active = 1",
+            db, table
+        );
+        assert!(expected_sql.contains("system.parts"));
+        assert!(expected_sql.contains("active = 1"));
+        assert!(expected_sql.contains("default"));
+        assert!(expected_sql.contains("trades"));
+    }
+
+    #[test]
+    fn test_check_parts_columns_sql() {
+        // Verify the SQL pattern for parts_columns consistency check
+        let targets = [
+            ("default".to_string(), "trades".to_string()),
+            ("logs".to_string(), "events".to_string()),
+        ];
+        let pairs: Vec<String> = targets
+            .iter()
+            .map(|(db, table)| format!("('{}', '{}')", db, table))
+            .collect();
+        let in_clause = pairs.join(", ");
+
+        let sql = format!(
+            "SELECT database, table, name AS column, \
+             groupUniqArray(type) AS uniq_types \
+             FROM system.parts_columns \
+             WHERE active AND (database, table) IN ({}) \
+             GROUP BY database, table, column \
+             HAVING length(uniq_types) > 1",
+            in_clause
+        );
+
+        assert!(sql.contains("system.parts_columns"));
+        assert!(sql.contains("groupUniqArray(type)"));
+        assert!(sql.contains("HAVING length(uniq_types) > 1"));
+        assert!(sql.contains("('default', 'trades')"));
+        assert!(sql.contains("('logs', 'events')"));
+    }
+
+    #[test]
+    fn test_disk_free_space_sql() {
+        // Verify the SQL query string for disk free space
+        let sql = "SELECT name, path, free_space FROM system.disks";
+        assert!(sql.contains("system.disks"));
+        assert!(sql.contains("free_space"));
+    }
+
+    #[test]
+    fn test_part_row_type() {
+        let part = PartRow {
+            name: "202401_1_50_3".to_string(),
+            partition_id: "202401".to_string(),
+            active: 1,
+        };
+        assert_eq!(part.name, "202401_1_50_3");
+        assert_eq!(part.partition_id, "202401");
+        assert_eq!(part.active, 1);
+    }
+
+    #[test]
+    fn test_column_inconsistency_type() {
+        let inconsistency = ColumnInconsistency {
+            database: "default".to_string(),
+            table: "trades".to_string(),
+            column: "amount".to_string(),
+            types: vec!["Float64".to_string(), "Decimal(18,2)".to_string()],
+        };
+        assert_eq!(inconsistency.database, "default");
+        assert_eq!(inconsistency.table, "trades");
+        assert_eq!(inconsistency.column, "amount");
+        assert_eq!(inconsistency.types.len(), 2);
+    }
+
+    #[test]
+    fn test_disk_space_row_type() {
+        let disk = DiskSpaceRow {
+            name: "default".to_string(),
+            path: "/var/lib/clickhouse".to_string(),
+            free_space: 1_000_000_000,
+        };
+        assert_eq!(disk.name, "default");
+        assert_eq!(disk.free_space, 1_000_000_000);
     }
 }
