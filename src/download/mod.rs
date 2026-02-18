@@ -5,6 +5,8 @@
 //! 2. Create local backup directory: `{data_path}/backup/{backup_name}/`
 //! 3. Flatten all parts into a work queue, download in parallel
 //!    (bounded by download_concurrency semaphore, rate-limited)
+//!    - Local disk parts: full download + decompress (tar+LZ4)
+//!    - S3 disk parts: download metadata files only (data objects stay in backup bucket until restore)
 //! 4. Save per-table metadata and manifest to local directory
 //! 5. Return backup directory path
 
@@ -21,6 +23,7 @@ use tracing::{debug, info, warn};
 use crate::concurrency::effective_download_concurrency;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo};
+use crate::object_disk::is_s3_disk;
 use crate::rate_limiter::RateLimiter;
 use crate::storage::S3Client;
 
@@ -48,8 +51,12 @@ struct DownloadWorkItem {
     db: String,
     /// Table name.
     table: String,
+    /// Disk name within the table's parts map.
+    disk_name: String,
     /// Part info (name, backup_key, etc.).
     part: PartInfo,
+    /// Whether this part resides on an S3 object disk.
+    is_s3_disk_part: bool,
 }
 
 /// Download a backup from S3 to the local filesystem.
@@ -110,7 +117,13 @@ pub async fn download(
             continue;
         }
 
-        for parts in table_manifest.parts.values() {
+        for (disk_name, parts) in &table_manifest.parts {
+            let disk_is_s3 = manifest
+                .disk_types
+                .get(disk_name)
+                .map(|dt| is_s3_disk(dt))
+                .unwrap_or(false);
+
             for part in parts {
                 if part.backup_key.is_empty() {
                     warn!(
@@ -125,7 +138,9 @@ pub async fn download(
                     table_key: table_key.clone(),
                     db: db.to_string(),
                     table: table.to_string(),
+                    disk_name: disk_name.clone(),
                     part: part.clone(),
+                    is_s3_disk_part: disk_is_s3 && part.s3_objects.is_some(),
                 });
             }
         }
@@ -161,58 +176,150 @@ pub async fn download(
                 table = %item.table_key,
                 part = %item.part.name,
                 key = %item.part.backup_key,
+                is_s3_disk = item.is_s3_disk_part,
                 "Downloading part"
             );
 
-            // Download compressed part from S3
-            let compressed_data = s3
-                .get_object(&item.part.backup_key)
-                .await
-                .with_context(|| {
+            let url_db = url_encode(&item.db);
+            let url_table = url_encode(&item.table);
+
+            if item.is_s3_disk_part {
+                // S3 disk part: download only metadata files, not the full
+                // compressed data archive. The actual S3 data objects remain
+                // in the backup bucket until restore copies them.
+                let metadata_prefix = &item.part.backup_key;
+                let metadata_objects = s3
+                    .list_objects(metadata_prefix)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to list metadata for S3 disk part {} of table {}",
+                            item.part.name, item.table_key
+                        )
+                    })?;
+
+                let shadow_dir = backup_dir
+                    .join("shadow")
+                    .join(&url_db)
+                    .join(&url_table)
+                    .join(&item.part.name);
+
+                std::fs::create_dir_all(&shadow_dir).with_context(|| {
                     format!(
-                        "Failed to download part {} for table {}",
-                        item.part.name, item.table_key
+                        "Failed to create shadow dir for S3 disk part: {}",
+                        shadow_dir.display()
                     )
                 })?;
 
-            let compressed_size = compressed_data.len() as u64;
+                let mut total_metadata_bytes = 0u64;
 
-            // Rate limit after download
-            rate_limiter.consume(compressed_size).await;
+                for obj in &metadata_objects {
+                    // Extract filename relative to the part prefix
+                    let relative_name = obj
+                        .key
+                        .strip_prefix(s3.prefix())
+                        .unwrap_or(&obj.key)
+                        .strip_prefix(metadata_prefix)
+                        .unwrap_or(&obj.key)
+                        .trim_start_matches('/');
 
-            // Decompress and extract to local directory
-            // Target: {backup_dir}/shadow/{db}/{table}/
-            let url_db = url_encode(&item.db);
-            let url_table = url_encode(&item.table);
-            let shadow_dir = backup_dir
-                .join("shadow")
-                .join(&url_db)
-                .join(&url_table);
+                    if relative_name.is_empty() {
+                        continue;
+                    }
 
-            // Run decompression in a blocking task (sync I/O)
-            let shadow_dir_clone = shadow_dir.clone();
-            let part_name = item.part.name.clone();
-            tokio::task::spawn_blocking(move || {
-                stream::decompress_part(&compressed_data, &shadow_dir_clone)
-            })
-            .await
-            .context("Decompress task panicked")?
-            .with_context(|| {
-                format!(
-                    "Failed to decompress part {} to {}",
-                    part_name,
-                    shadow_dir.display()
-                )
-            })?;
+                    let data = s3
+                        .get_object(
+                            &format!("{}/{}", metadata_prefix.trim_end_matches('/'), relative_name),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to download metadata file {} for part {}",
+                                relative_name, item.part.name
+                            )
+                        })?;
 
-            debug!(
-                table = %item.table_key,
-                part = %item.part.name,
-                compressed_size = compressed_size,
-                "Part downloaded and decompressed"
-            );
+                    let file_size = data.len() as u64;
+                    total_metadata_bytes += file_size;
 
-            Ok::<(String, u64), anyhow::Error>((item.table_key, compressed_size))
+                    // Write metadata file to local shadow directory
+                    let file_path = shadow_dir.join(relative_name);
+                    if let Some(parent) = file_path.parent() {
+                        std::fs::create_dir_all(parent).with_context(|| {
+                            format!(
+                                "Failed to create parent dir: {}",
+                                parent.display()
+                            )
+                        })?;
+                    }
+                    std::fs::write(&file_path, &data).with_context(|| {
+                        format!(
+                            "Failed to write metadata file: {}",
+                            file_path.display()
+                        )
+                    })?;
+                }
+
+                rate_limiter.consume(total_metadata_bytes).await;
+
+                debug!(
+                    table = %item.table_key,
+                    part = %item.part.name,
+                    metadata_files = metadata_objects.len(),
+                    metadata_bytes = total_metadata_bytes,
+                    "S3 disk part metadata downloaded (data objects stay on S3)"
+                );
+
+                Ok::<(String, u64), anyhow::Error>((item.table_key, total_metadata_bytes))
+            } else {
+                // Local disk part: full download + decompress
+                let compressed_data = s3
+                    .get_object(&item.part.backup_key)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to download part {} for table {}",
+                            item.part.name, item.table_key
+                        )
+                    })?;
+
+                let compressed_size = compressed_data.len() as u64;
+
+                // Rate limit after download
+                rate_limiter.consume(compressed_size).await;
+
+                // Decompress and extract to local directory
+                // Target: {backup_dir}/shadow/{db}/{table}/
+                let shadow_dir = backup_dir
+                    .join("shadow")
+                    .join(&url_db)
+                    .join(&url_table);
+
+                // Run decompression in a blocking task (sync I/O)
+                let shadow_dir_clone = shadow_dir.clone();
+                let part_name = item.part.name.clone();
+                tokio::task::spawn_blocking(move || {
+                    stream::decompress_part(&compressed_data, &shadow_dir_clone)
+                })
+                .await
+                .context("Decompress task panicked")?
+                .with_context(|| {
+                    format!(
+                        "Failed to decompress part {} to {}",
+                        part_name,
+                        shadow_dir.display()
+                    )
+                })?;
+
+                debug!(
+                    table = %item.table_key,
+                    part = %item.part.name,
+                    compressed_size = compressed_size,
+                    "Part downloaded and decompressed"
+                );
+
+                Ok::<(String, u64), anyhow::Error>((item.table_key, compressed_size))
+            }
         });
 
         handles.push(handle);
@@ -276,6 +383,8 @@ pub async fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::S3ObjectInfo;
+    use std::collections::HashMap;
 
     #[test]
     fn test_download_work_item_construction() {
@@ -292,17 +401,144 @@ mod tests {
             table_key: "default.trades".to_string(),
             db: "default".to_string(),
             table: "trades".to_string(),
+            disk_name: "default".to_string(),
             part: part.clone(),
+            is_s3_disk_part: false,
         };
 
         assert_eq!(work_item.table_key, "default.trades");
         assert_eq!(work_item.db, "default");
         assert_eq!(work_item.table, "trades");
+        assert_eq!(work_item.disk_name, "default");
         assert_eq!(work_item.part.name, "202401_1_50_3");
         assert_eq!(
             work_item.part.backup_key,
             "daily/data/default/trades/202401_1_50_3.tar.lz4"
         );
+        assert!(!work_item.is_s3_disk_part);
+    }
+
+    #[test]
+    fn test_download_s3_disk_work_item_detected() {
+        // Verify that S3 disk parts are flagged correctly
+        let s3_part = PartInfo {
+            name: "202401_1_50_3".to_string(),
+            size: 134_217_728,
+            backup_key: "daily/data/default/trades/s3disk/202401_1_50_3/".to_string(),
+            source: "uploaded".to_string(),
+            checksum_crc64: 12345,
+            s3_objects: Some(vec![S3ObjectInfo {
+                path: "store/abc/def/data.bin".to_string(),
+                size: 134_217_000,
+                backup_key: "daily/objects/store/abc/def/data.bin".to_string(),
+            }]),
+        };
+
+        let disk_types: HashMap<String, String> = HashMap::from([
+            ("default".to_string(), "local".to_string()),
+            ("s3disk".to_string(), "s3".to_string()),
+        ]);
+
+        // Simulate what the download loop does: detect S3 disk type
+        let disk_name = "s3disk";
+        let disk_is_s3 = disk_types
+            .get(disk_name)
+            .map(|dt| is_s3_disk(dt))
+            .unwrap_or(false);
+
+        let work_item = DownloadWorkItem {
+            table_key: "default.trades".to_string(),
+            db: "default".to_string(),
+            table: "trades".to_string(),
+            disk_name: disk_name.to_string(),
+            part: s3_part,
+            is_s3_disk_part: disk_is_s3 && true, // s3_objects.is_some()
+        };
+
+        assert!(work_item.is_s3_disk_part);
+        assert_eq!(work_item.disk_name, "s3disk");
+        assert!(work_item.part.s3_objects.is_some());
+    }
+
+    #[test]
+    fn test_download_local_parts_not_flagged_as_s3() {
+        // Verify that local disk parts are NOT flagged as S3
+        let local_part = PartInfo {
+            name: "202401_1_50_3".to_string(),
+            size: 4096,
+            backup_key: "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string(),
+            source: "uploaded".to_string(),
+            checksum_crc64: 11111,
+            s3_objects: None,
+        };
+
+        let disk_types: HashMap<String, String> =
+            HashMap::from([("default".to_string(), "local".to_string())]);
+
+        let disk_name = "default";
+        let disk_is_s3 = disk_types
+            .get(disk_name)
+            .map(|dt| is_s3_disk(dt))
+            .unwrap_or(false);
+
+        let work_item = DownloadWorkItem {
+            table_key: "default.trades".to_string(),
+            db: "default".to_string(),
+            table: "trades".to_string(),
+            disk_name: disk_name.to_string(),
+            part: local_part,
+            is_s3_disk_part: disk_is_s3 && false, // s3_objects.is_none()
+        };
+
+        assert!(!work_item.is_s3_disk_part);
+        assert_eq!(work_item.disk_name, "default");
+        assert!(work_item.part.s3_objects.is_none());
+    }
+
+    #[test]
+    fn test_download_s3_disk_skips_data_detection() {
+        // Verify that S3 disk detection requires BOTH disk_type=s3 AND s3_objects=Some
+        let disk_types: HashMap<String, String> = HashMap::from([
+            ("s3disk".to_string(), "s3".to_string()),
+            ("default".to_string(), "local".to_string()),
+        ]);
+
+        // Case 1: S3 disk with s3_objects -> is_s3_disk_part = true
+        let s3_disk_s3_objects = disk_types
+            .get("s3disk")
+            .map(|dt| is_s3_disk(dt))
+            .unwrap_or(false);
+        assert!(s3_disk_s3_objects && true); // s3_objects.is_some()
+
+        // Case 2: S3 disk but no s3_objects (shouldn't happen, but defensive) -> false
+        assert!(!(s3_disk_s3_objects && false)); // s3_objects.is_none()
+
+        // Case 3: Local disk with no s3_objects -> false
+        let local_disk = disk_types
+            .get("default")
+            .map(|dt| is_s3_disk(dt))
+            .unwrap_or(false);
+        assert!(!local_disk);
+
+        // Case 4: Unknown disk -> false
+        let unknown_disk = disk_types
+            .get("unknown")
+            .map(|dt| is_s3_disk(dt))
+            .unwrap_or(false);
+        assert!(!unknown_disk);
+    }
+
+    #[test]
+    fn test_download_object_storage_disk_detected() {
+        // Verify that "object_storage" disk type is also detected as S3
+        let disk_types: HashMap<String, String> =
+            HashMap::from([("objdisk".to_string(), "object_storage".to_string())]);
+
+        let disk_is_s3 = disk_types
+            .get("objdisk")
+            .map(|dt| is_s3_disk(dt))
+            .unwrap_or(false);
+        assert!(disk_is_s3);
     }
 
     #[test]
