@@ -190,6 +190,7 @@ async fn main() -> Result<()> {
                 &backup_dir,
                 delete_local,
                 diff_from_remote.as_deref(),
+                false, // resume: wired in Task 11
             )
             .await?;
 
@@ -331,6 +332,7 @@ async fn main() -> Result<()> {
                 &backup_dir,
                 delete_source,
                 diff_from_remote.as_deref(),
+                false, // resume: wired in Task 11
             )
             .await?;
 

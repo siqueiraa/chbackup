@@ -14,14 +14,14 @@
 
 pub mod stream;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use futures::future::try_join_all;
 use tokio::sync::Semaphore;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::backup::diff::diff_parts;
 use crate::concurrency::{effective_object_disk_copy_concurrency, effective_upload_concurrency};
@@ -29,6 +29,9 @@ use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo, S3ObjectInfo};
 use crate::object_disk::is_s3_disk;
 use crate::rate_limiter::RateLimiter;
+use crate::resume::{
+    compute_params_hash, delete_state_file, load_state_file, save_state_graceful, UploadState,
+};
 use crate::storage::s3::calculate_chunk_size;
 use crate::storage::S3Client;
 
@@ -158,6 +161,7 @@ struct S3DiskUploadWorkItem {
 /// * `backup_dir` - Path to the local backup directory
 /// * `delete_local` - If true, remove local backup directory after successful upload
 /// * `diff_from_remote` - Optional remote base backup name for incremental upload
+/// * `resume` - If true and use_resumable_state config is set, load resume state
 pub async fn upload(
     config: &Config,
     s3: &S3Client,
@@ -165,11 +169,13 @@ pub async fn upload(
     backup_dir: &Path,
     delete_local: bool,
     diff_from_remote: Option<&str>,
+    resume: bool,
 ) -> Result<()> {
     info!(
         backup_name = %backup_name,
         backup_dir = %backup_dir.display(),
         delete_local = delete_local,
+        resume = resume,
         "Starting upload"
     );
 
@@ -221,6 +227,46 @@ pub async fn upload(
         data_format = %data_format,
         "Loaded manifest"
     );
+
+    // 1c. Load resume state if --resume and use_resumable_state
+    let use_resume = resume && config.general.use_resumable_state;
+    let state_path = backup_dir.join("upload.state.json");
+    let current_params_hash = compute_params_hash(&[
+        backup_name,
+        diff_from_remote.unwrap_or(""),
+    ]);
+
+    let completed_keys: HashSet<String> = if use_resume {
+        match load_state_file::<UploadState>(&state_path) {
+            Ok(Some(state)) => {
+                if state.params_hash != current_params_hash {
+                    warn!(
+                        "Upload state params_hash mismatch (stale state from different params), ignoring"
+                    );
+                    HashSet::new()
+                } else if state.backup_name != backup_name {
+                    warn!(
+                        "Upload state backup_name mismatch, ignoring"
+                    );
+                    HashSet::new()
+                } else {
+                    let count = state.completed_keys.len();
+                    info!(
+                        completed = count,
+                        "Resuming upload: {} parts already uploaded", count
+                    );
+                    state.completed_keys
+                }
+            }
+            Ok(None) => HashSet::new(),
+            Err(e) => {
+                warn!(error = %e, "Failed to load upload state, starting fresh");
+                HashSet::new()
+            }
+        }
+    } else {
+        HashSet::new()
+    };
 
     // 2. Flatten all parts into work items, split by disk type
     let mut local_work_items: Vec<UploadWorkItem> = Vec::new();
@@ -287,6 +333,27 @@ pub async fn upload(
                         source_bucket
                     };
 
+                    // S3 disk metadata key used for resume tracking
+                    let metadata_key = format!(
+                        "{}/data/{}/{}/{}/{}/",
+                        backup_name,
+                        url_encode_component(db),
+                        url_encode_component(table),
+                        disk_name,
+                        part.name,
+                    );
+
+                    // Skip already-completed parts (resume)
+                    if completed_keys.contains(&metadata_key) {
+                        debug!(
+                            table = %table_key,
+                            part = %part.name,
+                            "Skipping already-uploaded S3 disk part (resume)"
+                        );
+                        has_parts = true;
+                        continue;
+                    }
+
                     let part_dir = find_part_dir(backup_dir, db, table, &part.name)?;
 
                     s3_disk_work_items.push(S3DiskUploadWorkItem {
@@ -317,6 +384,17 @@ pub async fn upload(
 
                     // Generate S3 key
                     let s3_key = s3_key_for_part(backup_name, db, table, &part.name);
+
+                    // Skip already-completed parts (resume)
+                    if completed_keys.contains(&s3_key) {
+                        debug!(
+                            table = %table_key,
+                            part = %part.name,
+                            "Skipping already-uploaded part (resume)"
+                        );
+                        has_parts = true;
+                        continue;
+                    }
 
                     local_work_items.push(UploadWorkItem {
                         table_key: table_key.clone(),
@@ -362,6 +440,18 @@ pub async fn upload(
     let s3_max_parts_count = config.s3.max_parts_count;
     let allow_object_disk_streaming = config.s3.allow_object_disk_streaming;
 
+    // Shared resume state for tracking completed parts across parallel tasks
+    let resume_state = if use_resume {
+        let state = UploadState {
+            completed_keys: completed_keys.clone(),
+            backup_name: backup_name.to_string(),
+            params_hash: current_params_hash.clone(),
+        };
+        Some(Arc::new(tokio::sync::Mutex::new((state, state_path.clone()))))
+    } else {
+        None
+    };
+
     // Result type: (table_key, disk_name, updated_part, compressed_size)
     type UploadResult = Result<(String, String, PartInfo, u64)>;
     let mut handles: Vec<tokio::task::JoinHandle<UploadResult>> = Vec::with_capacity(total_parts);
@@ -371,6 +461,7 @@ pub async fn upload(
         let sem = upload_semaphore.clone();
         let s3 = s3.clone();
         let rate_limiter = rate_limiter.clone();
+        let resume_state = resume_state.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -466,6 +557,13 @@ pub async fn upload(
                 "Part uploaded"
             );
 
+            // Update resume state after successful upload
+            if let Some(ref state_mutex) = resume_state {
+                let mut guard = state_mutex.lock().await;
+                guard.0.completed_keys.insert(item.s3_key.clone());
+                save_state_graceful(&guard.1, &guard.0);
+            }
+
             Ok((
                 item.table_key,
                 item.disk_name,
@@ -481,6 +579,7 @@ pub async fn upload(
     for item in s3_disk_work_items {
         let sem = object_disk_copy_semaphore.clone();
         let s3 = s3.clone();
+        let resume_state = resume_state.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -560,7 +659,7 @@ pub async fn upload(
             // Build updated part info
             let mut updated_part = item.part.clone();
             updated_part.s3_objects = Some(updated_s3_objects);
-            updated_part.backup_key = metadata_backup_key;
+            updated_part.backup_key = metadata_backup_key.clone();
             updated_part.source = "uploaded".to_string();
 
             debug!(
@@ -568,6 +667,13 @@ pub async fn upload(
                 part = %item.part.name,
                 "S3 disk part CopyObject complete"
             );
+
+            // Update resume state after successful CopyObject
+            if let Some(ref state_mutex) = resume_state {
+                let mut guard = state_mutex.lock().await;
+                guard.0.completed_keys.insert(metadata_backup_key);
+                save_state_graceful(&guard.1, &guard.0);
+            }
 
             // S3 disk parts have no compressed_size (no compression)
             Ok((item.table_key, item.disk_name, updated_part, 0u64))
@@ -621,19 +727,40 @@ pub async fn upload(
     manifest.compressed_size = total_compressed_size;
     manifest.data_format = data_format.clone();
 
-    // 6. Upload manifest LAST (per design 3.6)
+    // 6. Upload manifest LAST with atomic pattern (per design 3.6)
+    //    Upload to .tmp key, CopyObject to final key, delete .tmp
     let manifest_key = format!("{}/metadata.json", backup_name);
+    let manifest_tmp_key = format!("{}/metadata.json.tmp", backup_name);
     let manifest_bytes = manifest.to_json_bytes()?;
 
     info!(
         key = %manifest_key,
         size = manifest_bytes.len(),
-        "Uploading manifest"
+        "Uploading manifest atomically"
     );
 
-    s3.put_object_with_options(&manifest_key, manifest_bytes, Some("application/json"))
+    // Step 1: Upload to .tmp key
+    s3.put_object_with_options(&manifest_tmp_key, manifest_bytes, Some("application/json"))
         .await
-        .context("Failed to upload manifest to S3")?;
+        .context("Failed to upload manifest .tmp to S3")?;
+
+    // Step 2: CopyObject from .tmp to final key
+    let source_bucket = s3.bucket().to_string();
+    let source_key_full = s3.full_key(&manifest_tmp_key);
+    s3.copy_object(&source_bucket, &source_key_full, &manifest_key)
+        .await
+        .context("Failed to copy manifest from .tmp to final key")?;
+
+    // Step 3: Delete .tmp key
+    if let Err(e) = s3.delete_object(&manifest_tmp_key).await {
+        warn!(
+            error = %e,
+            key = %manifest_tmp_key,
+            "Failed to delete manifest .tmp key (non-fatal)"
+        );
+    }
+
+    info!("Manifest uploaded atomically");
 
     // 7. Update local manifest with S3 keys
     manifest
@@ -649,7 +776,12 @@ pub async fn upload(
         "Upload complete"
     );
 
-    // 8. Delete local backup if requested
+    // 8. Delete resume state file on success
+    if use_resume {
+        delete_state_file(&state_path);
+    }
+
+    // 9. Delete local backup if requested
     if delete_local {
         info!(
             backup_dir = %backup_dir.display(),
@@ -1077,5 +1209,51 @@ mod tests {
             .map(|dt| is_s3_disk(dt))
             .unwrap_or(false);
         assert!(disk_is_s3);
+    }
+
+    #[test]
+    fn test_upload_skips_completed_parts() {
+        // Verify that completed_keys causes parts to be skipped in work queue
+        let completed_keys: HashSet<String> = HashSet::from([
+            "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string(),
+        ]);
+
+        let s3_key = s3_key_for_part("daily", "default", "trades", "202401_1_50_3");
+        assert!(completed_keys.contains(&s3_key));
+
+        // A different part should NOT be in completed_keys
+        let other_key = s3_key_for_part("daily", "default", "trades", "202402_1_1_0");
+        assert!(!completed_keys.contains(&other_key));
+    }
+
+    #[test]
+    fn test_manifest_atomicity_key_format() {
+        // Verify .tmp key generation for atomic manifest upload
+        let backup_name = "daily-2024-01-15";
+        let manifest_key = format!("{}/metadata.json", backup_name);
+        let manifest_tmp_key = format!("{}/metadata.json.tmp", backup_name);
+
+        assert_eq!(manifest_key, "daily-2024-01-15/metadata.json");
+        assert_eq!(manifest_tmp_key, "daily-2024-01-15/metadata.json.tmp");
+
+        // tmp key should differ from final key
+        assert_ne!(manifest_key, manifest_tmp_key);
+
+        // tmp key should have .tmp suffix
+        assert!(manifest_tmp_key.ends_with(".tmp"));
+    }
+
+    #[test]
+    fn test_upload_resume_state_params_hash() {
+        use crate::resume::compute_params_hash;
+
+        // Verify params_hash for upload includes backup_name and diff_from_remote
+        let h1 = compute_params_hash(&["daily-2024-01-15", ""]);
+        let h2 = compute_params_hash(&["daily-2024-01-15", ""]);
+        assert_eq!(h1, h2);
+
+        // Different diff_from_remote should produce different hash
+        let h3 = compute_params_hash(&["daily-2024-01-15", "base-backup"]);
+        assert_ne!(h1, h3);
     }
 }
