@@ -386,7 +386,9 @@ async fn main() -> Result<()> {
 
         Command::Server { watch } => {
             if watch {
-                warn!("--watch flag is not yet implemented (Phase 3d), running server without watch");
+                warn!(
+                    "--watch flag is not yet implemented (Phase 3d), running server without watch"
+                );
             }
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
