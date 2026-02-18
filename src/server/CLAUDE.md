@@ -4,7 +4,7 @@
 
 Parent: [/CLAUDE.md](../../CLAUDE.md)
 
-This module implements the HTTP API server for chbackup using axum (design doc section 9). It enables Kubernetes sidecar operation with endpoints for creating, uploading, downloading, and restoring backups, plus health checks, action logging, and ClickHouse integration tables.
+This module implements the HTTP API server for chbackup using axum (design doc section 9). It enables Kubernetes sidecar operation with endpoints for creating, uploading, downloading, and restoring backups, plus health checks, action logging, ClickHouse integration tables, and watch mode lifecycle management.
 
 ## Directory Structure
 
@@ -29,6 +29,10 @@ src/server/
 - `current_op: Arc<Mutex<Option<RunningOp>>>` -- currently running operation for kill support
 - `op_semaphore: Arc<Semaphore>` -- concurrency control (1 permit when `allow_parallel=false`)
 - `metrics: Option<Arc<Metrics>>` -- Prometheus metrics registry (`None` when `config.api.enable_metrics` is false)
+- `watch_shutdown_tx: Option<watch::Sender<bool>>` -- watch loop shutdown signal (`None` when watch inactive)
+- `watch_reload_tx: Option<watch::Sender<bool>>` -- watch loop config reload signal (`None` when watch inactive)
+- `watch_status: Arc<Mutex<WatchStatus>>` -- shared watch loop status for API queries
+- `config_path: PathBuf` -- path to config file, used for config reload
 
 Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) since locks are held across `.await` points.
 
@@ -92,9 +96,10 @@ When `config.api.secure` is true, uses `axum_server::bind_rustls` with certifica
 
 ### Graceful Shutdown (mod.rs)
 Listens for Ctrl+C (SIGINT). On shutdown:
-1. Drops integration tables (if they were created)
-2. Stops accepting new connections
-3. Logs "Server stopped"
+1. Sends shutdown signal to watch loop (if active)
+2. Drops integration tables (if they were created)
+3. Stops accepting new connections
+4. Logs "Server stopped"
 
 ### Prometheus Metrics (metrics.rs)
 A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 metric families, all prefixed with `chbackup_`. Created conditionally in `AppState::new()` based on `config.api.enable_metrics`.
@@ -126,11 +131,26 @@ A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 met
 ### Clean Endpoint (routes.rs)
 `POST /api/v1/clean` -- Shadow directory cleanup. Follows the standard operation lifecycle pattern (try_start_op -> spawn -> finish_op/fail_op). Calls `list::clean_shadow(&ch, &data_path, None)` to remove `chbackup_*` directories from all disk shadow paths. Records `clean` operation label for duration, success, and error metrics.
 
+### Watch Mode Integration (Phase 3d)
+
+**WatchStatus struct** (state.rs): Shared between the watch loop and API handlers via `Arc<Mutex<WatchStatus>>`. Fields: `active`, `state` (string), `last_full`, `last_incr`, `consecutive_errors`, `next_backup_in`.
+
+**Watch loop spawn** (mod.rs): When `--watch` flag or `config.watch.enabled` is set, `start_server()` creates shutdown/reload channels, builds a `WatchContext`, and spawns `watch::run_watch_loop()` as a tokio background task. On server shutdown (Ctrl+C), the shutdown signal is sent to the watch loop.
+
+**SIGHUP handler** (mod.rs): Unix-only (`#[cfg(unix)]`). Spawns a task that listens for `SIGHUP` signals and sends `true` on the `reload_tx` channel, triggering config hot-reload in the watch loop. On non-Unix platforms, use the `/api/v1/reload` API endpoint instead.
+
+**spawn_watch_from_state()** (mod.rs): Creates new channels and a `WatchContext` from the current `AppState`, spawns the watch loop. Used by the `watch_start` API endpoint to start watch dynamically.
+
+**Watch API endpoints** (routes.rs -- replaced stubs):
+- `POST /api/v1/watch/start` -- Start watch loop; returns 409 if already active
+- `POST /api/v1/watch/stop` -- Stop watch loop via shutdown signal; returns 404 if not active
+- `GET /api/v1/watch/status` -- Returns JSON with state, last_full, last_incr, consecutive_errors, next_in
+- `POST /api/v1/reload` -- Sends reload signal to watch loop (or re-reads config if watch inactive)
+
 ### Stub Endpoints
 Endpoints for future phases return 501 Not Implemented:
-- `/api/v1/reload`, `/api/v1/restart` (Phase 3d -- watch mode)
+- `/api/v1/restart` (server restart logic)
 - `/api/v1/tables` (Phase 4f)
-- `/api/v1/watch/*` (Phase 3d)
 
 ### Sync Function Handling
 Sync functions from `list` module (`delete_local`, `clean_broken_local`) are called via `tokio::task::spawn_blocking` to avoid blocking the async runtime.
@@ -142,8 +162,9 @@ Sync functions from `list` module (`delete_local`, `clean_broken_local`) are cal
 
 ### Public API
 - `build_router(state: AppState) -> Router` -- Assembles all routes with optional auth middleware
-- `start_server(config: Arc<Config>, ch: ChClient, s3: S3Client) -> Result<()>` -- Full server lifecycle: state creation, router build, integration tables, auto-resume, listen, graceful shutdown
-- `AppState::new(config, ch, s3) -> Self` -- Create shared state with semaphore and optional metrics from config
+- `start_server(config: Arc<Config>, ch: ChClient, s3: S3Client, watch: bool, config_path: PathBuf) -> Result<()>` -- Full server lifecycle: state creation, router build, optional watch loop spawn, integration tables, auto-resume, listen, graceful shutdown
+- `spawn_watch_from_state(state: &mut AppState, config_path: PathBuf, macros: HashMap<String, String>)` -- Spawn watch loop from API context (used by watch_start endpoint)
+- `AppState::new(config, ch, s3, config_path) -> Self` -- Create shared state with semaphore, optional metrics, and watch fields initialized to None/default
 - `AppState::try_start_op(command) -> Result<(u64, CancellationToken), &str>` -- Start tracked operation
 - `AppState::finish_op(id)` / `fail_op(id, error)` / `kill_current() -> bool` -- Operation exit paths
 - `scan_resumable_state_files(data_path) -> Vec<ResumableOp>` -- Find interrupted operations

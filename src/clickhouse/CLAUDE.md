@@ -34,6 +34,7 @@ src/clickhouse/
 ### Row Types
 - `TableRow` -- From `system.tables`: database, name, engine, create_table_query, uuid, data_paths, total_bytes
 - `MutationRow` -- From `system.mutations`: database, table, mutation_id, command, parts_to_do_names, is_done
+- `MacroRow` -- From `system.macros`: macro_name (aliased from `macro`), substitution (Phase 3d)
 - `DiskRow` -- From `system.disks`: name, path, type_field, remote_path
 - `PartRow` -- From `system.parts`: name, partition_id, active (Phase 2d)
 - `ColumnInconsistency` -- Query result: database, table, column, types (Phase 2d)
@@ -66,6 +67,7 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `attach_part(db, table, part_name) -> Result<()>` -- ALTER TABLE ATTACH PART
 - `get_version() -> Result<String>` -- SELECT version()
 - `get_disks() -> Result<Vec<DiskRow>>` -- Query system.disks
+- `get_macros() -> Result<HashMap<String, String>>` -- Query system.macros for template resolution (Phase 3d); returns empty HashMap on error (graceful -- system.macros may not exist)
 - `execute_ddl(ddl) -> Result<()>` -- Execute arbitrary DDL
 - `create_integration_tables(api_host, api_port) -> Result<()>` -- Create `system.backup_list` and `system.backup_actions` URL engine tables for API server integration (Phase 3a)
 - `drop_integration_tables() -> Result<()>` -- Drop both integration tables (called on server shutdown)

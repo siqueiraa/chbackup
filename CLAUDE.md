@@ -63,6 +63,7 @@ Things that are easy to get wrong when reading the design doc:
 **Phase 2b** (incremental): Complete -- Incremental backups via --diff-from/--diff-from-remote, diff_parts() comparison, create_remote command.
 **Phase 2c** (S3 object disk): Complete -- S3 disk metadata parser (5 format versions), disk-aware shadow walk, CopyObject with retry+streaming fallback, mixed disk upload/download, UUID-isolated S3 restore with same-name optimization.
 **Phase 2d** (resume & reliability): Complete -- Resumable upload/download/restore via state files, atomic manifest upload (.tmp+CopyObject+delete), post-download CRC64 verification with retry, disk space pre-flight check, partition-level FREEZE, disk filtering (skip_disks/skip_disk_types), parts column consistency check, broken backup cleanup (clean_broken), ClickHouse TLS support.
+**Phase 3d** (watch mode): Complete -- Watch state machine loop with full+incremental backup chains, name template resolution ({type}/{time:FORMAT}/{shard} macros), resume-on-restart from remote backup listing, SIGHUP config hot-reload, API endpoints (watch/start, watch/stop, watch/status, reload), server --watch flag, Prometheus watch metrics.
 
 ## Source Module Map
 
@@ -86,8 +87,10 @@ src/
   upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart, CopyObject for S3 disk parts
   download/          -- download command: parallel S3 GetObject, LZ4+untar decompress, metadata-only for S3 disk parts
   restore/           -- restore command: CREATE DB/TABLE, parallel hardlink+ATTACH PART, UUID-isolated S3 CopyObject restore
-  clickhouse/        -- ChClient wrapper (FREEZE/UNFREEZE, DDL, queries, DiskRow with remote_path)
+  clickhouse/        -- ChClient wrapper (FREEZE/UNFREEZE, DDL, queries, DiskRow with remote_path, get_macros)
   storage/           -- S3Client wrapper (put, get, list, delete, head, multipart, copy_object)
+  watch/             -- Watch mode scheduler: state machine loop, name template resolution, resume state, config hot-reload
+  server/            -- HTTP API server: axum routes, AppState, metrics, auth, watch lifecycle endpoints
 ```
 
 Each directory module has its own `CLAUDE.md` with detailed API and pattern documentation.
@@ -105,6 +108,7 @@ clean_broken: list -> filter is_broken -> delete each
 retention_local: list_local -> filter out broken -> sort by timestamp asc -> delete oldest exceeding keep count
 retention_remote: list_remote -> filter out broken -> sort by timestamp asc -> for each to delete: gc_collect_referenced_keys (load all surviving manifests) -> gc_delete_backup (delete unreferenced keys, manifest last)
 clean_shadow: ChClient.get_disks -> filter out backup-type disks -> for each disk: scan shadow/ for chbackup_* dirs -> remove_dir_all
+watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|FullNow|IncrNow] -> resolve_name_template -> backup::create -> upload::upload -> [delete_local] -> [retention_local + retention_remote] -> sleep(watch_interval) -> loop
 ```
 
 ## Key Implementation Patterns
@@ -134,6 +138,11 @@ clean_shadow: ChClient.get_disks -> filter out backup-type disks -> for each dis
 - **Remote retention with GC**: `retention_remote()` calls `gc_collect_referenced_keys()` fresh per-backup-deletion to build a set of all S3 keys referenced by surviving backups, then `gc_delete_backup()` only deletes unreferenced keys (manifest deleted last). Design 8.2 race protection satisfied by fresh key collection each iteration.
 - **Config resolution for retention**: `effective_retention_local/remote()` resolves `retention.*` vs `general.*` config -- `retention.*` overrides when non-zero, else falls back to `general.*`
 - **Shadow directory cleanup**: `clean_shadow()` queries `get_disks()`, filters out backup-type disks, then removes `chbackup_*` directories from each disk's `shadow/` path; optional name filter matches `chbackup_{sanitized_name}_*`
+- **Watch state machine**: `run_watch_loop()` cycles through resume -> create -> upload -> delete_local -> retention -> sleep; uses `tokio::select!` for interruptible sleep (shutdown/reload signals); `WatchState` enum maps to Prometheus IntGauge values (1-7)
+- **Watch error recovery**: `force_next_full` flag forces full backup after any error; `consecutive_errors` counter resets to 0 on success; `max_consecutive_errors` (0 = unlimited) triggers loop exit
+- **Watch name templates**: `resolve_name_template()` substitutes `{type}`, `{time:FORMAT}`, and ClickHouse `system.macros` values; `resolve_template_prefix()` extracts the static prefix for backup filtering
+- **Watch config hot-reload**: SIGHUP (Unix) or `/api/v1/reload` triggers `Config::load()` + `validate()` at next sleep entry; current cycle completes first (design 10.8); logs old->new values for key parameters
+- **Watch server integration**: `start_server()` optionally spawns watch loop as background task; `spawn_watch_from_state()` enables dynamic start via API; channels (`watch::Sender<bool>`) for shutdown/reload signaling
 
 ## Remaining Limitations
 
