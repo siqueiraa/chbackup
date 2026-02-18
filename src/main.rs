@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
             let name = backup_name_required(backup_name, "download")?;
             let s3 = S3Client::new(&config.s3).await?;
 
-            let backup_dir = download::download(&config, &s3, &name).await?;
+            let backup_dir = download::download(&config, &s3, &name, false /* resume: wired in Task 11 */).await?;
 
             info!(
                 backup_name = %name,

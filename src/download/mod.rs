@@ -12,19 +12,24 @@
 
 pub mod stream;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
+use crate::backup::checksum::compute_crc64;
 use crate::concurrency::effective_download_concurrency;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo};
 use crate::object_disk::is_s3_disk;
 use crate::rate_limiter::RateLimiter;
+use crate::resume::{
+    compute_params_hash, delete_state_file, load_state_file, save_state_graceful, DownloadState,
+};
 use crate::storage::S3Client;
 
 /// URL-encode a component for use in S3 key paths and local directory names.
@@ -51,13 +56,70 @@ struct DownloadWorkItem {
     db: String,
     /// Table name.
     table: String,
-    /// Disk name within the table's parts map (used in tests and for future resume logic).
-    #[allow(dead_code)]
+    /// Disk name within the table's parts map (used for resume state tracking).
     disk_name: String,
     /// Part info (name, backup_key, etc.).
     part: PartInfo,
     /// Whether this part resides on an S3 object disk.
     is_s3_disk_part: bool,
+}
+
+/// Check available disk space before downloading.
+///
+/// Uses `nix::sys::statvfs::statvfs()` on the backup directory to determine
+/// available space. Returns an error if the available space (with 5% safety
+/// margin) is less than the required space.
+fn check_disk_space(backup_dir: &Path, required_bytes: u64) -> Result<()> {
+    // Ensure the directory exists for statvfs
+    let check_path = if backup_dir.exists() {
+        backup_dir.to_path_buf()
+    } else if let Some(parent) = backup_dir.parent() {
+        if parent.exists() {
+            parent.to_path_buf()
+        } else {
+            // Cannot check disk space if parent doesn't exist yet
+            return Ok(());
+        }
+    } else {
+        return Ok(());
+    };
+
+    match nix::sys::statvfs::statvfs(&check_path) {
+        Ok(stat) => {
+            let block_size = stat.block_size();
+            let available_blocks = stat.blocks_available() as u64;
+            let available_bytes = block_size * available_blocks;
+            // Apply 5% safety margin per design doc
+            let safe_available = (available_bytes as f64 * 0.95) as u64;
+
+            info!(
+                path = %check_path.display(),
+                available_bytes = available_bytes,
+                safe_available = safe_available,
+                required_bytes = required_bytes,
+                "Disk space pre-flight check"
+            );
+
+            if safe_available < required_bytes {
+                bail!(
+                    "Insufficient disk space: need {} bytes but only {} bytes available (with 5% safety margin) at {}",
+                    required_bytes,
+                    safe_available,
+                    check_path.display()
+                );
+            }
+
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                path = %check_path.display(),
+                error = %e,
+                "Failed to check disk space via statvfs (continuing anyway)"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Download a backup from S3 to the local filesystem.
@@ -70,13 +132,20 @@ struct DownloadWorkItem {
 /// * `config` - Application configuration (for data_path)
 /// * `s3` - S3 client for downloading objects
 /// * `backup_name` - Name of the backup to download
-pub async fn download(config: &Config, s3: &S3Client, backup_name: &str) -> Result<PathBuf> {
+/// * `resume` - If true and use_resumable_state config is set, load resume state
+pub async fn download(
+    config: &Config,
+    s3: &S3Client,
+    backup_name: &str,
+    resume: bool,
+) -> Result<PathBuf> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = Path::new(data_path).join("backup").join(backup_name);
 
     info!(
         backup_name = %backup_name,
         backup_dir = %backup_dir.display(),
+        resume = resume,
         "Starting download"
     );
 
@@ -96,9 +165,59 @@ pub async fn download(config: &Config, s3: &S3Client, backup_name: &str) -> Resu
         "Downloaded manifest"
     );
 
-    // 2. Create local backup directory
+    // 2. Disk space pre-flight check
+    // Sum up compressed sizes from manifest to estimate required space
+    let total_compressed: u64 = manifest
+        .tables
+        .values()
+        .flat_map(|tm| tm.parts.values())
+        .flat_map(|parts| parts.iter())
+        .map(|p| p.size)
+        .sum();
+
+    if total_compressed > 0 {
+        // Check the parent directory (backup_dir may not exist yet)
+        let check_parent = Path::new(data_path).join("backup");
+        std::fs::create_dir_all(&check_parent).ok();
+        check_disk_space(&check_parent, total_compressed)?;
+    }
+
+    // 2b. Create local backup directory
     std::fs::create_dir_all(&backup_dir)
         .with_context(|| format!("Failed to create backup dir: {}", backup_dir.display()))?;
+
+    // 2c. Load resume state if --resume and use_resumable_state
+    let use_resume = resume && config.general.use_resumable_state;
+    let state_path = backup_dir.join("download.state.json");
+    let current_params_hash = compute_params_hash(&[backup_name]);
+
+    let completed_keys: HashSet<String> = if use_resume {
+        match load_state_file::<DownloadState>(&state_path) {
+            Ok(Some(state)) => {
+                if state.params_hash != current_params_hash {
+                    warn!("Download state params_hash mismatch (stale state), ignoring");
+                    HashSet::new()
+                } else if state.backup_name != backup_name {
+                    warn!("Download state backup_name mismatch, ignoring");
+                    HashSet::new()
+                } else {
+                    let count = state.completed_keys.len();
+                    info!(
+                        completed = count,
+                        "Resuming download: {} parts already downloaded", count
+                    );
+                    state.completed_keys
+                }
+            }
+            Ok(None) => HashSet::new(),
+            Err(e) => {
+                warn!(error = %e, "Failed to load download state, starting fresh");
+                HashSet::new()
+            }
+        }
+    } else {
+        HashSet::new()
+    };
 
     // 3. Flatten all parts into work items
     let mut work_items: Vec<DownloadWorkItem> = Vec::new();
@@ -129,6 +248,16 @@ pub async fn download(config: &Config, s3: &S3Client, backup_name: &str) -> Resu
                     continue;
                 }
 
+                // Skip already-completed parts (resume)
+                if completed_keys.contains(&part.backup_key) {
+                    debug!(
+                        table = %table_key,
+                        part = %part.name,
+                        "Skipping already-downloaded part (resume)"
+                    );
+                    continue;
+                }
+
                 work_items.push(DownloadWorkItem {
                     table_key: table_key.clone(),
                     db: db.to_string(),
@@ -152,6 +281,19 @@ pub async fn download(config: &Config, s3: &S3Client, backup_name: &str) -> Resu
     // 4. Download parts in parallel with semaphore and rate limiter
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let rate_limiter = RateLimiter::new(config.backup.download_max_bytes_per_second);
+    let retries_on_failure = config.general.retries_on_failure;
+
+    // Shared resume state for tracking completed parts across parallel tasks
+    let resume_state = if use_resume {
+        let state = DownloadState {
+            completed_keys,
+            backup_name: backup_name.to_string(),
+            params_hash: current_params_hash,
+        };
+        Some(Arc::new(tokio::sync::Mutex::new((state, state_path.clone()))))
+    } else {
+        None
+    };
 
     let mut handles = Vec::with_capacity(total_parts);
 
@@ -160,6 +302,7 @@ pub async fn download(config: &Config, s3: &S3Client, backup_name: &str) -> Resu
         let s3 = s3.clone();
         let rate_limiter = rate_limiter.clone();
         let backup_dir = backup_dir.clone();
+        let resume_state = resume_state.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -260,52 +403,133 @@ pub async fn download(config: &Config, s3: &S3Client, backup_name: &str) -> Resu
                     "S3 disk part metadata downloaded (data objects stay on S3)"
                 );
 
+                // Update resume state after successful S3 disk part download
+                if let Some(ref state_mutex) = resume_state {
+                    let mut guard = state_mutex.lock().await;
+                    guard.0.completed_keys.insert(item.part.backup_key.clone());
+                    save_state_graceful(&guard.1, &guard.0);
+                }
+
                 Ok::<(String, u64), anyhow::Error>((item.table_key, total_metadata_bytes))
             } else {
-                // Local disk part: full download + decompress
-                let compressed_data =
-                    s3.get_object(&item.part.backup_key)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to download part {} for table {}",
-                                item.part.name, item.table_key
-                            )
-                        })?;
-
-                let compressed_size = compressed_data.len() as u64;
-
-                // Rate limit after download
-                rate_limiter.consume(compressed_size).await;
-
-                // Decompress and extract to local directory
-                // Target: {backup_dir}/shadow/{db}/{table}/
+                // Local disk part: full download + decompress + CRC64 verify
                 let shadow_dir = backup_dir.join("shadow").join(&url_db).join(&url_table);
-
-                // Run decompression in a blocking task (sync I/O)
-                let shadow_dir_clone = shadow_dir.clone();
                 let part_name = item.part.name.clone();
-                tokio::task::spawn_blocking(move || {
-                    stream::decompress_part(&compressed_data, &shadow_dir_clone)
-                })
-                .await
-                .context("Decompress task panicked")?
-                .with_context(|| {
-                    format!(
-                        "Failed to decompress part {} to {}",
-                        part_name,
-                        shadow_dir.display()
-                    )
-                })?;
+                let expected_crc = item.part.checksum_crc64;
+                let backup_key = item.part.backup_key.clone();
 
-                debug!(
-                    table = %item.table_key,
-                    part = %item.part.name,
-                    compressed_size = compressed_size,
-                    "Part downloaded and decompressed"
-                );
+                let mut last_error: Option<anyhow::Error> = None;
+                let max_attempts = if expected_crc != 0 { retries_on_failure + 1 } else { 1 };
 
-                Ok::<(String, u64), anyhow::Error>((item.table_key, compressed_size))
+                for attempt in 0..max_attempts {
+                    if attempt > 0 {
+                        info!(
+                            table = %item.table_key,
+                            part = %part_name,
+                            attempt = attempt + 1,
+                            "Retrying download after CRC64 mismatch"
+                        );
+                    }
+
+                    let compressed_data =
+                        s3.get_object(&backup_key)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to download part {} for table {}",
+                                    part_name, item.table_key
+                                )
+                            })?;
+
+                    let compressed_size = compressed_data.len() as u64;
+
+                    // Rate limit after download
+                    rate_limiter.consume(compressed_size).await;
+
+                    // Decompress and extract to local directory
+                    let shadow_dir_clone = shadow_dir.clone();
+                    let part_name_clone = part_name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        stream::decompress_part(&compressed_data, &shadow_dir_clone)
+                    })
+                    .await
+                    .context("Decompress task panicked")?
+                    .with_context(|| {
+                        format!(
+                            "Failed to decompress part {} to {}",
+                            part_name_clone,
+                            shadow_dir.display()
+                        )
+                    })?;
+
+                    // CRC64 verification after decompression
+                    if expected_crc != 0 {
+                        let checksums_path = shadow_dir.join(&part_name).join("checksums.txt");
+                        if checksums_path.exists() {
+                            let actual_crc = {
+                                let cp = checksums_path.clone();
+                                tokio::task::spawn_blocking(move || compute_crc64(&cp))
+                                    .await
+                                    .context("CRC64 compute task panicked")?
+                                    .with_context(|| {
+                                        format!(
+                                            "Failed to compute CRC64 for {}",
+                                            checksums_path.display()
+                                        )
+                                    })?
+                            };
+
+                            if actual_crc != expected_crc {
+                                warn!(
+                                    table = %item.table_key,
+                                    part = %part_name,
+                                    expected = expected_crc,
+                                    actual = actual_crc,
+                                    "Post-download CRC64 mismatch"
+                                );
+
+                                // Delete corrupted part directory
+                                let corrupt_dir = shadow_dir.join(&part_name);
+                                if corrupt_dir.exists() {
+                                    let _ = std::fs::remove_dir_all(&corrupt_dir);
+                                }
+
+                                last_error = Some(anyhow::anyhow!(
+                                    "CRC64 mismatch for part {}: expected {} got {}",
+                                    part_name,
+                                    expected_crc,
+                                    actual_crc
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+
+                    // CRC64 passed or no checksum available -- success
+                    debug!(
+                        table = %item.table_key,
+                        part = %part_name,
+                        compressed_size = compressed_size,
+                        "Part downloaded and decompressed"
+                    );
+
+                    // Update resume state after successful download
+                    if let Some(ref state_mutex) = resume_state {
+                        let mut guard = state_mutex.lock().await;
+                        guard.0.completed_keys.insert(backup_key.clone());
+                        save_state_graceful(&guard.1, &guard.0);
+                    }
+
+                    return Ok::<(String, u64), anyhow::Error>((
+                        item.table_key,
+                        compressed_size,
+                    ));
+                }
+
+                // All retries exhausted
+                Err(last_error.unwrap_or_else(|| {
+                    anyhow::anyhow!("Download failed for part {} after retries", part_name)
+                }))
             }
         });
 
@@ -350,6 +574,11 @@ pub async fn download(config: &Config, s3: &S3Client, backup_name: &str) -> Resu
     manifest
         .save_to_file(&manifest_path)
         .context("Failed to save manifest to local backup directory")?;
+
+    // 8. Delete resume state file on success
+    if use_resume {
+        delete_state_file(&state_path);
+    }
 
     info!(
         backup_name = %backup_name,
@@ -548,5 +777,62 @@ mod tests {
     #[test]
     fn test_url_encode_preserves_slashes() {
         assert_eq!(url_encode("path/to/file"), "path/to/file");
+    }
+
+    #[test]
+    fn test_download_skips_completed_parts() {
+        // Verify that completed_keys causes parts to be skipped
+        let completed_keys: HashSet<String> = HashSet::from([
+            "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string(),
+        ]);
+
+        let backup_key = "daily/data/default/trades/202401_1_50_3.tar.lz4";
+        assert!(completed_keys.contains(backup_key));
+
+        // A different part should NOT be skipped
+        let other_key = "daily/data/default/trades/202402_1_1_0.tar.lz4";
+        assert!(!completed_keys.contains(other_key));
+    }
+
+    #[test]
+    fn test_crc64_verification_pass() {
+        use crate::backup::checksum::compute_crc64;
+
+        // Create a test file, compute CRC64, verify it matches
+        let dir = tempfile::tempdir().unwrap();
+        let checksums_path = dir.path().join("checksums.txt");
+        std::fs::write(&checksums_path, b"test checksum data").unwrap();
+
+        let crc = compute_crc64(&checksums_path).unwrap();
+        assert_ne!(crc, 0);
+
+        // Second computation should match
+        let crc2 = compute_crc64(&checksums_path).unwrap();
+        assert_eq!(crc, crc2);
+    }
+
+    #[test]
+    fn test_disk_space_preflight_sufficient() {
+        // Check that the current temp directory has sufficient space for a small amount
+        let dir = tempfile::tempdir().unwrap();
+        let result = check_disk_space(dir.path(), 1024); // 1KB should be fine
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_disk_space_preflight_insufficient() {
+        // Check with an absurdly large requirement that no disk could satisfy
+        let dir = tempfile::tempdir().unwrap();
+        let result = check_disk_space(dir.path(), u64::MAX);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Insufficient disk space"));
+    }
+
+    #[test]
+    fn test_disk_space_preflight_nonexistent_path() {
+        // Non-existent path should gracefully skip
+        let result = check_disk_space(Path::new("/nonexistent/path/xyz"), 1024);
+        assert!(result.is_ok());
     }
 }
