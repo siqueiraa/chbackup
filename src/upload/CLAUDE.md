@@ -26,7 +26,13 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 
 ### S3 Key Format
 ```
+# Local disk parts (compressed archives):
 {backup_name}/data/{url_encode(db)}/{url_encode(table)}/{part_name}.tar.lz4
+
+# S3 disk parts (CopyObject, Phase 2c):
+{backup_name}/objects/{original_relative_path}             -- data objects
+{backup_name}/data/{url_encode(db)}/{url_encode(table)}/{disk_name}/{part_name}/  -- metadata files
+
 {backup_name}/metadata.json  (uploaded LAST)
 ```
 
@@ -41,8 +47,25 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 - Updated manifest (with both uploaded and carried parts) is saved locally and then uploaded to S3 last (atomicity guarantee still applies)
 - `compressed_size` is only counted for actually uploaded parts, not carried parts
 
+### Mixed Disk Upload Pipeline (Phase 2c)
+- Parts are split into two queues based on disk type: local parts and S3 disk parts
+- **Local parts**: existing compress+upload pipeline (tar+LZ4, PutObject/multipart)
+- **S3 disk parts**: server-side CopyObject for each `S3ObjectInfo` in `part.s3_objects`, plus PutObject for metadata files
+- Both queues run concurrently via `futures::future::try_join_all`
+- **Separate concurrency semaphore**: S3 disk CopyObject bounded by `effective_object_disk_copy_concurrency(config)` (default 8), independent from local upload concurrency
+- S3 disk source bucket/prefix parsed from `DiskRow.remote_path` via `parse_s3_uri()`
+- Uses `s3.copy_object_with_retry()` for retry+backoff and conditional streaming fallback
+- After CopyObject: `s3_obj.backup_key` is set to the destination key in the backup bucket
+- No compression for S3 disk parts (already stored as raw S3 objects)
+
+### CopyObject Concurrency (Phase 2c)
+- `object_disk_copy_semaphore` limits concurrent CopyObject operations
+- Default concurrency: 8 (conservative, since backup runs alongside FREEZE)
+- Configured via `backup.object_disk_copy_concurrency`
+- Independent from the local upload semaphore
+
 ### Public API
-- `upload(config, s3, backup_name, backup_dir, delete_local, diff_from_remote: Option<&str>) -> Result<()>` -- Main entry point; when `diff_from_remote` is provided, loads remote base manifest and skips carried parts
+- `upload(config, s3, backup_name, backup_dir, delete_local, diff_from_remote: Option<&str>) -> Result<()>` -- Main entry point; routes S3 disk parts through CopyObject and local parts through compress+upload
 - `compress_part(part_dir, archive_name) -> Result<Vec<u8>>` -- Sync tar+LZ4 compression
 
 ### Parallel Upload Pattern (Phase 2a)

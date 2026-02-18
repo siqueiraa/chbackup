@@ -34,6 +34,18 @@ Parts are sorted by `(partition, min_block)` for correct merge behavior. Part na
 - Chowns to ClickHouse uid/gid detected from `stat()` on data_path; skips chown if not root
 - `ALTER TABLE ATTACH PART` errors 232/233 (overlapping range, already exists) are logged as warnings and skipped
 
+### UUID-Isolated S3 Restore (attach.rs, Phase 2c)
+- S3 disk parts are restored via CopyObject instead of hardlink
+- **UUID path derivation**: `store/{uuid_hex[0..3]}/{uuid_with_dashes}/{relative_path}` -- matches ClickHouse's internal S3 path convention
+- `uuid_s3_prefix(uuid) -> String` generates the prefix from the destination table's UUID
+- **Same-name optimization**: Before copying, calls `ListObjectsV2(prefix=store/{uuid_hex[0..3]}/{uuid_with_dashes}/)` to get existing S3 objects. Objects matching both path and size are skipped (zero-copy). Single ListObjectsV2 per table, not per-object HeadObject.
+- S3 objects are copied from the backup bucket to the data bucket using `s3.copy_object_with_retry()`
+- Parallel S3 copies within a table bounded by `object_disk_server_side_copy_concurrency` semaphore (default 32)
+- After CopyObject: metadata files are rewritten using `object_disk::rewrite_metadata()` to update paths and set RefCount=0, ReadOnly=false
+- Rewritten metadata files are written to `detached/{part_name}/` before ATTACH
+- InlineData (v4+): no CopyObject needed for inline objects; preserved during rewrite
+- `OwnedAttachParams` extended with S3-related fields: `s3_client`, `disk_type_map`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming`, `disk_remote_paths`
+
 ### Detached Path Resolution
 Queries `system.tables` for `data_paths` column to find the table's data directory, then appends `detached/{part_name}/`.
 
@@ -42,8 +54,9 @@ Queries `system.tables` for `data_paths` column to find the table's data directo
 - `create_databases(ch, manifest) -> Result<()>` -- DDL for databases
 - `create_tables(ch, manifest, filter) -> Result<()>` -- DDL for tables
 - `attach_parts(params) -> Result<u64>` -- Hardlink + ATTACH PART (borrowed params), returns count
-- `attach_parts_owned(params) -> Result<u64>` -- Hardlink + ATTACH PART (owned params for tokio::spawn)
-- `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries
+- `attach_parts_owned(params) -> Result<u64>` -- Hardlink + ATTACH PART (owned params for tokio::spawn); handles both local and S3 disk parts
+- `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries; includes `s3_client`, `disk_type_map`, `disk_remote_paths`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming` for Phase 2c
+- `uuid_s3_prefix(uuid) -> String` -- Generate `store/{3char}/{uuid_with_dashes}/` prefix for S3 restore paths
 - `detect_clickhouse_ownership(data_path) -> Result<(Option<u32>, Option<u32>)>` -- UID/GID detection
 - `get_table_data_path(ch, db, table) -> Result<PathBuf>` -- Query data_paths
 - `sort_parts_by_min_block(parts) -> Vec<PartInfo>` -- Sorted copy

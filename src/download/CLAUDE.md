@@ -27,9 +27,18 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
 ### Download Flow
 1. Download manifest: `s3.get_object("{backup_name}/metadata.json")` -> parse `BackupManifest`
 2. Create local directory: `{data_path}/backup/{backup_name}/`
-3. For each table, for each part: download compressed archive, decompress to local
+3. For each table, for each part:
+   - **Local disk parts**: download compressed archive, decompress to local
+   - **S3 disk parts** (Phase 2c): download only metadata files (data objects stay in backup bucket until restore)
 4. Save manifest and per-table metadata locally
 5. Return backup directory path
+
+### S3 Disk Metadata-Only Download (Phase 2c)
+- S3 disk parts are detected via `object_disk::is_s3_disk(disk_type)` combined with `part.s3_objects.is_some()`
+- For S3 disk parts: `is_s3_disk_part` flag is set on `DownloadWorkItem`
+- Flagged parts skip the full compressed archive download; instead only the metadata files describing S3 object locations are downloaded
+- The actual S3 data objects are NOT downloaded -- they remain in the backup bucket and are copied directly to the data bucket during restore via CopyObject
+- This optimization avoids unnecessary data transfer for S3 disk parts (data never leaves S3)
 
 ### URL Encoding
 - `url_encode()` preserves `/` (unlike upload's `url_encode_component`) since it handles full paths

@@ -56,6 +56,9 @@ pub struct S3Object {
 - `delete_object(key) -> Result<()>` -- Delete single object
 - `delete_objects(keys) -> Result<()>` -- Batch delete (groups of 1000 per S3 API limit)
 - `head_object(key) -> Result<Option<u64>>` -- Check existence and get size
+- `copy_object(source_bucket, source_key, dest_key) -> Result<()>` -- Server-side copy with SSE/storage_class (Phase 2c)
+- `copy_object_streaming(source_bucket, source_key, dest_key) -> Result<()>` -- Download+upload fallback for cross-region (Phase 2c)
+- `copy_object_with_retry(source_bucket, source_key, dest_key, allow_streaming) -> Result<()>` -- Retry wrapper with exponential backoff and conditional streaming fallback (Phase 2c)
 - `create_multipart_upload(key) -> Result<String>` -- Initiate multipart upload
 - `upload_part(key, upload_id, part_number, body) -> Result<String>` -- Upload chunk
 - `complete_multipart_upload(key, upload_id, parts) -> Result<()>` -- Finalize multipart
@@ -68,6 +71,12 @@ pub struct S3Object {
 - `complete_multipart_upload(key, upload_id, parts) -> Result<()>` -- Finalize with list of `(part_number, e_tag)` tuples.
 - `abort_multipart_upload(key, upload_id) -> Result<()>` -- Cancel and clean up partial uploads.
 - `calculate_chunk_size(data_len, config_chunk_size, max_parts_count) -> u64` -- Standalone pure function. When `config_chunk_size` is 0, auto-computes from `data_len / max_parts_count`. Enforces 5 MiB minimum (S3 requirement).
+
+### CopyObject API (Phase 2c)
+- `copy_object(source_bucket, source_key, dest_key) -> Result<()>` -- Server-side copy using AWS SDK `CopyObject`. CopySource format: `"{source_bucket}/{source_key}"`. Applies SSE and storage_class settings. Destination key is relative to self's prefix.
+- `copy_object_streaming(source_bucket, source_key, dest_key) -> Result<()>` -- Fallback for cross-region copy failures. Downloads from source via raw AWS SDK client (`self.inner`), then uploads to dest via `self.put_object()`. Higher network cost but works across regions.
+- `copy_object_with_retry(source_bucket, source_key, dest_key, allow_streaming) -> Result<()>` -- Retry wrapper: retries `copy_object()` up to 3 times with exponential backoff (100ms, 400ms, 1600ms). On final failure: if `allow_streaming=true`, falls back to `copy_object_streaming()` with `warn!()` about high network traffic; if `false`, returns the error.
+- Used by upload (Task 6) and restore (Task 8) for S3 disk parts.
 
 ### Error Handling
 - All methods return `anyhow::Result` with `.context()` annotations

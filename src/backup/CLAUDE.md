@@ -31,17 +31,28 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - Hardlinks files from shadow to backup staging; falls back to copy on EXDEV (error code 18)
 - Skips `frozen_metadata.txt` files; identifies parts by presence of `checksums.txt`
 
+### Disk-Aware Shadow Walk (collect.rs, Phase 2c)
+- `collect_parts()` accepts `disk_type_map` and `disk_paths` to walk ALL disk paths, not just `data_path`
+- For each shadow directory, determines the owning disk by matching against `disk_paths`
+- S3 disk detection: uses `object_disk::is_s3_disk(disk_type)` to check if a disk is "s3" or "object_storage"
+- For S3 disk parts: reads metadata files from shadow, calls `object_disk::parse_metadata()` to extract S3 object references, populates `PartInfo.s3_objects: Some(Vec<S3ObjectInfo>)`, skips hardlinking data files
+- For local disk parts: existing hardlink behavior unchanged, `s3_objects: None`
+- `CollectedPart` struct includes `disk_name: String` for proper per-disk grouping in `mod.rs`
+- CRC64 checksum computed from `checksums.txt` for both local and S3 disk parts
+- Part size for S3 disk parts: sum of all `ObjectRef.size` values from parsed metadata
+
 ### CRC64 Checksum (checksum.rs)
 - Uses `crc::Crc::<u64>::new(&crc::CRC_64_XZ)` for ClickHouse-compatible checksums
 - Computes CRC64 of the `checksums.txt` file content for each part
 
 ### Incremental Diff Pattern (diff.rs)
 - `diff_parts(current: &mut BackupManifest, base: &BackupManifest) -> DiffResult`: pure function (no I/O), compares parts by `(table_key, disk_name, part_name, checksum_crc64)`
-- Matching parts (same name + CRC64): `source` set to `"carried:{base_name}"`, `backup_key` copied from base manifest
+- Matching parts (same name + CRC64): `source` set to `"carried:{base_name}"`, `backup_key` copied from base manifest, `s3_objects` carried forward from base (Phase 2c)
 - CRC64 mismatch (same name, different checksum): part stays `source = "uploaded"` (re-uploaded) + `warn!()` log per design doc section 3.5
 - Extra tables in base that are not in current: gracefully ignored
 - `DiffResult` returns counts: `carried`, `uploaded`, `crc_mismatches`
 - Triggered by `--diff-from` flag in `create()`, or by `--diff-from-remote` in `upload()` (reuses same function)
+- **S3 objects carry-forward** (Phase 2c): When a part is carried from the base manifest, `s3_objects` is cloned from the base part so the new manifest remains self-contained for download/restore. For local parts (`s3_objects: None`), cloning is a no-op.
 
 ### Backup Directory Layout
 ```
@@ -56,7 +67,8 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - `diff_parts(current, base) -> DiffResult` -- Incremental comparison of current vs base manifest parts
 - `compute_crc64(path) -> Result<u64>` -- File-level CRC64
 - `compute_crc64_bytes(data) -> u64` -- In-memory CRC64
-- `collect_parts(shadow_path, backup_dir, ...) -> Result<Vec<PartInfo>>` -- Walk and hardlink
+- `collect_parts(data_path, freeze_name, backup_dir, tables, disk_type_map, disk_paths) -> Result<HashMap<String, Vec<CollectedPart>>>` -- Walk all disk shadow directories, detect S3 disk parts, hardlink local parts (Phase 2c updated signature)
+- `CollectedPart` -- Struct with `database`, `table`, `part_info: PartInfo`, `disk_name: String`
 - `freeze_table(ch, db, table, freeze_name) -> Result<()>` -- Issue FREEZE
 - `check_mutations(ch, targets, timeout) -> Result<()>` -- Mutation pre-flight
 - `sync_replicas(ch, tables) -> Result<()>` -- Replica sync pre-flight

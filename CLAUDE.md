@@ -60,6 +60,8 @@ Things that are easy to get wrong when reading the design doc:
 **Phase 0** (skeleton): Complete -- CLI, config, ChClient, S3Client, PidLock, logging, error types.
 **Phase 1** (MVP): Complete -- Single-table backup and restore pipeline (sequential, no parallelism).
 **Phase 2a** (parallelism): Complete -- Parallel operations for all four command pipelines (create, upload, download, restore), multipart S3 upload for large parts, byte-level rate limiting.
+**Phase 2b** (incremental): Complete -- Incremental backups via --diff-from/--diff-from-remote, diff_parts() comparison, create_remote command.
+**Phase 2c** (S3 object disk): Complete -- S3 disk metadata parser (5 format versions), disk-aware shadow walk, CopyObject with retry+streaming fallback, mixed disk upload/download, UUID-isolated S3 restore with same-name optimization.
 
 ## Source Module Map
 
@@ -68,21 +70,22 @@ src/
   main.rs            -- CLI entry point, command dispatch
   lib.rs             -- Module declarations
   cli.rs             -- clap derive CLI definitions
-  concurrency.rs     -- Effective concurrency accessors (upload, download, max_connections)
+  concurrency.rs     -- Effective concurrency accessors (upload, download, max_connections, object_disk_copy)
   config.rs          -- Config loader (~106 params, env overlay)
   error.rs           -- ChBackupError (thiserror)
   lock.rs            -- PidLock (three-tier scope)
   logging.rs         -- tracing init (text/JSON)
-  manifest.rs        -- BackupManifest, TableManifest, PartInfo, DatabaseInfo (serde JSON)
+  manifest.rs        -- BackupManifest, TableManifest, PartInfo, S3ObjectInfo, DatabaseInfo (serde JSON)
+  object_disk.rs     -- ClickHouse S3 object disk metadata parser (5 format versions)
   rate_limiter.rs    -- Token-bucket rate limiter (shared via Arc, 0 = unlimited)
   table_filter.rs    -- Glob pattern matching for -t flag
   list.rs            -- list + delete commands (local dir scan + S3)
-  backup/            -- create command: parallel FREEZE, shadow walk, hardlink, CRC64, UNFREEZE
-  upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart
-  download/          -- download command: parallel S3 GetObject, LZ4+untar decompress
-  restore/           -- restore command: CREATE DB/TABLE, parallel hardlink+ATTACH PART
-  clickhouse/        -- ChClient wrapper (FREEZE/UNFREEZE, DDL, queries)
-  storage/           -- S3Client wrapper (put, get, list, delete, head, multipart)
+  backup/            -- create command: parallel FREEZE, disk-aware shadow walk, hardlink/S3 metadata, CRC64, UNFREEZE
+  upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart, CopyObject for S3 disk parts
+  download/          -- download command: parallel S3 GetObject, LZ4+untar decompress, metadata-only for S3 disk parts
+  restore/           -- restore command: CREATE DB/TABLE, parallel hardlink+ATTACH PART, UUID-isolated S3 CopyObject restore
+  clickhouse/        -- ChClient wrapper (FREEZE/UNFREEZE, DDL, queries, DiskRow with remote_path)
+  storage/           -- S3Client wrapper (put, get, list, delete, head, multipart, copy_object)
 ```
 
 Each directory module has its own `CLAUDE.md` with detailed API and pattern documentation.
@@ -90,10 +93,10 @@ Each directory module has its own `CLAUDE.md` with detailed API and pattern docu
 ## Data Flow
 
 ```
-create:   Config -> ChClient -> FREEZE -> walk shadow -> hardlink -> CRC64 -> UNFREEZE -> BackupManifest -> JSON
-upload:   BackupManifest(JSON) -> read parts -> tar+lz4 compress -> S3Client.put_object -> manifest last
-download: S3Client.get_object(manifest) -> BackupManifest -> S3Client.get_object(parts) -> lz4+untar -> local
-restore:  BackupManifest(JSON) -> CREATE DB/TABLE -> hardlink to detached/ -> ATTACH PART -> chown
+create:   Config -> ChClient -> FREEZE -> walk shadow (all disks) -> hardlink (local) / parse metadata (S3 disk) -> CRC64 -> UNFREEZE -> BackupManifest -> JSON
+upload:   BackupManifest(JSON) -> local parts: tar+lz4 compress -> S3Client.put_object | S3 disk parts: S3Client.copy_object -> manifest last
+download: S3Client.get_object(manifest) -> BackupManifest -> local parts: S3Client.get_object -> lz4+untar | S3 disk parts: metadata only
+restore:  BackupManifest(JSON) -> CREATE DB/TABLE -> local parts: hardlink to detached/ | S3 disk parts: CopyObject to UUID paths + rewrite metadata -> ATTACH PART -> chown
 list:     scan local dirs + S3Client.list -> display
 delete:   rm local dir or S3Client.delete_objects
 ```
@@ -109,12 +112,14 @@ delete:   rm local dir or S3Client.delete_objects
 - **spawn_blocking for sync I/O**: walkdir, tar, lz4 compression/decompression run via `spawn_blocking`
 - **Flat semaphore concurrency**: Each command pipeline uses a single `Arc<Semaphore>` shared across all spawned tasks; effective concurrency resolved from config via `concurrency.rs`
 - **Rate limiting**: Token-bucket `RateLimiter` (shared via `Clone`/`Arc`) gates bytes per second for uploads and downloads; 0 = unlimited
-- **OwnedAttachParams**: Owned variant of `AttachParams` for crossing `tokio::spawn` boundaries (no lifetime constraints)
+- **OwnedAttachParams**: Owned variant of `AttachParams` for crossing `tokio::spawn` boundaries (no lifetime constraints); extended with S3 fields for Phase 2c
+- **Object disk metadata parsing**: `object_disk.rs` parses all 5 ClickHouse metadata format versions (v1-v5) to extract S3 object references from frozen shadow files
+- **Disk-aware routing**: Each command pipeline checks `disk_type_map` to route parts: local disks use hardlink+compress, S3 disks ("s3"/"object_storage") use CopyObject
+- **CopyObject with retry+fallback**: `S3Client.copy_object_with_retry()` retries 3x with exponential backoff; conditional streaming fallback gated by `allow_object_disk_streaming` config
+- **UUID-isolated S3 restore**: Copies S3 objects to `store/{3char}/{uuid_with_dashes}/` paths derived from destination table UUID; same-name optimization skips objects that already exist with matching size
 
 ## Remaining Limitations
 
-- No incremental backups / --diff-from (Phase 2b)
-- No S3 disk support (Phase 2c)
 - No resume (Phase 2d)
 - No Mode A restore / --rm (Phase 4d)
 - No table remap / --as (Phase 4a)
