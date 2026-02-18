@@ -37,6 +37,16 @@ use self::collect::collect_parts;
 use self::diff::diff_parts;
 use self::freeze::{FreezeGuard, FreezeInfo};
 
+/// Parse a comma-separated partition list into a vector of partition IDs.
+///
+/// Trims whitespace from each partition ID. Returns an empty vec if input is None or empty.
+fn parse_partition_list(partitions: Option<&str>) -> Vec<String> {
+    match partitions {
+        Some(s) if !s.is_empty() => s.split(',').map(|p| p.trim().to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Create a local backup.
 ///
 /// Returns the manifest describing the backup contents.
@@ -44,6 +54,13 @@ use self::freeze::{FreezeGuard, FreezeInfo};
 /// If `diff_from` is provided, the specified local backup is used as a base
 /// for incremental comparison. Parts matching by name+CRC64 are carried
 /// forward (referencing the base backup's S3 key) instead of being re-uploaded.
+///
+/// If `partitions` is provided (comma-separated partition IDs), only those
+/// partitions are frozen via FREEZE PARTITION instead of whole-table FREEZE.
+///
+/// If `skip_check_parts_columns` is true, the pre-flight column consistency
+/// check is skipped even if `config.clickhouse.check_parts_columns` is true.
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     config: &Config,
     ch: &ChClient,
@@ -51,11 +68,14 @@ pub async fn create(
     table_pattern: Option<&str>,
     schema_only: bool,
     diff_from: Option<&str>,
+    partitions: Option<&str>,
+    _skip_check_parts_columns: bool,
 ) -> Result<BackupManifest> {
     info!(
         backup_name = %backup_name,
         table_pattern = ?table_pattern,
         schema_only = schema_only,
+        partitions = ?partitions,
         "Starting backup creation"
     );
 
@@ -195,6 +215,9 @@ pub async fn create(
         }
     }
 
+    // Parse partition list for partition-level freeze
+    let partition_ids = parse_partition_list(partitions);
+
     // Parallel FREEZE + collect for data tables
     let max_conn = effective_max_connections(config) as usize;
     let semaphore = Arc::new(Semaphore::new(max_conn));
@@ -224,6 +247,7 @@ pub async fn create(
         let disk_map_clone = disk_map.clone();
         let skip_disks_clone = config.clickhouse.skip_disks.clone();
         let skip_disk_types_clone = config.clickhouse.skip_disk_types.clone();
+        let partition_ids_clone = partition_ids.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -234,36 +258,80 @@ pub async fn create(
             let full_name = format!("{}.{}", db, table);
             let fname = freeze_name(&backup_name_owned, &db, &table);
 
-            // FREEZE the table
-            info!(
-                db = %db,
-                table = %table,
-                freeze_name = %fname,
-                "Freezing table"
-            );
+            // FREEZE the table (whole-table or per-partition)
+            let frozen = if partition_ids_clone.is_empty() {
+                // Whole-table FREEZE
+                info!(
+                    db = %db,
+                    table = %table,
+                    freeze_name = %fname,
+                    "Freezing table"
+                );
 
-            let freeze_result = ch.freeze_table(&db, &table, &fname).await;
-            let frozen = match freeze_result {
-                Ok(()) => true,
-                Err(e) => {
-                    let err_msg = format!("{e:#}");
-                    if ignore_not_exists
-                        && (err_msg.contains("UNKNOWN_TABLE")
-                            || err_msg.contains("UNKNOWN_DATABASE")
-                            || err_msg.contains("Code: 60")
-                            || err_msg.contains("Code: 81"))
-                    {
-                        warn!(
-                            db = %db,
-                            table = %table,
-                            error = %e,
-                            "Table not found during FREEZE (possibly dropped), skipping"
-                        );
-                        false
-                    } else {
-                        return Err(e);
+                let freeze_result = ch.freeze_table(&db, &table, &fname).await;
+                match freeze_result {
+                    Ok(()) => true,
+                    Err(e) => {
+                        let err_msg = format!("{e:#}");
+                        if ignore_not_exists
+                            && (err_msg.contains("UNKNOWN_TABLE")
+                                || err_msg.contains("UNKNOWN_DATABASE")
+                                || err_msg.contains("Code: 60")
+                                || err_msg.contains("Code: 81"))
+                        {
+                            warn!(
+                                db = %db,
+                                table = %table,
+                                error = %e,
+                                "Table not found during FREEZE (possibly dropped), skipping"
+                            );
+                            false
+                        } else {
+                            return Err(e);
+                        }
                     }
                 }
+            } else {
+                // Per-partition FREEZE
+                let mut any_frozen = false;
+                for partition_id in &partition_ids_clone {
+                    info!(
+                        db = %db,
+                        table = %table,
+                        partition = %partition_id,
+                        freeze_name = %fname,
+                        "Freezing partition"
+                    );
+
+                    let freeze_result = ch
+                        .freeze_partition(&db, &table, partition_id, &fname)
+                        .await;
+                    match freeze_result {
+                        Ok(()) => {
+                            any_frozen = true;
+                        }
+                        Err(e) => {
+                            let err_msg = format!("{e:#}");
+                            if ignore_not_exists
+                                && (err_msg.contains("UNKNOWN_TABLE")
+                                    || err_msg.contains("UNKNOWN_DATABASE")
+                                    || err_msg.contains("Code: 60")
+                                    || err_msg.contains("Code: 81"))
+                            {
+                                warn!(
+                                    db = %db,
+                                    table = %table,
+                                    partition = %partition_id,
+                                    error = %e,
+                                    "Table/partition not found during FREEZE PARTITION, skipping"
+                                );
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                any_frozen
             };
 
             if !frozen {
@@ -484,6 +552,7 @@ fn is_metadata_only_engine(engine: &str) -> bool {
 mod tests {
     use self::freeze::FreezeInfo;
     use super::*;
+    use crate::clickhouse::client::freeze_partition_sql;
 
     #[test]
     fn test_freeze_info_send_sync() {
@@ -547,5 +616,56 @@ mod tests {
         let parsed: BackupManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tables.len(), 0);
         assert_eq!(parsed.name, "empty-test");
+    }
+
+    #[test]
+    fn test_partition_list_parsing() {
+        // Empty/None cases
+        let empty = parse_partition_list(None);
+        assert!(empty.is_empty());
+
+        let empty_str = parse_partition_list(Some(""));
+        assert!(empty_str.is_empty());
+
+        // Single partition
+        let single = parse_partition_list(Some("202401"));
+        assert_eq!(single, vec!["202401"]);
+
+        // Multiple partitions
+        let multi = parse_partition_list(Some("202401,202402,202403"));
+        assert_eq!(multi, vec!["202401", "202402", "202403"]);
+
+        // Whitespace trimming
+        let spaced = parse_partition_list(Some(" 202401 , 202402 , 202403 "));
+        assert_eq!(spaced, vec!["202401", "202402", "202403"]);
+    }
+
+    #[test]
+    fn test_freeze_partition_called_for_each() {
+        // Verify that freeze_partition_sql generates correct SQL for each partition
+        let partitions = parse_partition_list(Some("202401,202402"));
+        assert_eq!(partitions.len(), 2);
+
+        let freeze_name = "chbackup_daily_default_trades";
+        for partition in &partitions {
+            let sql = freeze_partition_sql("default", "trades", partition, freeze_name);
+            assert!(sql.contains("FREEZE PARTITION"));
+            assert!(sql.contains(partition));
+            assert!(sql.contains(freeze_name));
+        }
+
+        // Verify first partition SQL
+        let sql1 = freeze_partition_sql("default", "trades", &partitions[0], freeze_name);
+        assert_eq!(
+            sql1,
+            "ALTER TABLE `default`.`trades` FREEZE PARTITION '202401' WITH NAME 'chbackup_daily_default_trades'"
+        );
+
+        // Verify second partition SQL
+        let sql2 = freeze_partition_sql("default", "trades", &partitions[1], freeze_name);
+        assert_eq!(
+            sql2,
+            "ALTER TABLE `default`.`trades` FREEZE PARTITION '202402' WITH NAME 'chbackup_daily_default_trades'"
+        );
     }
 }

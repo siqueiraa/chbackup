@@ -128,9 +128,6 @@ async fn main() -> Result<()> {
             backup_name,
         } => {
             // Warn about Phase 2+ flags that are not yet implemented
-            if partitions.is_some() {
-                warn!("--partitions flag is not yet implemented, ignoring");
-            }
             if skip_projections.is_some() {
                 warn!("--skip-projections flag is not yet implemented, ignoring");
             }
@@ -142,9 +139,6 @@ async fn main() -> Result<()> {
             }
             if named_collections {
                 warn!("--named-collections flag is not yet implemented, ignoring");
-            }
-            if skip_check_parts_columns {
-                warn!("--skip-check-parts-columns flag is not yet implemented, ignoring");
             }
             if resume {
                 warn!("--resume flag is not yet implemented, ignoring");
@@ -160,6 +154,8 @@ async fn main() -> Result<()> {
                 tables.as_deref(),
                 schema,
                 diff_from.as_deref(),
+                partitions.as_deref(),
+                skip_check_parts_columns,
             )
             .await?;
 
@@ -301,9 +297,6 @@ async fn main() -> Result<()> {
             if named_collections {
                 warn!("--named-collections flag is not yet implemented, ignoring");
             }
-            if skip_check_parts_columns {
-                warn!("--skip-check-parts-columns flag is not yet implemented, ignoring");
-            }
             if skip_projections.is_some() {
                 warn!("--skip-projections flag is not yet implemented, ignoring");
             }
@@ -323,6 +316,8 @@ async fn main() -> Result<()> {
                 tables.as_deref(),
                 false, // schema_only
                 None,  // diff_from (create_remote uses diff_from_remote on upload side)
+                None,  // partitions (create_remote doesn't support --partitions)
+                skip_check_parts_columns,
             )
             .await?;
 
