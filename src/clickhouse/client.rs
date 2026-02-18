@@ -399,6 +399,42 @@ impl ChClient {
         self.log_and_execute(ddl, "DDL").await
     }
 
+    // -- Integration tables (Phase 3a) --
+
+    /// Create the `system.backup_list` and `system.backup_actions` URL engine
+    /// integration tables in ClickHouse.
+    ///
+    /// These allow `SELECT * FROM system.backup_list` and
+    /// `INSERT INTO system.backup_actions(command) VALUES ('create_remote daily')`.
+    pub async fn create_integration_tables(&self, api_host: &str, api_port: &str) -> Result<()> {
+        let (list_ddl, actions_ddl) = integration_table_ddl(api_host, api_port);
+
+        self.execute_ddl(&list_ddl)
+            .await
+            .context("Failed to create system.backup_list integration table")?;
+
+        self.execute_ddl(&actions_ddl)
+            .await
+            .context("Failed to create system.backup_actions integration table")?;
+
+        info!("Created integration tables: system.backup_list, system.backup_actions");
+        Ok(())
+    }
+
+    /// Drop the `system.backup_list` and `system.backup_actions` integration tables.
+    pub async fn drop_integration_tables(&self) -> Result<()> {
+        self.execute_ddl("DROP TABLE IF EXISTS system.backup_list")
+            .await
+            .context("Failed to drop system.backup_list")?;
+
+        self.execute_ddl("DROP TABLE IF EXISTS system.backup_actions")
+            .await
+            .context("Failed to drop system.backup_actions")?;
+
+        info!("Dropped integration tables: system.backup_list, system.backup_actions");
+        Ok(())
+    }
+
     /// Check if a database exists.
     pub async fn database_exists(&self, db: &str) -> Result<bool> {
         #[derive(clickhouse::Row, serde::Deserialize)]
@@ -629,6 +665,41 @@ pub fn freeze_partition_sql(db: &str, table: &str, partition: &str, freeze_name:
         "ALTER TABLE `{}`.`{}` FREEZE PARTITION '{}' WITH NAME '{}'",
         db, table, partition, freeze_name
     )
+}
+
+/// Generate the DDL statements for the integration tables.
+///
+/// Returns (backup_list_ddl, backup_actions_ddl) matching the design doc section 9.1.
+pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String) {
+    let list_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS system.backup_list (\
+         name String, \
+         created DateTime, \
+         location String, \
+         size UInt64, \
+         data_size UInt64, \
+         object_disk_size UInt64, \
+         metadata_size UInt64, \
+         rbac_size UInt64, \
+         config_size UInt64, \
+         compressed_size UInt64, \
+         required String\
+         ) ENGINE = URL('http://{}:{}/api/v1/list', 'JSONEachRow')",
+        api_host, api_port
+    );
+
+    let actions_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS system.backup_actions (\
+         command String, \
+         start String, \
+         finish String, \
+         status String, \
+         error String\
+         ) ENGINE = URL('http://{}:{}/api/v1/actions', 'JSONEachRow')",
+        api_host, api_port
+    );
+
+    (list_ddl, actions_ddl)
 }
 
 #[cfg(test)]
@@ -941,5 +1012,44 @@ mod tests {
         };
         assert_eq!(disk.name, "default");
         assert_eq!(disk.free_space, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_integration_table_ddl_generation() {
+        let (list_ddl, actions_ddl) = integration_table_ddl("localhost", "7171");
+
+        // Verify backup_list DDL
+        assert!(list_ddl.contains("CREATE TABLE IF NOT EXISTS system.backup_list"));
+        assert!(list_ddl.contains("name String"));
+        assert!(list_ddl.contains("created DateTime"));
+        assert!(list_ddl.contains("location String"));
+        assert!(list_ddl.contains("size UInt64"));
+        assert!(list_ddl.contains("data_size UInt64"));
+        assert!(list_ddl.contains("object_disk_size UInt64"));
+        assert!(list_ddl.contains("metadata_size UInt64"));
+        assert!(list_ddl.contains("rbac_size UInt64"));
+        assert!(list_ddl.contains("config_size UInt64"));
+        assert!(list_ddl.contains("compressed_size UInt64"));
+        assert!(list_ddl.contains("required String"));
+        assert!(
+            list_ddl.contains("ENGINE = URL('http://localhost:7171/api/v1/list', 'JSONEachRow')")
+        );
+
+        // Verify backup_actions DDL
+        assert!(actions_ddl.contains("CREATE TABLE IF NOT EXISTS system.backup_actions"));
+        assert!(actions_ddl.contains("command String"));
+        assert!(actions_ddl.contains("start String"));
+        assert!(actions_ddl.contains("finish String"));
+        assert!(actions_ddl.contains("status String"));
+        assert!(actions_ddl.contains("error String"));
+        assert!(actions_ddl
+            .contains("ENGINE = URL('http://localhost:7171/api/v1/actions', 'JSONEachRow')"));
+    }
+
+    #[test]
+    fn test_integration_table_ddl_custom_host_port() {
+        let (list_ddl, actions_ddl) = integration_table_ddl("backup-server", "8080");
+        assert!(list_ddl.contains("http://backup-server:8080/api/v1/list"));
+        assert!(actions_ddl.contains("http://backup-server:8080/api/v1/actions"));
     }
 }

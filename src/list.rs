@@ -21,7 +21,7 @@ pub enum Location {
 }
 
 /// Summary of a single backup for display in list output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BackupSummary {
     /// Backup name.
     pub name: String,
