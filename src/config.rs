@@ -901,6 +901,14 @@ impl Config {
         if let Ok(v) = std::env::var("API_LISTEN") {
             self.api.listen = v;
         }
+
+        // Watch
+        if let Ok(v) = std::env::var("WATCH_INTERVAL") {
+            self.watch.watch_interval = v;
+        }
+        if let Ok(v) = std::env::var("FULL_INTERVAL") {
+            self.watch.full_interval = v;
+        }
     }
 
     /// Apply CLI --env KEY=VALUE overrides. These take priority over env vars.

@@ -26,6 +26,8 @@ fn clear_config_env_vars() {
     std::env::remove_var("CHBACKUP_LOG_LEVEL");
     std::env::remove_var("CHBACKUP_LOG_FORMAT");
     std::env::remove_var("API_LISTEN");
+    std::env::remove_var("WATCH_INTERVAL");
+    std::env::remove_var("FULL_INTERVAL");
 }
 
 #[test]
@@ -160,6 +162,32 @@ clickhouse:
     assert_eq!(config.clickhouse.port, 9999);
 
     // Clean up
+    clear_config_env_vars();
+}
+
+#[test]
+fn test_watch_env_overlay() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_config_env_vars();
+
+    // Set watch env vars
+    std::env::set_var("WATCH_INTERVAL", "30m");
+    std::env::set_var("FULL_INTERVAL", "12h");
+
+    let yaml = r#"
+watch:
+  enabled: false
+"#;
+
+    let mut tmpfile = NamedTempFile::new().expect("create temp file");
+    tmpfile.write_all(yaml.as_bytes()).expect("write yaml");
+
+    let config = Config::load(tmpfile.path(), &[]).expect("Config::load should succeed");
+
+    // Env vars should override defaults
+    assert_eq!(config.watch.watch_interval, "30m");
+    assert_eq!(config.watch.full_interval, "12h");
+
     clear_config_env_vars();
 }
 
