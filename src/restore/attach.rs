@@ -989,10 +989,7 @@ mod tests {
 
         // Verify OwnedAttachParams supports resume fields
         let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
-        let already = HashSet::from([
-            "202401_1_50_3".to_string(),
-            "202401_51_100_3".to_string(),
-        ]);
+        let already = HashSet::from(["202401_1_50_3".to_string(), "202401_51_100_3".to_string()]);
         let params = OwnedAttachParams {
             ch,
             db: "default".to_string(),
@@ -1045,12 +1042,7 @@ mod tests {
 
             assert_eq!(guard.0.attached_parts.len(), 1);
             assert_eq!(
-                guard
-                    .0
-                    .attached_parts
-                    .get("default.trades")
-                    .unwrap()
-                    .len(),
+                guard.0.attached_parts.get("default.trades").unwrap().len(),
                 1
             );
         });

@@ -805,7 +805,10 @@ mod tests {
         };
         // Should succeed even with TLS config
         let client = ChClient::new(&config);
-        assert!(client.is_ok(), "ChClient::new should succeed with TLS config");
+        assert!(
+            client.is_ok(),
+            "ChClient::new should succeed with TLS config"
+        );
     }
 
     #[test]

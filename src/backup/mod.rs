@@ -340,9 +340,8 @@ pub async fn create(
                         "Freezing partition"
                     );
 
-                    let freeze_result = ch
-                        .freeze_partition(&db, &table, partition_id, &fname)
-                        .await;
+                    let freeze_result =
+                        ch.freeze_partition(&db, &table, partition_id, &fname).await;
                     match freeze_result {
                         Ok(()) => {
                             any_frozen = true;
@@ -602,9 +601,7 @@ fn is_benign_type(type_str: &str) -> bool {
 /// are benign drift types (Enum, Tuple, Nullable, etc.).
 ///
 /// Returns only inconsistencies that contain at least one non-benign type.
-fn filter_benign_type_drift(
-    inconsistencies: Vec<ColumnInconsistency>,
-) -> Vec<ColumnInconsistency> {
+fn filter_benign_type_drift(inconsistencies: Vec<ColumnInconsistency>) -> Vec<ColumnInconsistency> {
     inconsistencies
         .into_iter()
         .filter(|inc| !inc.types.iter().all(|t| is_benign_type(t)))

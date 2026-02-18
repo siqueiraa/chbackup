@@ -290,7 +290,10 @@ pub async fn download(
             backup_name: backup_name.to_string(),
             params_hash: current_params_hash,
         };
-        Some(Arc::new(tokio::sync::Mutex::new((state, state_path.clone()))))
+        Some(Arc::new(tokio::sync::Mutex::new((
+            state,
+            state_path.clone(),
+        ))))
     } else {
         None
     };
@@ -419,7 +422,11 @@ pub async fn download(
                 let backup_key = item.part.backup_key.clone();
 
                 let mut last_error: Option<anyhow::Error> = None;
-                let max_attempts = if expected_crc != 0 { retries_on_failure + 1 } else { 1 };
+                let max_attempts = if expected_crc != 0 {
+                    retries_on_failure + 1
+                } else {
+                    1
+                };
 
                 for attempt in 0..max_attempts {
                     if attempt > 0 {
@@ -431,15 +438,12 @@ pub async fn download(
                         );
                     }
 
-                    let compressed_data =
-                        s3.get_object(&backup_key)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "Failed to download part {} for table {}",
-                                    part_name, item.table_key
-                                )
-                            })?;
+                    let compressed_data = s3.get_object(&backup_key).await.with_context(|| {
+                        format!(
+                            "Failed to download part {} for table {}",
+                            part_name, item.table_key
+                        )
+                    })?;
 
                     let compressed_size = compressed_data.len() as u64;
 
@@ -520,10 +524,7 @@ pub async fn download(
                         save_state_graceful(&guard.1, &guard.0);
                     }
 
-                    return Ok::<(String, u64), anyhow::Error>((
-                        item.table_key,
-                        compressed_size,
-                    ));
+                    return Ok::<(String, u64), anyhow::Error>((item.table_key, compressed_size));
                 }
 
                 // All retries exhausted
@@ -782,9 +783,8 @@ mod tests {
     #[test]
     fn test_download_skips_completed_parts() {
         // Verify that completed_keys causes parts to be skipped
-        let completed_keys: HashSet<String> = HashSet::from([
-            "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string(),
-        ]);
+        let completed_keys: HashSet<String> =
+            HashSet::from(["daily/data/default/trades/202401_1_50_3.tar.lz4".to_string()]);
 
         let backup_key = "daily/data/default/trades/202401_1_50_3.tar.lz4";
         assert!(completed_keys.contains(backup_key));

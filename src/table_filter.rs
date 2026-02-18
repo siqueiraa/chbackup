@@ -207,9 +207,24 @@ mod tests {
         let skip_disks = vec!["cache_disk".to_string(), "tmp_disk".to_string()];
         let skip_types: Vec<String> = Vec::new();
 
-        assert!(is_disk_excluded("cache_disk", "local", &skip_disks, &skip_types));
-        assert!(is_disk_excluded("tmp_disk", "local", &skip_disks, &skip_types));
-        assert!(!is_disk_excluded("default", "local", &skip_disks, &skip_types));
+        assert!(is_disk_excluded(
+            "cache_disk",
+            "local",
+            &skip_disks,
+            &skip_types
+        ));
+        assert!(is_disk_excluded(
+            "tmp_disk",
+            "local",
+            &skip_disks,
+            &skip_types
+        ));
+        assert!(!is_disk_excluded(
+            "default",
+            "local",
+            &skip_disks,
+            &skip_types
+        ));
         assert!(!is_disk_excluded("s3disk", "s3", &skip_disks, &skip_types));
     }
 
@@ -219,8 +234,18 @@ mod tests {
         let skip_types = vec!["cache".to_string(), "memory".to_string()];
 
         assert!(is_disk_excluded("disk1", "cache", &skip_disks, &skip_types));
-        assert!(is_disk_excluded("disk2", "memory", &skip_disks, &skip_types));
-        assert!(!is_disk_excluded("default", "local", &skip_disks, &skip_types));
+        assert!(is_disk_excluded(
+            "disk2",
+            "memory",
+            &skip_disks,
+            &skip_types
+        ));
+        assert!(!is_disk_excluded(
+            "default",
+            "local",
+            &skip_disks,
+            &skip_types
+        ));
         assert!(!is_disk_excluded("s3disk", "s3", &skip_disks, &skip_types));
     }
 
@@ -230,9 +255,19 @@ mod tests {
         let skip_types: Vec<String> = Vec::new();
 
         // Nothing should be excluded when both lists are empty
-        assert!(!is_disk_excluded("default", "local", &skip_disks, &skip_types));
+        assert!(!is_disk_excluded(
+            "default",
+            "local",
+            &skip_disks,
+            &skip_types
+        ));
         assert!(!is_disk_excluded("s3disk", "s3", &skip_disks, &skip_types));
-        assert!(!is_disk_excluded("cache_disk", "cache", &skip_disks, &skip_types));
+        assert!(!is_disk_excluded(
+            "cache_disk",
+            "cache",
+            &skip_disks,
+            &skip_types
+        ));
     }
 
     #[test]
@@ -241,12 +276,32 @@ mod tests {
         let skip_types = vec!["cache".to_string()];
 
         // Should be excluded if either name or type matches
-        assert!(is_disk_excluded("cache_disk", "cache", &skip_disks, &skip_types));
+        assert!(is_disk_excluded(
+            "cache_disk",
+            "cache",
+            &skip_disks,
+            &skip_types
+        ));
         // Name match alone
-        assert!(is_disk_excluded("cache_disk", "local", &skip_disks, &skip_types));
+        assert!(is_disk_excluded(
+            "cache_disk",
+            "local",
+            &skip_disks,
+            &skip_types
+        ));
         // Type match alone
-        assert!(is_disk_excluded("other_disk", "cache", &skip_disks, &skip_types));
+        assert!(is_disk_excluded(
+            "other_disk",
+            "cache",
+            &skip_disks,
+            &skip_types
+        ));
         // Neither matches
-        assert!(!is_disk_excluded("default", "local", &skip_disks, &skip_types));
+        assert!(!is_disk_excluded(
+            "default",
+            "local",
+            &skip_disks,
+            &skip_types
+        ));
     }
 }

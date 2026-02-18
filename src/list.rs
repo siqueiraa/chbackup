@@ -353,11 +353,7 @@ pub async fn clean_broken_remote(s3: &S3Client) -> Result<usize> {
 }
 
 /// Clean broken backups by location (local or remote).
-pub async fn clean_broken(
-    data_path: &str,
-    s3: &S3Client,
-    location: &Location,
-) -> Result<()> {
+pub async fn clean_broken(data_path: &str, s3: &S3Client, location: &Location) -> Result<()> {
     match location {
         Location::Local => {
             let count = clean_broken_local(data_path)?;

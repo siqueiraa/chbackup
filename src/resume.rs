@@ -193,10 +193,7 @@ mod tests {
         let mut attached_parts = HashMap::new();
         attached_parts.insert(
             "default.trades".to_string(),
-            vec![
-                "202401_1_50_3".to_string(),
-                "202402_1_1_0".to_string(),
-            ],
+            vec!["202401_1_50_3".to_string(), "202402_1_1_0".to_string()],
         );
 
         let state = RestoreState {

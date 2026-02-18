@@ -231,10 +231,7 @@ pub async fn upload(
     // 1c. Load resume state if --resume and use_resumable_state
     let use_resume = resume && config.general.use_resumable_state;
     let state_path = backup_dir.join("upload.state.json");
-    let current_params_hash = compute_params_hash(&[
-        backup_name,
-        diff_from_remote.unwrap_or(""),
-    ]);
+    let current_params_hash = compute_params_hash(&[backup_name, diff_from_remote.unwrap_or("")]);
 
     let completed_keys: HashSet<String> = if use_resume {
         match load_state_file::<UploadState>(&state_path) {
@@ -245,9 +242,7 @@ pub async fn upload(
                     );
                     HashSet::new()
                 } else if state.backup_name != backup_name {
-                    warn!(
-                        "Upload state backup_name mismatch, ignoring"
-                    );
+                    warn!("Upload state backup_name mismatch, ignoring");
                     HashSet::new()
                 } else {
                     let count = state.completed_keys.len();
@@ -447,7 +442,10 @@ pub async fn upload(
             backup_name: backup_name.to_string(),
             params_hash: current_params_hash.clone(),
         };
-        Some(Arc::new(tokio::sync::Mutex::new((state, state_path.clone()))))
+        Some(Arc::new(tokio::sync::Mutex::new((
+            state,
+            state_path.clone(),
+        ))))
     } else {
         None
     };
@@ -1214,9 +1212,8 @@ mod tests {
     #[test]
     fn test_upload_skips_completed_parts() {
         // Verify that completed_keys causes parts to be skipped in work queue
-        let completed_keys: HashSet<String> = HashSet::from([
-            "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string(),
-        ]);
+        let completed_keys: HashSet<String> =
+            HashSet::from(["daily/data/default/trades/202401_1_50_3.tar.lz4".to_string()]);
 
         let s3_key = s3_key_for_part("daily", "default", "trades", "202401_1_50_3");
         assert!(completed_keys.contains(&s3_key));

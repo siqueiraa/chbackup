@@ -147,10 +147,7 @@ pub async fn restore(
                     "Loaded restore resume state"
                 );
                 for (table_key, parts) in state.attached_parts {
-                    already_attached
-                        .entry(table_key)
-                        .or_default()
-                        .extend(parts);
+                    already_attached.entry(table_key).or_default().extend(parts);
                 }
             } else {
                 warn!(
@@ -309,10 +306,7 @@ pub async fn restore(
         );
 
         // Get already-attached parts for this table (from resume state)
-        let table_already_attached = already_attached
-            .get(table_key)
-            .cloned()
-            .unwrap_or_default();
+        let table_already_attached = already_attached.get(table_key).cloned().unwrap_or_default();
 
         restore_items.push((
             table_key.clone(),
@@ -480,10 +474,7 @@ mod tests {
             attached_parts: HashMap::from([
                 (
                     "default.trades".to_string(),
-                    vec![
-                        "202401_1_50_3".to_string(),
-                        "202401_51_100_3".to_string(),
-                    ],
+                    vec!["202401_1_50_3".to_string(), "202401_51_100_3".to_string()],
                 ),
                 (
                     "default.orders".to_string(),
@@ -507,10 +498,7 @@ mod tests {
         // Simulate merge with system.parts (adding new parts)
         let mut already_attached: HashMap<String, HashSet<String>> = HashMap::new();
         for (table_key, parts) in loaded.attached_parts {
-            already_attached
-                .entry(table_key)
-                .or_default()
-                .extend(parts);
+            already_attached.entry(table_key).or_default().extend(parts);
         }
 
         // Simulated system.parts returns additional parts

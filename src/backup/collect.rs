@@ -154,7 +154,10 @@ pub fn collect_parts(
 
     for (disk_name, disk_path) in &paths_to_walk {
         // Skip disks that are excluded by name or type
-        let disk_type = disk_type_map.get(disk_name).map(|s| s.as_str()).unwrap_or("");
+        let disk_type = disk_type_map
+            .get(disk_name)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         if is_disk_excluded(disk_name, disk_type, skip_disks, skip_disk_types) {
             info!(
                 disk = %disk_name,
