@@ -81,7 +81,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/watch/start", post(routes::watch_start_stub))
         .route("/api/v1/watch/stop", post(routes::watch_stop_stub))
         .route("/api/v1/watch/status", get(routes::watch_status_stub))
-        .route("/metrics", get(routes::metrics_stub));
+        .route("/metrics", get(routes::metrics));
 
     // Conditionally apply auth middleware
     let has_auth = !state.config.api.username.is_empty() && !state.config.api.password.is_empty();

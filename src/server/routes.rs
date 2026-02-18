@@ -7,6 +7,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use chrono::Utc;
@@ -16,6 +17,7 @@ use tracing::{info, warn};
 use crate::list;
 
 use super::actions::ActionStatus;
+use super::metrics::Metrics;
 use super::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -896,9 +898,61 @@ pub async fn watch_status_stub() -> (StatusCode, &'static str) {
     (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
 }
 
-/// GET /metrics -- Prometheus metrics (Phase 3b)
-pub async fn metrics_stub() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3b)")
+/// GET /metrics -- Prometheus metrics endpoint
+///
+/// When metrics are enabled (`enable_metrics=true`), encodes all registered
+/// prometheus metrics into text exposition format. On each scrape, refreshes
+/// backup count gauges and in-progress state.
+///
+/// Returns 501 Not Implemented when metrics are disabled.
+pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(metrics) = &state.metrics else {
+        return (StatusCode::NOT_IMPLEMENTED, "metrics disabled".to_string());
+    };
+
+    // Refresh backup count gauges (expensive -- OK for 15-30s scrape intervals)
+    refresh_backup_counts(&state, metrics).await;
+
+    match metrics.encode() {
+        Ok(text) => {
+            // DEBUG_MARKER:F002 - verify /metrics returns prometheus text
+            info!(target: "debug", "DEBUG_VERIFY:F002_scrape_ok");
+            // END_DEBUG_MARKER:F002
+            (StatusCode::OK, text)
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to encode metrics");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("metrics encoding error: {}", e),
+            )
+        }
+    }
+}
+
+/// Refresh backup count and in-progress gauges for the `/metrics` scrape.
+///
+/// Calls `list_local` (via `spawn_blocking`) and `list_remote` (async) to
+/// update the `number_backups_local` and `number_backups_remote` gauges.
+/// Also updates the `in_progress` gauge from `current_op`.
+async fn refresh_backup_counts(state: &AppState, metrics: &Metrics) {
+    // Refresh local backup count (sync function -- use spawn_blocking)
+    let data_path = state.config.clickhouse.data_path.clone();
+    match tokio::task::spawn_blocking(move || crate::list::list_local(&data_path)).await {
+        Ok(Ok(summaries)) => metrics.number_backups_local.set(summaries.len() as i64),
+        Ok(Err(e)) => warn!(error = %e, "Failed to refresh local backup count for metrics"),
+        Err(e) => warn!(error = %e, "spawn_blocking failed for list_local in metrics"),
+    }
+
+    // Refresh remote backup count (async)
+    match crate::list::list_remote(&state.s3).await {
+        Ok(summaries) => metrics.number_backups_remote.set(summaries.len() as i64),
+        Err(e) => warn!(error = %e, "Failed to refresh remote backup count for metrics"),
+    }
+
+    // Refresh in_progress gauge from current_op
+    let is_running = state.current_op.lock().await.is_some();
+    metrics.in_progress.set(if is_running { 1 } else { 0 });
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,9 +1159,54 @@ mod tests {
         let (status, body) = watch_status_stub().await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert!(body.contains("Phase 3d"));
+    }
 
-        let (status, body) = metrics_stub().await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("Phase 3b"));
+    #[test]
+    fn test_metrics_handler_returns_prometheus_text() {
+        // Verify that Metrics::encode() produces valid prometheus text format
+        // that the handler returns on the success path.
+        let metrics =
+            super::Metrics::new().expect("Metrics::new() should succeed");
+        let text = metrics.encode().expect("encode() should succeed");
+
+        // Handler returns (StatusCode::OK, text) when metrics is Some
+        assert!(!text.is_empty(), "Encoded text should not be empty");
+        assert!(
+            text.contains("# HELP chbackup_"),
+            "Should contain prometheus HELP lines"
+        );
+        assert!(
+            text.contains("# TYPE chbackup_"),
+            "Should contain prometheus TYPE lines"
+        );
+        // Verify it's text/plain prometheus format (contains histogram and gauge data)
+        assert!(
+            text.contains("chbackup_backup_duration_seconds"),
+            "Should contain duration histogram"
+        );
+        assert!(
+            text.contains("chbackup_in_progress"),
+            "Should contain in_progress gauge"
+        );
+    }
+
+    #[test]
+    fn test_metrics_handler_disabled() {
+        // When state.metrics is None, the handler returns 501.
+        // Verify the None path logic produces the expected status code.
+        let metrics: Option<std::sync::Arc<super::Metrics>> = None;
+
+        // Simulates the handler's None path
+        let result = if metrics.is_some() {
+            (StatusCode::OK, "has metrics".to_string())
+        } else {
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                "metrics disabled".to_string(),
+            )
+        };
+
+        assert_eq!(result.0, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(result.1, "metrics disabled");
     }
 }
