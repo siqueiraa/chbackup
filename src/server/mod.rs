@@ -16,7 +16,9 @@ pub mod metrics;
 pub mod routes;
 pub mod state;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -28,6 +30,7 @@ use tracing::{info, warn};
 use crate::clickhouse::ChClient;
 use crate::config::Config;
 use crate::storage::S3Client;
+use crate::watch;
 
 use self::state::AppState;
 
@@ -104,10 +107,108 @@ pub fn build_router(state: AppState) -> Router {
 /// Creates `AppState`, builds the router, optionally creates integration tables,
 /// runs auto-resume, then listens on the configured address.
 ///
+/// When `watch` is true, spawns the watch loop as a background task alongside
+/// the HTTP server. The watch loop is also started if `config.watch.enabled` is set.
+///
 /// Graceful shutdown is triggered by Ctrl+C (SIGINT). On shutdown, integration
-/// tables are dropped if they were created.
-pub async fn start_server(config: Arc<Config>, ch: ChClient, s3: S3Client) -> Result<()> {
-    let state = AppState::new(config.clone(), ch.clone(), s3);
+/// tables are dropped if they were created, and the watch loop is signaled to stop.
+pub async fn start_server(
+    config: Arc<Config>,
+    ch: ChClient,
+    s3: S3Client,
+    watch: bool,
+    config_path: PathBuf,
+) -> Result<()> {
+    let mut state = AppState::new(config.clone(), ch.clone(), s3.clone());
+
+    // Determine if watch should be enabled (CLI flag or config)
+    let watch_enabled = watch || config.watch.enabled;
+
+    // Set up watch loop channels and spawn if enabled
+    let watch_shutdown_tx = if watch_enabled {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+
+        // Store senders in AppState for API endpoint access
+        state.watch_shutdown_tx = Some(shutdown_tx.clone());
+        state.watch_reload_tx = Some(reload_tx.clone());
+
+        // Query macros from ClickHouse for template resolution
+        let macros = ch.get_macros().await.unwrap_or_default();
+        if !macros.is_empty() {
+            info!(macros = ?macros, "Resolved ClickHouse macros for watch templates");
+        }
+
+        let watch_status = state.watch_status.clone();
+        let watch_metrics = state.metrics.clone();
+
+        // Mark watch as active
+        {
+            let mut ws = watch_status.lock().await;
+            ws.active = true;
+            ws.state = "idle".to_string();
+        }
+
+        let ctx = watch::WatchContext {
+            config: config.clone(),
+            ch: ch.clone(),
+            s3: s3.clone(),
+            metrics: watch_metrics,
+            state: watch::WatchState::Idle,
+            consecutive_errors: 0,
+            force_next_full: false,
+            last_backup_name: None,
+            shutdown_rx,
+            reload_rx,
+            config_path: config_path.clone(),
+            macros,
+        };
+
+        let watch_status_clone = watch_status.clone();
+        tokio::spawn(async move {
+            let exit = watch::run_watch_loop(ctx).await;
+            // Mark watch as inactive on exit
+            let mut ws = watch_status_clone.lock().await;
+            ws.active = false;
+            ws.state = "inactive".to_string();
+
+            match exit {
+                watch::WatchLoopExit::Shutdown => {
+                    info!("Watch loop stopped by shutdown signal");
+                }
+                watch::WatchLoopExit::MaxErrors => {
+                    warn!("Watch loop aborted: max consecutive errors reached");
+                }
+                watch::WatchLoopExit::Stopped => {
+                    info!("Watch loop stopped via API");
+                }
+            }
+        });
+
+        // Spawn SIGHUP handler for config reload (Unix only)
+        #[cfg(unix)]
+        {
+            let reload_tx_clone = reload_tx.clone();
+            tokio::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sighup =
+                    signal(SignalKind::hangup()).expect("failed to register SIGHUP handler");
+                loop {
+                    sighup.recv().await;
+                    info!("SIGHUP received, triggering config reload");
+                    reload_tx_clone.send(true).ok();
+                }
+            });
+        }
+
+        info!("Watch loop started");
+
+        // Keep a reference so we can send shutdown on server exit
+        Some(shutdown_tx)
+    } else {
+        None
+    };
+
     let router = build_router(state.clone());
 
     // Parse listen address
@@ -153,9 +254,13 @@ pub async fn start_server(config: Arc<Config>, ch: ChClient, s3: S3Client) -> Re
         // Spawn shutdown signal handler
         let ch_shutdown = ch.clone();
         let created_tables_shutdown = created_tables;
+        let watch_shutdown_tx_clone = watch_shutdown_tx.clone();
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.ok();
             info!("Shutdown signal received");
+            if let Some(tx) = watch_shutdown_tx_clone {
+                tx.send(true).ok();
+            }
             if created_tables_shutdown {
                 if let Err(e) = ch_shutdown.drop_integration_tables().await {
                     warn!(error = %e, "Failed to drop integration tables during shutdown");
@@ -178,11 +283,15 @@ pub async fn start_server(config: Arc<Config>, ch: ChClient, s3: S3Client) -> Re
 
         let ch_shutdown = ch.clone();
         let created_tables_shutdown = created_tables;
+        let watch_shutdown_tx_clone = watch_shutdown_tx.clone();
 
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
                 tokio::signal::ctrl_c().await.ok();
                 info!("Shutdown signal received");
+                if let Some(tx) = watch_shutdown_tx_clone {
+                    tx.send(true).ok();
+                }
                 if created_tables_shutdown {
                     if let Err(e) = ch_shutdown.drop_integration_tables().await {
                         warn!(error = %e, "Failed to drop integration tables during shutdown");
@@ -195,6 +304,64 @@ pub async fn start_server(config: Arc<Config>, ch: ChClient, s3: S3Client) -> Re
 
     info!("Server stopped");
     Ok(())
+}
+
+/// Spawn a watch loop from API state (for the watch/start endpoint).
+///
+/// Creates new channels and a WatchContext, spawns the loop, and stores
+/// the shutdown/reload senders in AppState.
+pub async fn spawn_watch_from_state(
+    state: &mut AppState,
+    config_path: PathBuf,
+    macros: HashMap<String, String>,
+) {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+
+    state.watch_shutdown_tx = Some(shutdown_tx);
+    state.watch_reload_tx = Some(reload_tx);
+
+    let watch_status = state.watch_status.clone();
+    {
+        let mut ws = watch_status.lock().await;
+        ws.active = true;
+        ws.state = "idle".to_string();
+    }
+
+    let ctx = watch::WatchContext {
+        config: state.config.clone(),
+        ch: state.ch.clone(),
+        s3: state.s3.clone(),
+        metrics: state.metrics.clone(),
+        state: watch::WatchState::Idle,
+        consecutive_errors: 0,
+        force_next_full: false,
+        last_backup_name: None,
+        shutdown_rx,
+        reload_rx,
+        config_path,
+        macros,
+    };
+
+    let watch_status_clone = watch_status;
+    tokio::spawn(async move {
+        let exit = watch::run_watch_loop(ctx).await;
+        let mut ws = watch_status_clone.lock().await;
+        ws.active = false;
+        ws.state = "inactive".to_string();
+
+        match exit {
+            watch::WatchLoopExit::Shutdown => {
+                info!("Watch loop stopped by shutdown signal");
+            }
+            watch::WatchLoopExit::MaxErrors => {
+                warn!("Watch loop aborted: max consecutive errors reached");
+            }
+            watch::WatchLoopExit::Stopped => {
+                info!("Watch loop stopped via API");
+            }
+        }
+    });
 }
 
 /// Parse the host and port for integration table URLs.
