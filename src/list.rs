@@ -4,6 +4,7 @@
 //! produce a summary of available backups. The `delete` function removes
 //! backups from local disk or S3.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -451,6 +452,96 @@ pub fn retention_local(data_path: &str, keep: i32) -> Result<usize> {
         "retention_local: deleted N of M local backups"
     );
     Ok(deleted)
+}
+
+// -- GC functions --
+
+/// Extract all referenced S3 keys from a backup manifest.
+///
+/// Collects `backup_key` from every `PartInfo` and every `S3ObjectInfo`
+/// within each table's parts. Returns a set of relative S3 keys.
+fn collect_keys_from_manifest(manifest: &BackupManifest) -> HashSet<String> {
+    let mut keys = HashSet::new();
+
+    for table in manifest.tables.values() {
+        for parts in table.parts.values() {
+            for part in parts {
+                if !part.backup_key.is_empty() {
+                    keys.insert(part.backup_key.clone());
+                }
+                if let Some(ref s3_objects) = part.s3_objects {
+                    for s3_obj in s3_objects {
+                        if !s3_obj.backup_key.is_empty() {
+                            keys.insert(s3_obj.backup_key.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    keys
+}
+
+/// Collect all S3 keys referenced by surviving remote backups (excluding one).
+///
+/// Downloads and parses each surviving backup's manifest, then unions all
+/// referenced keys. Used by GC to determine which keys must not be deleted.
+///
+/// `exclude_backup` is the backup currently being deleted -- its manifest
+/// is not loaded (it would reference its own keys).
+pub async fn gc_collect_referenced_keys(
+    s3: &S3Client,
+    exclude_backup: &str,
+) -> Result<HashSet<String>> {
+    let backups = list_remote(s3).await?;
+
+    let mut all_keys = HashSet::new();
+    let mut manifest_count = 0;
+
+    for backup in &backups {
+        // Skip the backup being deleted
+        if backup.name == exclude_backup {
+            continue;
+        }
+        // Skip broken backups (no valid manifest to load)
+        if backup.is_broken {
+            continue;
+        }
+
+        let manifest_key = format!("{}/metadata.json", backup.name);
+        match s3.get_object(&manifest_key).await {
+            Ok(data) => match BackupManifest::from_json_bytes(&data) {
+                Ok(manifest) => {
+                    let keys = collect_keys_from_manifest(&manifest);
+                    all_keys.extend(keys);
+                    manifest_count += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        backup = %backup.name,
+                        error = %e,
+                        "gc: failed to parse manifest, skipping"
+                    );
+                }
+            },
+            Err(e) => {
+                warn!(
+                    backup = %backup.name,
+                    error = %e,
+                    "gc: failed to download manifest, skipping"
+                );
+            }
+        }
+    }
+
+    info!(
+        manifest_count = manifest_count,
+        key_count = all_keys.len(),
+        "gc: collected N referenced keys from M manifests"
+    );
+
+    Ok(all_keys)
 }
 
 // -- Shadow cleanup functions --
@@ -1238,5 +1329,138 @@ mod tests {
         // keep=-1 also means no retention action
         let deleted = retention_local(dir.path().to_str().unwrap(), -1).unwrap();
         assert_eq!(deleted, 0, "Should not delete anything when keep=-1");
+    }
+
+    // -- GC key collection tests --
+
+    #[test]
+    fn test_collect_referenced_keys_from_manifest() {
+        use crate::manifest::{PartInfo, S3ObjectInfo, TableManifest};
+
+        let mut parts = HashMap::new();
+
+        // Local disk parts with backup_key
+        parts.insert(
+            "default".to_string(),
+            vec![
+                PartInfo {
+                    name: "202401_1_50_3".to_string(),
+                    size: 100,
+                    backup_key: "daily/data/default/trades/default/202401_1_50_3.tar.lz4"
+                        .to_string(),
+                    source: "uploaded".to_string(),
+                    checksum_crc64: 123,
+                    s3_objects: None,
+                },
+                PartInfo {
+                    name: "202402_1_1_0".to_string(),
+                    size: 50,
+                    backup_key: "daily/data/default/trades/default/202402_1_1_0.tar.lz4"
+                        .to_string(),
+                    source: "uploaded".to_string(),
+                    checksum_crc64: 456,
+                    s3_objects: None,
+                },
+            ],
+        );
+
+        // S3 disk parts with s3_objects
+        parts.insert(
+            "s3disk".to_string(),
+            vec![PartInfo {
+                name: "202403_1_1_0".to_string(),
+                size: 200,
+                backup_key: "daily/data/default/trades/s3disk/202403_1_1_0.tar.lz4".to_string(),
+                source: "uploaded".to_string(),
+                checksum_crc64: 789,
+                s3_objects: Some(vec![
+                    S3ObjectInfo {
+                        path: "store/abc/def/data.bin".to_string(),
+                        size: 190,
+                        backup_key: "daily/objects/store/abc/def/data.bin".to_string(),
+                    },
+                    S3ObjectInfo {
+                        path: "store/abc/def/index.bin".to_string(),
+                        size: 10,
+                        backup_key: "daily/objects/store/abc/def/index.bin".to_string(),
+                    },
+                ]),
+            }],
+        );
+
+        let mut tables = HashMap::new();
+        tables.insert(
+            "default.trades".to_string(),
+            TableManifest {
+                ddl: "CREATE TABLE ...".to_string(),
+                uuid: None,
+                engine: "MergeTree".to_string(),
+                total_bytes: 350,
+                parts,
+                pending_mutations: Vec::new(),
+                metadata_only: false,
+                dependencies: Vec::new(),
+            },
+        );
+
+        let manifest = BackupManifest {
+            manifest_version: 1,
+            name: "daily".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: "24.1.3.31".to_string(),
+            chbackup_version: "0.1.0".to_string(),
+            data_format: "lz4".to_string(),
+            compressed_size: 350,
+            metadata_size: 256,
+            disks: HashMap::new(),
+            disk_types: HashMap::new(),
+            disk_remote_paths: HashMap::new(),
+            tables,
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+        };
+
+        let keys = collect_keys_from_manifest(&manifest);
+
+        // Should have 5 keys total: 2 local parts + 1 s3 disk part + 2 s3 objects
+        assert_eq!(keys.len(), 5);
+
+        // Local disk part keys
+        assert!(keys.contains("daily/data/default/trades/default/202401_1_50_3.tar.lz4"));
+        assert!(keys.contains("daily/data/default/trades/default/202402_1_1_0.tar.lz4"));
+
+        // S3 disk part key
+        assert!(keys.contains("daily/data/default/trades/s3disk/202403_1_1_0.tar.lz4"));
+
+        // S3 object keys
+        assert!(keys.contains("daily/objects/store/abc/def/data.bin"));
+        assert!(keys.contains("daily/objects/store/abc/def/index.bin"));
+    }
+
+    #[test]
+    fn test_collect_keys_from_empty_manifest() {
+        let manifest = BackupManifest {
+            manifest_version: 1,
+            name: "empty".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: "24.1.3.31".to_string(),
+            chbackup_version: "0.1.0".to_string(),
+            data_format: "lz4".to_string(),
+            compressed_size: 0,
+            metadata_size: 0,
+            disks: HashMap::new(),
+            disk_types: HashMap::new(),
+            disk_remote_paths: HashMap::new(),
+            tables: HashMap::new(),
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+        };
+
+        let keys = collect_keys_from_manifest(&manifest);
+        assert!(keys.is_empty(), "Empty manifest should produce no keys");
     }
 }
