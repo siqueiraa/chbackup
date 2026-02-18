@@ -383,8 +383,97 @@ async fn main() -> Result<()> {
             info!("CleanBroken command complete");
         }
 
-        Command::Watch { .. } => {
-            info!("watch: not implemented in Phase 1");
+        Command::Watch {
+            watch_interval,
+            full_interval,
+            name_template,
+            tables,
+        } => {
+            // Apply CLI overrides to config watch fields
+            let mut config = config;
+            if let Some(v) = watch_interval {
+                config.watch.watch_interval = v;
+            }
+            if let Some(v) = full_interval {
+                config.watch.full_interval = v;
+            }
+            if let Some(v) = name_template {
+                config.watch.name_template = v;
+            }
+            if tables.is_some() {
+                config.watch.tables = tables;
+            }
+
+            let ch = ChClient::new(&config.clickhouse)?;
+            let s3 = S3Client::new(&config.s3).await?;
+
+            // Query macros from ClickHouse for template resolution
+            let macros = ch.get_macros().await.unwrap_or_default();
+            if !macros.is_empty() {
+                info!(macros = ?macros, "Resolved ClickHouse macros for watch templates");
+            }
+
+            // Create shutdown and reload channels
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+
+            // Spawn Ctrl+C handler for graceful shutdown
+            let shutdown_tx_clone = shutdown_tx.clone();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                info!("Shutdown signal received");
+                shutdown_tx_clone.send(true).ok();
+            });
+
+            // Spawn SIGHUP handler for config reload (Unix only)
+            #[cfg(unix)]
+            {
+                let reload_tx_clone = reload_tx.clone();
+                tokio::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sighup =
+                        signal(SignalKind::hangup()).expect("failed to register SIGHUP handler");
+                    loop {
+                        sighup.recv().await;
+                        info!("SIGHUP received, triggering config reload");
+                        reload_tx_clone.send(true).ok();
+                    }
+                });
+            }
+
+            let config_path = PathBuf::from(&cli.config);
+            let ctx = chbackup::watch::WatchContext {
+                config: Arc::new(config),
+                ch,
+                s3,
+                metrics: None, // No metrics in standalone watch mode
+                state: chbackup::watch::WatchState::Idle,
+                consecutive_errors: 0,
+                force_next_full: false,
+                last_backup_name: None,
+                shutdown_rx,
+                reload_rx,
+                config_path,
+                macros,
+            };
+
+            let exit = chbackup::watch::run_watch_loop(ctx).await;
+
+            // Suppress unused variable warnings for channel senders
+            drop(shutdown_tx);
+            drop(reload_tx);
+
+            match exit {
+                chbackup::watch::WatchLoopExit::Shutdown => {
+                    info!("Watch loop stopped by shutdown signal");
+                }
+                chbackup::watch::WatchLoopExit::MaxErrors => {
+                    bail!("Watch loop aborted: max consecutive errors reached");
+                }
+                chbackup::watch::WatchLoopExit::Stopped => {
+                    info!("Watch loop stopped");
+                }
+            }
         }
 
         Command::Server { watch } => {
