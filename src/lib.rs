@@ -16,6 +16,7 @@ pub mod server;
 pub mod storage;
 pub mod table_filter;
 pub mod upload;
+pub mod watch;
 
 #[cfg(test)]
 mod tests {
