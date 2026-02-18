@@ -8,7 +8,7 @@
 //! 3. Chown to ClickHouse uid/gid
 //! 4. ALTER TABLE ATTACH PART '{part_name}'
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,6 +21,7 @@ use walkdir::WalkDir;
 use crate::clickhouse::client::ChClient;
 use crate::manifest::PartInfo;
 use crate::object_disk::{is_s3_disk, parse_metadata, rewrite_metadata};
+use crate::resume::{save_state_graceful, RestoreState};
 use crate::storage::S3Client;
 
 use super::sort::{needs_sequential_attach, sort_parts_by_min_block};
@@ -45,6 +46,10 @@ pub struct AttachParams<'a> {
     pub clickhouse_uid: Option<u32>,
     /// ClickHouse process GID (for chown).
     pub clickhouse_gid: Option<u32>,
+    /// Parts already attached (resume skip set).
+    pub already_attached: &'a HashSet<String>,
+    /// Shared resume state for tracking (optional).
+    pub resume_state: Option<&'a Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>>,
 }
 
 /// Owned parameters for attaching parts to a table.
@@ -84,6 +89,12 @@ pub struct OwnedAttachParams {
     pub table_uuid: Option<String>,
     /// Parts grouped by disk name, for S3 disk routing.
     pub parts_by_disk: HashMap<String, Vec<PartInfo>>,
+    /// Parts already attached (from resume state + system.parts). Parts in this
+    /// set are skipped during ATTACH.
+    pub already_attached: HashSet<String>,
+    /// Shared resume state for tracking attached parts across parallel tasks.
+    /// When set, each successful ATTACH is recorded and persisted.
+    pub resume_state: Option<Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>>,
 }
 
 /// Derive the UUID-based S3 path prefix for restore.
@@ -405,6 +416,8 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
         table_data_path: &params.table_data_path,
         clickhouse_uid: params.clickhouse_uid,
         clickhouse_gid: params.clickhouse_gid,
+        already_attached: &params.already_attached,
+        resume_state: params.resume_state.as_ref(),
     };
 
     attach_parts_inner(&attach_params, &params.engine).await
@@ -414,6 +427,7 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
 ///
 /// Hardlinks backup part files to the table's detached/ directory, then
 /// executes ALTER TABLE ATTACH PART for each part.
+#[allow(dead_code)]
 pub async fn attach_parts(params: &AttachParams<'_>) -> Result<u64> {
     // When called from the borrowed API, we don't have engine info,
     // so default to sequential (safe for all engines).
@@ -464,7 +478,22 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
 
     let mut attached_count = 0u64;
 
+    let table_key = format!("{}.{}", db, table);
+    let mut skipped_resume = 0u64;
+
     for part in &sorted_parts {
+        // Resume: skip parts already attached
+        if params.already_attached.contains(&part.name) {
+            skipped_resume += 1;
+            debug!(
+                db = %db,
+                table = %table,
+                part = %part.name,
+                "Skipping already-attached part (resume)"
+            );
+            continue;
+        }
+
         // Destination: {table_data_path}/detached/{part_name}/
         let dest_dir = detached_dir.join(&part.name);
 
@@ -522,6 +551,19 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
         match params.ch.attach_part(db, table, &part.name).await {
             Ok(()) => {
                 attached_count += 1;
+
+                // Save resume state after each successful ATTACH
+                if let Some(state_mutex) = &params.resume_state {
+                    let mut guard = state_mutex.lock().await;
+                    guard
+                        .0
+                        .attached_parts
+                        .entry(table_key.clone())
+                        .or_default()
+                        .push(part.name.clone());
+                    let state_path = guard.1.clone();
+                    save_state_graceful(&state_path, &guard.0);
+                }
             }
             Err(e) => {
                 let err_str = format!("{:#}", e);
@@ -546,6 +588,15 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                 }
             }
         }
+    }
+
+    if skipped_resume > 0 {
+        info!(
+            db = %db,
+            table = %table,
+            skipped = skipped_resume,
+            "Skipped already-attached parts (resume)"
+        );
     }
 
     info!(
@@ -918,6 +969,8 @@ mod tests {
             disk_remote_paths: HashMap::new(),
             table_uuid: Some("5f3a7b2c-1234-5678-9abc-def012345678".to_string()),
             parts_by_disk: HashMap::new(),
+            already_attached: HashSet::new(),
+            resume_state: None,
         };
 
         assert_eq!(params.object_disk_server_side_copy_concurrency, 32);
@@ -928,5 +981,78 @@ mod tests {
             params.table_uuid,
             Some("5f3a7b2c-1234-5678-9abc-def012345678".to_string())
         );
+    }
+
+    #[test]
+    fn test_owned_attach_params_resume_fields() {
+        use crate::config::ClickHouseConfig;
+
+        // Verify OwnedAttachParams supports resume fields
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let already = HashSet::from([
+            "202401_1_50_3".to_string(),
+            "202401_51_100_3".to_string(),
+        ]);
+        let params = OwnedAttachParams {
+            ch,
+            db: "default".to_string(),
+            table: "trades".to_string(),
+            parts: Vec::new(),
+            backup_dir: PathBuf::from("/tmp"),
+            table_data_path: PathBuf::from("/tmp"),
+            clickhouse_uid: None,
+            clickhouse_gid: None,
+            engine: "MergeTree".to_string(),
+            s3_client: None,
+            disk_type_map: HashMap::new(),
+            object_disk_server_side_copy_concurrency: 32,
+            allow_object_disk_streaming: false,
+            disk_remote_paths: HashMap::new(),
+            table_uuid: None,
+            parts_by_disk: HashMap::new(),
+            already_attached: already.clone(),
+            resume_state: None,
+        };
+
+        assert_eq!(params.already_attached.len(), 2);
+        assert!(params.already_attached.contains("202401_1_50_3"));
+        assert!(params.already_attached.contains("202401_51_100_3"));
+        assert!(params.resume_state.is_none());
+    }
+
+    #[test]
+    fn test_resume_state_tracking_with_mutex() {
+        use crate::resume::RestoreState;
+
+        // Verify the Arc<Mutex<(RestoreState, PathBuf)>> pattern works
+        let state = RestoreState {
+            attached_parts: HashMap::new(),
+            backup_name: "test-backup".to_string(),
+        };
+        let state_path = PathBuf::from("/tmp/test.state.json");
+        let shared = Arc::new(tokio::sync::Mutex::new((state, state_path)));
+
+        // Simulate what attach_parts_inner does in a blocking context
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut guard = shared.lock().await;
+            guard
+                .0
+                .attached_parts
+                .entry("default.trades".to_string())
+                .or_default()
+                .push("202401_1_50_3".to_string());
+
+            assert_eq!(guard.0.attached_parts.len(), 1);
+            assert_eq!(
+                guard
+                    .0
+                    .attached_parts
+                    .get("default.trades")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
     }
 }

@@ -229,7 +229,7 @@ async fn main() -> Result<()> {
             schema,
             data_only,
             rm,
-            resume,
+            resume: _resume,
             rbac,
             configs,
             named_collections,
@@ -249,9 +249,6 @@ async fn main() -> Result<()> {
             if rm {
                 warn!("--rm flag is not implemented in Phase 1, ignoring");
             }
-            if resume {
-                warn!("--resume flag is not implemented in Phase 1, ignoring");
-            }
             if rbac {
                 warn!("--rbac flag is not implemented in Phase 1, ignoring");
             }
@@ -268,7 +265,16 @@ async fn main() -> Result<()> {
             let name = backup_name_required(backup_name, "restore")?;
             let ch = ChClient::new(&config.clickhouse)?;
 
-            restore::restore(&config, &ch, &name, tables.as_deref(), schema, data_only).await?;
+            restore::restore(
+                &config,
+                &ch,
+                &name,
+                tables.as_deref(),
+                schema,
+                data_only,
+                false, // resume: wired in Task 11
+            )
+            .await?;
 
             info!(backup_name = %name, "Restore command complete");
         }

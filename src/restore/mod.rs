@@ -14,7 +14,7 @@ pub mod attach;
 pub mod schema;
 pub mod sort;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,6 +30,7 @@ use crate::concurrency::{
 use crate::config::Config;
 use crate::manifest::BackupManifest;
 use crate::object_disk::is_s3_disk;
+use crate::resume::{delete_state_file, load_state_file, RestoreState};
 use crate::storage::S3Client;
 use crate::table_filter::TableFilter;
 
@@ -52,6 +53,7 @@ use schema::{create_databases, create_tables};
 /// * `table_pattern` - Optional table filter pattern (glob)
 /// * `schema_only` - If true, only restore schema (no data)
 /// * `data_only` - If true, only restore data (no schema creation)
+/// * `resume` - If true, load resume state and skip already-attached parts
 pub async fn restore(
     config: &Config,
     ch: &ChClient,
@@ -59,6 +61,7 @@ pub async fn restore(
     table_pattern: Option<&str>,
     schema_only: bool,
     data_only: bool,
+    resume: bool,
 ) -> Result<()> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = PathBuf::from(data_path).join("backup").join(backup_name);
@@ -129,6 +132,74 @@ pub async fn restore(
         return Ok(());
     }
 
+    // 5a. Resume state: load previously attached parts from state file + system.parts
+    let state_path = backup_dir.join("restore.state.json");
+    let mut already_attached: HashMap<String, HashSet<String>> = HashMap::new();
+
+    if resume {
+        // Load state file (may not exist on first run)
+        if let Ok(Some(state)) = load_state_file::<RestoreState>(&state_path) {
+            if state.backup_name == backup_name {
+                let total_parts: usize = state.attached_parts.values().map(|v| v.len()).sum();
+                info!(
+                    tables = state.attached_parts.len(),
+                    parts = total_parts,
+                    "Loaded restore resume state"
+                );
+                for (table_key, parts) in state.attached_parts {
+                    already_attached
+                        .entry(table_key)
+                        .or_default()
+                        .extend(parts);
+                }
+            } else {
+                warn!(
+                    state_backup = %state.backup_name,
+                    current_backup = %backup_name,
+                    "Ignoring stale restore state (different backup name)"
+                );
+            }
+        }
+
+        // Query system.parts for authoritative view of already-attached parts
+        for table_key in &table_keys {
+            let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
+            match ch.query_system_parts(db, table).await {
+                Ok(parts) => {
+                    if !parts.is_empty() {
+                        let part_names: HashSet<String> =
+                            parts.into_iter().map(|p| p.name).collect();
+                        info!(
+                            table = %table_key,
+                            live_parts = part_names.len(),
+                            "Merged system.parts into resume state"
+                        );
+                        already_attached
+                            .entry(table_key.clone())
+                            .or_default()
+                            .extend(part_names);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        table = %table_key,
+                        error = %e,
+                        "Failed to query system.parts, relying on state file only"
+                    );
+                }
+            }
+        }
+
+        if !already_attached.is_empty() {
+            let total: usize = already_attached.values().map(|s| s.len()).sum();
+            info!(
+                tables = already_attached.len(),
+                parts = total,
+                "Resuming restore: skipping already-attached parts"
+            );
+        }
+    }
+
     // Detect ClickHouse ownership for chown
     let (ch_uid, ch_gid) = detect_clickhouse_ownership(Path::new(data_path)).unwrap_or_else(|e| {
         warn!(error = %e, "Failed to detect ClickHouse ownership");
@@ -176,6 +247,24 @@ pub async fn restore(
         effective_object_disk_server_side_copy_concurrency(config) as usize;
     let allow_streaming = config.s3.allow_object_disk_streaming;
 
+    // Build shared resume state tracker (for parallel tasks to update)
+    let resume_state: Option<Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>> = if resume {
+        // Initialize state from already_attached so we preserve existing progress
+        let initial_state = RestoreState {
+            attached_parts: already_attached
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                .collect(),
+            backup_name: backup_name.to_string(),
+        };
+        Some(Arc::new(tokio::sync::Mutex::new((
+            initial_state,
+            state_path.clone(),
+        ))))
+    } else {
+        None
+    };
+
     // Collect tables that need data restore
     let mut restore_items: Vec<(String, OwnedAttachParams)> = Vec::new();
 
@@ -219,6 +308,12 @@ pub async fn restore(
             "Restoring table data"
         );
 
+        // Get already-attached parts for this table (from resume state)
+        let table_already_attached = already_attached
+            .get(table_key)
+            .cloned()
+            .unwrap_or_default();
+
         restore_items.push((
             table_key.clone(),
             OwnedAttachParams {
@@ -238,6 +333,8 @@ pub async fn restore(
                 disk_remote_paths: disk_remote_paths.clone(),
                 table_uuid,
                 parts_by_disk: table_manifest.parts.clone(),
+                already_attached: table_already_attached,
+                resume_state: resume_state.clone(),
             },
         ));
     }
@@ -294,6 +391,11 @@ pub async fn restore(
         parts = total_attached,
         "Restore complete"
     );
+
+    // 8. Delete resume state file on successful completion
+    if resume {
+        delete_state_file(&state_path);
+    }
 
     Ok(())
 }
@@ -364,5 +466,116 @@ mod tests {
             result,
             PathBuf::from("/var/lib/clickhouse/data/default/trades")
         );
+    }
+
+    #[test]
+    fn test_restore_resume_state_load_and_merge() {
+        use crate::resume::{load_state_file, save_state_file, RestoreState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("restore.state.json");
+
+        // Create a state file with some attached parts
+        let state = RestoreState {
+            attached_parts: HashMap::from([
+                (
+                    "default.trades".to_string(),
+                    vec![
+                        "202401_1_50_3".to_string(),
+                        "202401_51_100_3".to_string(),
+                    ],
+                ),
+                (
+                    "default.orders".to_string(),
+                    vec!["202401_1_10_1".to_string()],
+                ),
+            ]),
+            backup_name: "daily-2024-01-15".to_string(),
+        };
+
+        save_state_file(&state_path, &state).unwrap();
+
+        // Load and verify
+        let loaded: RestoreState = load_state_file(&state_path).unwrap().unwrap();
+        assert_eq!(loaded.backup_name, "daily-2024-01-15");
+        assert_eq!(loaded.attached_parts.len(), 2);
+        assert_eq!(
+            loaded.attached_parts.get("default.trades").unwrap().len(),
+            2
+        );
+
+        // Simulate merge with system.parts (adding new parts)
+        let mut already_attached: HashMap<String, HashSet<String>> = HashMap::new();
+        for (table_key, parts) in loaded.attached_parts {
+            already_attached
+                .entry(table_key)
+                .or_default()
+                .extend(parts);
+        }
+
+        // Simulated system.parts returns additional parts
+        let system_parts = vec!["202401_1_50_3".to_string(), "202402_1_5_0".to_string()];
+        already_attached
+            .entry("default.trades".to_string())
+            .or_default()
+            .extend(system_parts);
+
+        // Verify merge: should have 3 unique parts for trades (union of state + system.parts)
+        let trades_parts = already_attached.get("default.trades").unwrap();
+        assert!(trades_parts.contains("202401_1_50_3"));
+        assert!(trades_parts.contains("202401_51_100_3"));
+        assert!(trades_parts.contains("202402_1_5_0"));
+        assert_eq!(trades_parts.len(), 3);
+
+        // orders table unchanged (only from state file)
+        let orders_parts = already_attached.get("default.orders").unwrap();
+        assert_eq!(orders_parts.len(), 1);
+        assert!(orders_parts.contains("202401_1_10_1"));
+    }
+
+    #[test]
+    fn test_restore_resume_stale_state_ignored() {
+        use crate::resume::{load_state_file, save_state_file, RestoreState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("restore.state.json");
+
+        // Create state with a different backup name
+        let state = RestoreState {
+            attached_parts: HashMap::from([(
+                "default.trades".to_string(),
+                vec!["202401_1_50_3".to_string()],
+            )]),
+            backup_name: "old-backup-name".to_string(),
+        };
+
+        save_state_file(&state_path, &state).unwrap();
+
+        // Load and check backup name mismatch
+        let loaded: RestoreState = load_state_file(&state_path).unwrap().unwrap();
+        let current_backup = "new-backup-name";
+
+        // State should be ignored because backup_name doesn't match
+        assert_ne!(loaded.backup_name, current_backup);
+        // In the real code, this leads to an empty already_attached map
+    }
+
+    #[test]
+    fn test_restore_resume_state_deleted_on_success() {
+        use crate::resume::{delete_state_file, save_state_file, RestoreState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("restore.state.json");
+
+        let state = RestoreState {
+            attached_parts: HashMap::new(),
+            backup_name: "test".to_string(),
+        };
+
+        save_state_file(&state_path, &state).unwrap();
+        assert!(state_path.exists());
+
+        delete_state_file(&state_path);
+        assert!(!state_path.exists());
     }
 }
