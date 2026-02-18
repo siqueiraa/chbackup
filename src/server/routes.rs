@@ -702,6 +702,211 @@ pub struct RestoreRemoteRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Delete, clean, kill, and stub endpoints (Task 7)
+// ---------------------------------------------------------------------------
+
+/// DELETE /api/v1/delete/{location}/{name} -- delete a backup
+pub async fn delete_backup(
+    State(state): State<AppState>,
+    Path((location, name)): Path<(String, String)>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let loc = match location.as_str() {
+        "local" => list::Location::Local,
+        "remote" => list::Location::Remote,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "invalid location '{}': expected 'local' or 'remote'",
+                        other
+                    ),
+                }),
+            ));
+        }
+    };
+
+    let (id, _token) = state.try_start_op("delete").await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        info!(backup_name = %name, location = %location, "Starting delete operation");
+
+        let data_path = state_clone.config.clickhouse.data_path.clone();
+        let result = match loc {
+            list::Location::Local => {
+                let dp = data_path.clone();
+                let n = name.clone();
+                tokio::task::spawn_blocking(move || list::delete_local(&dp, &n))
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
+            }
+            list::Location::Remote => list::delete_remote(&state_clone.s3, &name).await,
+        };
+
+        match result {
+            Ok(_) => {
+                info!(backup_name = %name, "Delete operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                warn!(backup_name = %name, error = %e, "Delete operation failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
+}
+
+/// POST /api/v1/clean/remote_broken -- delete broken remote backups
+pub async fn clean_remote_broken(
+    State(state): State<AppState>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let (id, _token) = state
+        .try_start_op("clean_broken_remote")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        info!("Starting clean_broken_remote operation");
+
+        let result = list::clean_broken_remote(&state_clone.s3).await;
+
+        match result {
+            Ok(count) => {
+                info!(count = count, "clean_broken_remote operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                warn!(error = %e, "clean_broken_remote operation failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
+}
+
+/// POST /api/v1/clean/local_broken -- delete broken local backups
+pub async fn clean_local_broken(
+    State(state): State<AppState>,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    let (id, _token) = state
+        .try_start_op("clean_broken_local")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        info!("Starting clean_broken_local operation");
+
+        let data_path = state_clone.config.clickhouse.data_path.clone();
+        let result = tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)));
+
+        match result {
+            Ok(count) => {
+                info!(count = count, "clean_broken_local operation completed");
+                state_clone.finish_op(id).await;
+            }
+            Err(e) => {
+                warn!(error = %e, "clean_broken_local operation failed");
+                state_clone.fail_op(id, e.to_string()).await;
+            }
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
+}
+
+/// POST /api/v1/kill -- cancel the currently running operation
+pub async fn kill_op(State(state): State<AppState>) -> Result<&'static str, StatusCode> {
+    if state.kill_current().await {
+        info!("Operation killed");
+        Ok("killed")
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub endpoints -- return 501 Not Implemented
+// ---------------------------------------------------------------------------
+
+/// POST /api/v1/clean -- retention cleanup (Phase 3c)
+pub async fn clean_stub() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3c)")
+}
+
+/// POST /api/v1/reload -- config hot-reload (Phase 3d)
+pub async fn reload_stub() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+}
+
+/// POST /api/v1/restart -- server restart (Phase 3d)
+pub async fn restart_stub() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+}
+
+/// GET /api/v1/tables -- table listing (Phase 4f)
+pub async fn tables_stub() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 4f)")
+}
+
+/// POST /api/v1/watch/start -- start watch loop (Phase 3d)
+pub async fn watch_start_stub() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+}
+
+/// POST /api/v1/watch/stop -- stop watch loop (Phase 3d)
+pub async fn watch_stop_stub() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+}
+
+/// GET /api/v1/watch/status -- watch loop status (Phase 3d)
+pub async fn watch_status_stub() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3d)")
+}
+
+/// GET /metrics -- Prometheus metrics (Phase 3b)
+pub async fn metrics_stub() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 3b)")
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -842,5 +1047,75 @@ mod tests {
             Some("source_db:target_db")
         );
         assert_eq!(req.rm, Some(true));
+    }
+
+    #[test]
+    fn test_error_response_serialization() {
+        let response = ErrorResponse {
+            error: "something went wrong".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).expect("ErrorResponse should serialize");
+        assert!(json.contains("\"error\":\"something went wrong\""));
+    }
+
+    #[test]
+    fn test_delete_path_parsing() {
+        // Verify "local"/"remote" string maps correctly to Location
+        let local_result = match "local" {
+            "local" => Some(list::Location::Local),
+            "remote" => Some(list::Location::Remote),
+            _ => None,
+        };
+        assert_eq!(local_result, Some(list::Location::Local));
+
+        let remote_result = match "remote" {
+            "local" => Some(list::Location::Local),
+            "remote" => Some(list::Location::Remote),
+            _ => None,
+        };
+        assert_eq!(remote_result, Some(list::Location::Remote));
+
+        let invalid_result = match "invalid" {
+            "local" => Some(list::Location::Local),
+            "remote" => Some(list::Location::Remote),
+            _ => None,
+        };
+        assert!(invalid_result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stub_endpoints_return_501() {
+        let (status, body) = clean_stub().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("Phase 3c"));
+
+        let (status, body) = reload_stub().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("Phase 3d"));
+
+        let (status, body) = restart_stub().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("Phase 3d"));
+
+        let (status, body) = tables_stub().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("Phase 4f"));
+
+        let (status, body) = watch_start_stub().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("Phase 3d"));
+
+        let (status, body) = watch_stop_stub().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("Phase 3d"));
+
+        let (status, body) = watch_status_stub().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("Phase 3d"));
+
+        let (status, body) = metrics_stub().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("Phase 3b"));
     }
 }
