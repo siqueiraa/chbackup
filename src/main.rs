@@ -140,12 +140,14 @@ async fn main() -> Result<()> {
             if named_collections {
                 warn!("--named-collections flag is not yet implemented, ignoring");
             }
-            if resume {
-                warn!("--resume flag is not yet implemented, ignoring");
-            }
-
             let name = resolve_backup_name(backup_name);
             let ch = ChClient::new(&config.clickhouse)?;
+
+            // Note: --resume is not applicable to `create` (backup is local-only,
+            // no resume state tracking needed). The flag is accepted but ignored.
+            if resume {
+                info!("--resume flag has no effect on the create command");
+            }
 
             let _manifest = backup::create(
                 &config,
@@ -168,10 +170,6 @@ async fn main() -> Result<()> {
             resume,
             backup_name,
         } => {
-            if resume {
-                warn!("--resume flag is not yet implemented, ignoring");
-            }
-
             let name = backup_name_required(backup_name, "upload")?;
             let s3 = S3Client::new(&config.s3).await?;
 
@@ -179,6 +177,7 @@ async fn main() -> Result<()> {
                 .join("backup")
                 .join(&name);
 
+            let effective_resume = resume && config.general.use_resumable_state;
             upload::upload(
                 &config,
                 &s3,
@@ -186,7 +185,7 @@ async fn main() -> Result<()> {
                 &backup_dir,
                 delete_local,
                 diff_from_remote.as_deref(),
-                false, // resume: wired in Task 11
+                effective_resume,
             )
             .await?;
 
@@ -199,16 +198,14 @@ async fn main() -> Result<()> {
             backup_name,
         } => {
             if hardlink_exists_files {
-                warn!("--hardlink-exists-files flag is not implemented in Phase 1, ignoring");
-            }
-            if resume {
-                warn!("--resume flag is not implemented in Phase 1, ignoring");
+                warn!("--hardlink-exists-files flag is not yet implemented, ignoring");
             }
 
             let name = backup_name_required(backup_name, "download")?;
             let s3 = S3Client::new(&config.s3).await?;
 
-            let backup_dir = download::download(&config, &s3, &name, false /* resume: wired in Task 11 */).await?;
+            let effective_resume = resume && config.general.use_resumable_state;
+            let backup_dir = download::download(&config, &s3, &name, effective_resume).await?;
 
             info!(
                 backup_name = %name,
@@ -225,42 +222,43 @@ async fn main() -> Result<()> {
             schema,
             data_only,
             rm,
-            resume: _resume,
+            resume,
             rbac,
             configs,
             named_collections,
             skip_empty_tables,
             backup_name,
         } => {
-            // Warn about Phase 2+ flags
+            // Warn about flags not yet implemented
             if rename_as.is_some() {
-                warn!("--as flag is not implemented in Phase 1, ignoring");
+                warn!("--as flag is not yet implemented, ignoring");
             }
             if database_mapping.is_some() {
-                warn!("--database-mapping flag is not implemented in Phase 1, ignoring");
+                warn!("--database-mapping flag is not yet implemented, ignoring");
             }
             if partitions.is_some() {
-                warn!("--partitions flag is not implemented in Phase 1, ignoring");
+                warn!("--partitions flag is not yet implemented for restore, ignoring");
             }
             if rm {
-                warn!("--rm flag is not implemented in Phase 1, ignoring");
+                warn!("--rm flag is not yet implemented, ignoring");
             }
             if rbac {
-                warn!("--rbac flag is not implemented in Phase 1, ignoring");
+                warn!("--rbac flag is not yet implemented, ignoring");
             }
             if configs {
-                warn!("--configs flag is not implemented in Phase 1, ignoring");
+                warn!("--configs flag is not yet implemented, ignoring");
             }
             if named_collections {
-                warn!("--named-collections flag is not implemented in Phase 1, ignoring");
+                warn!("--named-collections flag is not yet implemented, ignoring");
             }
             if skip_empty_tables {
-                warn!("--skip-empty-tables flag is not implemented in Phase 1, ignoring");
+                warn!("--skip-empty-tables flag is not yet implemented, ignoring");
             }
 
             let name = backup_name_required(backup_name, "restore")?;
             let ch = ChClient::new(&config.clickhouse)?;
 
+            let effective_resume = resume && config.general.use_resumable_state;
             restore::restore(
                 &config,
                 &ch,
@@ -268,7 +266,7 @@ async fn main() -> Result<()> {
                 tables.as_deref(),
                 schema,
                 data_only,
-                false, // resume: wired in Task 11
+                effective_resume,
             )
             .await?;
 
@@ -287,7 +285,7 @@ async fn main() -> Result<()> {
             resume,
             backup_name,
         } => {
-            // Warn about unimplemented Phase 2+ flags
+            // Warn about unimplemented flags
             if rbac {
                 warn!("--rbac flag is not yet implemented, ignoring");
             }
@@ -299,9 +297,6 @@ async fn main() -> Result<()> {
             }
             if skip_projections.is_some() {
                 warn!("--skip-projections flag is not yet implemented, ignoring");
-            }
-            if resume {
-                warn!("--resume flag is not yet implemented, ignoring");
             }
 
             let name = resolve_backup_name(backup_name);
@@ -326,6 +321,7 @@ async fn main() -> Result<()> {
                 .join("backup")
                 .join(&name);
 
+            let effective_resume = resume && config.general.use_resumable_state;
             upload::upload(
                 &config,
                 &s3,
@@ -333,7 +329,7 @@ async fn main() -> Result<()> {
                 &backup_dir,
                 delete_source,
                 diff_from_remote.as_deref(),
-                false, // resume: wired in Task 11
+                effective_resume,
             )
             .await?;
 
@@ -375,7 +371,12 @@ async fn main() -> Result<()> {
         }
 
         Command::CleanBroken { location } => {
-            info!(location = ?location, "clean_broken: not implemented in Phase 1");
+            let s3 = S3Client::new(&config.s3).await?;
+            let loc = map_cli_location(location);
+
+            list::clean_broken(&config.clickhouse.data_path, &s3, &loc).await?;
+
+            info!("CleanBroken command complete");
         }
 
         Command::Watch { .. } => {
