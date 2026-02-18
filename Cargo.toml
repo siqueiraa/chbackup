@@ -62,5 +62,13 @@ chrono = { version = "0.4", features = ["serde"] }
 # PID lock (Unix process liveness check)
 libc = "0.2"
 
+# HTTP API server
+axum = "0.7"
+tower-http = { version = "0.6", features = ["auth"] }
+tower = "0.5"
+http = "1"
+base64 = "0.22"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
 [dev-dependencies]
 tempfile = "3"

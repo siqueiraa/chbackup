@@ -147,4 +147,37 @@ mod tests {
             let _ = &params.disk_remote_paths;
         }
     }
+
+    #[test]
+    fn test_phase3a_deps_available() {
+        // Verify Phase 3a dependencies are importable
+        use axum::Router;
+        use base64::Engine as _;
+        use tokio_util::sync::CancellationToken;
+
+        // Verify types are constructible
+        let _router: Router = Router::new();
+        let _token = CancellationToken::new();
+        let _encoded = base64::engine::general_purpose::STANDARD.encode(b"test");
+    }
+
+    #[test]
+    fn test_backup_summary_serializable() {
+        use crate::list::BackupSummary;
+
+        let summary = BackupSummary {
+            name: "test-backup".to_string(),
+            timestamp: Some(chrono::Utc::now()),
+            size: 1024,
+            compressed_size: 512,
+            table_count: 3,
+            is_broken: false,
+            broken_reason: None,
+        };
+
+        let json = serde_json::to_string(&summary).expect("BackupSummary should serialize to JSON");
+        assert!(json.contains("test-backup"));
+        assert!(json.contains("1024"));
+        assert!(json.contains("512"));
+    }
 }
