@@ -51,7 +51,8 @@ struct DownloadWorkItem {
     db: String,
     /// Table name.
     table: String,
-    /// Disk name within the table's parts map.
+    /// Disk name within the table's parts map (used in tests and for future resume logic).
+    #[allow(dead_code)]
     disk_name: String,
     /// Part info (name, backup_key, etc.).
     part: PartInfo,
@@ -176,6 +177,7 @@ pub async fn download(
                 table = %item.table_key,
                 part = %item.part.name,
                 key = %item.part.backup_key,
+                disk = %item.disk_name,
                 is_s3_disk = item.is_s3_disk_part,
                 "Downloading part"
             );
@@ -452,7 +454,7 @@ mod tests {
             table: "trades".to_string(),
             disk_name: disk_name.to_string(),
             part: s3_part,
-            is_s3_disk_part: disk_is_s3 && true, // s3_objects.is_some()
+            is_s3_disk_part: disk_is_s3, // s3_objects.is_some()
         };
 
         assert!(work_item.is_s3_disk_part);
@@ -476,7 +478,7 @@ mod tests {
             HashMap::from([("default".to_string(), "local".to_string())]);
 
         let disk_name = "default";
-        let disk_is_s3 = disk_types
+        let _disk_is_s3 = disk_types
             .get(disk_name)
             .map(|dt| is_s3_disk(dt))
             .unwrap_or(false);
@@ -487,7 +489,7 @@ mod tests {
             table: "trades".to_string(),
             disk_name: disk_name.to_string(),
             part: local_part,
-            is_s3_disk_part: disk_is_s3 && false, // s3_objects.is_none()
+            is_s3_disk_part: false, // local disk, s3_objects.is_none()
         };
 
         assert!(!work_item.is_s3_disk_part);
@@ -508,10 +510,13 @@ mod tests {
             .get("s3disk")
             .map(|dt| is_s3_disk(dt))
             .unwrap_or(false);
-        assert!(s3_disk_s3_objects && true); // s3_objects.is_some()
+        assert!(s3_disk_s3_objects); // s3_objects.is_some() -> true
 
         // Case 2: S3 disk but no s3_objects (shouldn't happen, but defensive) -> false
-        assert!(!(s3_disk_s3_objects && false)); // s3_objects.is_none()
+        // When s3_objects is None on an S3 disk, is_s3_disk_part should be false
+        // (defensive -- shouldn't happen, but the flag explicitly requires s3_objects)
+        let s3_disk_no_objects = false; // s3_objects.is_none() -> is_s3_disk_part = false
+        assert!(!s3_disk_no_objects);
 
         // Case 3: Local disk with no s3_objects -> false
         let local_disk = disk_types

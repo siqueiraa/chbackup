@@ -14,6 +14,7 @@ pub mod attach;
 pub mod schema;
 pub mod sort;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,9 +24,11 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::clickhouse::client::ChClient;
-use crate::concurrency::effective_max_connections;
+use crate::concurrency::{effective_max_connections, effective_object_disk_server_side_copy_concurrency};
 use crate::config::Config;
 use crate::manifest::BackupManifest;
+use crate::object_disk::is_s3_disk;
+use crate::storage::S3Client;
 use crate::table_filter::TableFilter;
 
 use attach::{attach_parts_owned, detect_clickhouse_ownership, get_table_data_path, OwnedAttachParams};
@@ -136,6 +139,41 @@ pub async fn restore(
         Vec::new()
     });
 
+    // Check if any tables have S3 disk parts -- if so, build S3Client
+    let has_s3_disks = manifest.disk_types.values().any(|dt| is_s3_disk(dt));
+    let s3_client = if has_s3_disks {
+        match S3Client::new(&config.s3).await {
+            Ok(client) => Some(client),
+            Err(e) => {
+                warn!(error = %e, "Failed to create S3Client for S3 disk restore, S3 disk parts will fail");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build disk remote paths from live disks (for S3 CopyObject source)
+    let disk_remote_paths: HashMap<String, String> = if has_s3_disks {
+        match ch.get_disks().await {
+            Ok(disks) => disks
+                .into_iter()
+                .filter(|d| !d.remote_path.is_empty())
+                .map(|d| (d.name, d.remote_path))
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "Failed to get disk info for S3 restore");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
+    let object_disk_concurrency =
+        effective_object_disk_server_side_copy_concurrency(config) as usize;
+    let allow_streaming = config.s3.allow_object_disk_streaming;
+
     // Collect tables that need data restore
     let mut restore_items: Vec<(String, OwnedAttachParams)> = Vec::new();
 
@@ -173,6 +211,10 @@ pub async fn restore(
             data_path,
         );
 
+        // Find the table's UUID from live tables (needed for S3 restore path derivation)
+        let table_uuid = find_table_uuid(&live_tables, db, table)
+            .or_else(|| table_manifest.uuid.clone());
+
         info!(
             table = %table_key,
             parts = all_parts.len(),
@@ -192,6 +234,13 @@ pub async fn restore(
                 clickhouse_uid: ch_uid,
                 clickhouse_gid: ch_gid,
                 engine: table_manifest.engine.clone(),
+                s3_client: s3_client.clone(),
+                disk_type_map: manifest.disk_types.clone(),
+                object_disk_server_side_copy_concurrency: object_disk_concurrency,
+                allow_object_disk_streaming: allow_streaming,
+                disk_remote_paths: disk_remote_paths.clone(),
+                table_uuid,
+                parts_by_disk: table_manifest.parts.clone(),
             },
         ));
     }
@@ -267,6 +316,23 @@ fn find_table_data_path(
 
     // Table not found in live tables -- use default path construction
     get_table_data_path(&[], config_data_path, db, table)
+}
+
+/// Find the UUID for a table from the live table list.
+///
+/// The UUID is used for S3 disk restore to derive UUID-isolated object paths.
+/// Prefers the live table UUID (current destination) over the manifest UUID.
+fn find_table_uuid(
+    live_tables: &[crate::clickhouse::client::TableRow],
+    db: &str,
+    table: &str,
+) -> Option<String> {
+    for row in live_tables {
+        if row.database == db && row.name == table && !row.uuid.is_empty() {
+            return Some(row.uuid.clone());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
