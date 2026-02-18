@@ -1,13 +1,14 @@
 # Session State
 
 **Plan:** 2026-02-18-01-phase2d-resume-reliability
-**Status:** NOT_STARTED
+**Status:** IN_PROGRESS
 **MR Review:** NOT_RUN
-**Branch:** `phase2d-resume-reliability`
-**Started:** -
+**Branch:** `claude/phase2d-resume-reliability`
+**Worktree:** `-`
+**Started:** 2026-02-18T10:31:06Z
 **Completed:** -
 **Elapsed:** -
-**Last Updated:** 2026-02-18T12:00:00Z
+**Last Updated:** 2026-02-18T10:31:06Z
 
 ---
 
@@ -49,10 +50,10 @@
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 0 | Plan Validation Gate | pending |
-| 0a-state | Session State Check | pending |
-| 0a-deps | Task Dependency Analysis | pending |
-| 0b | Branch Handling | pending |
-| 1 | Session Startup | pending |
+| 0a-state | Session State Check | done |
+| 0a-deps | Task Dependency Analysis | done |
+| 0b | Branch Handling | done |
+| 1 | Session Startup | done |
 | 2 | Group Execution | pending |
 | 2.4 | Runtime Verification | pending |
 | 2.5 | MR Review | pending |
@@ -79,7 +80,7 @@
 | Agent | Phases | Status |
 |-------|--------|--------|
 | execute-validator | 0 | pending |
-| execute-startup | 0a-1 | pending |
+| execute-startup | 0a-1 | done |
 | execute-runtime | 2.4 | pending |
 | execute-reviewer | 2.5-2.6 | pending |
 | execute-completion | 3 | pending |
@@ -118,13 +119,13 @@ Group D (Wiring -- depends on all above):
 
 | Task | Description | Status | Commit | Acceptance |
 |------|-------------|--------|--------|------------|
-| 1 | ClickHouse TLS support | pending | - | F001 |
-| 2 | New ChClient query methods | pending | - | F002 |
-| 3 | Disk filtering | pending | - | F003 |
-| 4 | Resume state types and helpers | pending | - | F004 |
-| 5 | Upload resume + manifest atomicity | pending | - | F005 |
-| 6 | Download resume + CRC64 + disk space | pending | - | F006 |
-| 7 | Restore resume | pending | - | F007 |
+| 1 | ClickHouse TLS support | done | bfa5a22 | F001 |
+| 2 | New ChClient query methods | done | 9f4a80b | F002 |
+| 3 | Disk filtering | done | ff42860 | F003 |
+| 4 | Resume state types and helpers | done | 7215cf1 | F004 |
+| 5 | Upload resume + manifest atomicity | done | 8d63844 | F005 |
+| 6 | Download resume + CRC64 + disk space | done | 79a5d85 | F006 |
+| 7 | Restore resume | done | 1e44ff6 | F007 |
 | 8 | Broken backup + clean_broken | pending | - | F008 |
 | 9 | Partition-level backup | pending | - | F009 |
 | 10 | Parts column check | pending | - | F010 |
@@ -156,7 +157,7 @@ Group D (Wiring -- depends on all above):
 
 ## Acceptance Summary
 
-0/12 PASS
+7/12 PASS
 
 ---
 

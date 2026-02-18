@@ -1,13 +1,13 @@
 {
   "plan": "2026-02-18-01-phase2d-resume-reliability",
-  "status": {"pass": 0, "fail": 12, "total": 12},
-  "last_updated": "2026-02-18T11:30:00Z",
+  "status": {"pass": 7, "fail": 5, "total": 12},
+  "last_updated": "2026-02-18T13:30:00Z",
   "features": [
     {
       "id": "F001",
       "category": "feature",
       "description": "ClickHouse TLS support in ChClient",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -43,13 +43,13 @@
         ]
       },
       "related_tasks": [1],
-      "verified_at": null
+      "verified_at": "2026-02-18T12:00:00Z"
     },
     {
       "id": "F002",
       "category": "feature",
       "description": "New ChClient query methods (freeze_partition, query_system_parts, check_parts_columns, query_disk_free_space)",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -84,13 +84,13 @@
         ]
       },
       "related_tasks": [2],
-      "verified_at": null
+      "verified_at": "2026-02-18T12:10:00Z"
     },
     {
       "id": "F003",
       "category": "feature",
       "description": "Disk filtering (skip_disks, skip_disk_types) in table_filter and backup",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -125,13 +125,13 @@
         ]
       },
       "related_tasks": [3],
-      "verified_at": null
+      "verified_at": "2026-02-18T12:20:00Z"
     },
     {
       "id": "F004",
       "category": "feature",
       "description": "Resume state types and serialization helpers (src/resume.rs)",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -166,13 +166,13 @@
         ]
       },
       "related_tasks": [4],
-      "verified_at": null
+      "verified_at": "2026-02-18T13:00:00Z"
     },
     {
       "id": "F005",
       "category": "feature",
       "description": "Upload resume + manifest atomicity (.tmp + CopyObject + delete)",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -209,13 +209,13 @@
         ]
       },
       "related_tasks": [5],
-      "verified_at": null
+      "verified_at": "2026-02-18T13:10:00Z"
     },
     {
       "id": "F006",
       "category": "feature",
       "description": "Download resume + CRC64 verification + disk space pre-flight",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -252,13 +252,13 @@
         ]
       },
       "related_tasks": [6],
-      "verified_at": null
+      "verified_at": "2026-02-18T13:20:00Z"
     },
     {
       "id": "F007",
       "category": "feature",
       "description": "Restore resume with system.parts query",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -295,7 +295,7 @@
         ]
       },
       "related_tasks": [7],
-      "verified_at": null
+      "verified_at": "2026-02-18T13:30:00Z"
     },
     {
       "id": "F008",
