@@ -4,4 +4,5 @@
 //! section 9, enabling Kubernetes sidecar operation.
 
 pub mod actions;
+pub mod auth;
 pub mod state;
