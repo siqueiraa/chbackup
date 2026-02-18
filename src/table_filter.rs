@@ -79,6 +79,28 @@ pub fn is_engine_excluded(engine: &str, skip_engines: &[String]) -> bool {
     skip_engines.iter().any(|e| e == engine)
 }
 
+/// Check if a disk should be excluded from backup.
+///
+/// A disk is excluded if its name is in `skip_disks` (exact match)
+/// or its type is in `skip_disk_types` (exact match).
+///
+/// Used with `config.clickhouse.skip_disks` and `config.clickhouse.skip_disk_types`
+/// to exclude specific disks or disk types from backup processing.
+pub fn is_disk_excluded(
+    disk_name: &str,
+    disk_type: &str,
+    skip_disks: &[String],
+    skip_disk_types: &[String],
+) -> bool {
+    if skip_disks.iter().any(|d| d == disk_name) {
+        return true;
+    }
+    if skip_disk_types.iter().any(|t| t == disk_type) {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +198,55 @@ mod tests {
         assert!(filter.matches("default", "trades"));
         assert!(filter.matches("default", "trader"));
         assert!(!filter.matches("default", "trading"));
+    }
+
+    // -- Disk filtering tests --
+
+    #[test]
+    fn test_is_disk_excluded_by_name() {
+        let skip_disks = vec!["cache_disk".to_string(), "tmp_disk".to_string()];
+        let skip_types: Vec<String> = Vec::new();
+
+        assert!(is_disk_excluded("cache_disk", "local", &skip_disks, &skip_types));
+        assert!(is_disk_excluded("tmp_disk", "local", &skip_disks, &skip_types));
+        assert!(!is_disk_excluded("default", "local", &skip_disks, &skip_types));
+        assert!(!is_disk_excluded("s3disk", "s3", &skip_disks, &skip_types));
+    }
+
+    #[test]
+    fn test_is_disk_excluded_by_type() {
+        let skip_disks: Vec<String> = Vec::new();
+        let skip_types = vec!["cache".to_string(), "memory".to_string()];
+
+        assert!(is_disk_excluded("disk1", "cache", &skip_disks, &skip_types));
+        assert!(is_disk_excluded("disk2", "memory", &skip_disks, &skip_types));
+        assert!(!is_disk_excluded("default", "local", &skip_disks, &skip_types));
+        assert!(!is_disk_excluded("s3disk", "s3", &skip_disks, &skip_types));
+    }
+
+    #[test]
+    fn test_is_disk_excluded_empty_lists() {
+        let skip_disks: Vec<String> = Vec::new();
+        let skip_types: Vec<String> = Vec::new();
+
+        // Nothing should be excluded when both lists are empty
+        assert!(!is_disk_excluded("default", "local", &skip_disks, &skip_types));
+        assert!(!is_disk_excluded("s3disk", "s3", &skip_disks, &skip_types));
+        assert!(!is_disk_excluded("cache_disk", "cache", &skip_disks, &skip_types));
+    }
+
+    #[test]
+    fn test_is_disk_excluded_both_match() {
+        let skip_disks = vec!["cache_disk".to_string()];
+        let skip_types = vec!["cache".to_string()];
+
+        // Should be excluded if either name or type matches
+        assert!(is_disk_excluded("cache_disk", "cache", &skip_disks, &skip_types));
+        // Name match alone
+        assert!(is_disk_excluded("cache_disk", "local", &skip_disks, &skip_types));
+        // Type match alone
+        assert!(is_disk_excluded("other_disk", "cache", &skip_disks, &skip_types));
+        // Neither matches
+        assert!(!is_disk_excluded("default", "local", &skip_disks, &skip_types));
     }
 }

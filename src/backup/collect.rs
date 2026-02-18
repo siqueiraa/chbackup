@@ -20,6 +20,7 @@ use super::checksum::compute_crc64;
 use crate::clickhouse::client::TableRow;
 use crate::manifest::{PartInfo, S3ObjectInfo};
 use crate::object_disk;
+use crate::table_filter::is_disk_excluded;
 
 /// URL-encode a database or table name for use in file paths.
 ///
@@ -111,6 +112,7 @@ pub struct CollectedPart {
 /// Walks ALL disk paths (not just `data_path`) to discover parts on every disk.
 ///
 /// Returns a mapping of "db.table" -> Vec<CollectedPart> with disk_name populated.
+#[allow(clippy::too_many_arguments)]
 pub fn collect_parts(
     data_path: &str,
     freeze_name: &str,
@@ -118,6 +120,8 @@ pub fn collect_parts(
     tables: &[TableRow],
     disk_type_map: &HashMap<String, String>,
     disk_paths: &HashMap<String, String>,
+    skip_disks: &[String],
+    skip_disk_types: &[String],
 ) -> Result<HashMap<String, Vec<CollectedPart>>> {
     let uuid_map = build_uuid_map(tables);
     let mut result: HashMap<String, Vec<CollectedPart>> = HashMap::new();
@@ -149,6 +153,17 @@ pub fn collect_parts(
     }
 
     for (disk_name, disk_path) in &paths_to_walk {
+        // Skip disks that are excluded by name or type
+        let disk_type = disk_type_map.get(disk_name).map(|s| s.as_str()).unwrap_or("");
+        if is_disk_excluded(disk_name, disk_type, skip_disks, skip_disk_types) {
+            info!(
+                disk = %disk_name,
+                disk_type = %disk_type,
+                "Skipping disk (excluded by skip_disks or skip_disk_types)"
+            );
+            continue;
+        }
+
         let shadow_dir = PathBuf::from(disk_path).join("shadow").join(freeze_name);
 
         if !shadow_dir.exists() {
@@ -590,6 +605,8 @@ mod tests {
             &tables,
             &disk_type_map,
             &disk_paths,
+            &[],
+            &[],
         )
         .unwrap();
 
@@ -666,6 +683,8 @@ mod tests {
             &tables,
             &disk_type_map,
             &disk_paths,
+            &[],
+            &[],
         )
         .unwrap();
 

@@ -222,6 +222,8 @@ pub async fn create(
         let table_row_clone = table_row.clone();
         let disk_type_map_clone = disk_type_map.clone();
         let disk_map_clone = disk_map.clone();
+        let skip_disks_clone = config.clickhouse.skip_disks.clone();
+        let skip_disk_types_clone = config.clickhouse.skip_disk_types.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -289,6 +291,8 @@ pub async fn create(
                     &tables_for_collect,
                     &disk_type_map_clone,
                     &disk_map_clone,
+                    &skip_disks_clone,
+                    &skip_disk_types_clone,
                 )
             })
             .await
