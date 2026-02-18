@@ -406,6 +406,10 @@ pub struct WatchConfig {
     #[serde(default = "default_name_template")]
     pub name_template: String,
 
+    /// table filter pattern for watch backups (None = match all)
+    #[serde(default)]
+    pub tables: Option<String>,
+
     /// abort after N consecutive failures
     #[serde(default = "default_max_consecutive_errors")]
     pub max_consecutive_errors: u32,
@@ -600,6 +604,7 @@ impl Default for WatchConfig {
             watch_interval: default_watch_interval(),
             full_interval: default_full_interval(),
             name_template: default_name_template(),
+            tables: None,
             max_consecutive_errors: default_max_consecutive_errors(),
             retry_interval: default_retry_interval(),
             delete_local_after_upload: true,
@@ -1120,6 +1125,7 @@ impl Config {
             "watch.watch_interval" => self.watch.watch_interval = value.to_string(),
             "watch.full_interval" => self.watch.full_interval = value.to_string(),
             "watch.name_template" => self.watch.name_template = value.to_string(),
+            "watch.tables" => self.watch.tables = Some(value.to_string()),
             "watch.max_consecutive_errors" => {
                 self.watch.max_consecutive_errors = value.parse().context("Invalid u32")?
             }
@@ -1245,7 +1251,7 @@ impl Config {
 
 /// Parse a simple duration string (e.g. "1h", "24h", "30m", "5s", "10s") into seconds.
 /// Supports h (hours), m (minutes), s (seconds) suffixes.
-fn parse_duration_secs(s: &str) -> Result<u64> {
+pub fn parse_duration_secs(s: &str) -> Result<u64> {
     let s = s.trim();
     if s.is_empty() {
         return Err(anyhow::anyhow!("Empty duration string"));
@@ -1280,5 +1286,35 @@ mod tests {
         assert_eq!(parse_duration_secs("30m").unwrap(), 1800);
         assert_eq!(parse_duration_secs("5s").unwrap(), 5);
         assert_eq!(parse_duration_secs("10s").unwrap(), 10);
+    }
+
+    #[test]
+    fn test_parse_duration_secs_public_access() {
+        // Verify parse_duration_secs is public and callable from tests
+        use crate::config::parse_duration_secs;
+        assert_eq!(parse_duration_secs("1h").unwrap(), 3600);
+        assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
+        assert_eq!(parse_duration_secs("45m").unwrap(), 2700);
+        assert_eq!(parse_duration_secs("120s").unwrap(), 120);
+    }
+
+    #[test]
+    fn test_watch_config_tables_field() {
+        // Verify WatchConfig has tables field with Option<String>
+        let mut watch = WatchConfig::default();
+        assert!(watch.tables.is_none(), "Default tables should be None");
+
+        watch.tables = Some("default.*".to_string());
+        assert_eq!(watch.tables, Some("default.*".to_string()));
+
+        // Verify serde deserialization with tables field present
+        let yaml = "enabled: true\ntables: 'default.*'";
+        let config: WatchConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.tables, Some("default.*".to_string()));
+
+        // Verify serde deserialization without tables field (backward compat)
+        let yaml_no_tables = "enabled: true";
+        let config2: WatchConfig = serde_yaml::from_str(yaml_no_tables).unwrap();
+        assert!(config2.tables.is_none());
     }
 }
