@@ -35,6 +35,9 @@ pub struct BackupSummary {
     pub table_count: usize,
     /// Whether the backup manifest is missing or corrupt.
     pub is_broken: bool,
+    /// Reason why the backup is broken (e.g., "metadata.json not found").
+    /// None for valid backups.
+    pub broken_reason: Option<String>,
 }
 
 /// List backups based on the requested location.
@@ -145,9 +148,11 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                         compressed_size: manifest.compressed_size,
                         table_count: manifest.tables.len(),
                         is_broken: false,
+                        broken_reason: None,
                     });
                 }
                 Err(e) => {
+                    let reason = format!("manifest parse error: {e}");
                     warn!(
                         backup = %name,
                         error = %e,
@@ -160,10 +165,12 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                         compressed_size: 0,
                         table_count: 0,
                         is_broken: true,
+                        broken_reason: Some(reason),
                     });
                 }
             },
             Err(e) => {
+                let reason = format!("metadata.json not found: {e}");
                 debug!(
                     backup = %name,
                     error = %e,
@@ -176,6 +183,7 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                     compressed_size: 0,
                     table_count: 0,
                     is_broken: true,
+                    broken_reason: Some(reason),
                 });
             }
         }
@@ -276,6 +284,93 @@ pub async fn delete_remote(s3: &S3Client, backup_name: &str) -> Result<()> {
     Ok(())
 }
 
+// -- Clean broken functions --
+
+/// Delete all broken local backups (missing or corrupt metadata.json).
+///
+/// Returns the count of deleted broken backups.
+pub fn clean_broken_local(data_path: &str) -> Result<usize> {
+    let backups = list_local(data_path)?;
+    let broken: Vec<&BackupSummary> = backups.iter().filter(|b| b.is_broken).collect();
+
+    if broken.is_empty() {
+        info!("No broken local backups found");
+        return Ok(0);
+    }
+
+    let mut deleted = 0;
+    for b in &broken {
+        match delete_local(data_path, &b.name) {
+            Ok(()) => {
+                info!(backup = %b.name, "Deleted broken local backup");
+                deleted += 1;
+            }
+            Err(e) => {
+                warn!(
+                    backup = %b.name,
+                    error = %e,
+                    "Failed to delete broken local backup"
+                );
+            }
+        }
+    }
+
+    info!("clean_broken: deleted {} broken backups", deleted);
+    Ok(deleted)
+}
+
+/// Delete all broken remote backups (missing or corrupt metadata.json).
+///
+/// Returns the count of deleted broken backups.
+pub async fn clean_broken_remote(s3: &S3Client) -> Result<usize> {
+    let backups = list_remote(s3).await?;
+    let broken: Vec<&BackupSummary> = backups.iter().filter(|b| b.is_broken).collect();
+
+    if broken.is_empty() {
+        info!("No broken remote backups found");
+        return Ok(0);
+    }
+
+    let mut deleted = 0;
+    for b in &broken {
+        match delete_remote(s3, &b.name).await {
+            Ok(()) => {
+                info!(backup = %b.name, "Deleted broken remote backup");
+                deleted += 1;
+            }
+            Err(e) => {
+                warn!(
+                    backup = %b.name,
+                    error = %e,
+                    "Failed to delete broken remote backup"
+                );
+            }
+        }
+    }
+
+    info!("clean_broken: deleted {} broken backups", deleted);
+    Ok(deleted)
+}
+
+/// Clean broken backups by location (local or remote).
+pub async fn clean_broken(
+    data_path: &str,
+    s3: &S3Client,
+    location: &Location,
+) -> Result<()> {
+    match location {
+        Location::Local => {
+            let count = clean_broken_local(data_path)?;
+            info!(count = count, "Clean broken local complete");
+        }
+        Location::Remote => {
+            let count = clean_broken_remote(s3).await?;
+            info!(count = count, "Clean broken remote complete");
+        }
+    }
+    Ok(())
+}
+
 // -- Internal helpers --
 
 /// Parse a backup summary from a metadata.json file path.
@@ -288,6 +383,7 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
             compressed_size: 0,
             table_count: 0,
             is_broken: true,
+            broken_reason: Some("metadata.json not found".to_string()),
         };
     }
 
@@ -299,8 +395,10 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
             compressed_size: manifest.compressed_size,
             table_count: manifest.tables.len(),
             is_broken: false,
+            broken_reason: None,
         },
         Err(e) => {
+            let reason = format!("manifest parse error: {e}");
             warn!(
                 backup = %name,
                 path = %metadata_path.display(),
@@ -314,6 +412,7 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
                 compressed_size: 0,
                 table_count: 0,
                 is_broken: true,
+                broken_reason: Some(reason),
             }
         }
     }
@@ -376,7 +475,14 @@ fn format_size(bytes: u64) -> String {
 /// Print a formatted table of backup summaries.
 fn print_backup_table(summaries: &[BackupSummary]) {
     for s in summaries {
-        let status = if s.is_broken { " [BROKEN]" } else { "" };
+        let status = if s.is_broken {
+            match &s.broken_reason {
+                Some(reason) => format!(" [BROKEN: {}]", reason),
+                None => " [BROKEN]".to_string(),
+            }
+        } else {
+            String::new()
+        };
         let ts = match &s.timestamp {
             Some(t) => t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
             None => "unknown".to_string(),
@@ -577,5 +683,130 @@ mod tests {
             "daily/metadata.json"
         );
         assert_eq!(strip_s3_prefix("other/key", "chbackup"), "other/key");
+    }
+
+    #[test]
+    fn test_broken_backup_display_reason() {
+        // A broken backup with missing metadata.json should show the reason
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        // Create a broken backup (no metadata.json)
+        let broken_dir = backup_base.join("broken-no-meta");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+
+        // Create a broken backup with invalid metadata.json
+        let broken_invalid = backup_base.join("broken-invalid");
+        std::fs::create_dir_all(&broken_invalid).unwrap();
+        std::fs::write(broken_invalid.join("metadata.json"), "not valid json").unwrap();
+
+        let summaries = list_local(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(summaries.len(), 2);
+
+        let no_meta = summaries
+            .iter()
+            .find(|s| s.name == "broken-no-meta")
+            .unwrap();
+        assert!(no_meta.is_broken);
+        assert!(no_meta.broken_reason.is_some());
+        assert!(
+            no_meta
+                .broken_reason
+                .as_ref()
+                .unwrap()
+                .contains("metadata.json not found"),
+            "Expected 'metadata.json not found' but got: {:?}",
+            no_meta.broken_reason
+        );
+
+        let invalid = summaries
+            .iter()
+            .find(|s| s.name == "broken-invalid")
+            .unwrap();
+        assert!(invalid.is_broken);
+        assert!(invalid.broken_reason.is_some());
+        assert!(
+            invalid
+                .broken_reason
+                .as_ref()
+                .unwrap()
+                .contains("manifest parse error"),
+            "Expected 'manifest parse error' but got: {:?}",
+            invalid.broken_reason
+        );
+    }
+
+    #[test]
+    fn test_clean_broken_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        // Create a broken backup (no metadata.json)
+        let broken_dir = backup_base.join("broken-backup");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+
+        // Create another broken backup with invalid JSON
+        let broken_dir2 = backup_base.join("broken-invalid");
+        std::fs::create_dir_all(&broken_dir2).unwrap();
+        std::fs::write(broken_dir2.join("metadata.json"), "bad json").unwrap();
+
+        // Verify both exist
+        assert!(broken_dir.exists());
+        assert!(broken_dir2.exists());
+
+        // Clean broken
+        let count = clean_broken_local(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(count, 2, "Should have deleted 2 broken backups");
+
+        // Verify both are gone
+        assert!(!broken_dir.exists());
+        assert!(!broken_dir2.exists());
+    }
+
+    #[test]
+    fn test_clean_broken_local_preserves_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        // Create a valid backup
+        let valid_dir = backup_base.join("valid-backup");
+        std::fs::create_dir_all(&valid_dir).unwrap();
+        let manifest = BackupManifest {
+            manifest_version: 1,
+            name: "valid-backup".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: "24.1.3.31".to_string(),
+            chbackup_version: "0.1.0".to_string(),
+            data_format: "lz4".to_string(),
+            compressed_size: 1024,
+            metadata_size: 256,
+            disks: HashMap::new(),
+            disk_types: HashMap::new(),
+            disk_remote_paths: HashMap::new(),
+            tables: HashMap::new(),
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+        };
+        manifest
+            .save_to_file(&valid_dir.join("metadata.json"))
+            .unwrap();
+
+        // Create a broken backup
+        let broken_dir = backup_base.join("broken-backup");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+
+        // Clean broken
+        let count = clean_broken_local(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(count, 1, "Should have deleted 1 broken backup");
+
+        // Verify valid backup is preserved
+        assert!(valid_dir.exists());
+        // Verify broken backup is gone
+        assert!(!broken_dir.exists());
     }
 }
