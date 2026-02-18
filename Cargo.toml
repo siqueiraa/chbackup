@@ -70,5 +70,8 @@ http = "1"
 base64 = "0.22"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 
+# Prometheus metrics (Phase 3b)
+prometheus = "0.13"
+
 [dev-dependencies]
 tempfile = "3"

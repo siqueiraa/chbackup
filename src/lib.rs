@@ -163,6 +163,28 @@ mod tests {
     }
 
     #[test]
+    fn test_phase3b_prometheus_available() {
+        use prometheus::{
+            opts, Encoder, Gauge, Histogram, HistogramOpts, IntCounter, Registry, TextEncoder,
+        };
+        let registry = Registry::new();
+        let counter = IntCounter::new("test_counter", "help").unwrap();
+        registry.register(Box::new(counter.clone())).unwrap();
+        let encoder = TextEncoder::new();
+        let mut buffer = Vec::new();
+        encoder.encode(&registry.gather(), &mut buffer).unwrap();
+        assert!(!buffer.is_empty());
+
+        // Verify other types are available
+        let _gauge = Gauge::new("test_gauge", "help").unwrap();
+        let _histogram = Histogram::with_opts(
+            HistogramOpts::new("test_hist", "help").buckets(vec![1.0, 5.0, 10.0]),
+        )
+        .unwrap();
+        let _opts = opts!("test_opts", "help");
+    }
+
+    #[test]
     fn test_backup_summary_serializable() {
         use crate::list::BackupSummary;
 
