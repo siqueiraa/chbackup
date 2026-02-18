@@ -11,9 +11,10 @@ This module implements the HTTP API server for chbackup using axum (design doc s
 ```
 src/server/
   mod.rs          -- build_router(), start_server(), parse_integration_host_port(), re-exports
-  routes.rs       -- All endpoint handler functions (~20 endpoints), request/response types
+  routes.rs       -- All endpoint handler functions (~20 endpoints), request/response types, metrics instrumentation
   actions.rs      -- ActionLog ring buffer + ActionEntry/ActionStatus types
   auth.rs         -- Basic auth middleware (HTTP Basic, optional based on config)
+  metrics.rs      -- Metrics struct (custom prometheus::Registry), 14 metric families, encode()
   state.rs        -- AppState, RunningOp, operation management, auto-resume on restart
 ```
 
@@ -27,6 +28,7 @@ src/server/
 - `action_log: Arc<Mutex<ActionLog>>` -- operation history ring buffer
 - `current_op: Arc<Mutex<Option<RunningOp>>>` -- currently running operation for kill support
 - `op_semaphore: Arc<Semaphore>` -- concurrency control (1 permit when `allow_parallel=false`)
+- `metrics: Option<Arc<Metrics>>` -- Prometheus metrics registry (`None` when `config.api.enable_metrics` is false)
 
 Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) since locks are held across `.await` points.
 
@@ -94,13 +96,39 @@ Listens for Ctrl+C (SIGINT). On shutdown:
 2. Stops accepting new connections
 3. Logs "Server stopped"
 
+### Prometheus Metrics (metrics.rs)
+A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 metric families, all prefixed with `chbackup_`. Created conditionally in `AppState::new()` based on `config.api.enable_metrics`.
+
+**Metric families:**
+- `chbackup_backup_duration_seconds` -- HistogramVec with `operation` label (create, upload, download, restore, create_remote, restore_remote, delete, clean_broken_remote, clean_broken_local)
+- `chbackup_backup_size_bytes` -- Gauge (last backup compressed size)
+- `chbackup_backup_last_success_timestamp` -- Gauge (Unix timestamp)
+- `chbackup_parts_uploaded_total` -- IntCounter
+- `chbackup_parts_skipped_incremental_total` -- IntCounter
+- `chbackup_errors_total` -- IntCounterVec with `operation` label
+- `chbackup_successful_operations_total` -- IntCounterVec with `operation` label
+- `chbackup_number_backups_local` -- IntGauge (refreshed on scrape)
+- `chbackup_number_backups_remote` -- IntGauge (refreshed on scrape)
+- `chbackup_in_progress` -- IntGauge (1 if running, 0 otherwise)
+- `chbackup_watch_state` -- IntGauge (Phase 3d, defaults to 0)
+- `chbackup_watch_last_full_timestamp` -- Gauge (Phase 3d, defaults to 0)
+- `chbackup_watch_last_incremental_timestamp` -- Gauge (Phase 3d, defaults to 0)
+- `chbackup_watch_consecutive_errors` -- IntGauge (Phase 3d, defaults to 0)
+
+**Scrape-time refresh:** The `/metrics` handler calls `refresh_backup_counts()` which uses `spawn_blocking` for `list_local()` and async for `list_remote()` to update backup count gauges. The `in_progress` gauge is computed from `current_op` state.
+
+**Operation instrumentation:** Each spawned task in `routes.rs` records:
+- Duration via `backup_duration_seconds.with_label_values(&[op]).observe(elapsed)`
+- Success via `successful_operations_total.with_label_values(&[op]).inc()`
+- Failure via `errors_total.with_label_values(&[op]).inc()`
+- For create: `backup_size_bytes.set(manifest.compressed_size)` and `backup_last_success_timestamp.set(now)`
+
 ### Stub Endpoints
 Endpoints for future phases return 501 Not Implemented:
 - `/api/v1/clean` (Phase 3c -- retention)
 - `/api/v1/reload`, `/api/v1/restart` (Phase 3d -- watch mode)
 - `/api/v1/tables` (Phase 4f)
 - `/api/v1/watch/*` (Phase 3d)
-- `/metrics` (Phase 3b -- Prometheus)
 
 ### Sync Function Handling
 Sync functions from `list` module (`delete_local`, `clean_broken_local`) are called via `tokio::task::spawn_blocking` to avoid blocking the async runtime.
@@ -113,11 +141,13 @@ Sync functions from `list` module (`delete_local`, `clean_broken_local`) are cal
 ### Public API
 - `build_router(state: AppState) -> Router` -- Assembles all routes with optional auth middleware
 - `start_server(config: Arc<Config>, ch: ChClient, s3: S3Client) -> Result<()>` -- Full server lifecycle: state creation, router build, integration tables, auto-resume, listen, graceful shutdown
-- `AppState::new(config, ch, s3) -> Self` -- Create shared state with semaphore from config
+- `AppState::new(config, ch, s3) -> Self` -- Create shared state with semaphore and optional metrics from config
 - `AppState::try_start_op(command) -> Result<(u64, CancellationToken), &str>` -- Start tracked operation
 - `AppState::finish_op(id)` / `fail_op(id, error)` / `kill_current() -> bool` -- Operation exit paths
 - `scan_resumable_state_files(data_path) -> Vec<ResumableOp>` -- Find interrupted operations
 - `auto_resume(state)` -- Spawn resume tasks for found state files
+- `Metrics::new() -> Result<Self, prometheus::Error>` -- Create metrics registry with all 14 families registered
+- `Metrics::encode() -> Result<String, prometheus::Error>` -- Encode all metrics to Prometheus text exposition format
 
 ### Error Handling
 - Handler errors return `(StatusCode, Json<ErrorResponse>)` tuples
