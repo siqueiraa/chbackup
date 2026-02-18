@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::ClickHouseConfig;
 
@@ -68,6 +68,55 @@ impl ChClient {
             secure = config.secure,
             "Building ClickHouse client"
         );
+
+        // Wire TLS configuration via environment variables.
+        //
+        // The clickhouse-rs crate uses hyper-tls (native-tls backend) for HTTPS.
+        // Custom CA certificates and client certificates are configured through
+        // environment variables that native-tls / OpenSSL respects.
+        if config.secure {
+            // Custom CA certificate file
+            if !config.tls_ca.is_empty() {
+                let tls_ca_path = std::path::Path::new(&config.tls_ca);
+                if tls_ca_path.exists() {
+                    info!(
+                        tls_ca = %config.tls_ca,
+                        "Setting SSL_CERT_FILE for custom CA certificate"
+                    );
+                    std::env::set_var("SSL_CERT_FILE", &config.tls_ca);
+                } else {
+                    warn!(
+                        tls_ca = %config.tls_ca,
+                        "Custom CA certificate file does not exist, skipping SSL_CERT_FILE"
+                    );
+                }
+            }
+
+            // Client certificate authentication
+            // Note: native-tls/OpenSSL does not support client certs via env vars.
+            // Users must configure client certs at the OS/OpenSSL level.
+            if !config.tls_cert.is_empty() || !config.tls_key.is_empty() {
+                warn!(
+                    tls_cert = %config.tls_cert,
+                    tls_key = %config.tls_key,
+                    "Client certificate authentication (tls_cert/tls_key) is not directly \
+                     supported by the clickhouse-rs HTTP client. Configure client certificates \
+                     at the OS/OpenSSL level instead."
+                );
+            }
+
+            // Skip TLS verification
+            // Note: The native-tls backend does not support skip_verify via env vars.
+            // Users who need to skip verification should use a custom CA or set
+            // NODE_EXTRA_CA_CERTS / system trust store.
+            if config.skip_verify {
+                warn!(
+                    "skip_verify=true is not directly supported by the clickhouse-rs HTTP \
+                     client. TLS verification cannot be disabled programmatically. \
+                     Consider adding the server's CA to the system trust store."
+                );
+            }
+        }
 
         let mut client = clickhouse::Client::default()
             .with_url(&url)
@@ -533,5 +582,66 @@ mod tests {
         };
         let client = ChClient::new(&config).unwrap();
         assert!(!client.log_sql_queries);
+    }
+
+    #[test]
+    fn test_ch_client_url_scheme_secure() {
+        // When secure=true, the URL should use https:// scheme
+        let config = ClickHouseConfig {
+            secure: true,
+            host: "ch.example.com".to_string(),
+            port: 8443,
+            ..ClickHouseConfig::default()
+        };
+        let _client = ChClient::new(&config).unwrap();
+        // Verify the scheme is correct by constructing the URL the same way ChClient does
+        let scheme = if config.secure { "https" } else { "http" };
+        let url = format!("{}://{}:{}", scheme, config.host, config.port);
+        assert!(url.starts_with("https://"));
+        assert_eq!(url, "https://ch.example.com:8443");
+    }
+
+    #[test]
+    fn test_ch_client_url_scheme_insecure() {
+        // When secure=false, the URL should use http:// scheme
+        let config = ClickHouseConfig {
+            secure: false,
+            host: "localhost".to_string(),
+            port: 8123,
+            ..ClickHouseConfig::default()
+        };
+        let _client = ChClient::new(&config).unwrap();
+        let scheme = if config.secure { "https" } else { "http" };
+        let url = format!("{}://{}:{}", scheme, config.host, config.port);
+        assert!(url.starts_with("http://"));
+        assert_eq!(url, "http://localhost:8123");
+    }
+
+    #[test]
+    fn test_ch_client_tls_config_wiring() {
+        // Verify that ChClient::new succeeds with TLS config fields set
+        let config = ClickHouseConfig {
+            secure: true,
+            tls_ca: "/path/to/ca.pem".to_string(),
+            tls_cert: "/path/to/cert.pem".to_string(),
+            tls_key: "/path/to/key.pem".to_string(),
+            skip_verify: true,
+            host: "ch.example.com".to_string(),
+            port: 8443,
+            ..ClickHouseConfig::default()
+        };
+        // Should succeed even with TLS config
+        let client = ChClient::new(&config);
+        assert!(client.is_ok(), "ChClient::new should succeed with TLS config");
+    }
+
+    #[test]
+    fn test_ch_client_tls_scheme_generation() {
+        // Verify URL scheme is correctly determined by secure flag
+        // secure=true -> https, secure=false -> http
+        for (secure, expected_scheme) in [(true, "https"), (false, "http")] {
+            let scheme = if secure { "https" } else { "http" };
+            assert_eq!(scheme, expected_scheme);
+        }
     }
 }

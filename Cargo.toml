@@ -32,7 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # ClickHouse
-clickhouse = { version = "0.13", features = ["inserter"] }
+clickhouse = { version = "0.13", features = ["inserter", "native-tls"] }
 
 # S3
 aws-sdk-s3 = "1"
