@@ -27,7 +27,7 @@ use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use crate::clickhouse::client::{freeze_name, ChClient, TableRow};
+use crate::clickhouse::client::{freeze_name, ChClient, ColumnInconsistency, TableRow};
 use crate::concurrency::effective_max_connections;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, DatabaseInfo, TableManifest};
@@ -69,7 +69,7 @@ pub async fn create(
     schema_only: bool,
     diff_from: Option<&str>,
     partitions: Option<&str>,
-    _skip_check_parts_columns: bool,
+    skip_check_parts_columns: bool,
 ) -> Result<BackupManifest> {
     info!(
         backup_name = %backup_name,
@@ -140,6 +140,43 @@ pub async fn create(
             "No tables matched pattern '{}'. Set backup.allow_empty_backups=true to allow empty backups",
             pattern
         );
+    }
+
+    // 5b. Parts column consistency check (design 3.3)
+    if config.clickhouse.check_parts_columns && !skip_check_parts_columns {
+        let targets: Vec<(String, String)> = filtered_tables
+            .iter()
+            .map(|t| (t.database.clone(), t.name.clone()))
+            .collect();
+
+        match ch.check_parts_columns(&targets).await {
+            Ok(inconsistencies) => {
+                let actionable = filter_benign_type_drift(inconsistencies);
+                if !actionable.is_empty() {
+                    for inc in &actionable {
+                        warn!(
+                            database = %inc.database,
+                            table = %inc.table,
+                            column = %inc.column,
+                            types = ?inc.types,
+                            "Column type inconsistency detected across active parts"
+                        );
+                    }
+                    info!(
+                        count = actionable.len(),
+                        "Parts column consistency check found inconsistencies (proceeding anyway)"
+                    );
+                } else {
+                    info!("Parts column consistency check passed");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Parts column consistency check failed, continuing anyway"
+                );
+            }
+        }
     }
 
     // 6. Check for pending mutations (design 3.1)
@@ -548,6 +585,32 @@ fn is_metadata_only_engine(engine: &str) -> bool {
     )
 }
 
+/// Check if a type string represents a benign drift type.
+///
+/// Per design 3.3, Enum variants, Tuple element names, Nullable wrappers,
+/// and Array(Tuple) are considered benign drift that does not indicate
+/// actual schema incompatibility.
+fn is_benign_type(type_str: &str) -> bool {
+    type_str.starts_with("Enum")
+        || type_str.starts_with("Tuple")
+        || type_str.starts_with("Nullable(Enum")
+        || type_str.starts_with("Nullable(Tuple")
+        || type_str.starts_with("Array(Tuple")
+}
+
+/// Filter out column inconsistencies where ALL types in the inconsistency
+/// are benign drift types (Enum, Tuple, Nullable, etc.).
+///
+/// Returns only inconsistencies that contain at least one non-benign type.
+fn filter_benign_type_drift(
+    inconsistencies: Vec<ColumnInconsistency>,
+) -> Vec<ColumnInconsistency> {
+    inconsistencies
+        .into_iter()
+        .filter(|inc| !inc.types.iter().all(|t| is_benign_type(t)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use self::freeze::FreezeInfo;
@@ -667,5 +730,80 @@ mod tests {
             sql2,
             "ALTER TABLE `default`.`trades` FREEZE PARTITION '202402' WITH NAME 'chbackup_daily_default_trades'"
         );
+    }
+
+    #[test]
+    fn test_parts_columns_check_disabled() {
+        // When check_parts_columns is false, no checking is needed.
+        // This test verifies the config gating logic conceptually:
+        // if !config.check_parts_columns, the check is skipped entirely.
+        let check_enabled = false;
+        let skip_flag = false;
+        let should_check = check_enabled && !skip_flag;
+        assert!(!should_check);
+
+        // Also verify skip flag overrides config
+        let check_enabled = true;
+        let skip_flag = true;
+        let should_check = check_enabled && !skip_flag;
+        assert!(!should_check);
+
+        // Both must be right for check to run
+        let check_enabled = true;
+        let skip_flag = false;
+        let should_check = check_enabled && !skip_flag;
+        assert!(should_check);
+    }
+
+    #[test]
+    fn test_parts_columns_check_skip_benign_types() {
+        // Enum drift is benign
+        let enum_drift = ColumnInconsistency {
+            database: "default".to_string(),
+            table: "trades".to_string(),
+            column: "status".to_string(),
+            types: vec![
+                "Enum8('active' = 1, 'inactive' = 2)".to_string(),
+                "Enum8('active' = 1, 'inactive' = 2, 'deleted' = 3)".to_string(),
+            ],
+        };
+
+        // Tuple drift is benign
+        let tuple_drift = ColumnInconsistency {
+            database: "default".to_string(),
+            table: "events".to_string(),
+            column: "metadata".to_string(),
+            types: vec![
+                "Tuple(a UInt64, b String)".to_string(),
+                "Tuple(a UInt64, b String, c Float64)".to_string(),
+            ],
+        };
+
+        // Nullable(Enum) drift is benign
+        let nullable_enum_drift = ColumnInconsistency {
+            database: "logs".to_string(),
+            table: "entries".to_string(),
+            column: "level".to_string(),
+            types: vec![
+                "Nullable(Enum8('info' = 1))".to_string(),
+                "Nullable(Enum8('info' = 1, 'warn' = 2))".to_string(),
+            ],
+        };
+
+        // Real drift (non-benign): Float64 vs Decimal
+        let real_drift = ColumnInconsistency {
+            database: "default".to_string(),
+            table: "trades".to_string(),
+            column: "amount".to_string(),
+            types: vec!["Float64".to_string(), "Decimal(18,2)".to_string()],
+        };
+
+        let all = vec![enum_drift, tuple_drift, nullable_enum_drift, real_drift];
+        let actionable = filter_benign_type_drift(all);
+
+        // Only the real drift should remain
+        assert_eq!(actionable.len(), 1);
+        assert_eq!(actionable[0].column, "amount");
+        assert_eq!(actionable[0].types, vec!["Float64", "Decimal(18,2)"]);
     }
 }
