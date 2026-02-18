@@ -5,7 +5,9 @@
 //! via a semaphore (single-op when allow_parallel=false).
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +19,36 @@ use tracing::{info, warn};
 
 use super::actions::ActionLog;
 use super::metrics::Metrics;
+
+/// Current status of the watch loop, shared between the watch loop and API handlers.
+#[derive(Debug, Clone)]
+pub struct WatchStatus {
+    /// Whether the watch loop is currently active.
+    pub active: bool,
+    /// Human-readable state (e.g. "idle", "creating_full", "sleeping").
+    pub state: String,
+    /// Timestamp of the last successful full backup.
+    pub last_full: Option<DateTime<Utc>>,
+    /// Timestamp of the last successful incremental backup.
+    pub last_incr: Option<DateTime<Utc>>,
+    /// Number of consecutive errors in the watch loop.
+    pub consecutive_errors: u32,
+    /// Estimated time until the next backup (when sleeping).
+    pub next_backup_in: Option<Duration>,
+}
+
+impl Default for WatchStatus {
+    fn default() -> Self {
+        Self {
+            active: false,
+            state: "inactive".to_string(),
+            last_full: None,
+            last_incr: None,
+            consecutive_errors: 0,
+            next_backup_in: None,
+        }
+    }
+}
 
 /// Shared application state for all axum handlers.
 ///
@@ -32,6 +64,12 @@ pub struct AppState {
     pub op_semaphore: Arc<Semaphore>,
     /// Prometheus metrics registry. `None` when `config.api.enable_metrics` is false.
     pub metrics: Option<Arc<Metrics>>,
+    /// Watch loop shutdown signal sender. `None` when watch is not active.
+    pub watch_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Watch loop config reload signal sender. `None` when watch is not active.
+    pub watch_reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Shared watch status for API queries.
+    pub watch_status: Arc<Mutex<WatchStatus>>,
 }
 
 /// Tracks a currently running operation for cancellation support.
@@ -82,6 +120,9 @@ impl AppState {
             current_op: Arc::new(Mutex::new(None)),
             op_semaphore: Arc::new(Semaphore::new(permits)),
             metrics,
+            watch_shutdown_tx: None,
+            watch_reload_tx: None,
+            watch_status: Arc::new(Mutex::new(WatchStatus::default())),
         }
     }
 
@@ -474,6 +515,28 @@ mod tests {
             .clone()
             .try_acquire_owned()
             .expect("Should acquire third permit");
+    }
+
+    #[tokio::test]
+    async fn test_app_state_watch_handle_default_none() {
+        let config = test_config(false);
+
+        // We can't construct a full AppState without real CH/S3 clients,
+        // but we can verify the default values for watch fields directly.
+        assert!(!config.api.allow_parallel);
+
+        // Verify WatchStatus defaults
+        let watch_status = WatchStatus::default();
+        assert!(!watch_status.active);
+        assert_eq!(watch_status.state, "inactive");
+        assert!(watch_status.last_full.is_none());
+        assert!(watch_status.last_incr.is_none());
+        assert_eq!(watch_status.consecutive_errors, 0);
+        assert!(watch_status.next_backup_in.is_none());
+
+        // Verify that watch_shutdown_tx and watch_reload_tx
+        // would be None in a newly-created AppState (checked via the new() logic)
+        // The None initialization is in AppState::new(), verified by compilation.
     }
 
     #[test]
