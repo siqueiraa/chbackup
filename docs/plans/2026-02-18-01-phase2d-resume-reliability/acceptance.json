@@ -1,6 +1,6 @@
 {
   "plan": "2026-02-18-01-phase2d-resume-reliability",
-  "status": {"pass": 10, "fail": 2, "total": 12},
+  "status": {"pass": 12, "fail": 0, "total": 12},
   "last_updated": "2026-02-18T13:30:00Z",
   "features": [
     {
@@ -426,7 +426,7 @@
       "id": "F011",
       "category": "feature",
       "description": "Wire --resume and --partitions flags in main.rs (remove 'not yet implemented' warnings)",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -461,13 +461,13 @@
         ]
       },
       "related_tasks": [11],
-      "verified_at": null
+      "verified_at": "2026-02-18T15:00:00Z"
     },
     {
       "id": "FDOC",
       "category": "documentation",
       "description": "CLAUDE.md updated for all modified modules",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -503,7 +503,7 @@
         ]
       },
       "related_tasks": [12],
-      "verified_at": null
+      "verified_at": "2026-02-18T15:10:00Z"
     }
   ]
 }

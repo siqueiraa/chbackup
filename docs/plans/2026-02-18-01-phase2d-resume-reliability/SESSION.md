@@ -129,8 +129,8 @@ Group D (Wiring -- depends on all above):
 | 8 | Broken backup + clean_broken | done | de99468 | F008 |
 | 9 | Partition-level backup | done | bb1c0e3 | F009 |
 | 10 | Parts column check | done | c905417 | F010 |
-| 11 | Wire flags in main.rs | pending | - | F011 |
-| 12 | Update CLAUDE.md | pending | - | FDOC |
+| 11 | Wire flags in main.rs | done | 6631e92 | F011 |
+| 12 | Update CLAUDE.md | done | 00c9e18 | FDOC |
 
 **Status values:** pending, in_progress, fixing, done
 
@@ -157,7 +157,7 @@ Group D (Wiring -- depends on all above):
 
 ## Acceptance Summary
 
-10/12 PASS
+12/12 PASS
 
 ---
 
