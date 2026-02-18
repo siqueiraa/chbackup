@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
+use crate::clickhouse::{sanitize_name, ChClient};
+use crate::config::Config;
 use crate::manifest::BackupManifest;
 use crate::storage::S3Client;
 
@@ -365,6 +367,212 @@ pub async fn clean_broken(data_path: &str, s3: &S3Client, location: &Location) -
         }
     }
     Ok(())
+}
+
+// -- Retention functions --
+
+/// Resolve the effective local retention count.
+///
+/// Returns `retention.backups_to_keep_local` when non-zero, otherwise falls back
+/// to `general.backups_to_keep_local`. This matches clickhouse-backup behavior
+/// where the `retention:` section overrides the `general:` section.
+pub fn effective_retention_local(config: &Config) -> i32 {
+    if config.retention.backups_to_keep_local != 0 {
+        config.retention.backups_to_keep_local
+    } else {
+        config.general.backups_to_keep_local
+    }
+}
+
+/// Resolve the effective remote retention count.
+///
+/// Returns `retention.backups_to_keep_remote` when non-zero, otherwise falls back
+/// to `general.backups_to_keep_remote`. This matches clickhouse-backup behavior
+/// where the `retention:` section overrides the `general:` section.
+pub fn effective_retention_remote(config: &Config) -> i32 {
+    if config.retention.backups_to_keep_remote != 0 {
+        config.retention.backups_to_keep_remote
+    } else {
+        config.general.backups_to_keep_remote
+    }
+}
+
+/// Delete oldest local backups exceeding the `keep` count.
+///
+/// Follows the `clean_broken_local` pattern: list -> filter -> sort -> delete -> count.
+/// Broken backups are excluded from retention counting and deletion.
+///
+/// - `keep == 0` or `keep == -1`: no retention action (return Ok(0)).
+///   `-1` means "delete after upload" which is handled by the upload module.
+/// - `keep > 0`: keep the N newest valid backups, delete the rest.
+///
+/// Returns the number of deleted backups.
+pub fn retention_local(data_path: &str, keep: i32) -> Result<usize> {
+    if keep <= 0 {
+        return Ok(0);
+    }
+
+    let backups = list_local(data_path)?;
+
+    // Filter to valid (non-broken) backups only
+    let mut valid: Vec<&BackupSummary> = backups.iter().filter(|b| !b.is_broken).collect();
+
+    let keep = keep as usize;
+    if valid.len() <= keep {
+        return Ok(0);
+    }
+
+    // Sort by timestamp ascending (oldest first).
+    // None timestamps (should not happen for valid backups) treated as very old.
+    valid.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    let to_delete = valid.len() - keep;
+    let mut deleted = 0;
+
+    for b in valid.iter().take(to_delete) {
+        match delete_local(data_path, &b.name) {
+            Ok(()) => {
+                info!(backup = %b.name, "retention_local: deleted old backup");
+                deleted += 1;
+            }
+            Err(e) => {
+                warn!(
+                    backup = %b.name,
+                    error = %e,
+                    "retention_local: failed to delete backup"
+                );
+            }
+        }
+    }
+
+    info!(
+        deleted = deleted,
+        total = backups.len(),
+        "retention_local: deleted N of M local backups"
+    );
+    Ok(deleted)
+}
+
+// -- Shadow cleanup functions --
+
+/// Remove `chbackup_*` directories from a single disk's shadow path (sync helper).
+///
+/// If `name` is provided, only removes entries matching `chbackup_{sanitized_name}_*`.
+/// If `name` is `None`, removes all entries matching `chbackup_*`.
+///
+/// Returns the number of directories removed.
+fn clean_shadow_dir(disk_path: &str, name: Option<&str>) -> Result<usize> {
+    let shadow_path = PathBuf::from(disk_path).join("shadow");
+
+    if !shadow_path.exists() {
+        return Ok(0);
+    }
+
+    let entries = std::fs::read_dir(&shadow_path).with_context(|| {
+        format!(
+            "Failed to read shadow directory: {}",
+            shadow_path.display()
+        )
+    })?;
+
+    let prefix_filter = name.map(|n| format!("chbackup_{}_", sanitize_name(n)));
+
+    let mut removed = 0;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "Failed to read shadow directory entry");
+                continue;
+            }
+        };
+
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        let should_remove = if let Some(ref prefix) = prefix_filter {
+            dir_name.starts_with(prefix)
+        } else {
+            dir_name.starts_with("chbackup_")
+        };
+
+        if should_remove {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    info!(
+                        freeze_name = %dir_name,
+                        disk = %disk_path,
+                        "clean_shadow: removed shadow directory"
+                    );
+                    removed += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        freeze_name = %dir_name,
+                        disk = %disk_path,
+                        error = %e,
+                        "clean_shadow: failed to remove shadow directory"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Remove `chbackup_*` shadow directories from all non-backup disks.
+///
+/// Queries ClickHouse for all disks, filters out backup-type disks (per design 13),
+/// and removes matching shadow directories from each remaining disk.
+///
+/// If `name` is provided, only removes entries matching `chbackup_{sanitized_name}_*`.
+/// Returns the total number of directories removed across all disks.
+pub async fn clean_shadow(ch: &ChClient, data_path: &str, name: Option<&str>) -> Result<usize> {
+    let disks = ch.get_disks().await?;
+
+    let mut total = 0;
+    for disk in &disks {
+        // Skip backup-type disks per design 13
+        if disk.disk_type == "backup" {
+            debug!(disk = %disk.name, "Skipping backup-type disk for shadow cleanup");
+            continue;
+        }
+
+        let disk_path = disk.path.clone();
+        let name_owned = name.map(|n| n.to_string());
+        let count = tokio::task::spawn_blocking(move || {
+            clean_shadow_dir(&disk_path, name_owned.as_deref())
+        })
+        .await
+        .context("Shadow cleanup task panicked")??;
+
+        total += count;
+    }
+
+    // Also check data_path itself in case it's not listed as a disk
+    // (the default disk path may differ from system.disks entries)
+    let data_path_in_disks = disks.iter().any(|d| d.path == data_path);
+    if !data_path_in_disks {
+        let dp = data_path.to_string();
+        let name_owned = name.map(|n| n.to_string());
+        let count = tokio::task::spawn_blocking(move || {
+            clean_shadow_dir(&dp, name_owned.as_deref())
+        })
+        .await
+        .context("Shadow cleanup task panicked")??;
+        total += count;
+    }
+
+    info!(total = total, "clean_shadow: removed N shadow directories");
+    Ok(total)
 }
 
 // -- Internal helpers --
@@ -804,5 +1012,231 @@ mod tests {
         assert!(valid_dir.exists());
         // Verify broken backup is gone
         assert!(!broken_dir.exists());
+    }
+
+    #[test]
+    fn test_clean_shadow_removes_chbackup_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let shadow_dir = dir.path().join("shadow");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+
+        // Create chbackup shadow directories (should be removed)
+        let chbackup1 = shadow_dir.join("chbackup_daily_mon_default_trades");
+        std::fs::create_dir_all(&chbackup1).unwrap();
+        // Add a file inside to ensure remove_dir_all works
+        std::fs::write(chbackup1.join("data.bin"), b"test").unwrap();
+
+        let chbackup2 = shadow_dir.join("chbackup_weekly_default_events");
+        std::fs::create_dir_all(&chbackup2).unwrap();
+
+        // Create non-chbackup shadow directory (should NOT be removed)
+        let other = shadow_dir.join("other_freeze_data");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let count = clean_shadow_dir(dir.path().to_str().unwrap(), None).unwrap();
+
+        assert_eq!(count, 2, "Should have removed 2 chbackup shadow dirs");
+        assert!(!chbackup1.exists(), "chbackup_daily_mon should be removed");
+        assert!(!chbackup2.exists(), "chbackup_weekly should be removed");
+        assert!(other.exists(), "other_freeze_data should NOT be removed");
+    }
+
+    #[test]
+    fn test_clean_shadow_with_name_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let shadow_dir = dir.path().join("shadow");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+
+        // Create chbackup shadow directories
+        let chbackup1 = shadow_dir.join("chbackup_daily_mon_default_trades");
+        std::fs::create_dir_all(&chbackup1).unwrap();
+
+        let chbackup2 = shadow_dir.join("chbackup_weekly_default_events");
+        std::fs::create_dir_all(&chbackup2).unwrap();
+
+        // Filter by backup name "daily-mon" -> sanitized to "daily_mon"
+        let count =
+            clean_shadow_dir(dir.path().to_str().unwrap(), Some("daily-mon")).unwrap();
+
+        assert_eq!(count, 1, "Should have removed 1 matching shadow dir");
+        assert!(!chbackup1.exists(), "chbackup_daily_mon should be removed");
+        assert!(
+            chbackup2.exists(),
+            "chbackup_weekly should NOT be removed (different backup name)"
+        );
+    }
+
+    #[test]
+    fn test_clean_shadow_no_shadow_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // No shadow directory created
+        let count = clean_shadow_dir(dir.path().to_str().unwrap(), None).unwrap();
+        assert_eq!(count, 0, "Should return 0 when no shadow dir exists");
+    }
+
+    #[test]
+    fn test_clean_shadow_empty_shadow_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let shadow_dir = dir.path().join("shadow");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+        // Shadow dir exists but empty
+        let count = clean_shadow_dir(dir.path().to_str().unwrap(), None).unwrap();
+        assert_eq!(count, 0, "Should return 0 when shadow dir is empty");
+    }
+
+    // -- Retention tests --
+
+    /// Helper to create a valid backup with a specific timestamp in the temp dir.
+    fn create_backup_with_timestamp(
+        backup_base: &std::path::Path,
+        name: &str,
+        timestamp: DateTime<Utc>,
+    ) {
+        let backup_dir = backup_base.join(name);
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let manifest = BackupManifest {
+            manifest_version: 1,
+            name: name.to_string(),
+            timestamp,
+            clickhouse_version: "24.1.3.31".to_string(),
+            chbackup_version: "0.1.0".to_string(),
+            data_format: "lz4".to_string(),
+            compressed_size: 1024,
+            metadata_size: 256,
+            disks: HashMap::new(),
+            disk_types: HashMap::new(),
+            disk_remote_paths: HashMap::new(),
+            tables: HashMap::new(),
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+        };
+        manifest
+            .save_to_file(&backup_dir.join("metadata.json"))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_effective_retention_local() {
+        use crate::config::Config;
+
+        // retention overrides general when non-zero
+        let mut config = Config::default();
+        config.retention.backups_to_keep_local = 3;
+        config.general.backups_to_keep_local = 5;
+        assert_eq!(effective_retention_local(&config), 3);
+
+        // fallback to general when retention is 0
+        let mut config2 = Config::default();
+        config2.retention.backups_to_keep_local = 0;
+        config2.general.backups_to_keep_local = 5;
+        assert_eq!(effective_retention_local(&config2), 5);
+
+        // both zero => 0
+        let config3 = Config::default();
+        assert_eq!(effective_retention_local(&config3), 0);
+
+        // remote variant
+        let mut config4 = Config::default();
+        config4.retention.backups_to_keep_remote = 7;
+        config4.general.backups_to_keep_remote = 10;
+        assert_eq!(effective_retention_remote(&config4), 7);
+
+        // remote fallback
+        let mut config5 = Config::default();
+        config5.retention.backups_to_keep_remote = 0;
+        config5.general.backups_to_keep_remote = 10;
+        assert_eq!(effective_retention_remote(&config5), 10);
+    }
+
+    #[test]
+    fn test_retention_local_deletes_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        let base_ts = chrono::Utc::now();
+
+        // Create 5 backups with timestamps spread 1 day apart
+        for i in 0..5 {
+            let ts = base_ts - chrono::Duration::days(4 - i);
+            create_backup_with_timestamp(&backup_base, &format!("backup-day-{}", i), ts);
+        }
+
+        // Keep 3
+        let deleted = retention_local(dir.path().to_str().unwrap(), 3).unwrap();
+        assert_eq!(deleted, 2, "Should have deleted 2 oldest backups");
+
+        // The 3 newest (day-2, day-3, day-4) should remain
+        assert!(backup_base.join("backup-day-2").exists());
+        assert!(backup_base.join("backup-day-3").exists());
+        assert!(backup_base.join("backup-day-4").exists());
+
+        // The 2 oldest (day-0, day-1) should be gone
+        assert!(!backup_base.join("backup-day-0").exists());
+        assert!(!backup_base.join("backup-day-1").exists());
+    }
+
+    #[test]
+    fn test_retention_local_skips_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        let base_ts = chrono::Utc::now();
+
+        // Create 4 valid backups
+        for i in 0..4 {
+            let ts = base_ts - chrono::Duration::days(3 - i);
+            create_backup_with_timestamp(&backup_base, &format!("backup-{}", i), ts);
+        }
+
+        // Create 1 broken backup (no metadata.json)
+        let broken_dir = backup_base.join("broken-backup");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+
+        // Keep 3 => should delete 1 oldest valid backup, leaving broken untouched
+        let deleted = retention_local(dir.path().to_str().unwrap(), 3).unwrap();
+        assert_eq!(deleted, 1, "Should have deleted 1 oldest valid backup");
+
+        // Broken backup should still exist
+        assert!(broken_dir.exists(), "Broken backup should be untouched");
+
+        // Oldest valid (backup-0) should be gone
+        assert!(!backup_base.join("backup-0").exists());
+
+        // Newer 3 valid backups should remain
+        assert!(backup_base.join("backup-1").exists());
+        assert!(backup_base.join("backup-2").exists());
+        assert!(backup_base.join("backup-3").exists());
+    }
+
+    #[test]
+    fn test_retention_local_zero_means_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        let base_ts = chrono::Utc::now();
+
+        // Create 5 backups
+        for i in 0..5 {
+            let ts = base_ts - chrono::Duration::days(4 - i);
+            create_backup_with_timestamp(&backup_base, &format!("backup-{}", i), ts);
+        }
+
+        // keep=0 means unlimited, should delete nothing
+        let deleted = retention_local(dir.path().to_str().unwrap(), 0).unwrap();
+        assert_eq!(deleted, 0, "Should not delete anything when keep=0");
+
+        // All 5 should still exist
+        for i in 0..5 {
+            assert!(backup_base.join(format!("backup-{}", i)).exists());
+        }
+
+        // keep=-1 also means no retention action
+        let deleted = retention_local(dir.path().to_str().unwrap(), -1).unwrap();
+        assert_eq!(deleted, 0, "Should not delete anything when keep=-1");
     }
 }
