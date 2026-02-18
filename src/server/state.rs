@@ -139,6 +139,210 @@ impl AppState {
     }
 }
 
+/// A resumable operation found by scanning the backup directory for state files.
+#[derive(Debug, Clone)]
+pub struct ResumableOp {
+    /// Name of the backup directory.
+    pub backup_name: String,
+    /// Type of operation: "upload", "download", or "restore".
+    pub op_type: String,
+}
+
+/// Scan the backup directory for resumable state files.
+///
+/// Walks `{data_path}/backup/` and checks each subdirectory for
+/// `upload.state.json`, `download.state.json`, or `restore.state.json`.
+pub fn scan_resumable_state_files(data_path: &str) -> Vec<ResumableOp> {
+    let backup_dir = std::path::Path::new(data_path).join("backup");
+    let mut ops = Vec::new();
+
+    let entries = match std::fs::read_dir(&backup_dir) {
+        Ok(entries) => entries,
+        Err(_) => return ops,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let backup_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        for (state_file, op_type) in &[
+            ("upload.state.json", "upload"),
+            ("download.state.json", "download"),
+            ("restore.state.json", "restore"),
+        ] {
+            if path.join(state_file).exists() {
+                ops.push(ResumableOp {
+                    backup_name: backup_name.clone(),
+                    op_type: op_type.to_string(),
+                });
+            }
+        }
+    }
+
+    ops
+}
+
+/// Scan for and auto-resume interrupted operations on server startup.
+///
+/// If `config.api.complete_resumable_after_restart` is false, this is a no-op.
+/// Otherwise, scans for state files and spawns the corresponding operations.
+pub async fn auto_resume(state: &AppState) {
+    if !state.config.api.complete_resumable_after_restart {
+        tracing::info!("Auto-resume disabled by configuration");
+        return;
+    }
+
+    let data_path = &state.config.clickhouse.data_path;
+    let ops = scan_resumable_state_files(data_path);
+
+    if ops.is_empty() {
+        tracing::info!("Auto-resume: no resumable operations found");
+        return;
+    }
+
+    tracing::info!(count = ops.len(), "Auto-resume: found {} resumable operations", ops.len());
+
+    for op in ops {
+        let state_clone = state.clone();
+        let backup_name = op.backup_name.clone();
+        let op_type = op.op_type.clone();
+
+        match op_type.as_str() {
+            "upload" => {
+                tokio::spawn(async move {
+                    let (id, _token) = match state_clone.try_start_op("upload").await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                backup_name = %backup_name,
+                                error = %e,
+                                "Auto-resume: could not start upload operation"
+                            );
+                            return;
+                        }
+                    };
+
+                    tracing::info!(backup_name = %backup_name, "Auto-resume: resuming upload");
+
+                    let backup_dir = std::path::PathBuf::from(&state_clone.config.clickhouse.data_path)
+                        .join("backup")
+                        .join(&backup_name);
+
+                    let result = crate::upload::upload(
+                        &state_clone.config,
+                        &state_clone.s3,
+                        &backup_name,
+                        &backup_dir,
+                        false,  // delete_local
+                        None,   // diff_from_remote
+                        true,   // resume = true
+                    )
+                    .await;
+
+                    match result {
+                        Ok(_) => {
+                            tracing::info!(backup_name = %backup_name, "Auto-resume: upload completed");
+                            state_clone.finish_op(id).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: upload failed");
+                            state_clone.fail_op(id, e.to_string()).await;
+                        }
+                    }
+                });
+            }
+            "download" => {
+                tokio::spawn(async move {
+                    let (id, _token) = match state_clone.try_start_op("download").await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                backup_name = %backup_name,
+                                error = %e,
+                                "Auto-resume: could not start download operation"
+                            );
+                            return;
+                        }
+                    };
+
+                    tracing::info!(backup_name = %backup_name, "Auto-resume: resuming download");
+
+                    let result = crate::download::download(
+                        &state_clone.config,
+                        &state_clone.s3,
+                        &backup_name,
+                        true,   // resume = true
+                    )
+                    .await;
+
+                    match result {
+                        Ok(_) => {
+                            tracing::info!(backup_name = %backup_name, "Auto-resume: download completed");
+                            state_clone.finish_op(id).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: download failed");
+                            state_clone.fail_op(id, e.to_string()).await;
+                        }
+                    }
+                });
+            }
+            "restore" => {
+                tokio::spawn(async move {
+                    let (id, _token) = match state_clone.try_start_op("restore").await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                backup_name = %backup_name,
+                                error = %e,
+                                "Auto-resume: could not start restore operation"
+                            );
+                            return;
+                        }
+                    };
+
+                    tracing::info!(backup_name = %backup_name, "Auto-resume: resuming restore");
+
+                    let result = crate::restore::restore(
+                        &state_clone.config,
+                        &state_clone.ch,
+                        &backup_name,
+                        None,   // tables
+                        false,  // schema_only
+                        false,  // data_only
+                        true,   // resume = true
+                    )
+                    .await;
+
+                    match result {
+                        Ok(_) => {
+                            tracing::info!(backup_name = %backup_name, "Auto-resume: restore completed");
+                            state_clone.finish_op(id).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: restore failed");
+                            state_clone.fail_op(id, e.to_string()).await;
+                        }
+                    }
+                });
+            }
+            other => {
+                tracing::warn!(op_type = %other, "Auto-resume: unknown operation type, skipping");
+            }
+        }
+
+        // Small delay between spawned operations to avoid overwhelming the system
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +446,65 @@ mod tests {
             .clone()
             .try_acquire_owned()
             .expect("Should acquire third permit");
+    }
+
+    #[test]
+    fn test_scan_resumable_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let ops = scan_resumable_state_files(dir.path().to_str().unwrap());
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_scan_resumable_finds_state_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup");
+
+        // Create two backup directories with state files
+        let backup1 = backup_dir.join("daily-2024-01-15");
+        std::fs::create_dir_all(&backup1).unwrap();
+        std::fs::write(backup1.join("upload.state.json"), "{}").unwrap();
+
+        let backup2 = backup_dir.join("daily-2024-01-16");
+        std::fs::create_dir_all(&backup2).unwrap();
+        std::fs::write(backup2.join("download.state.json"), "{}").unwrap();
+        std::fs::write(backup2.join("restore.state.json"), "{}").unwrap();
+
+        let ops = scan_resumable_state_files(dir.path().to_str().unwrap());
+        assert_eq!(ops.len(), 3);
+
+        // Verify all ops are found (order may vary due to readdir)
+        let upload_ops: Vec<_> = ops.iter().filter(|o| o.op_type == "upload").collect();
+        let download_ops: Vec<_> = ops.iter().filter(|o| o.op_type == "download").collect();
+        let restore_ops: Vec<_> = ops.iter().filter(|o| o.op_type == "restore").collect();
+
+        assert_eq!(upload_ops.len(), 1);
+        assert_eq!(download_ops.len(), 1);
+        assert_eq!(restore_ops.len(), 1);
+        assert_eq!(upload_ops[0].backup_name, "daily-2024-01-15");
+        assert_eq!(download_ops[0].backup_name, "daily-2024-01-16");
+        assert_eq!(restore_ops[0].backup_name, "daily-2024-01-16");
+    }
+
+    #[test]
+    fn test_scan_resumable_nonexistent_dir() {
+        let ops = scan_resumable_state_files("/nonexistent/path");
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_scan_resumable_ignores_files_in_backup_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        // A file directly in backup/ should be ignored (not a directory)
+        std::fs::write(backup_dir.join("stale.json"), "{}").unwrap();
+
+        let ops = scan_resumable_state_files(dir.path().to_str().unwrap());
+        assert!(ops.is_empty());
     }
 }
