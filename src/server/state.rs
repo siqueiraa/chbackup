@@ -13,7 +13,10 @@ use crate::clickhouse::ChClient;
 use crate::config::Config;
 use crate::storage::S3Client;
 
+use tracing::{info, warn};
+
 use super::actions::ActionLog;
+use super::metrics::Metrics;
 
 /// Shared application state for all axum handlers.
 ///
@@ -27,6 +30,8 @@ pub struct AppState {
     pub action_log: Arc<Mutex<ActionLog>>,
     pub current_op: Arc<Mutex<Option<RunningOp>>>,
     pub op_semaphore: Arc<Semaphore>,
+    /// Prometheus metrics registry. `None` when `config.api.enable_metrics` is false.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// Tracks a currently running operation for cancellation support.
@@ -52,6 +57,26 @@ impl AppState {
             1
         };
 
+        // Conditionally create Prometheus metrics
+        let metrics = if config.api.enable_metrics {
+            match Metrics::new() {
+                Ok(m) => {
+                    let count = m.registry.gather().len();
+                    // DEBUG_MARKER:F001 - verify metrics registered in AppState
+                    info!(target: "debug", "DEBUG_VERIFY:F001_metrics_registered count={}", count);
+                    // END_DEBUG_MARKER:F001
+                    info!("Metrics registry created with {} metric families", count);
+                    Some(Arc::new(m))
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to create metrics registry, continuing without metrics");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             config,
             ch,
@@ -59,6 +84,7 @@ impl AppState {
             action_log: Arc::new(Mutex::new(ActionLog::new(100))),
             current_op: Arc::new(Mutex::new(None)),
             op_semaphore: Arc::new(Semaphore::new(permits)),
+            metrics,
         }
     }
 
@@ -498,6 +524,53 @@ mod tests {
     fn test_scan_resumable_nonexistent_dir() {
         let ops = scan_resumable_state_files("/nonexistent/path");
         assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_app_state_with_metrics_enabled() {
+        // Verify that when enable_metrics=true (default), Metrics is created
+        let config = test_config(false);
+        assert!(config.api.enable_metrics, "Default config should have enable_metrics=true");
+
+        // Create metrics the same way AppState::new() does
+        let metrics = if config.api.enable_metrics {
+            Metrics::new().ok().map(Arc::new)
+        } else {
+            None
+        };
+
+        assert!(
+            metrics.is_some(),
+            "Metrics should be Some when enable_metrics=true"
+        );
+
+        // Verify the registry has all 14 metric families
+        let families = metrics.as_ref().unwrap().registry.gather();
+        assert_eq!(
+            families.len(),
+            14,
+            "Expected 14 metric families, got {}",
+            families.len()
+        );
+    }
+
+    #[test]
+    fn test_app_state_with_metrics_disabled() {
+        // Verify that when enable_metrics=false, Metrics is None
+        let mut config = Config::default();
+        config.api.enable_metrics = false;
+        let config = Arc::new(config);
+
+        let metrics = if config.api.enable_metrics {
+            Metrics::new().ok().map(Arc::new)
+        } else {
+            None
+        };
+
+        assert!(
+            metrics.is_none(),
+            "Metrics should be None when enable_metrics=false"
+        );
     }
 
     #[test]
