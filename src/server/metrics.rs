@@ -331,4 +331,86 @@ mod tests {
             text2
         );
     }
+
+    #[test]
+    fn test_metrics_duration_observation() {
+        let metrics = Metrics::new().expect("Metrics::new() should succeed");
+
+        // Observe a duration for the "create" operation
+        metrics
+            .backup_duration_seconds
+            .with_label_values(&["create"])
+            .observe(42.5);
+
+        let text = metrics.encode().expect("encode() should succeed");
+
+        // Verify the histogram recorded 1 observation
+        assert!(
+            text.contains("chbackup_backup_duration_seconds_count{operation=\"create\"} 1"),
+            "Duration histogram should have count 1 for create, got:\n{}",
+            text
+        );
+        assert!(
+            text.contains("chbackup_backup_duration_seconds_sum{operation=\"create\"} 42.5"),
+            "Duration histogram should have sum 42.5 for create, got:\n{}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_metrics_error_increment() {
+        let metrics = Metrics::new().expect("Metrics::new() should succeed");
+
+        // Increment error counter for "create"
+        metrics
+            .errors_total
+            .with_label_values(&["create"])
+            .inc();
+
+        let text = metrics.encode().expect("encode() should succeed");
+
+        assert!(
+            text.contains("chbackup_errors_total{operation=\"create\"} 1"),
+            "errors_total for create should be 1, got:\n{}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_metrics_success_increment() {
+        let metrics = Metrics::new().expect("Metrics::new() should succeed");
+
+        // Increment successful operations counter for "upload"
+        metrics
+            .successful_operations_total
+            .with_label_values(&["upload"])
+            .inc();
+
+        let text = metrics.encode().expect("encode() should succeed");
+
+        assert!(
+            text.contains(
+                "chbackup_successful_operations_total{operation=\"upload\"} 1"
+            ),
+            "successful_operations_total for upload should be 1, got:\n{}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_metrics_size_gauge() {
+        let metrics = Metrics::new().expect("Metrics::new() should succeed");
+
+        // Set backup_size_bytes gauge
+        metrics.backup_size_bytes.set(123456789.0);
+
+        let text = metrics.encode().expect("encode() should succeed");
+
+        assert!(
+            text.contains("chbackup_backup_size_bytes 1.23456789e8")
+                || text.contains("chbackup_backup_size_bytes 123456789"),
+            "backup_size_bytes should be 123456789, got:\n{}",
+            text
+        );
+    }
 }

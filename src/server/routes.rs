@@ -314,6 +314,7 @@ pub async fn create_backup(
 
         info!(backup_name = %backup_name, "Starting create operation");
 
+        let start_time = std::time::Instant::now();
         let result = crate::backup::create(
             &state_clone.config,
             &state_clone.ch,
@@ -325,13 +326,30 @@ pub async fn create_backup(
             req.skip_check_parts_columns.unwrap_or(false),
         )
         .await;
+        let duration = start_time.elapsed().as_secs_f64();
 
         match result {
-            Ok(_) => {
+            Ok(manifest) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["create"]).observe(duration);
+                    m.successful_operations_total.with_label_values(&["create"]).inc();
+                    m.backup_last_success_timestamp.set(Utc::now().timestamp() as f64);
+                    m.backup_size_bytes.set(manifest.compressed_size as f64);
+                    // DEBUG_MARKER:F003 - verify duration recorded for create
+                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=create duration={}", duration);
+                    // END_DEBUG_MARKER:F003
+                }
                 info!(backup_name = %backup_name, "Create operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["create"]).observe(duration);
+                    m.errors_total.with_label_values(&["create"]).inc();
+                    // DEBUG_MARKER:F004 - verify error counted for create
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=create");
+                    // END_DEBUG_MARKER:F004
+                }
                 warn!(backup_name = %backup_name, error = %e, "Create operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
@@ -380,6 +398,7 @@ pub async fn upload_backup(
             .join(&name);
 
         let effective_resume = state_clone.config.general.use_resumable_state;
+        let start_time = std::time::Instant::now();
         let result = crate::upload::upload(
             &state_clone.config,
             &state_clone.s3,
@@ -390,13 +409,25 @@ pub async fn upload_backup(
             effective_resume,
         )
         .await;
+        let duration = start_time.elapsed().as_secs_f64();
 
         match result {
             Ok(_) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["upload"]).observe(duration);
+                    m.successful_operations_total.with_label_values(&["upload"]).inc();
+                    m.backup_last_success_timestamp.set(Utc::now().timestamp() as f64);
+                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=upload duration={}", duration);
+                }
                 info!(backup_name = %name, "Upload operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["upload"]).observe(duration);
+                    m.errors_total.with_label_values(&["upload"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=upload");
+                }
                 warn!(backup_name = %name, error = %e, "Upload operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
@@ -441,6 +472,7 @@ pub async fn download_backup(
         info!(backup_name = %name, "Starting download operation");
 
         let effective_resume = state_clone.config.general.use_resumable_state;
+        let start_time = std::time::Instant::now();
         let result = crate::download::download(
             &state_clone.config,
             &state_clone.s3,
@@ -448,13 +480,24 @@ pub async fn download_backup(
             effective_resume,
         )
         .await;
+        let duration = start_time.elapsed().as_secs_f64();
 
         match result {
             Ok(_backup_dir) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["download"]).observe(duration);
+                    m.successful_operations_total.with_label_values(&["download"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=download duration={}", duration);
+                }
                 info!(backup_name = %name, "Download operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["download"]).observe(duration);
+                    m.errors_total.with_label_values(&["download"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=download");
+                }
                 warn!(backup_name = %name, error = %e, "Download operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
@@ -501,6 +544,7 @@ pub async fn restore_backup(
         info!(backup_name = %name, "Starting restore operation");
 
         let effective_resume = state_clone.config.general.use_resumable_state;
+        let start_time = std::time::Instant::now();
         let result = crate::restore::restore(
             &state_clone.config,
             &state_clone.ch,
@@ -511,13 +555,24 @@ pub async fn restore_backup(
             effective_resume,
         )
         .await;
+        let duration = start_time.elapsed().as_secs_f64();
 
         match result {
             Ok(_) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["restore"]).observe(duration);
+                    m.successful_operations_total.with_label_values(&["restore"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=restore duration={}", duration);
+                }
                 info!(backup_name = %name, "Restore operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["restore"]).observe(duration);
+                    m.errors_total.with_label_values(&["restore"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=restore");
+                }
                 warn!(backup_name = %name, error = %e, "Restore operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
@@ -563,6 +618,8 @@ pub async fn create_remote(
 
         info!(backup_name = %backup_name, "Starting create_remote operation");
 
+        let start_time = std::time::Instant::now();
+
         // Step 1: Create local backup
         let create_result = crate::backup::create(
             &state_clone.config,
@@ -576,11 +633,20 @@ pub async fn create_remote(
         )
         .await;
 
-        if let Err(e) = create_result {
-            warn!(backup_name = %backup_name, error = %e, "create_remote: create step failed");
-            state_clone.fail_op(id, e.to_string()).await;
-            return;
-        }
+        let manifest = match create_result {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                let duration = start_time.elapsed().as_secs_f64();
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["create_remote"]).observe(duration);
+                    m.errors_total.with_label_values(&["create_remote"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=create_remote");
+                }
+                warn!(backup_name = %backup_name, error = %e, "create_remote: create step failed");
+                state_clone.fail_op(id, e.to_string()).await;
+                return;
+            }
+        };
 
         // Step 2: Upload to S3
         let backup_dir = std::path::PathBuf::from(&state_clone.config.clickhouse.data_path)
@@ -598,13 +664,26 @@ pub async fn create_remote(
             effective_resume,
         )
         .await;
+        let duration = start_time.elapsed().as_secs_f64();
 
         match upload_result {
             Ok(_) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["create_remote"]).observe(duration);
+                    m.successful_operations_total.with_label_values(&["create_remote"]).inc();
+                    m.backup_last_success_timestamp.set(Utc::now().timestamp() as f64);
+                    m.backup_size_bytes.set(manifest.compressed_size as f64);
+                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=create_remote duration={}", duration);
+                }
                 info!(backup_name = %backup_name, "create_remote operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["create_remote"]).observe(duration);
+                    m.errors_total.with_label_values(&["create_remote"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=create_remote");
+                }
                 warn!(backup_name = %backup_name, error = %e, "create_remote: upload step failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
@@ -647,6 +726,8 @@ pub async fn restore_remote(
     tokio::spawn(async move {
         info!(backup_name = %name, "Starting restore_remote operation");
 
+        let start_time = std::time::Instant::now();
+
         // Step 1: Download from S3
         let effective_resume = state_clone.config.general.use_resumable_state;
         let download_result = crate::download::download(
@@ -658,6 +739,12 @@ pub async fn restore_remote(
         .await;
 
         if let Err(e) = download_result {
+            let duration = start_time.elapsed().as_secs_f64();
+            if let Some(m) = &state_clone.metrics {
+                m.backup_duration_seconds.with_label_values(&["restore_remote"]).observe(duration);
+                m.errors_total.with_label_values(&["restore_remote"]).inc();
+                info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=restore_remote");
+            }
             warn!(backup_name = %name, error = %e, "restore_remote: download step failed");
             state_clone.fail_op(id, e.to_string()).await;
             return;
@@ -674,13 +761,24 @@ pub async fn restore_remote(
             effective_resume,
         )
         .await;
+        let duration = start_time.elapsed().as_secs_f64();
 
         match restore_result {
             Ok(_) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["restore_remote"]).observe(duration);
+                    m.successful_operations_total.with_label_values(&["restore_remote"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=restore_remote duration={}", duration);
+                }
                 info!(backup_name = %name, "restore_remote operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["restore_remote"]).observe(duration);
+                    m.errors_total.with_label_values(&["restore_remote"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=restore_remote");
+                }
                 warn!(backup_name = %name, error = %e, "restore_remote: restore step failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
@@ -737,6 +835,7 @@ pub async fn delete_backup(
         info!(backup_name = %name, location = %location, "Starting delete operation");
 
         let data_path = state_clone.config.clickhouse.data_path.clone();
+        let start_time = std::time::Instant::now();
         let result = match loc {
             list::Location::Local => {
                 let dp = data_path.clone();
@@ -747,13 +846,24 @@ pub async fn delete_backup(
             }
             list::Location::Remote => list::delete_remote(&state_clone.s3, &name).await,
         };
+        let duration = start_time.elapsed().as_secs_f64();
 
         match result {
             Ok(_) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["delete"]).observe(duration);
+                    m.successful_operations_total.with_label_values(&["delete"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=delete duration={}", duration);
+                }
                 info!(backup_name = %name, "Delete operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["delete"]).observe(duration);
+                    m.errors_total.with_label_values(&["delete"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=delete");
+                }
                 warn!(backup_name = %name, error = %e, "Delete operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
@@ -786,14 +896,26 @@ pub async fn clean_remote_broken(
     tokio::spawn(async move {
         info!("Starting clean_broken_remote operation");
 
+        let start_time = std::time::Instant::now();
         let result = list::clean_broken_remote(&state_clone.s3).await;
+        let duration = start_time.elapsed().as_secs_f64();
 
         match result {
             Ok(count) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["clean_broken_remote"]).observe(duration);
+                    m.successful_operations_total.with_label_values(&["clean_broken_remote"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=clean_broken_remote duration={}", duration);
+                }
                 info!(count = count, "clean_broken_remote operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["clean_broken_remote"]).observe(duration);
+                    m.errors_total.with_label_values(&["clean_broken_remote"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=clean_broken_remote");
+                }
                 warn!(error = %e, "clean_broken_remote operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
@@ -827,16 +949,28 @@ pub async fn clean_local_broken(
         info!("Starting clean_broken_local operation");
 
         let data_path = state_clone.config.clickhouse.data_path.clone();
+        let start_time = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)));
+        let duration = start_time.elapsed().as_secs_f64();
 
         match result {
             Ok(count) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["clean_broken_local"]).observe(duration);
+                    m.successful_operations_total.with_label_values(&["clean_broken_local"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F003_duration_recorded op=clean_broken_local duration={}", duration);
+                }
                 info!(count = count, "clean_broken_local operation completed");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
+                if let Some(m) = &state_clone.metrics {
+                    m.backup_duration_seconds.with_label_values(&["clean_broken_local"]).observe(duration);
+                    m.errors_total.with_label_values(&["clean_broken_local"]).inc();
+                    info!(target: "debug", "DEBUG_VERIFY:F004_error_counted op=clean_broken_local");
+                }
                 warn!(error = %e, "clean_broken_local operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
