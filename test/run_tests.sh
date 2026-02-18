@@ -101,6 +101,21 @@ if should_run "setup"; then
 fi
 
 # ---------------------------------------------------------------------------
+# Load seed data for round-trip verification
+# ---------------------------------------------------------------------------
+if should_run "seed_data"; then
+    info "Loading seed data"
+    clickhouse-client --multiquery < /test/fixtures/seed_data.sql
+    pass "Seed data loaded"
+
+    # Capture row counts for post-restore verification
+    TRADES_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    USERS_COUNT=$(clickhouse-client -q "SELECT count() FROM default.users")
+    EVENTS_COUNT=$(clickhouse-client -q "SELECT count() FROM default.events")
+    info "Row counts: trades=${TRADES_COUNT}, users=${USERS_COUNT}, events=${EVENTS_COUNT}"
+fi
+
+# ---------------------------------------------------------------------------
 # Smoke test: chbackup binary
 # ---------------------------------------------------------------------------
 if should_run "smoke_binary"; then
@@ -134,6 +149,93 @@ if should_run "smoke_list"; then
     else
         fail "chbackup list"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# Round-trip test: create -> upload -> delete local -> download -> restore
+# ---------------------------------------------------------------------------
+if should_run "test_round_trip"; then
+    info "Round-trip test: create -> upload -> delete local -> download -> restore"
+    BACKUP_NAME="roundtrip_test_$$"
+
+    # Capture pre-backup row counts
+    PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    PRE_USERS=$(clickhouse-client -q "SELECT count() FROM default.users")
+    PRE_EVENTS=$(clickhouse-client -q "SELECT count() FROM default.events")
+    info "Pre-backup counts: trades=${PRE_TRADES}, users=${PRE_USERS}, events=${PRE_EVENTS}"
+
+    # Step 1: Create backup
+    info "  Step 1: chbackup create ${BACKUP_NAME}"
+    if chbackup create "${BACKUP_NAME}" 2>&1; then
+        pass "create ${BACKUP_NAME}"
+    else
+        fail "create ${BACKUP_NAME}"
+    fi
+
+    # Step 2: Upload to S3
+    info "  Step 2: chbackup upload ${BACKUP_NAME}"
+    if chbackup upload "${BACKUP_NAME}" 2>&1; then
+        pass "upload ${BACKUP_NAME}"
+    else
+        fail "upload ${BACKUP_NAME}"
+    fi
+
+    # Step 3: Delete local backup
+    info "  Step 3: chbackup delete local ${BACKUP_NAME}"
+    if chbackup delete local "${BACKUP_NAME}" 2>&1; then
+        pass "delete local ${BACKUP_NAME}"
+    else
+        fail "delete local ${BACKUP_NAME}"
+    fi
+
+    # Step 4: Download from S3
+    info "  Step 4: chbackup download ${BACKUP_NAME}"
+    if chbackup download "${BACKUP_NAME}" 2>&1; then
+        pass "download ${BACKUP_NAME}"
+    else
+        fail "download ${BACKUP_NAME}"
+    fi
+
+    # Step 5: DROP tables and restore
+    info "  Step 5: DROP tables and restore"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
+
+    if chbackup restore "${BACKUP_NAME}" 2>&1; then
+        pass "restore ${BACKUP_NAME}"
+    else
+        fail "restore ${BACKUP_NAME}"
+    fi
+
+    # Step 6: Verify row counts match pre-backup state
+    info "  Step 6: Verify row counts"
+    POST_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    POST_USERS=$(clickhouse-client -q "SELECT count() FROM default.users")
+    POST_EVENTS=$(clickhouse-client -q "SELECT count() FROM default.events")
+
+    if [[ "$POST_TRADES" -eq "$PRE_TRADES" ]]; then
+        pass "trades row count matches: ${POST_TRADES}"
+    else
+        fail "trades row count mismatch: expected=${PRE_TRADES} got=${POST_TRADES}"
+    fi
+
+    if [[ "$POST_USERS" -eq "$PRE_USERS" ]]; then
+        pass "users row count matches: ${POST_USERS}"
+    else
+        fail "users row count mismatch: expected=${PRE_USERS} got=${POST_USERS}"
+    fi
+
+    if [[ "$POST_EVENTS" -eq "$PRE_EVENTS" ]]; then
+        pass "events row count matches: ${POST_EVENTS}"
+    else
+        fail "events row count mismatch: expected=${PRE_EVENTS} got=${POST_EVENTS}"
+    fi
+
+    # Cleanup: delete remote backup
+    info "  Cleanup: delete remote ${BACKUP_NAME}"
+    chbackup delete remote "${BACKUP_NAME}" 2>&1 || true
+    chbackup delete local "${BACKUP_NAME}" 2>&1 || true
 fi
 
 # ---------------------------------------------------------------------------

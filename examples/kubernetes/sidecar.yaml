@@ -1,0 +1,136 @@
+# =============================================================================
+# sidecar.yaml -- K8s Deployment with ClickHouse + chbackup sidecar
+# =============================================================================
+# Example Kubernetes manifest for running chbackup as a sidecar container
+# alongside ClickHouse. The sidecar runs in server+watch mode, providing:
+#   - Automatic scheduled backups (full + incremental)
+#   - On-demand operations via HTTP API (port 7171)
+#   - Prometheus metrics for monitoring
+#
+# Prerequisites:
+#   1. Create the S3 credentials secret:
+#      kubectl create secret generic chbackup-s3-creds \
+#        --from-literal=access-key=YOUR_ACCESS_KEY \
+#        --from-literal=secret-key=YOUR_SECRET_KEY
+#
+#   2. Adjust S3_BUCKET, WATCH_INTERVAL, and FULL_INTERVAL env vars below.
+#
+# Design doc references: 1.3 (K8s Sidecar), 10.9 (Watch Mode in Docker)
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse-with-backup
+  labels:
+    app: clickhouse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clickhouse
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+      annotations:
+        # Prometheus scraping for chbackup metrics
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7171"
+        prometheus.io/path: "/api/v1/metrics"
+    spec:
+      # Allow watch loop to finish current backup cycle on shutdown (design 11.5)
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        # -----------------------------------------------------------------
+        # ClickHouse server
+        # -----------------------------------------------------------------
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24.8
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+        # -----------------------------------------------------------------
+        # chbackup sidecar -- server + watch mode
+        # -----------------------------------------------------------------
+        - name: chbackup
+          image: ghcr.io/user/chbackup:latest
+          args: ["server", "--watch"]
+          ports:
+            - name: api
+              containerPort: 7171
+          env:
+            # S3 configuration
+            - name: S3_BUCKET
+              value: "my-clickhouse-backups"
+            - name: S3_REGION
+              value: "us-east-1"
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: chbackup-s3-creds
+                  key: access-key
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: chbackup-s3-creds
+                  key: secret-key
+            # Watch mode schedule
+            - name: WATCH_INTERVAL
+              value: "1h"
+            - name: FULL_INTERVAL
+              value: "24h"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /api/v1/status
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/status
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+      # Shared volume for /var/lib/clickhouse -- chbackup needs filesystem
+      # access to the same data directory for FREEZE hardlinks (design 1.1).
+      volumes:
+        - name: data
+          emptyDir: {}
