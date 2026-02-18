@@ -1031,7 +1031,9 @@ mod tests {
         assert!(list_ddl.contains("config_size UInt64"));
         assert!(list_ddl.contains("compressed_size UInt64"));
         assert!(list_ddl.contains("required String"));
-        assert!(list_ddl.contains("ENGINE = URL('http://localhost:7171/api/v1/list', 'JSONEachRow')"));
+        assert!(
+            list_ddl.contains("ENGINE = URL('http://localhost:7171/api/v1/list', 'JSONEachRow')")
+        );
 
         // Verify backup_actions DDL
         assert!(actions_ddl.contains("CREATE TABLE IF NOT EXISTS system.backup_actions"));
@@ -1040,7 +1042,8 @@ mod tests {
         assert!(actions_ddl.contains("finish String"));
         assert!(actions_ddl.contains("status String"));
         assert!(actions_ddl.contains("error String"));
-        assert!(actions_ddl.contains("ENGINE = URL('http://localhost:7171/api/v1/actions', 'JSONEachRow')"));
+        assert!(actions_ddl
+            .contains("ENGINE = URL('http://localhost:7171/api/v1/actions', 'JSONEachRow')"));
     }
 
     #[test]

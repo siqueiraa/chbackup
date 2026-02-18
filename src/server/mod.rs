@@ -83,8 +83,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(routes::metrics_stub));
 
     // Conditionally apply auth middleware
-    let has_auth =
-        !state.config.api.username.is_empty() && !state.config.api.password.is_empty();
+    let has_auth = !state.config.api.username.is_empty() && !state.config.api.password.is_empty();
 
     let router = if has_auth {
         info!("API authentication enabled");

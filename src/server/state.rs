@@ -207,7 +207,11 @@ pub async fn auto_resume(state: &AppState) {
         return;
     }
 
-    tracing::info!(count = ops.len(), "Auto-resume: found {} resumable operations", ops.len());
+    tracing::info!(
+        count = ops.len(),
+        "Auto-resume: found {} resumable operations",
+        ops.len()
+    );
 
     for op in ops {
         let state_clone = state.clone();
@@ -231,18 +235,19 @@ pub async fn auto_resume(state: &AppState) {
 
                     tracing::info!(backup_name = %backup_name, "Auto-resume: resuming upload");
 
-                    let backup_dir = std::path::PathBuf::from(&state_clone.config.clickhouse.data_path)
-                        .join("backup")
-                        .join(&backup_name);
+                    let backup_dir =
+                        std::path::PathBuf::from(&state_clone.config.clickhouse.data_path)
+                            .join("backup")
+                            .join(&backup_name);
 
                     let result = crate::upload::upload(
                         &state_clone.config,
                         &state_clone.s3,
                         &backup_name,
                         &backup_dir,
-                        false,  // delete_local
-                        None,   // diff_from_remote
-                        true,   // resume = true
+                        false, // delete_local
+                        None,  // diff_from_remote
+                        true,  // resume = true
                     )
                     .await;
 
@@ -278,7 +283,7 @@ pub async fn auto_resume(state: &AppState) {
                         &state_clone.config,
                         &state_clone.s3,
                         &backup_name,
-                        true,   // resume = true
+                        true, // resume = true
                     )
                     .await;
 
@@ -314,10 +319,10 @@ pub async fn auto_resume(state: &AppState) {
                         &state_clone.config,
                         &state_clone.ch,
                         &backup_name,
-                        None,   // tables
-                        false,  // schema_only
-                        false,  // data_only
-                        true,   // resume = true
+                        None,  // tables
+                        false, // schema_only
+                        false, // data_only
+                        true,  // resume = true
                     )
                     .await;
 

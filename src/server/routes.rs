@@ -236,10 +236,8 @@ pub async fn list_backups(
     let data_path = &state.config.clickhouse.data_path;
     let mut results = Vec::new();
 
-    let show_local =
-        params.location.is_none() || params.location.as_deref() == Some("local");
-    let show_remote =
-        params.location.is_none() || params.location.as_deref() == Some("remote");
+    let show_local = params.location.is_none() || params.location.as_deref() == Some("local");
+    let show_remote = params.location.is_none() || params.location.as_deref() == Some("remote");
 
     if show_local {
         match list::list_local(data_path) {
@@ -277,7 +275,7 @@ fn summary_to_list_response(s: list::BackupSummary, location: &str) -> ListRespo
         created: s.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
         location: location.to_string(),
         size: s.size,
-        data_size: s.size, // For now, same as size (total uncompressed)
+        data_size: s.size,   // For now, same as size (total uncompressed)
         object_disk_size: 0, // Requires manifest disk_types analysis (future)
         metadata_size: 0,    // TODO: expose from manifest metadata_size field
         rbac_size: 0,        // Not implemented until Phase 4e
@@ -717,10 +715,7 @@ pub async fn delete_backup(
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: format!(
-                        "invalid location '{}': expected 'local' or 'remote'",
-                        other
-                    ),
+                    error: format!("invalid location '{}': expected 'local' or 'remote'", other),
                 }),
             ));
         }
@@ -1042,10 +1037,7 @@ mod tests {
         assert_eq!(req.tables.as_deref(), Some("default.*"));
         assert_eq!(req.schema, Some(false));
         assert_eq!(req.data_only, Some(true));
-        assert_eq!(
-            req.database_mapping.as_deref(),
-            Some("source_db:target_db")
-        );
+        assert_eq!(req.database_mapping.as_deref(), Some("source_db:target_db"));
         assert_eq!(req.rm, Some(true));
     }
 
