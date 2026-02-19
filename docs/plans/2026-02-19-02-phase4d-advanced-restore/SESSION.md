@@ -1,13 +1,14 @@
 # Session State
 
 **Plan:** 2026-02-19-02-phase4d-advanced-restore
-**Status:** NOT_STARTED
+**Status:** IN_PROGRESS
 **MR Review:** NOT_RUN
-**Branch:** `TBD (Phase 0b will create)`
-**Started:** -
+**Branch:** `feat/phase4d-advanced-restore`
+**Worktree:** `-`
+**Started:** 2026-02-19T13:15:06Z
 **Completed:** -
 **Elapsed:** -
-**Last Updated:** 2026-02-19T15:00:00Z
+**Last Updated:** 2026-02-19T13:15:06Z
 
 ---
 
@@ -46,11 +47,11 @@
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 0 | Plan Validation Gate | pending |
-| 0a-state | Session State Check | pending |
-| 0a-deps | Task Dependency Analysis | pending |
-| 0b | Branch Handling | pending |
-| 1 | Session Startup | pending |
+| 0 | Plan Validation Gate | done |
+| 0a-state | Session State Check | done |
+| 0a-deps | Task Dependency Analysis | done |
+| 0b | Branch Handling | done |
+| 1 | Session Startup | done |
 | 2 | Group Execution | pending |
 | 2.4 | Runtime Verification | pending |
 | 2.5 | MR Review | pending |
@@ -77,7 +78,7 @@
 | Agent | Phases | Status |
 |-------|--------|--------|
 | execute-validator | 0 | pending |
-| execute-startup | 0a-1 | pending |
+| execute-startup | 0a-1 | done |
 | execute-runtime | 2.4 | pending |
 | execute-reviewer | 2.5-2.6 | pending |
 | execute-completion | 3 | pending |
@@ -114,16 +115,16 @@ Group D (Independent -- Final):
 
 | Task | Description | Status | Commit | Acceptance |
 |------|-------------|--------|--------|------------|
-| 1 | ChClient new methods | pending | - | F001 |
-| 2 | DDL helpers in remap.rs | pending | - | F002 |
-| 3 | Reverse DROP ordering in topo.rs | pending | - | F003 |
-| 4 | Mode A DROP phase in schema.rs | pending | - | F004 |
-| 5 | ZK conflict resolution in schema.rs | pending | - | F005 |
-| 6 | ATTACH TABLE mode in mod.rs | pending | - | F006 |
-| 7 | Mutation re-apply in mod.rs | pending | - | F007 |
-| 8 | Wire rm parameter through restore() | pending | - | F008 |
-| 9 | Integration in restore() orchestrator | pending | - | F009 |
-| 10 | Update CLAUDE.md for modified modules | pending | - | FDOC |
+| 1 | ChClient new methods | done | 424b808c | F001 |
+| 2 | DDL helpers in remap.rs | done | 681c0719 | F002 |
+| 3 | Reverse DROP ordering in topo.rs | done | 774fee97 | F003 |
+| 4 | Mode A DROP phase in schema.rs | done | b5b22bb3 | F004 |
+| 5 | ZK conflict resolution in schema.rs | done | b022a6c8 | F005 |
+| 6 | ATTACH TABLE mode in mod.rs | done | 76ee6e37 | F006 |
+| 7 | Mutation re-apply in mod.rs | done | 58d2f50e | F007 |
+| 8 | Wire rm parameter through restore() | done | ee753213 | F008 |
+| 9 | Integration in restore() orchestrator | done | dba458b3 | F009 |
+| 10 | Update CLAUDE.md for modified modules | done | 7b59c959 | FDOC |
 
 **Status values:** pending, in_progress, fixing, done
 
@@ -150,13 +151,13 @@ Group D (Independent -- Final):
 
 ## Acceptance Summary
 
-0/10 PASS
+10/10 PASS
 
 ---
 
 ## Current Focus
 
-Plan validated. Awaiting user approval (Phase 9).
+All groups complete. Group A (Tasks 1, 2, 3), Group B (Tasks 4, 5, 6), Group C (Tasks 7, 8, 9), Group D (Task 10: CLAUDE.md update). 10/10 tasks PASS.
 
 ---
 

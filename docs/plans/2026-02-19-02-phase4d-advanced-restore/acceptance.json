@@ -1,13 +1,13 @@
 {
   "plan": "2026-02-19-02-phase4d-advanced-restore",
-  "status": {"pass": 0, "fail": 10, "total": 10},
-  "last_updated": "2026-02-19T14:00:00Z",
+  "status": {"pass": 10, "fail": 0, "total": 10},
+  "last_updated": "2026-02-19T15:00:00Z",
   "features": [
     {
       "id": "F001",
       "category": "feature",
       "description": "ChClient new methods for Mode A, ZK, ATTACH TABLE, DatabaseReplicated, mutations",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -48,7 +48,7 @@
       "id": "F002",
       "category": "feature",
       "description": "DDL helpers: parse_replicated_params, resolve_zk_macros, add_on_cluster_clause, rewrite_distributed_cluster",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -89,7 +89,7 @@
       "id": "F003",
       "category": "feature",
       "description": "Reverse DROP ordering: engine_drop_priority and sort_tables_for_drop",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -130,7 +130,7 @@
       "id": "F004",
       "category": "feature",
       "description": "Mode A DROP phase: drop_tables and drop_databases in schema.rs",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -171,7 +171,7 @@
       "id": "F005",
       "category": "feature",
       "description": "ZK conflict resolution and DatabaseReplicated detection",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -212,7 +212,7 @@
       "id": "F006",
       "category": "feature",
       "description": "ATTACH TABLE mode for Replicated engines",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -253,7 +253,7 @@
       "id": "F007",
       "category": "feature",
       "description": "Pending mutation re-application after ATTACH",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -294,7 +294,7 @@
       "id": "F008",
       "category": "feature",
       "description": "Wire rm parameter through restore() and all 5 call sites",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -335,7 +335,7 @@
       "id": "F009",
       "category": "feature",
       "description": "Full integration of Mode A, ON CLUSTER, DatabaseReplicated, ZK, ATTACH TABLE, Distributed cluster rewrite, mutations in restore()",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -376,7 +376,7 @@
       "id": "FDOC",
       "category": "documentation",
       "description": "CLAUDE.md updated for all modified modules",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
