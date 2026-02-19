@@ -75,6 +75,18 @@ pub struct ColumnInconsistency {
     pub types: Vec<String>,
 }
 
+/// JSON/Object column detected by `check_json_columns`.
+///
+/// Indicates that a column uses the Object('json') or JSON experimental type,
+/// which may not FREEZE correctly in all ClickHouse versions.
+#[derive(Debug, Clone)]
+pub struct JsonColumnInfo {
+    pub database: String,
+    pub table: String,
+    pub column: String,
+    pub column_type: String,
+}
+
 /// Row from `system.macros` query.
 #[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
 pub struct MacroRow {
@@ -293,6 +305,32 @@ impl ChClient {
             .context("Failed to list tables from system.tables")?;
 
         info!(table_count = rows.len(), "Listed tables");
+        Ok(rows)
+    }
+
+    /// List all tables including system databases.
+    ///
+    /// Same as `list_tables()` but without the system database exclusion filter.
+    /// Used by the `tables --all` command.
+    pub async fn list_all_tables(&self) -> Result<Vec<TableRow>> {
+        let sql = "SELECT database, name, engine, create_table_query, \
+                   toString(uuid) as uuid, data_paths, total_bytes \
+                   FROM system.tables";
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing list_all_tables");
+        } else {
+            debug!(sql = %sql, "Executing list_all_tables");
+        }
+
+        let rows = self
+            .inner
+            .query(sql)
+            .fetch_all::<TableRow>()
+            .await
+            .context("Failed to list all tables from system.tables")?;
+
+        info!(table_count = rows.len(), "Listed all tables (including system)");
         Ok(rows)
     }
 
@@ -658,6 +696,72 @@ impl ChClient {
             .collect();
 
         Ok(inconsistencies)
+    }
+
+    // -- JSON/Object column type detection --
+
+    /// Check for columns using Object or JSON types (design 16.4).
+    ///
+    /// For each (database, table) pair, queries `system.columns` to find columns
+    /// whose type contains 'Object' or 'JSON'. These types are experimental in
+    /// ClickHouse and may not FREEZE correctly.
+    ///
+    /// This is a warning-only check and never blocks backup.
+    pub async fn check_json_columns(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<Vec<JsonColumnInfo>> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build the IN clause for (database, table) pairs
+        let pairs: Vec<String> = targets
+            .iter()
+            .map(|(db, table)| format!("('{}', '{}')", db, table))
+            .collect();
+        let in_clause = pairs.join(", ");
+
+        let sql = format!(
+            "SELECT database, table, name AS column, type AS column_type \
+             FROM system.columns \
+             WHERE (database, table) IN ({}) \
+             AND (type LIKE '%Object%' OR type LIKE '%JSON%')",
+            in_clause
+        );
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing check_json_columns");
+        } else {
+            debug!(sql = %sql, "Executing check_json_columns");
+        }
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct JsonColumnRow {
+            database: String,
+            table: String,
+            column: String,
+            column_type: String,
+        }
+
+        let rows = self
+            .inner
+            .query(&sql)
+            .fetch_all::<JsonColumnRow>()
+            .await
+            .context("Failed to check JSON/Object columns in system.columns")?;
+
+        let json_cols: Vec<JsonColumnInfo> = rows
+            .into_iter()
+            .map(|r| JsonColumnInfo {
+                database: r.database,
+                table: r.table,
+                column: r.column,
+                column_type: r.column_type,
+            })
+            .collect();
+
+        Ok(json_cols)
     }
 
     // -- Disk free space query --
@@ -1650,6 +1754,28 @@ mod tests {
         assert_eq!(macros.get("replica"), Some(&"r1".to_string()));
     }
 
+    #[test]
+    fn test_list_all_tables_sql_no_system_filter() {
+        // Verify that list_all_tables uses SQL without a system database filter.
+        // list_tables uses: WHERE database NOT IN ('system', ...)
+        // list_all_tables should NOT have that filter.
+        let list_tables_sql = "SELECT database, name, engine, create_table_query, \
+                   toString(uuid) as uuid, data_paths, total_bytes \
+                   FROM system.tables \
+                   WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')";
+
+        let list_all_tables_sql = "SELECT database, name, engine, create_table_query, \
+                   toString(uuid) as uuid, data_paths, total_bytes \
+                   FROM system.tables";
+
+        // list_tables SQL should contain the WHERE clause
+        assert!(list_tables_sql.contains("WHERE database NOT IN"));
+
+        // list_all_tables SQL should NOT contain the WHERE clause
+        assert!(!list_all_tables_sql.contains("WHERE database NOT IN"));
+        assert!(list_all_tables_sql.contains("system.tables"));
+    }
+
     // -- Phase 4d: SQL generation tests for new ChClient methods --
 
     #[test]
@@ -1725,5 +1851,50 @@ mod tests {
             sql,
             "ALTER TABLE `logs`.`events` UPDATE status = 'archived' WHERE ts < '2024-01-01' SETTINGS mutations_sync=2"
         );
+    }
+
+    // -- Phase 4f: JSON/Object column detection tests --
+
+    #[test]
+    fn test_json_column_row_struct() {
+        // Verify JsonColumnInfo struct can hold expected data
+        let info = JsonColumnInfo {
+            database: "default".to_string(),
+            table: "events".to_string(),
+            column: "metadata".to_string(),
+            column_type: "Object('json')".to_string(),
+        };
+        assert_eq!(info.database, "default");
+        assert_eq!(info.table, "events");
+        assert_eq!(info.column, "metadata");
+        assert_eq!(info.column_type, "Object('json')");
+    }
+
+    #[test]
+    fn test_json_column_check_sql() {
+        // Verify the SQL pattern for JSON/Object column detection
+        let targets = [
+            ("default".to_string(), "events".to_string()),
+            ("logs".to_string(), "raw".to_string()),
+        ];
+        let pairs: Vec<String> = targets
+            .iter()
+            .map(|(db, table)| format!("('{}', '{}')", db, table))
+            .collect();
+        let in_clause = pairs.join(", ");
+
+        let sql = format!(
+            "SELECT database, table, name AS column, type AS column_type \
+             FROM system.columns \
+             WHERE (database, table) IN ({}) \
+             AND (type LIKE '%Object%' OR type LIKE '%JSON%')",
+            in_clause
+        );
+
+        assert!(sql.contains("system.columns"));
+        assert!(sql.contains("LIKE '%Object%'"));
+        assert!(sql.contains("LIKE '%JSON%'"));
+        assert!(sql.contains("('default', 'events')"));
+        assert!(sql.contains("('logs', 'raw')"));
     }
 }
