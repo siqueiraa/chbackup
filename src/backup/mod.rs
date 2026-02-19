@@ -196,6 +196,42 @@ pub async fn create(
         }
     }
 
+    // 5c. JSON/Object column type detection (design 16.4)
+    {
+        let targets: Vec<(String, String)> = filtered_tables
+            .iter()
+            .map(|t| (t.database.clone(), t.name.clone()))
+            .collect();
+
+        match ch.check_json_columns(&targets).await {
+            Ok(json_cols) => {
+                if !json_cols.is_empty() {
+                    for col in &json_cols {
+                        warn!(
+                            database = %col.database,
+                            table = %col.table,
+                            column = %col.column,
+                            column_type = %col.column_type,
+                            "JSON/Object column detected -- may not FREEZE correctly"
+                        );
+                    }
+                    info!(
+                        count = json_cols.len(),
+                        "JSON/Object columns detected (proceeding with backup)"
+                    );
+                } else {
+                    info!("JSON/Object column type check passed");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "JSON/Object column type check failed, continuing anyway"
+                );
+            }
+        }
+    }
+
     // 6. Check for pending mutations (design 3.1)
     let mutation_targets: Vec<(String, String)> = filtered_tables
         .iter()
