@@ -58,10 +58,7 @@ pub struct RestorePhases {
 }
 
 /// Classify filtered tables into restore phases using metadata_only flag.
-pub fn classify_restore_tables(
-    manifest: &BackupManifest,
-    table_keys: &[String],
-) -> RestorePhases {
+pub fn classify_restore_tables(manifest: &BackupManifest, table_keys: &[String]) -> RestorePhases {
     let mut data_tables: Vec<String> = Vec::new();
     let mut ddl_only_tables: Vec<String> = Vec::new();
 
@@ -105,11 +102,9 @@ pub fn topological_sort(
     keys: &[String],
 ) -> Result<Vec<String>> {
     // Check if any table has non-empty dependencies
-    let has_deps = keys.iter().any(|k| {
-        tables
-            .get(k)
-            .is_some_and(|tm| !tm.dependencies.is_empty())
-    });
+    let has_deps = keys
+        .iter()
+        .any(|k| tables.get(k).is_some_and(|tm| !tm.dependencies.is_empty()));
 
     if !has_deps {
         // Fallback: sort by engine priority only
@@ -273,10 +268,7 @@ mod tests {
     fn test_data_table_priority() {
         assert_eq!(data_table_priority("default.trades"), 0);
         assert_eq!(data_table_priority("default.users"), 0);
-        assert_eq!(
-            data_table_priority("default..inner_id.5f3a7b2c-1234"),
-            1
-        );
+        assert_eq!(data_table_priority("default..inner_id.5f3a7b2c-1234"), 1);
         assert_eq!(data_table_priority("default..inner.mv_target"), 1);
     }
 
@@ -314,16 +306,12 @@ mod tests {
         assert!(phases.data_tables.contains(&"default.users".to_string()));
 
         // DDL-only should contain view and dict
-        assert!(
-            phases
-                .ddl_only_tables
-                .contains(&"default.my_view".to_string())
-        );
-        assert!(
-            phases
-                .ddl_only_tables
-                .contains(&"default.user_dict".to_string())
-        );
+        assert!(phases
+            .ddl_only_tables
+            .contains(&"default.my_view".to_string()));
+        assert!(phases
+            .ddl_only_tables
+            .contains(&"default.user_dict".to_string()));
     }
 
     #[test]

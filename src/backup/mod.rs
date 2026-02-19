@@ -849,16 +849,10 @@ mod tests {
             .get("default.trades_view")
             .cloned()
             .unwrap_or_default();
-        assert_eq!(
-            deps2,
-            vec!["default.trades", "default.users"]
-        );
+        assert_eq!(deps2, vec!["default.trades", "default.users"]);
 
         // Table with no dependencies (not in map)
-        let deps3 = deps_map
-            .get("default.trades")
-            .cloned()
-            .unwrap_or_default();
+        let deps3 = deps_map.get("default.trades").cloned().unwrap_or_default();
         assert!(deps3.is_empty());
 
         // Verify these can be used in TableManifest
