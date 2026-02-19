@@ -177,7 +177,14 @@ pub async fn restore(
                 "Phase 2b: {} postponed tables (schema-only)",
                 phases.postponed_tables.len()
             );
-            create_tables(ch, &manifest, &phases.postponed_tables, data_only, remap_ref).await?;
+            create_tables(
+                ch,
+                &manifest,
+                &phases.postponed_tables,
+                data_only,
+                remap_ref,
+            )
+            .await?;
         }
         if !data_only && !manifest.functions.is_empty() {
             create_functions(ch, &manifest).await?;
@@ -451,7 +458,14 @@ pub async fn restore(
             "Phase 2b: {} postponed tables",
             phases.postponed_tables.len()
         );
-        create_tables(ch, &manifest, &phases.postponed_tables, data_only, remap_ref).await?;
+        create_tables(
+            ch,
+            &manifest,
+            &phases.postponed_tables,
+            data_only,
+            remap_ref,
+        )
+        .await?;
     }
 
     // Phase 3: DDL-only objects (topologically sorted)
