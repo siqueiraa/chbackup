@@ -235,9 +235,6 @@ async fn main() -> Result<()> {
             if partitions.is_some() {
                 warn!("--partitions flag is not yet implemented for restore, ignoring");
             }
-            if rm {
-                warn!("--rm flag is not yet implemented, ignoring");
-            }
             if rbac {
                 warn!("--rbac flag is not yet implemented, ignoring");
             }
@@ -267,6 +264,7 @@ async fn main() -> Result<()> {
                 tables.as_deref(),
                 schema,
                 data_only,
+                rm,
                 effective_resume,
                 rename_as.as_deref(),
                 db_mapping.as_ref(),
@@ -352,9 +350,6 @@ async fn main() -> Result<()> {
             backup_name,
         } => {
             // Warn about unimplemented flags
-            if rm {
-                warn!("--rm flag is not yet implemented, ignoring");
-            }
             if rbac {
                 warn!("--rbac flag is not yet implemented, ignoring");
             }
@@ -389,6 +384,7 @@ async fn main() -> Result<()> {
                 tables.as_deref(),
                 false, // schema_only (not a flag on restore_remote per design)
                 false, // data_only (not a flag on restore_remote per design)
+                rm,
                 effective_resume,
                 rename_as.as_deref(),
                 db_mapping.as_ref(),

@@ -46,8 +46,9 @@ use topo::{classify_restore_tables, topological_sort};
 
 /// Restore a backup to ClickHouse.
 ///
-/// Implements Mode B (non-destructive): creates databases and tables if they
-/// don't exist, then attaches data parts via detached/ directory.
+/// Implements Mode B (non-destructive) and Mode A (destructive `--rm`) restore.
+/// Mode B: creates databases and tables if they don't exist, then attaches data parts.
+/// Mode A: DROP tables/databases before CREATE using reverse engine priority order.
 /// Tables are restored in parallel, bounded by max_connections semaphore.
 ///
 /// # Arguments
@@ -58,6 +59,7 @@ use topo::{classify_restore_tables, topological_sort};
 /// * `table_pattern` - Optional table filter pattern (glob)
 /// * `schema_only` - If true, only restore schema (no data)
 /// * `data_only` - If true, only restore data (no schema creation)
+/// * `rm` - If true, DROP tables/databases before CREATE (Mode A)
 /// * `resume` - If true, load resume state and skip already-attached parts
 /// * `rename_as` - Optional `--as` value for single table rename (e.g. "dst_db.dst_table")
 /// * `database_mapping` - Optional database mapping from `-m` flag (pre-parsed HashMap)
@@ -69,6 +71,7 @@ pub async fn restore(
     table_pattern: Option<&str>,
     schema_only: bool,
     data_only: bool,
+    rm: bool,
     resume: bool,
     rename_as: Option<&str>,
     database_mapping: Option<&HashMap<String, String>>,
@@ -81,6 +84,7 @@ pub async fn restore(
         backup_dir = %backup_dir.display(),
         schema_only = schema_only,
         data_only = data_only,
+        rm = rm,
         "Starting restore"
     );
 

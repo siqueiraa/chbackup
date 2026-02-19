@@ -390,6 +390,7 @@ pub async fn auto_resume(state: &AppState) {
                         None,  // tables
                         false, // schema_only
                         false, // data_only
+                        false, // rm (auto-resume never drops)
                         true,  // resume = true
                         None,  // rename_as (auto-resume restores to original names)
                         None,  // database_mapping (auto-resume restores to original names)
