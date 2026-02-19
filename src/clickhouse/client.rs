@@ -104,6 +104,20 @@ pub struct DiskSpaceRow {
     pub free_space: u64,
 }
 
+/// Row with a single `name` column -- used by RBAC/named-collection queries.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+struct NameRow {
+    name: String,
+}
+
+/// Row returned by `SHOW CREATE ...` queries.
+///
+/// ClickHouse returns the column as `statement` for `SHOW CREATE USER`, etc.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+struct ShowCreateRow {
+    statement: String,
+}
+
 impl ChClient {
     /// Build a new `ChClient` from the given `ClickHouseConfig`.
     ///
@@ -831,6 +845,181 @@ impl ChClient {
         self.log_and_execute(&sql, "MUTATION").await
     }
 
+    // -- RBAC, named collections, and user-defined functions queries (Phase 4e) --
+
+    /// Query RBAC objects of a given entity type from ClickHouse system tables.
+    ///
+    /// For each entity found in the corresponding system table, runs `SHOW CREATE {entity_type}`
+    /// to get the full DDL. Returns Vec of (name, DDL) tuples.
+    ///
+    /// Entity types: "USER", "ROLE", "ROW POLICY", "SETTINGS PROFILE", "QUOTA"
+    /// Corresponding system tables: system.users, system.roles, system.row_policies,
+    ///   system.settings_profiles, system.quotas
+    ///
+    /// On query error, logs a warning and returns an empty Vec (graceful degradation).
+    pub async fn query_rbac_objects(&self, entity_type: &str) -> Result<Vec<(String, String)>> {
+        let system_table = match entity_type {
+            "USER" => "system.users",
+            "ROLE" => "system.roles",
+            "ROW POLICY" => "system.row_policies",
+            "SETTINGS PROFILE" => "system.settings_profiles",
+            "QUOTA" => "system.quotas",
+            _ => {
+                warn!(entity_type = %entity_type, "Unknown RBAC entity type, skipping");
+                return Ok(Vec::new());
+            }
+        };
+
+        let names_sql = format!("SELECT name FROM {}", system_table);
+
+        if self.log_sql_queries {
+            info!(sql = %names_sql, "Executing query_rbac_objects ({})", entity_type);
+        } else {
+            debug!(sql = %names_sql, "Executing query_rbac_objects ({})", entity_type);
+        }
+
+        let names: Vec<NameRow> = match self.inner.query(&names_sql).fetch_all().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    entity_type = %entity_type,
+                    table = %system_table,
+                    "Failed to query {} (may not exist), skipping", system_table
+                );
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut results = Vec::with_capacity(names.len());
+        for name_row in &names {
+            let show_sql = format!("SHOW CREATE {} {}", entity_type, quote_identifier(&name_row.name));
+
+            match self.inner.query(&show_sql).fetch_one::<ShowCreateRow>().await {
+                Ok(row) => {
+                    results.push((name_row.name.clone(), row.statement));
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        entity_type = %entity_type,
+                        name = %name_row.name,
+                        "Failed to SHOW CREATE {} {}, skipping", entity_type, name_row.name
+                    );
+                }
+            }
+        }
+
+        debug!(
+            entity_type = %entity_type,
+            count = results.len(),
+            "Queried RBAC objects"
+        );
+        Ok(results)
+    }
+
+    /// Query named collections from ClickHouse.
+    ///
+    /// Queries `system.named_collections` for names, then `SHOW CREATE NAMED COLLECTION`
+    /// for each. Returns Vec of CREATE DDL strings.
+    ///
+    /// On query error, logs a warning and returns an empty Vec (graceful degradation).
+    pub async fn query_named_collections(&self) -> Result<Vec<String>> {
+        let names_sql = "SELECT name FROM system.named_collections";
+
+        if self.log_sql_queries {
+            info!(sql = %names_sql, "Executing query_named_collections");
+        } else {
+            debug!(sql = %names_sql, "Executing query_named_collections");
+        }
+
+        let names: Vec<NameRow> = match self.inner.query(names_sql).fetch_all().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to query system.named_collections (may not exist), skipping"
+                );
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut results = Vec::with_capacity(names.len());
+        for name_row in &names {
+            let show_sql = format!(
+                "SHOW CREATE NAMED COLLECTION {}",
+                quote_identifier(&name_row.name)
+            );
+
+            match self.inner.query(&show_sql).fetch_one::<ShowCreateRow>().await {
+                Ok(row) => {
+                    results.push(row.statement);
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        name = %name_row.name,
+                        "Failed to SHOW CREATE NAMED COLLECTION {}, skipping", name_row.name
+                    );
+                }
+            }
+        }
+
+        debug!(count = results.len(), "Queried named collections");
+        Ok(results)
+    }
+
+    /// Query user-defined SQL functions from ClickHouse.
+    ///
+    /// Queries `system.functions WHERE origin = 'SQLUserDefined'` for names,
+    /// then `SHOW CREATE FUNCTION` for each. Returns Vec of CREATE DDL strings.
+    ///
+    /// On query error, logs a warning and returns an empty Vec (graceful degradation).
+    pub async fn query_user_defined_functions(&self) -> Result<Vec<String>> {
+        let names_sql = "SELECT name FROM system.functions WHERE origin = 'SQLUserDefined'";
+
+        if self.log_sql_queries {
+            info!(sql = %names_sql, "Executing query_user_defined_functions");
+        } else {
+            debug!(sql = %names_sql, "Executing query_user_defined_functions");
+        }
+
+        let names: Vec<NameRow> = match self.inner.query(names_sql).fetch_all().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to query user-defined functions, skipping"
+                );
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut results = Vec::with_capacity(names.len());
+        for name_row in &names {
+            let show_sql = format!(
+                "SHOW CREATE FUNCTION {}",
+                quote_identifier(&name_row.name)
+            );
+
+            match self.inner.query(&show_sql).fetch_one::<ShowCreateRow>().await {
+                Ok(row) => {
+                    results.push(row.statement);
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        name = %name_row.name,
+                        "Failed to SHOW CREATE FUNCTION {}, skipping", name_row.name
+                    );
+                }
+            }
+        }
+
+        debug!(count = results.len(), "Queried user-defined functions");
+        Ok(results)
+    }
+
     /// Query `system.disks` for disk free space information.
     ///
     /// Returns disk name, path, and free space in bytes for each disk.
@@ -852,6 +1041,16 @@ impl ChClient {
 
         Ok(rows)
     }
+}
+
+/// Quote an identifier for use in ClickHouse SQL.
+///
+/// Wraps the name in backticks and escapes any backticks within the name by
+/// doubling them (standard SQL identifier escaping).
+///
+/// Example: `my user` -> `` `my user` ``, `` back`tick `` -> `` `back``tick` ``
+fn quote_identifier(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
 }
 
 /// Sanitize a name for use in freeze names.
