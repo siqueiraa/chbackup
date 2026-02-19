@@ -9,6 +9,7 @@ use chbackup::config::Config;
 use chbackup::lock::{lock_for_command, lock_path_for_scope, PidLock};
 use chbackup::logging;
 use chbackup::storage::S3Client;
+use chbackup::restore::remap;
 use chbackup::{backup, download, list, restore, upload};
 use chrono::Utc;
 use clap::Parser;
@@ -231,12 +232,6 @@ async fn main() -> Result<()> {
             backup_name,
         } => {
             // Warn about flags not yet implemented
-            if rename_as.is_some() {
-                warn!("--as flag is not yet implemented, ignoring");
-            }
-            if database_mapping.is_some() {
-                warn!("--database-mapping flag is not yet implemented, ignoring");
-            }
             if partitions.is_some() {
                 warn!("--partitions flag is not yet implemented for restore, ignoring");
             }
@@ -259,6 +254,11 @@ async fn main() -> Result<()> {
             let name = backup_name_required(backup_name, "restore")?;
             let ch = ChClient::new(&config.clickhouse)?;
 
+            let db_mapping = match &database_mapping {
+                Some(s) => Some(remap::parse_database_mapping(s)?),
+                None => None,
+            };
+
             let effective_resume = resume && config.general.use_resumable_state;
             restore::restore(
                 &config,
@@ -268,8 +268,8 @@ async fn main() -> Result<()> {
                 schema,
                 data_only,
                 effective_resume,
-                None,
-                None,
+                rename_as.as_deref(),
+                db_mapping.as_ref(),
             )
             .await?;
 
@@ -339,9 +339,63 @@ async fn main() -> Result<()> {
             info!(backup_name = %name, "CreateRemote command complete");
         }
 
-        Command::RestoreRemote { backup_name, .. } => {
-            let _ = backup_name;
-            info!("restore_remote: not implemented in Phase 1");
+        Command::RestoreRemote {
+            tables,
+            rename_as,
+            database_mapping,
+            rm,
+            rbac,
+            configs,
+            named_collections,
+            skip_empty_tables,
+            resume,
+            backup_name,
+        } => {
+            // Warn about unimplemented flags
+            if rm {
+                warn!("--rm flag is not yet implemented, ignoring");
+            }
+            if rbac {
+                warn!("--rbac flag is not yet implemented, ignoring");
+            }
+            if configs {
+                warn!("--configs flag is not yet implemented, ignoring");
+            }
+            if named_collections {
+                warn!("--named-collections flag is not yet implemented, ignoring");
+            }
+            if skip_empty_tables {
+                warn!("--skip-empty-tables flag is not yet implemented, ignoring");
+            }
+
+            let name = backup_name_required(backup_name, "restore_remote")?;
+            let ch = ChClient::new(&config.clickhouse)?;
+            let s3 = S3Client::new(&config.s3).await?;
+
+            let db_mapping = match &database_mapping {
+                Some(s) => Some(remap::parse_database_mapping(s)?),
+                None => None,
+            };
+
+            // Step 1: Download from S3
+            let effective_resume = resume && config.general.use_resumable_state;
+            let _backup_dir = download::download(&config, &s3, &name, effective_resume).await?;
+
+            // Step 2: Restore with remap
+            restore::restore(
+                &config,
+                &ch,
+                &name,
+                tables.as_deref(),
+                false, // schema_only (not a flag on restore_remote per design)
+                false, // data_only (not a flag on restore_remote per design)
+                effective_resume,
+                rename_as.as_deref(),
+                db_mapping.as_ref(),
+            )
+            .await?;
+
+            info!(backup_name = %name, "RestoreRemote command complete");
         }
 
         Command::List { location } => {
