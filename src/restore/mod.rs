@@ -14,6 +14,7 @@ pub mod attach;
 pub mod remap;
 pub mod schema;
 pub mod sort;
+pub mod topo;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
