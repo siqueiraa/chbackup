@@ -82,6 +82,18 @@ pub struct MacroRow {
     pub substitution: String,
 }
 
+/// Row from `system.tables` query for dependency columns.
+///
+/// Private -- only used by `query_table_dependencies()`. The `dependencies_database`
+/// and `dependencies_table` columns are parallel arrays available in CH 23.3+.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+struct DependencyRow {
+    database: String,
+    name: String,
+    dependencies_database: Vec<String>,
+    dependencies_table: Vec<String>,
+}
+
 /// Row from `system.disks` query with free_space information.
 ///
 /// Separate from `DiskRow` to avoid breaking existing `get_disks()` callers.
@@ -636,6 +648,59 @@ impl ChClient {
 
     // -- Disk free space query --
 
+    /// Query `system.tables` for table dependency information.
+    ///
+    /// Returns a map from `"db.table"` to `Vec<"dep_db.dep_table">`, representing
+    /// which tables each table depends on. This is used to populate the
+    /// `TableManifest.dependencies` field during backup creation.
+    ///
+    /// On query failure (e.g., ClickHouse < 23.3 where `dependencies_database`
+    /// and `dependencies_table` columns do not exist), catches the error, logs
+    /// a warning, and returns `Ok(HashMap::new())` for graceful degradation.
+    pub async fn query_table_dependencies(&self) -> Result<HashMap<String, Vec<String>>> {
+        let sql = "SELECT database, name, dependencies_database, dependencies_table \
+                   FROM system.tables \
+                   WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')";
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing query_table_dependencies");
+        } else {
+            debug!(sql = %sql, "Executing query_table_dependencies");
+        }
+
+        let rows = match self.inner.query(sql).fetch_all::<DependencyRow>().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to query table dependencies (CH < 23.3?), dependencies will be empty"
+                );
+                return Ok(HashMap::new());
+            }
+        };
+
+        let mut result: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let key = format!("{}.{}", row.database, row.name);
+            let deps: Vec<String> = row
+                .dependencies_database
+                .iter()
+                .zip(row.dependencies_table.iter())
+                .filter(|(db, tbl)| !db.is_empty() && !tbl.is_empty())
+                .map(|(db, tbl)| format!("{}.{}", db, tbl))
+                .collect();
+            if !deps.is_empty() {
+                result.insert(key, deps);
+            }
+        }
+
+        info!(
+            tables_with_deps = result.len(),
+            "Queried table dependencies"
+        );
+        Ok(result)
+    }
+
     /// Query `system.disks` for disk free space information.
     ///
     /// Returns disk name, path, and free space in bytes for each disk.
@@ -1087,6 +1152,70 @@ mod tests {
         assert!(actions_ddl.contains("error String"));
         assert!(actions_ddl
             .contains("ENGINE = URL('http://localhost:7171/api/v1/actions', 'JSONEachRow')"));
+    }
+
+    #[test]
+    fn test_dependency_row_deserialize() {
+        // Verify DependencyRow struct can deserialize from JSON
+        // (simulating the shape of system.tables dependency columns)
+        let row = DependencyRow {
+            database: "default".to_string(),
+            name: "user_dict".to_string(),
+            dependencies_database: vec!["default".to_string(), "logs".to_string()],
+            dependencies_table: vec!["users".to_string(), "events".to_string()],
+        };
+        assert_eq!(row.database, "default");
+        assert_eq!(row.name, "user_dict");
+        assert_eq!(row.dependencies_database.len(), 2);
+        assert_eq!(row.dependencies_table.len(), 2);
+
+        // Verify combining parallel arrays into "db.table" format
+        let deps: Vec<String> = row
+            .dependencies_database
+            .iter()
+            .zip(row.dependencies_table.iter())
+            .filter(|(db, tbl)| !db.is_empty() && !tbl.is_empty())
+            .map(|(db, tbl)| format!("{}.{}", db, tbl))
+            .collect();
+        assert_eq!(deps, vec!["default.users", "logs.events"]);
+    }
+
+    #[test]
+    fn test_dependency_row_empty_deps() {
+        // Tables with no dependencies should produce empty vec
+        let row = DependencyRow {
+            database: "default".to_string(),
+            name: "trades".to_string(),
+            dependencies_database: Vec::new(),
+            dependencies_table: Vec::new(),
+        };
+        let deps: Vec<String> = row
+            .dependencies_database
+            .iter()
+            .zip(row.dependencies_table.iter())
+            .filter(|(db, tbl)| !db.is_empty() && !tbl.is_empty())
+            .map(|(db, tbl)| format!("{}.{}", db, tbl))
+            .collect();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_dependency_row_filters_empty_entries() {
+        // Some ClickHouse versions may return empty strings in the arrays
+        let row = DependencyRow {
+            database: "default".to_string(),
+            name: "view1".to_string(),
+            dependencies_database: vec!["default".to_string(), "".to_string()],
+            dependencies_table: vec!["trades".to_string(), "".to_string()],
+        };
+        let deps: Vec<String> = row
+            .dependencies_database
+            .iter()
+            .zip(row.dependencies_table.iter())
+            .filter(|(db, tbl)| !db.is_empty() && !tbl.is_empty())
+            .map(|(db, tbl)| format!("{}.{}", db, tbl))
+            .collect();
+        assert_eq!(deps, vec!["default.trades"]);
     }
 
     #[test]
