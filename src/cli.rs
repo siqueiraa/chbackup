@@ -1,5 +1,21 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// Output format for list commands.
+#[derive(Debug, Clone, ValueEnum, Default)]
+pub enum ListFormat {
+    /// Default human-readable table format
+    #[default]
+    Default,
+    /// JSON array output
+    Json,
+    /// YAML output
+    Yaml,
+    /// CSV with header row
+    Csv,
+    /// Tab-separated values with header row
+    Tsv,
+}
+
 /// chbackup - Drop-in Rust replacement for clickhouse-backup.
 /// Single static binary, S3-only storage, non-destructive restore.
 #[derive(Parser, Debug)]
@@ -255,6 +271,10 @@ pub enum Command {
         /// Show local or remote backups (default: both)
         #[arg(value_enum)]
         location: Option<Location>,
+
+        /// Output format: default, json, yaml, csv, tsv
+        #[arg(long, value_enum, default_value_t = ListFormat::Default)]
+        format: ListFormat,
     },
 
     /// List tables from ClickHouse or from a remote backup

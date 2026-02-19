@@ -588,10 +588,9 @@ pub async fn create(
     // Clear the guard so Drop doesn't warn
     let _ = std::mem::take(&mut freeze_guard);
 
-    // Propagate the first error if any task failed -- clean up backup dir first
+    // Propagate the first error if any task failed -- clean up backup dir + shadow
     if let Some(e) = first_error {
-        // Remove the partially-created backup directory (shadow cleanup is
-        // the caller's responsibility via `clean` command).
+        // Remove the partially-created backup directory
         if backup_dir.exists() {
             if let Err(rm_err) = std::fs::remove_dir_all(&backup_dir) {
                 warn!(
@@ -605,6 +604,14 @@ pub async fn create(
                     "Removed partial backup directory after error"
                 );
             }
+        }
+        // Clean shadow directories left by this backup's FREEZE operations
+        match crate::list::clean_shadow(ch, &config.clickhouse.data_path, Some(backup_name)).await {
+            Ok(n) if n > 0 => info!(count = n, "Cleaned shadow directories after backup error"),
+            Err(shadow_err) => {
+                warn!(error = %shadow_err, "Failed to clean shadow directories after backup error");
+            }
+            _ => {}
         }
         return Err(e);
     }
