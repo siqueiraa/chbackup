@@ -1,9 +1,12 @@
 //! Schema restoration: CREATE DATABASE and CREATE TABLE from manifest DDL.
 //!
-//! Implements Mode B (non-destructive) restore:
-//! - Creates databases if they don't exist
-//! - Creates tables if they don't exist (skips existing tables)
+//! Implements Mode B (non-destructive) and Mode A (destructive `--rm`) restore:
+//! - Mode B: Creates databases and tables if they don't exist (skips existing)
+//! - Mode A: DROP tables/databases before CREATE, using reverse engine priority
+//!   order with retry loop for dependency failures
 //! - When remap is active, rewrites DDL for target database/table names
+//! - ZK conflict resolution for Replicated tables
+//! - DatabaseReplicated detection
 
 use std::collections::HashSet;
 
@@ -13,7 +16,11 @@ use tracing::{debug, info, warn};
 use crate::clickhouse::client::ChClient;
 use crate::manifest::{BackupManifest, DatabaseInfo};
 
-use super::remap::{rewrite_create_database_ddl, rewrite_create_table_ddl, RemapConfig};
+use super::remap::{
+    parse_replicated_params, resolve_zk_macros, rewrite_create_database_ddl,
+    rewrite_create_table_ddl, RemapConfig,
+};
+use super::topo::sort_tables_for_drop;
 
 /// Create databases from the manifest.
 ///
@@ -101,6 +108,302 @@ async fn create_database(ch: &ChClient, db_info: &DatabaseInfo) -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Mode A (--rm): DROP phase
+// ---------------------------------------------------------------------------
+
+/// System databases that must never be dropped.
+const SYSTEM_DATABASES: &[&str] = &["system", "information_schema", "INFORMATION_SCHEMA"];
+
+/// Drop tables in reverse engine priority order (Mode A).
+///
+/// Tables are sorted by `engine_drop_priority` (Distributed/Merge first,
+/// data tables last). Failures are retried in subsequent rounds (max 10),
+/// following the same pattern as `create_ddl_objects()`.
+///
+/// When `on_cluster` is set, DROP DDL includes ON CLUSTER clause.
+/// When a database is in `replicated_databases`, ON CLUSTER is skipped for
+/// tables in that database.
+pub async fn drop_tables(
+    ch: &ChClient,
+    manifest: &BackupManifest,
+    table_keys: &[String],
+    remap: Option<&RemapConfig>,
+    on_cluster: Option<&str>,
+    replicated_databases: &HashSet<String>,
+) -> Result<()> {
+    if table_keys.is_empty() {
+        return Ok(());
+    }
+
+    let sorted = sort_tables_for_drop(manifest, table_keys);
+
+    info!(
+        count = sorted.len(),
+        "Phase 0: Dropping {} tables (Mode A)",
+        sorted.len()
+    );
+
+    let mut pending = sorted;
+    let max_rounds = 10;
+
+    for round in 0..max_rounds {
+        let mut failed: Vec<(String, String)> = Vec::new();
+        let mut dropped_this_round = 0u32;
+
+        for table_key in &pending {
+            let (src_db, src_table) =
+                table_key.split_once('.').unwrap_or(("default", table_key));
+
+            // Determine destination db/table (may be remapped)
+            let (dst_db, dst_table) = match remap {
+                Some(rc) if rc.is_active() => rc.remap_table_key(table_key),
+                _ => (src_db.to_string(), src_table.to_string()),
+            };
+
+            // Determine ON CLUSTER setting for this table
+            let effective_on_cluster =
+                if replicated_databases.contains(&dst_db) {
+                    None // Skip ON CLUSTER for DatabaseReplicated databases
+                } else {
+                    on_cluster
+                };
+
+            let dst_key = format!("{}.{}", dst_db, dst_table);
+            match ch.drop_table(&dst_db, &dst_table, effective_on_cluster).await {
+                Ok(()) => {
+                    info!(table = %dst_key, "Dropping table");
+                    dropped_this_round += 1;
+                }
+                Err(e) => {
+                    if round == 0 {
+                        debug!(
+                            table = %dst_key,
+                            error = %e,
+                            round = round,
+                            "DROP TABLE failed, will retry"
+                        );
+                    }
+                    failed.push((table_key.clone(), e.to_string()));
+                }
+            }
+        }
+
+        if failed.is_empty() {
+            break;
+        }
+
+        if dropped_this_round == 0 && round > 0 {
+            let failed_keys: Vec<&str> = failed.iter().map(|(k, _)| k.as_str()).collect();
+            anyhow::bail!(
+                "Failed to drop {} tables after {} retry rounds: {:?}. Last errors: {}",
+                failed.len(),
+                round + 1,
+                failed_keys,
+                failed
+                    .iter()
+                    .map(|(k, e)| format!("{}: {}", k, e))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+
+        info!(
+            round = round,
+            dropped = dropped_this_round,
+            remaining = failed.len(),
+            "DROP TABLE retry round"
+        );
+
+        pending = failed.into_iter().map(|(k, _)| k).collect();
+    }
+
+    info!(count = table_keys.len(), "Table drop phase complete");
+    Ok(())
+}
+
+/// Drop databases (Mode A).
+///
+/// Drops each database in the manifest that is not a system database
+/// (`system`, `information_schema`, `INFORMATION_SCHEMA`).
+/// When `on_cluster` is set, includes ON CLUSTER clause unless the
+/// database is in `replicated_databases`.
+pub async fn drop_databases(
+    ch: &ChClient,
+    manifest: &BackupManifest,
+    remap: Option<&RemapConfig>,
+    on_cluster: Option<&str>,
+    replicated_databases: &HashSet<String>,
+) -> Result<()> {
+    if manifest.databases.is_empty() {
+        return Ok(());
+    }
+
+    // Collect unique database names to drop (after remap)
+    let mut dropped: HashSet<String> = HashSet::new();
+
+    for db_info in &manifest.databases {
+        let dst_db = match remap {
+            Some(rc) if rc.is_active() => {
+                let (d, _) = rc.remap_table_key(&format!("{}.dummy", db_info.name));
+                d
+            }
+            _ => db_info.name.clone(),
+        };
+
+        // Never drop system databases
+        if SYSTEM_DATABASES.contains(&dst_db.as_str()) {
+            debug!(database = %dst_db, "Skipping system database DROP");
+            continue;
+        }
+
+        if dropped.contains(&dst_db) {
+            continue;
+        }
+
+        let effective_on_cluster = if replicated_databases.contains(&dst_db) {
+            None
+        } else {
+            on_cluster
+        };
+
+        info!(database = %dst_db, "Dropping database");
+        match ch.drop_database(&dst_db, effective_on_cluster).await {
+            Ok(()) => {
+                dropped.insert(dst_db);
+            }
+            Err(e) => {
+                warn!(
+                    database = %dst_db,
+                    error = %e,
+                    "Failed to drop database, continuing"
+                );
+            }
+        }
+    }
+
+    info!(
+        count = dropped.len(),
+        "Database drop phase complete"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ZK conflict resolution and DatabaseReplicated detection
+// ---------------------------------------------------------------------------
+
+/// Check and resolve ZK replica path conflicts for a Replicated table.
+///
+/// 1. Parse ZK path + replica name from DDL
+/// 2. Resolve macros using provided macro map
+/// 3. Check `system.zookeeper` for existing replica
+/// 4. If conflict: `SYSTEM DROP REPLICA`
+///
+/// Returns `Ok(())` on success or if not a Replicated table.
+/// Logs warnings for conflicts and failures (non-fatal).
+pub async fn resolve_zk_conflict(
+    ch: &ChClient,
+    ddl: &str,
+    macros: &std::collections::HashMap<String, String>,
+    table_uuid: Option<&str>,
+) -> Result<()> {
+    // Only applies to Replicated engines
+    let (zk_path_template, replica_template) = match parse_replicated_params(ddl) {
+        Some((path, replica)) => (path, replica),
+        None => return Ok(()), // Not a Replicated engine
+    };
+
+    // Build a macro map that includes uuid if available
+    let mut resolve_macros = macros.clone();
+    if let Some(uuid) = table_uuid {
+        resolve_macros.entry("uuid".to_string()).or_insert_with(|| uuid.to_string());
+    }
+
+    let resolved_path = resolve_zk_macros(&zk_path_template, &resolve_macros);
+    let resolved_replica = resolve_zk_macros(&replica_template, &resolve_macros);
+
+    // Check if replica already exists in ZK
+    let exists = ch
+        .check_zk_replica_exists(&resolved_path, &resolved_replica)
+        .await?;
+
+    if exists {
+        warn!(
+            zk_path = %resolved_path,
+            replica = %resolved_replica,
+            "ZK replica conflict detected, dropping existing replica"
+        );
+        if let Err(e) = ch
+            .drop_replica_from_zkpath(&resolved_replica, &resolved_path)
+            .await
+        {
+            warn!(
+                error = %e,
+                zk_path = %resolved_path,
+                replica = %resolved_replica,
+                "SYSTEM DROP REPLICA failed (non-fatal, table creation may still succeed)"
+            );
+        } else {
+            info!(
+                zk_path = %resolved_path,
+                replica = %resolved_replica,
+                "SYSTEM DROP REPLICA successful"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Query which databases use the Replicated engine.
+///
+/// Returns a set of database names that should skip ON CLUSTER.
+pub async fn detect_replicated_databases(
+    ch: &ChClient,
+    manifest: &BackupManifest,
+) -> HashSet<String> {
+    let mut replicated = HashSet::new();
+
+    // Collect unique database names from manifest
+    let db_names: HashSet<String> = manifest
+        .databases
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+
+    for db_name in &db_names {
+        match ch.query_database_engine(db_name).await {
+            Ok(engine) if engine == "Replicated" => {
+                info!(
+                    database = %db_name,
+                    "DatabaseReplicated detected, skipping ON CLUSTER for this database"
+                );
+                replicated.insert(db_name.clone());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    database = %db_name,
+                    error = %e,
+                    "Failed to query database engine, assuming non-Replicated"
+                );
+            }
+        }
+    }
+
+    replicated
+}
+
+/// Returns true if the engine name indicates a Replicated*MergeTree variant.
+pub fn is_replicated_engine(engine: &str) -> bool {
+    engine.starts_with("Replicated")
+}
+
+// ---------------------------------------------------------------------------
+// Schema creation (Mode B / shared)
+// ---------------------------------------------------------------------------
 
 /// Create tables from the manifest.
 ///
@@ -481,5 +784,58 @@ mod tests {
                 input
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4d: Mode A DROP phase tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_drop_system_databases_skipped() {
+        // Verify that SYSTEM_DATABASES contains the expected databases
+        assert!(SYSTEM_DATABASES.contains(&"system"));
+        assert!(SYSTEM_DATABASES.contains(&"information_schema"));
+        assert!(SYSTEM_DATABASES.contains(&"INFORMATION_SCHEMA"));
+
+        // Verify normal databases are not in the list
+        assert!(!SYSTEM_DATABASES.contains(&"default"));
+        assert!(!SYSTEM_DATABASES.contains(&"prod"));
+    }
+
+    #[test]
+    fn test_is_replicated_engine() {
+        // Replicated engines -> true
+        assert!(is_replicated_engine("ReplicatedMergeTree"));
+        assert!(is_replicated_engine("ReplicatedReplacingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedAggregatingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedCollapsingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedSummingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedVersionedCollapsingMergeTree"));
+
+        // Non-replicated engines -> false
+        assert!(!is_replicated_engine("MergeTree"));
+        assert!(!is_replicated_engine("ReplacingMergeTree"));
+        assert!(!is_replicated_engine("View"));
+        assert!(!is_replicated_engine("MaterializedView"));
+        assert!(!is_replicated_engine("Dictionary"));
+        assert!(!is_replicated_engine("Distributed"));
+        assert!(!is_replicated_engine("Kafka"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4d: ZK conflict resolution tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_replicated_engine_in_ddl() {
+        // parse_replicated_params should detect replicated engines
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = ReplicatedMergeTree('/path', 'r1') ORDER BY id";
+        let result = parse_replicated_params(ddl);
+        assert!(result.is_some());
+
+        // Non-replicated should return None
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = MergeTree() ORDER BY id";
+        let result = parse_replicated_params(ddl);
+        assert!(result.is_none());
     }
 }
