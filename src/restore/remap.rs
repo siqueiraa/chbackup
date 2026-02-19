@@ -417,9 +417,7 @@ fn skip_object_name(s: &str) -> usize {
         } else if bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_' || bytes[pos] == b'.' {
             // Unquoted identifier character (including dot for db.table)
             while pos < bytes.len()
-                && (bytes[pos].is_ascii_alphanumeric()
-                    || bytes[pos] == b'_'
-                    || bytes[pos] == b'.')
+                && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_' || bytes[pos] == b'.')
             {
                 pos += 1;
             }
@@ -1329,8 +1327,7 @@ mod tests {
         macros.insert("replica".to_string(), "r1".to_string());
         macros.insert("uuid".to_string(), "abc-123".to_string());
 
-        let result =
-            resolve_zk_macros("/clickhouse/tables/{shard}/{database}/{table}", &macros);
+        let result = resolve_zk_macros("/clickhouse/tables/{shard}/{database}/{table}", &macros);
         assert_eq!(result, "/clickhouse/tables/01/mydb/mytable");
     }
 
@@ -1339,10 +1336,7 @@ mod tests {
         let mut macros = HashMap::new();
         macros.insert("shard".to_string(), "01".to_string());
         // {database} and {table} not in map -- should be left as-is
-        let result = resolve_zk_macros(
-            "/clickhouse/tables/{shard}/{database}/{table}",
-            &macros,
-        );
+        let result = resolve_zk_macros("/clickhouse/tables/{shard}/{database}/{table}", &macros);
         assert_eq!(result, "/clickhouse/tables/01/{database}/{table}");
     }
 
@@ -1411,7 +1405,10 @@ mod tests {
     fn test_add_on_cluster_clause_already_present() {
         let ddl = "CREATE TABLE `db`.`t` ON CLUSTER 'existing' (id UInt64) ENGINE = MergeTree";
         let result = add_on_cluster_clause(ddl, "new_cluster");
-        assert_eq!(result, ddl, "Should not modify DDL with existing ON CLUSTER");
+        assert_eq!(
+            result, ddl,
+            "Should not modify DDL with existing ON CLUSTER"
+        );
     }
 
     #[test]

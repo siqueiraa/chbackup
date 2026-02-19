@@ -90,10 +90,7 @@ pub fn engine_drop_priority(engine: &str) -> u8 {
 ///
 /// Returns tables sorted by `engine_drop_priority`, with DDL-only objects
 /// (Distributed, Views, Dictionaries) first and data tables last.
-pub fn sort_tables_for_drop(
-    manifest: &BackupManifest,
-    table_keys: &[String],
-) -> Vec<String> {
+pub fn sort_tables_for_drop(manifest: &BackupManifest, table_keys: &[String]) -> Vec<String> {
     let mut sorted = table_keys.to_vec();
     sorted.sort_by_key(|k| {
         manifest

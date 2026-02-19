@@ -17,9 +17,8 @@ use crate::clickhouse::client::ChClient;
 use crate::manifest::{BackupManifest, DatabaseInfo};
 
 use super::remap::{
-    add_on_cluster_clause, parse_replicated_params, resolve_zk_macros,
-    rewrite_create_database_ddl, rewrite_create_table_ddl, rewrite_distributed_cluster,
-    RemapConfig,
+    add_on_cluster_clause, parse_replicated_params, resolve_zk_macros, rewrite_create_database_ddl,
+    rewrite_create_table_ddl, rewrite_distributed_cluster, RemapConfig,
 };
 use super::topo::sort_tables_for_drop;
 
@@ -76,13 +75,8 @@ pub async fn create_databases(
                 } else {
                     // No mapping for this database -- create as-is
                     if !created.contains(&db_info.name) {
-                        create_database_with_cluster(
-                            ch,
-                            db_info,
-                            on_cluster,
-                            replicated_databases,
-                        )
-                        .await?;
+                        create_database_with_cluster(ch, db_info, on_cluster, replicated_databases)
+                            .await?;
                         created.insert(db_info.name.clone());
                     }
                 }
@@ -194,8 +188,7 @@ pub async fn drop_tables(
         let mut dropped_this_round = 0u32;
 
         for table_key in &pending {
-            let (src_db, src_table) =
-                table_key.split_once('.').unwrap_or(("default", table_key));
+            let (src_db, src_table) = table_key.split_once('.').unwrap_or(("default", table_key));
 
             // Determine destination db/table (may be remapped)
             let (dst_db, dst_table) = match remap {
@@ -204,15 +197,17 @@ pub async fn drop_tables(
             };
 
             // Determine ON CLUSTER setting for this table
-            let effective_on_cluster =
-                if replicated_databases.contains(&dst_db) {
-                    None // Skip ON CLUSTER for DatabaseReplicated databases
-                } else {
-                    on_cluster
-                };
+            let effective_on_cluster = if replicated_databases.contains(&dst_db) {
+                None // Skip ON CLUSTER for DatabaseReplicated databases
+            } else {
+                on_cluster
+            };
 
             let dst_key = format!("{}.{}", dst_db, dst_table);
-            match ch.drop_table(&dst_db, &dst_table, effective_on_cluster).await {
+            match ch
+                .drop_table(&dst_db, &dst_table, effective_on_cluster)
+                .await
+            {
                 Ok(()) => {
                     info!(table = %dst_key, "Dropping table");
                     dropped_this_round += 1;
@@ -324,10 +319,7 @@ pub async fn drop_databases(
         }
     }
 
-    info!(
-        count = dropped.len(),
-        "Database drop phase complete"
-    );
+    info!(count = dropped.len(), "Database drop phase complete");
     Ok(())
 }
 
@@ -359,7 +351,9 @@ pub async fn resolve_zk_conflict(
     // Build a macro map that includes uuid if available
     let mut resolve_macros = macros.clone();
     if let Some(uuid) = table_uuid {
-        resolve_macros.entry("uuid".to_string()).or_insert_with(|| uuid.to_string());
+        resolve_macros
+            .entry("uuid".to_string())
+            .or_insert_with(|| uuid.to_string());
     }
 
     let resolved_path = resolve_zk_macros(&zk_path_template, &resolve_macros);
@@ -408,11 +402,7 @@ pub async fn detect_replicated_databases(
     let mut replicated = HashSet::new();
 
     // Collect unique database names from manifest
-    let db_names: HashSet<String> = manifest
-        .databases
-        .iter()
-        .map(|d| d.name.clone())
-        .collect();
+    let db_names: HashSet<String> = manifest.databases.iter().map(|d| d.name.clone()).collect();
 
     for db_name in &db_names {
         match ch.query_database_engine(db_name).await {
@@ -927,7 +917,9 @@ mod tests {
         assert!(is_replicated_engine("ReplicatedAggregatingMergeTree"));
         assert!(is_replicated_engine("ReplicatedCollapsingMergeTree"));
         assert!(is_replicated_engine("ReplicatedSummingMergeTree"));
-        assert!(is_replicated_engine("ReplicatedVersionedCollapsingMergeTree"));
+        assert!(is_replicated_engine(
+            "ReplicatedVersionedCollapsingMergeTree"
+        ));
 
         // Non-replicated engines -> false
         assert!(!is_replicated_engine("MergeTree"));
@@ -965,7 +957,10 @@ mod tests {
         // Step 1: Parse replicated params from DDL
         let ddl = "CREATE TABLE default.trades (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{database}/{table}', '{replica}') ORDER BY id";
         let (path_template, replica_template) = parse_replicated_params(ddl).unwrap();
-        assert_eq!(path_template, "/clickhouse/tables/{shard}/{database}/{table}");
+        assert_eq!(
+            path_template,
+            "/clickhouse/tables/{shard}/{database}/{table}"
+        );
         assert_eq!(replica_template, "{replica}");
 
         // Step 2: Resolve macros
@@ -991,7 +986,10 @@ mod tests {
     fn test_resolve_zk_skip_non_replicated() {
         let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = MergeTree() ORDER BY id";
         let result = parse_replicated_params(ddl);
-        assert!(result.is_none(), "Non-replicated engines should return None");
+        assert!(
+            result.is_none(),
+            "Non-replicated engines should return None"
+        );
 
         // resolve_zk_conflict() returns Ok(()) immediately for non-Replicated engines
         // (can't test async here, but the guard is parse_replicated_params returning None)

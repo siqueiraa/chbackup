@@ -722,7 +722,10 @@ async fn reapply_pending_mutations(
                 "Re-applying mutation... this may take time"
             );
 
-            match ch.execute_mutation(&dst_db, &dst_table, &mutation.command).await {
+            match ch
+                .execute_mutation(&dst_db, &dst_table, &mutation.command)
+                .await
+            {
                 Ok(()) => {
                     info!(
                         table = %dst_key,
@@ -812,9 +815,7 @@ async fn try_attach_table_mode(
     info!(table = %dst_key, "ATTACH TABLE mode: detaching table");
     ch.detach_table_sync(dst_db, dst_table)
         .await
-        .with_context(|| {
-            format!("ATTACH TABLE mode: failed to DETACH TABLE {}", dst_key)
-        })?;
+        .with_context(|| format!("ATTACH TABLE mode: failed to DETACH TABLE {}", dst_key))?;
 
     // Step 2: DROP REPLICA from ZK
     if let Some((zk_path_template, replica_template)) = parse_replicated_params(ddl) {
@@ -881,9 +882,7 @@ async fn try_attach_table_mode(
     info!(table = %dst_key, "ATTACH TABLE mode: attaching table");
     ch.attach_table(dst_db, dst_table)
         .await
-        .with_context(|| {
-            format!("ATTACH TABLE mode: failed to ATTACH TABLE {}", dst_key)
-        })?;
+        .with_context(|| format!("ATTACH TABLE mode: failed to ATTACH TABLE {}", dst_key))?;
 
     // Step 5: SYSTEM RESTORE REPLICA
     info!(table = %dst_key, "ATTACH TABLE mode: restoring replica");
@@ -1056,7 +1055,9 @@ mod tests {
         assert!(is_replicated_engine("ReplicatedSummingMergeTree"));
         assert!(is_replicated_engine("ReplicatedAggregatingMergeTree"));
         assert!(is_replicated_engine("ReplicatedCollapsingMergeTree"));
-        assert!(is_replicated_engine("ReplicatedVersionedCollapsingMergeTree"));
+        assert!(is_replicated_engine(
+            "ReplicatedVersionedCollapsingMergeTree"
+        ));
         assert!(is_replicated_engine("ReplicatedGraphiteMergeTree"));
 
         // Non-Replicated engines should NOT trigger ATTACH TABLE mode
@@ -1170,10 +1171,7 @@ mod tests {
                     mutation_id: "0000000002".to_string(),
                     command: "UPDATE status = 'archived' WHERE created_at < '2024-01-01'"
                         .to_string(),
-                    parts_to_do: vec![
-                        "202401_1_50_3".to_string(),
-                        "202402_1_10_1".to_string(),
-                    ],
+                    parts_to_do: vec!["202401_1_50_3".to_string(), "202402_1_10_1".to_string()],
                 },
             ],
             metadata_only: false,

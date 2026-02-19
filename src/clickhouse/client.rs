@@ -706,12 +706,7 @@ impl ChClient {
     /// Drop a table (Mode A).
     ///
     /// SQL: `DROP TABLE IF EXISTS \`db\`.\`table\` [ON CLUSTER 'cluster'] SYNC`
-    pub async fn drop_table(
-        &self,
-        db: &str,
-        table: &str,
-        on_cluster: Option<&str>,
-    ) -> Result<()> {
+    pub async fn drop_table(&self, db: &str, table: &str, on_cluster: Option<&str>) -> Result<()> {
         let sql = drop_table_sql(db, table, on_cluster);
         self.log_and_execute(&sql, "DROP TABLE").await
     }
@@ -755,11 +750,7 @@ impl ChClient {
     /// Drop a replica from ZooKeeper by explicit ZK path.
     ///
     /// SQL: `SYSTEM DROP REPLICA 'replica_name' FROM ZKPATH 'zk_path'`
-    pub async fn drop_replica_from_zkpath(
-        &self,
-        replica_name: &str,
-        zk_path: &str,
-    ) -> Result<()> {
+    pub async fn drop_replica_from_zkpath(&self, replica_name: &str, zk_path: &str) -> Result<()> {
         let sql = drop_replica_from_zkpath_sql(replica_name, zk_path);
         self.log_and_execute(&sql, "SYSTEM DROP REPLICA FROM ZKPATH")
             .await
@@ -770,11 +761,7 @@ impl ChClient {
     /// SQL: `SELECT count() FROM system.zookeeper WHERE path='{zk_path}/replicas' AND name='{replica_name}'`
     ///
     /// Returns `false` on query error (system.zookeeper may not be accessible).
-    pub async fn check_zk_replica_exists(
-        &self,
-        zk_path: &str,
-        replica_name: &str,
-    ) -> Result<bool> {
+    pub async fn check_zk_replica_exists(&self, zk_path: &str, replica_name: &str) -> Result<bool> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct CountRow {
             cnt: u64,
@@ -818,10 +805,7 @@ impl ChClient {
             engine: String,
         }
 
-        let sql = format!(
-            "SELECT engine FROM system.databases WHERE name = '{}'",
-            db
-        );
+        let sql = format!("SELECT engine FROM system.databases WHERE name = '{}'", db);
 
         if self.log_sql_queries {
             info!(sql = %sql, "Executing query_database_engine");
@@ -842,12 +826,7 @@ impl ChClient {
     /// The command is from `MutationInfo.command` (e.g., "DELETE WHERE user_id = 5").
     ///
     /// SQL: `ALTER TABLE \`db\`.\`table\` {command} SETTINGS mutations_sync=2`
-    pub async fn execute_mutation(
-        &self,
-        db: &str,
-        table: &str,
-        command: &str,
-    ) -> Result<()> {
+    pub async fn execute_mutation(&self, db: &str, table: &str, command: &str) -> Result<()> {
         let sql = execute_mutation_sql(db, table, command);
         self.log_and_execute(&sql, "MUTATION").await
     }
@@ -1506,10 +1485,7 @@ mod tests {
 
     #[test]
     fn test_drop_replica_sql_generation() {
-        let sql = drop_replica_from_zkpath_sql(
-            "r1",
-            "/clickhouse/tables/01/default/trades",
-        );
+        let sql = drop_replica_from_zkpath_sql("r1", "/clickhouse/tables/01/default/trades");
         assert_eq!(
             sql,
             "SYSTEM DROP REPLICA 'r1' FROM ZKPATH '/clickhouse/tables/01/default/trades'"
@@ -1525,7 +1501,11 @@ mod tests {
         );
 
         // UPDATE mutation
-        let sql = execute_mutation_sql("logs", "events", "UPDATE status = 'archived' WHERE ts < '2024-01-01'");
+        let sql = execute_mutation_sql(
+            "logs",
+            "events",
+            "UPDATE status = 'archived' WHERE ts < '2024-01-01'",
+        );
         assert_eq!(
             sql,
             "ALTER TABLE `logs`.`events` UPDATE status = 'archived' WHERE ts < '2024-01-01' SETTINGS mutations_sync=2"
