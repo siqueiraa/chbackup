@@ -26,6 +26,7 @@ use crate::concurrency::effective_download_concurrency;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo};
 use crate::object_disk::is_s3_disk;
+use crate::progress::ProgressTracker;
 use crate::rate_limiter::RateLimiter;
 use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, DownloadState,
@@ -390,6 +391,13 @@ pub async fn download(
         total_parts, concurrency
     );
 
+    // Create progress tracker for download
+    let progress = ProgressTracker::new(
+        "Download",
+        total_parts as u64,
+        config.general.disable_progress_bar,
+    );
+
     // 4. Download parts in parallel with semaphore and rate limiter
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let rate_limiter = RateLimiter::new(config.backup.download_max_bytes_per_second);
@@ -422,6 +430,7 @@ pub async fn download(
         let data_format_clone = manifest.data_format.clone();
         let data_path_clone = data_path_str.clone();
         let backup_name_clone = backup_name.to_string();
+        let progress = progress.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -529,6 +538,8 @@ pub async fn download(
                     save_state_graceful(&guard.1, &guard.0);
                 }
 
+                progress.inc();
+
                 Ok::<(String, u64), anyhow::Error>((item.table_key, total_metadata_bytes))
             } else {
                 // Local disk part: full download + decompress + CRC64 verify
@@ -572,6 +583,8 @@ pub async fn download(
                                     guard.0.completed_keys.insert(backup_key.clone());
                                     save_state_graceful(&guard.1, &guard.0);
                                 }
+
+                                progress.inc();
 
                                 return Ok::<(String, u64), anyhow::Error>(
                                     (item.table_key, 0),
@@ -693,6 +706,8 @@ pub async fn download(
                         save_state_graceful(&guard.1, &guard.0);
                     }
 
+                    progress.inc();
+
                     return Ok::<(String, u64), anyhow::Error>((item.table_key, compressed_size));
                 }
 
@@ -712,6 +727,8 @@ pub async fn download(
         .context("A download task panicked")?
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
+
+    progress.finish();
 
     // 5. Tally totals
     let mut total_compressed_bytes = 0u64;

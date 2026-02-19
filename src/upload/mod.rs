@@ -28,6 +28,7 @@ use crate::concurrency::{effective_object_disk_copy_concurrency, effective_uploa
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo, S3ObjectInfo};
 use crate::object_disk::is_s3_disk;
+use crate::progress::ProgressTracker;
 use crate::rate_limiter::RateLimiter;
 use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, UploadState,
@@ -436,6 +437,13 @@ pub async fn upload(
         );
     }
 
+    // Create progress tracker for upload
+    let progress = ProgressTracker::new(
+        "Upload",
+        total_parts as u64,
+        config.general.disable_progress_bar,
+    );
+
     // 3. Upload both queues in parallel
     let upload_semaphore = Arc::new(Semaphore::new(concurrency));
     let object_disk_copy_semaphore = Arc::new(Semaphore::new(object_disk_concurrency));
@@ -471,6 +479,7 @@ pub async fn upload(
         let rate_limiter = rate_limiter.clone();
         let resume_state = resume_state.clone();
         let data_format_clone = data_format.clone();
+        let progress = progress.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -574,6 +583,8 @@ pub async fn upload(
                 save_state_graceful(&guard.1, &guard.0);
             }
 
+            progress.inc();
+
             Ok((
                 item.table_key,
                 item.disk_name,
@@ -590,6 +601,7 @@ pub async fn upload(
         let sem = object_disk_copy_semaphore.clone();
         let s3 = s3.clone();
         let resume_state = resume_state.clone();
+        let progress = progress.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -685,6 +697,8 @@ pub async fn upload(
                 save_state_graceful(&guard.1, &guard.0);
             }
 
+            progress.inc();
+
             // S3 disk parts have no compressed_size (no compression)
             Ok((item.table_key, item.disk_name, updated_part, 0u64))
         });
@@ -698,6 +712,8 @@ pub async fn upload(
         .context("An upload task panicked")?
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
+
+    progress.finish();
 
     // 4. Apply results to manifest sequentially
     let mut total_compressed_size = 0u64;
