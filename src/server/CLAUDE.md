@@ -78,8 +78,16 @@ Conditionally applied to the entire router when `config.api.username` AND `confi
 
 ### Compound Operations
 - `create_remote`: chains `backup::create()` then `upload::upload()` in a single spawned task
-- `restore_remote`: chains `download::download()` then `restore::restore()` in a single spawned task
+- `restore_remote`: chains `download::download()` then `restore::restore()` in a single spawned task; passes `rename_as` and `database_mapping` remap parameters to the restore step (Phase 4a)
 - If the first step fails, the operation is marked as failed and the second step is skipped
+
+### Restore Remap Parameters (routes.rs, Phase 4a)
+Both restore endpoints accept remap parameters for table/database renaming:
+
+- **`RestoreRequest`** (for `POST /api/v1/restore/{name}`): Fields: `tables`, `schema`, `data_only`, `rename_as` (optional, `--as` flag value), `database_mapping` (optional, `-m` flag value as `"src:dst,..."` string), `rm`. The `database_mapping` string is parsed via `remap::parse_database_mapping()` inside the spawned task; parse errors cause immediate `fail_op`.
+- **`RestoreRemoteRequest`** (for `POST /api/v1/restore_remote/{name}`): Fields: `tables`, `schema`, `data_only`, `rename_as` (optional), `database_mapping` (optional). Both remap fields use `#[serde(default)]` for backward compatibility.
+
+Auto-resume (`auto_resume()` in state.rs) passes `None` for both `rename_as` and `database_mapping` since resume restores to original names.
 
 ### Auto-Resume on Restart (state.rs)
 When `config.api.complete_resumable_after_restart` is true, `auto_resume()` scans `{data_path}/backup/` for state files (`upload.state.json`, `download.state.json`, `restore.state.json`) and spawns corresponding operations with `resume=true`. Operations go through `try_start_op()` respecting concurrency limits. Small delay (100ms) between spawned operations.

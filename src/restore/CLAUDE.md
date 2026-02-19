@@ -13,7 +13,8 @@ Phase 1 implements Mode B only (non-destructive). Mode A (`--rm` DROP) is Phase 
 ```
 src/restore/
   mod.rs      -- Entry point: restore() orchestrates the full restore flow
-  schema.rs   -- CREATE DATABASE and CREATE TABLE from manifest DDL
+  remap.rs    -- Table/database remap: DDL rewriting, name mapping for --as and -m flags
+  schema.rs   -- CREATE DATABASE and CREATE TABLE from manifest DDL (remap-aware)
   attach.rs   -- Hardlink parts to detached/, chown, ATTACH PART
   sort.rs     -- SortPartsByMinBlock for correct attachment order
 ```
@@ -23,9 +24,22 @@ src/restore/
 ### Part Sort Order (sort.rs)
 Parts are sorted by `(partition, min_block)` for correct merge behavior. Part name format is `{partition}_{min}_{max}_{level}` where partition may contain underscores, so parsing splits from the right. Engines containing "Replacing", "Collapsing", or "Versioned" require strictly sequential sorted ATTACH.
 
+### DDL Rewriting / Remap (remap.rs, Phase 4a)
+All functions are pure (no async, no I/O) for easy unit testing. DDL rewriting uses string manipulation (no regex crate dependency).
+
+- **`RemapConfig`** struct: Holds parsed remap state from CLI flags. Fields: `rename_as` (single table rename as `(src_db, src_table, dst_db, dst_table)`), `database_mapping` (HashMap of src_db -> dst_db), `default_replica_path` (ZK path template from config). Created via `RemapConfig::new()` which validates `--as` requires `-t` (single table, no wildcards).
+- **`RemapConfig::remap_table_key(original_key)`**: Given a manifest key `"db.table"`, returns the destination `(db, table)`. Priority: `--as` rename takes precedence over `-m` database mapping. Non-matched keys pass through unchanged.
+- **`parse_database_mapping(s)`**: Parses `-m prod:staging,logs:logs_copy` format into `HashMap<String, String>`. Validates colon separator and non-empty source/destination. Returns `Result`.
+- **`rewrite_create_table_ddl()`**: Applies four transformations to CREATE TABLE DDL:
+  1. Table name replacement (handles both backtick-quoted and unquoted `db.table`)
+  2. UUID clause removal (`UUID 'hex-hex-hex'` -> empty, lets ClickHouse assign new)
+  3. ZK path rewriting in ReplicatedMergeTree engine (first single-quoted arg replaced with `default_replica_path` template substituting `{database}` and `{table}`)
+  4. Distributed engine database/table reference update (second and third positional args)
+- **`rewrite_create_database_ddl()`**: Rewrites database name in `CREATE DATABASE` DDL (backtick-quoted and unquoted)
+
 ### Schema Creation (schema.rs)
-- `create_databases()`: Executes DDL from `manifest.databases[]` with `IF NOT EXISTS` safety
-- `create_tables()`: For each filtered table, checks existence first, then executes the stored `CREATE TABLE` DDL
+- `create_databases()`: Executes DDL from `manifest.databases[]` with `IF NOT EXISTS` safety. When remap is active, creates target databases with rewritten DDL; tracks created databases to avoid duplicates.
+- `create_tables()`: For each filtered table, checks existence first, then executes the stored `CREATE TABLE` DDL. When remap is active, rewrites DDL before execution and checks existence using destination db/table names.
 
 ### Part Attachment (attach.rs)
 - Uses `AttachParams` struct to bundle all parameters for a table's attachment
@@ -46,6 +60,13 @@ Parts are sorted by `(partition, min_block)` for correct merge behavior. Part na
 - InlineData (v4+): no CopyObject needed for inline objects; preserved during rewrite
 - `OwnedAttachParams` extended with S3-related fields: `s3_client`, `disk_type_map`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming`, `disk_remote_paths`
 
+### Remap Integration in Restore Flow (Phase 4a)
+When remap is active (`rename_as` or `database_mapping` provided):
+- `RemapConfig` is built from CLI params inside `restore()` and threaded through to `create_databases()` and `create_tables()`
+- Manifest table keys (`"db.table"`) are remapped to destination db/table via `remap_table_key()` for schema creation, data path resolution, UUID lookup, and `OwnedAttachParams` construction
+- Resume state uses *original* manifest table keys (since state file and manifest parts reference original names), but queries `system.parts` using *destination* db/table names
+- `find_table_data_path()` and `find_table_uuid()` use destination db/table since those are the live ClickHouse tables
+
 ### Resume State Tracking (Phase 2d)
 - When `resume=true` (gated by both `--resume` CLI flag AND `config.general.use_resumable_state`):
   - Loads `RestoreState` from `{backup_dir}/restore.state.json` at start
@@ -63,9 +84,14 @@ Parts are sorted by `(partition, min_block)` for correct merge behavior. Part na
 Queries `system.tables` for `data_paths` column to find the table's data directory, then appends `detached/{part_name}/`.
 
 ### Public API
-- `restore(config, ch, backup_name, table_pattern, schema_only, data_only, resume: bool) -> Result<()>` -- Main entry point with resume support (Phase 2d)
-- `create_databases(ch, manifest) -> Result<()>` -- DDL for databases
-- `create_tables(ch, manifest, filter) -> Result<()>` -- DDL for tables
+- `restore(config, ch, backup_name, table_pattern, schema_only, data_only, resume, rename_as: Option<&str>, database_mapping: Option<&HashMap<String, String>>) -> Result<()>` -- Main entry point with resume support (Phase 2d) and remap support (Phase 4a); 9 parameters
+- `create_databases(ch, manifest, remap: Option<&RemapConfig>) -> Result<()>` -- DDL for databases (remap-aware)
+- `create_tables(ch, manifest, filter, data_only, remap: Option<&RemapConfig>) -> Result<()>` -- DDL for tables (remap-aware)
+- `RemapConfig::new(rename_as_str, table_pattern, db_mapping_str, default_replica_path) -> Result<Option<Self>>` -- Build remap config from CLI flags (returns None when no remap active)
+- `RemapConfig::remap_table_key(original_key) -> (String, String)` -- Map manifest key to destination db/table
+- `parse_database_mapping(s) -> Result<HashMap<String, String>>` -- Parse `-m` CLI value
+- `rewrite_create_table_ddl(ddl, src_db, src_table, dst_db, dst_table, default_replica_path) -> String` -- Full DDL rewrite
+- `rewrite_create_database_ddl(ddl, src_db, dst_db) -> String` -- Database DDL rewrite
 - `attach_parts(params) -> Result<u64>` -- Hardlink + ATTACH PART (borrowed params), returns count
 - `attach_parts_owned(params) -> Result<u64>` -- Hardlink + ATTACH PART (owned params for tokio::spawn); handles both local and S3 disk parts; skips already-attached parts when resume is active (Phase 2d)
 - `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries; includes `s3_client`, `disk_type_map`, `disk_remote_paths`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming` for Phase 2c; `already_attached`, `restore_state_path` for Phase 2d
