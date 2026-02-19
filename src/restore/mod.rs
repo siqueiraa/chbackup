@@ -1,14 +1,12 @@
-//! Restore: read manifest, CREATE DB/TABLE, hardlink to detached, ATTACH PART.
+//! Restore: phased restore with dependency-aware DDL ordering.
 //!
-//! Implements Mode B (non-destructive) restore flow from design doc section 5:
+//! Implements Mode B (non-destructive) restore flow from design doc sections 5.1/5.5/5.6:
 //! 1. Read manifest from `{backup_dir}/metadata.json`
-//! 2. CREATE databases from manifest.databases DDL
-//! 3. For each table in manifest (filtered by table_pattern), parallel by max_connections:
-//!    - If table does not exist: CREATE TABLE from DDL
-//!    - Sort parts by (partition, min_block)
-//!    - Hardlink parts to detached/ directory
-//!    - ALTER TABLE ATTACH PART for each part (engine-aware routing)
-//! 4. Log summary
+//! 2. Phase 1: CREATE databases from manifest.databases DDL
+//! 3. Phase 2: CREATE + ATTACH data tables (sorted by engine priority)
+//! 4. Phase 3: CREATE DDL-only objects (topologically sorted by dependencies)
+//! 5. Phase 4: CREATE functions from manifest.functions
+//! 6. Log summary
 
 pub mod attach;
 pub mod remap;
@@ -40,7 +38,8 @@ use attach::{
     attach_parts_owned, detect_clickhouse_ownership, get_table_data_path, OwnedAttachParams,
 };
 use remap::RemapConfig;
-use schema::{create_databases, create_tables};
+use schema::{create_databases, create_ddl_objects, create_functions, create_tables};
+use topo::{classify_restore_tables, topological_sort};
 
 /// Restore a backup to ClickHouse.
 ///
@@ -141,16 +140,36 @@ pub async fn restore(
     )?;
     let remap_ref = remap_config.as_ref();
 
-    // 3. CREATE databases (Phase 1: create databases from manifest)
+    // 2c. Classify tables into restore phases
+    let phases = classify_restore_tables(&manifest, &table_keys);
+
+    // Phase 1: CREATE databases
     if !data_only {
         create_databases(ch, &manifest, remap_ref).await?;
     }
 
-    // 4. CREATE tables
-    create_tables(ch, &manifest, &table_keys, data_only, remap_ref).await?;
+    // Phase 2: CREATE data tables (not DDL-only objects)
+    info!(
+        count = phases.data_tables.len(),
+        "Phase 2: {} data tables",
+        phases.data_tables.len()
+    );
+    create_tables(ch, &manifest, &phases.data_tables, data_only, remap_ref).await?;
 
-    // 5. Attach data parts (skip if schema_only)
+    // Schema-only mode: also create DDL-only objects but skip data attach
     if schema_only {
+        if !data_only && !phases.ddl_only_tables.is_empty() {
+            let sorted_ddl = topological_sort(&manifest.tables, &phases.ddl_only_tables)?;
+            info!(
+                count = sorted_ddl.len(),
+                "Phase 3: {} DDL-only objects",
+                sorted_ddl.len()
+            );
+            create_ddl_objects(ch, &manifest, &sorted_ddl, remap_ref).await?;
+        }
+        if !data_only && !manifest.functions.is_empty() {
+            create_functions(ch, &manifest).await?;
+        }
         info!("Schema-only mode, skipping data restore");
         return Ok(());
     }
@@ -183,7 +202,8 @@ pub async fn restore(
 
         // Query system.parts for authoritative view of already-attached parts
         // When remap is active, query using the *destination* db/table names
-        for table_key in &table_keys {
+        // Only query data tables (DDL-only objects have no parts)
+        for table_key in &phases.data_tables {
             let (orig_db, orig_table) = table_key.split_once('.').unwrap_or(("default", table_key));
             let (query_db, query_table) = match remap_ref {
                 Some(rc) if rc.is_active() => {
@@ -293,20 +313,14 @@ pub async fn restore(
         None
     };
 
-    // Collect tables that need data restore
+    // Collect data tables that need data restore (phases.data_tables already excludes DDL-only)
     let mut restore_items: Vec<(String, OwnedAttachParams)> = Vec::new();
 
-    for table_key in &table_keys {
+    for table_key in &phases.data_tables {
         let table_manifest = match manifest.tables.get(table_key) {
             Some(tm) => tm,
             None => continue,
         };
-
-        // Skip metadata-only tables for data restore
-        if table_manifest.metadata_only {
-            debug!(table = %table_key, "Metadata-only table, skipping data restore");
-            continue;
-        }
 
         let (src_db, src_table) = table_key.split_once('.').unwrap_or(("default", table_key));
 
@@ -417,6 +431,22 @@ pub async fn restore(
         total_attached += attached;
     }
 
+    // Phase 3: DDL-only objects (topologically sorted)
+    if !data_only && !phases.ddl_only_tables.is_empty() {
+        let sorted_ddl = topological_sort(&manifest.tables, &phases.ddl_only_tables)?;
+        info!(
+            count = sorted_ddl.len(),
+            "Phase 3: {} DDL-only objects",
+            sorted_ddl.len()
+        );
+        create_ddl_objects(ch, &manifest, &sorted_ddl, remap_ref).await?;
+    }
+
+    // Phase 4: Functions
+    if !data_only && !manifest.functions.is_empty() {
+        create_functions(ch, &manifest).await?;
+    }
+
     info!(
         backup_name = %backup_name,
         tables = tables_restored,
@@ -424,7 +454,7 @@ pub async fn restore(
         "Restore complete"
     );
 
-    // 8. Delete resume state file on successful completion
+    // Delete resume state file on successful completion
     if resume {
         delete_state_file(&state_path);
     }
