@@ -3,13 +3,15 @@ mod cli;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
-use chbackup::clickhouse::ChClient;
+use anyhow::{bail, Context, Result};
+use chbackup::clickhouse::{ChClient, TableRow};
 use chbackup::config::Config;
 use chbackup::lock::{lock_for_command, lock_path_for_scope, PidLock};
 use chbackup::logging;
+use chbackup::manifest::BackupManifest;
 use chbackup::restore::remap;
 use chbackup::storage::S3Client;
+use chbackup::table_filter::TableFilter;
 use chbackup::{backup, download, list, restore, upload};
 use chrono::Utc;
 use clap::Parser;
@@ -379,8 +381,103 @@ async fn main() -> Result<()> {
             info!("List command complete");
         }
 
-        Command::Tables { .. } => {
-            info!("tables: not implemented in Phase 1");
+        Command::Tables {
+            tables,
+            all,
+            remote_backup,
+        } => {
+            if let Some(backup_name) = remote_backup {
+                // Remote mode: download manifest and list tables
+                let s3 = S3Client::new(&config.s3).await?;
+                let manifest_key = format!("{}/metadata.json", backup_name);
+                let manifest_data = s3
+                    .get_object(&manifest_key)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to download manifest for backup '{}'", backup_name)
+                    })?;
+                let manifest = BackupManifest::from_json_bytes(&manifest_data)
+                    .context("Failed to parse backup manifest")?;
+
+                let filter = tables.as_deref().map(TableFilter::new);
+
+                for (full_name, tm) in &manifest.tables {
+                    let parts: Vec<&str> = full_name.splitn(2, '.').collect();
+                    let (db, tbl) = if parts.len() == 2 {
+                        (parts[0], parts[1])
+                    } else {
+                        (full_name.as_str(), "")
+                    };
+
+                    if let Some(ref f) = filter {
+                        if !f.matches(db, tbl) {
+                            continue;
+                        }
+                    }
+
+                    let total: u64 = tm
+                        .parts
+                        .values()
+                        .flat_map(|v| v.iter())
+                        .map(|p| p.size)
+                        .sum();
+                    println!(
+                        "  {}\t{}\t{}",
+                        full_name,
+                        tm.engine,
+                        list::format_size(total)
+                    );
+                }
+
+                info!(
+                    backup_name = %backup_name,
+                    tables_count = manifest.tables.len(),
+                    "Tables command complete (remote)"
+                );
+            } else {
+                // Live mode: query ClickHouse
+                let ch = ChClient::new(&config.clickhouse)?;
+                ch.ping().await?;
+
+                let rows = if all {
+                    ch.list_all_tables().await?
+                } else {
+                    ch.list_tables().await?
+                };
+
+                let filter = tables.as_deref().map(TableFilter::new);
+
+                let filtered: Vec<&TableRow> = rows
+                    .iter()
+                    .filter(|t| {
+                        if let Some(ref f) = filter {
+                            if all {
+                                f.matches_including_system(&t.database, &t.name)
+                            } else {
+                                f.matches(&t.database, &t.name)
+                            }
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+
+                for t in &filtered {
+                    let bytes = t.total_bytes.unwrap_or(0);
+                    println!(
+                        "  {}.{}\t{}\t{}",
+                        t.database,
+                        t.name,
+                        t.engine,
+                        list::format_size(bytes)
+                    );
+                }
+
+                info!(
+                    tables_count = filtered.len(),
+                    "Tables command complete"
+                );
+            }
         }
 
         Command::Delete {

@@ -884,7 +884,7 @@ fn strip_s3_prefix(key: &str, prefix: &str) -> String {
 }
 
 /// Format a byte count into human-readable units.
-pub(crate) fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;

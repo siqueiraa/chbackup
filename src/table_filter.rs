@@ -51,6 +51,15 @@ impl TableFilter {
         let full_name = format!("{db}.{table}");
         self.patterns.iter().any(|p| p.matches(&full_name))
     }
+
+    /// Check if the given database.table combination matches any pattern.
+    ///
+    /// Unlike [`matches()`](Self::matches), does NOT exclude system databases.
+    /// Used by the `tables --all` command where system tables should be visible.
+    pub fn matches_including_system(&self, db: &str, table: &str) -> bool {
+        let full_name = format!("{db}.{table}");
+        self.patterns.iter().any(|p| p.matches(&full_name))
+    }
 }
 
 /// Check if a database is a system database.
@@ -198,6 +207,33 @@ mod tests {
         assert!(filter.matches("default", "trades"));
         assert!(filter.matches("default", "trader"));
         assert!(!filter.matches("default", "trading"));
+    }
+
+    #[test]
+    fn test_table_filter_matches_including_system() {
+        let filter = TableFilter::new("system.*");
+        // matches() excludes system databases
+        assert!(!filter.matches("system", "tables"));
+        assert!(!filter.matches("system", "parts"));
+        // matches_including_system() includes system databases
+        assert!(filter.matches_including_system("system", "tables"));
+        assert!(filter.matches_including_system("system", "parts"));
+
+        // INFORMATION_SCHEMA matches with its own pattern
+        let filter_info = TableFilter::new("INFORMATION_SCHEMA.*");
+        assert!(!filter_info.matches("INFORMATION_SCHEMA", "columns"));
+        assert!(filter_info.matches_including_system("INFORMATION_SCHEMA", "columns"));
+
+        // Wildcard pattern matches all system databases
+        let filter_all = TableFilter::new("*.*");
+        assert!(filter_all.matches_including_system("system", "tables"));
+        assert!(filter_all.matches_including_system("INFORMATION_SCHEMA", "columns"));
+        assert!(filter_all.matches_including_system("information_schema", "tables"));
+
+        // Non-matching patterns still do not match
+        let filter2 = TableFilter::new("default.*");
+        assert!(!filter2.matches_including_system("system", "tables"));
+        assert!(filter2.matches_including_system("default", "trades"));
     }
 
     // -- Disk filtering tests --
