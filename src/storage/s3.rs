@@ -754,17 +754,53 @@ impl S3Client {
 
     // -- CopyObject operations --
 
+    /// S3 CopyObject size limit: 5 GiB. Objects larger than this require
+    /// multipart copy (upload_part_copy).
+    const COPY_OBJECT_MAX_SIZE: u64 = 5_368_709_120;
+
     /// Server-side copy of an object between buckets (or within a bucket).
     ///
     /// `source_bucket` and `source_key` identify the source object (absolute).
     /// `dest_key` is relative to this client's configured prefix.
     /// Applies SSE and storage class settings to the destination.
+    ///
+    /// For objects larger than 5 GiB, automatically uses multipart copy
+    /// (upload_part_copy) since the S3 CopyObject API has a 5 GiB limit.
     pub async fn copy_object(
         &self,
         source_bucket: &str,
         source_key: &str,
         dest_key: &str,
     ) -> Result<()> {
+        // Check source object size to determine if we need multipart copy.
+        // If head_object fails, fall through to single CopyObject (will fail
+        // with a more descriptive error if the object truly doesn't exist).
+        let source_size = match self
+            .inner
+            .head_object()
+            .bucket(source_bucket)
+            .key(source_key)
+            .send()
+            .await
+        {
+            Ok(resp) => Some(resp.content_length().unwrap_or(0) as u64),
+            Err(_) => None,
+        };
+
+        if let Some(size) = source_size {
+            if size > Self::COPY_OBJECT_MAX_SIZE {
+                info!(
+                    source_key = %source_key,
+                    size = size,
+                    "Source object exceeds 5GB, using multipart copy"
+                );
+                return self
+                    .copy_object_multipart(source_bucket, source_key, dest_key, size)
+                    .await;
+            }
+        }
+
+        // Single CopyObject for objects <= 5 GiB (or when size is unknown)
         let full_dest_key = self.full_key(dest_key);
         let copy_source = format!("{}/{}", source_bucket, source_key);
 
@@ -816,6 +852,211 @@ impl S3Client {
             "CopyObject complete"
         );
         Ok(())
+    }
+
+    /// Multipart server-side copy for objects larger than 5 GiB.
+    ///
+    /// Uses S3 `upload_part_copy` to copy byte ranges of the source object
+    /// into a multipart upload on the destination. Automatically calculates
+    /// chunk size to stay within the 10,000 part limit.
+    ///
+    /// On any error during part copying, aborts the multipart upload to
+    /// avoid leaving orphaned parts.
+    async fn copy_object_multipart(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        dest_key: &str,
+        source_size: u64,
+    ) -> Result<()> {
+        let full_dest_key = self.full_key(dest_key);
+
+        // Create multipart upload with same settings as put_object/copy_object
+        let mut create_req = self
+            .inner
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&full_dest_key);
+
+        // Apply storage class
+        if !self.storage_class.is_empty() {
+            let sc: aws_sdk_s3::types::StorageClass = self.storage_class.as_str().into();
+            create_req = create_req.storage_class(sc);
+        }
+
+        // Apply server-side encryption
+        if self.sse == "aws:kms" {
+            create_req = create_req.server_side_encryption(ServerSideEncryption::AwsKms);
+            if !self.sse_kms_key_id.is_empty() {
+                create_req = create_req.ssekms_key_id(&self.sse_kms_key_id);
+            }
+        } else if self.sse == "AES256" {
+            create_req = create_req.server_side_encryption(ServerSideEncryption::Aes256);
+        }
+
+        // Apply ACL
+        if !self.acl.is_empty() {
+            let acl: ObjectCannedAcl = self.acl.as_str().into();
+            create_req = create_req.acl(acl);
+        }
+
+        let create_resp = create_req.send().await.with_context(|| {
+            format!(
+                "Multipart copy: failed to create multipart upload for {}",
+                full_dest_key
+            )
+        })?;
+
+        let upload_id = create_resp
+            .upload_id()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Multipart copy: no upload_id returned for {}",
+                    full_dest_key
+                )
+            })?
+            .to_string();
+
+        // Calculate chunk size: auto mode (0), max 10000 parts
+        let chunk_size = calculate_chunk_size(source_size, 0, 10000);
+        let part_count = source_size.div_ceil(chunk_size);
+
+        info!(
+            source_key = %source_key,
+            source_size = source_size,
+            chunk_size = chunk_size,
+            part_count = part_count,
+            "Starting multipart copy"
+        );
+
+        // Copy parts; on any error, abort the multipart upload
+        let copy_source = format!("{}/{}", source_bucket, source_key);
+        let result = self
+            .copy_parts(
+                &full_dest_key,
+                &upload_id,
+                &copy_source,
+                source_size,
+                chunk_size,
+                part_count,
+            )
+            .await;
+
+        match result {
+            Ok(completed_parts) => {
+                // Complete the multipart upload
+                let completed = CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed_parts))
+                    .build();
+
+                self.inner
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&full_dest_key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(completed)
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Multipart copy: failed to complete upload for {}",
+                            full_dest_key
+                        )
+                    })?;
+
+                info!(
+                    dest = %full_dest_key,
+                    part_count = part_count,
+                    "Multipart copy completed successfully"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Abort the multipart upload to clean up orphaned parts
+                warn!(
+                    dest = %full_dest_key,
+                    upload_id = %upload_id,
+                    error = %e,
+                    "Multipart copy failed, aborting upload"
+                );
+                if let Err(abort_err) = self
+                    .inner
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&full_dest_key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await
+                {
+                    warn!(
+                        upload_id = %upload_id,
+                        error = %abort_err,
+                        "Failed to abort multipart upload (orphaned parts may remain)"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Copy byte-range parts from source to destination using upload_part_copy.
+    ///
+    /// Returns the completed parts on success, or an error on first failure.
+    async fn copy_parts(
+        &self,
+        full_dest_key: &str,
+        upload_id: &str,
+        copy_source: &str,
+        source_size: u64,
+        chunk_size: u64,
+        part_count: u64,
+    ) -> Result<Vec<CompletedPart>> {
+        let mut completed_parts = Vec::with_capacity(part_count as usize);
+
+        for part_idx in 0..part_count {
+            let start = part_idx * chunk_size;
+            let end = ((part_idx + 1) * chunk_size - 1).min(source_size - 1);
+            let range = format!("bytes={}-{}", start, end);
+            let part_number = (part_idx + 1) as i32;
+
+            debug!(
+                part_number = part_number,
+                range = %range,
+                "Copying part via upload_part_copy"
+            );
+
+            let resp = self
+                .inner
+                .upload_part_copy()
+                .bucket(&self.bucket)
+                .key(full_dest_key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .copy_source(copy_source)
+                .copy_source_range(&range)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "Multipart copy: upload_part_copy failed for part {} (range {})",
+                        part_number, range
+                    )
+                })?;
+
+            let e_tag = resp
+                .copy_part_result()
+                .and_then(|r| r.e_tag().map(|s| s.to_string()))
+                .unwrap_or_default();
+
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(e_tag)
+                    .build(),
+            );
+        }
+
+        Ok(completed_parts)
     }
 
     /// Streaming copy fallback: downloads from source then uploads to dest.
