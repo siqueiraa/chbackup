@@ -81,14 +81,24 @@ pub struct RestorePhases {
     pub ddl_only_tables: Vec<String>,
 }
 
-/// Classify filtered tables into restore phases using metadata_only flag.
+/// Classify filtered tables into restore phases using metadata_only flag,
+/// streaming engine detection, and refreshable MV detection.
+///
+/// Decision tree (checked in order):
+/// 1. Streaming engine (Kafka/NATS/RabbitMQ/S3Queue) -> postponed_tables
+/// 2. Refreshable MV (MaterializedView + REFRESH in DDL) -> postponed_tables
+/// 3. metadata_only == true -> ddl_only_tables
+/// 4. Otherwise -> data_tables
 pub fn classify_restore_tables(manifest: &BackupManifest, table_keys: &[String]) -> RestorePhases {
     let mut data_tables: Vec<String> = Vec::new();
+    let mut postponed_tables: Vec<String> = Vec::new();
     let mut ddl_only_tables: Vec<String> = Vec::new();
 
     for key in table_keys {
         if let Some(tm) = manifest.tables.get(key) {
-            if tm.metadata_only {
+            if is_streaming_engine(&tm.engine) || is_refreshable_mv(tm) {
+                postponed_tables.push(key.clone());
+            } else if tm.metadata_only {
                 ddl_only_tables.push(key.clone());
             } else {
                 data_tables.push(key.clone());
@@ -101,16 +111,18 @@ pub fn classify_restore_tables(manifest: &BackupManifest, table_keys: &[String])
 
     info!(
         data = data_tables.len(),
+        postponed = postponed_tables.len(),
         ddl_only = ddl_only_tables.len(),
-        "Classified {} tables: {} data, {} DDL-only",
+        "Classified {} tables: {} data, {} postponed, {} DDL-only",
         table_keys.len(),
         data_tables.len(),
+        postponed_tables.len(),
         ddl_only_tables.len(),
     );
 
     RestorePhases {
         data_tables,
-        postponed_tables: Vec::new(), // Phase 4c
+        postponed_tables,
         ddl_only_tables,
     }
 }
@@ -458,6 +470,121 @@ mod tests {
         assert_eq!(sorted[0], "default.user_dict");
         assert_eq!(sorted[1], "default.my_view");
         assert_eq!(sorted[2], "default.dist_table");
+    }
+
+    #[test]
+    fn test_classify_streaming_engines_postponed() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "default.trades".to_string(),
+            make_table_manifest("MergeTree", false, vec![]),
+        );
+        tables.insert(
+            "default.kafka_source".to_string(),
+            make_table_manifest("Kafka", false, vec![]),
+        );
+        tables.insert(
+            "default.my_view".to_string(),
+            make_table_manifest("View", true, vec![]),
+        );
+
+        let manifest = make_manifest(tables);
+        let all_keys: Vec<String> = manifest.tables.keys().cloned().collect();
+
+        let phases = classify_restore_tables(&manifest, &all_keys);
+
+        assert_eq!(phases.data_tables.len(), 1);
+        assert!(phases.data_tables.contains(&"default.trades".to_string()));
+
+        assert_eq!(phases.postponed_tables.len(), 1);
+        assert!(phases
+            .postponed_tables
+            .contains(&"default.kafka_source".to_string()));
+
+        assert_eq!(phases.ddl_only_tables.len(), 1);
+        assert!(phases
+            .ddl_only_tables
+            .contains(&"default.my_view".to_string()));
+    }
+
+    #[test]
+    fn test_classify_refreshable_mv_postponed() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "default.trades".to_string(),
+            make_table_manifest("MergeTree", false, vec![]),
+        );
+
+        let mut refresh_mv = make_table_manifest("MaterializedView", true, vec![]);
+        refresh_mv.ddl = "CREATE MATERIALIZED VIEW default.refresh_mv REFRESH EVERY 1 HOUR ENGINE = MergeTree() ORDER BY symbol AS SELECT symbol, count() FROM default.trades GROUP BY symbol".to_string();
+        tables.insert("default.refresh_mv".to_string(), refresh_mv);
+
+        tables.insert(
+            "default.regular_mv".to_string(),
+            make_table_manifest("MaterializedView", true, vec![]),
+        );
+
+        let manifest = make_manifest(tables);
+        let all_keys: Vec<String> = manifest.tables.keys().cloned().collect();
+
+        let phases = classify_restore_tables(&manifest, &all_keys);
+
+        assert_eq!(phases.data_tables.len(), 1);
+        assert!(phases.data_tables.contains(&"default.trades".to_string()));
+
+        assert_eq!(phases.postponed_tables.len(), 1);
+        assert!(phases
+            .postponed_tables
+            .contains(&"default.refresh_mv".to_string()));
+
+        assert_eq!(phases.ddl_only_tables.len(), 1);
+        assert!(phases
+            .ddl_only_tables
+            .contains(&"default.regular_mv".to_string()));
+    }
+
+    #[test]
+    fn test_classify_all_streaming_engines() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "default.kafka_src".to_string(),
+            make_table_manifest("Kafka", false, vec![]),
+        );
+        tables.insert(
+            "default.nats_src".to_string(),
+            make_table_manifest("NATS", false, vec![]),
+        );
+        tables.insert(
+            "default.rabbitmq_src".to_string(),
+            make_table_manifest("RabbitMQ", false, vec![]),
+        );
+        tables.insert(
+            "default.s3queue_src".to_string(),
+            make_table_manifest("S3Queue", false, vec![]),
+        );
+
+        let manifest = make_manifest(tables);
+        let all_keys: Vec<String> = manifest.tables.keys().cloned().collect();
+
+        let phases = classify_restore_tables(&manifest, &all_keys);
+
+        assert!(phases.data_tables.is_empty());
+        assert_eq!(phases.postponed_tables.len(), 4);
+        assert!(phases.ddl_only_tables.is_empty());
+
+        // All four engines should be in postponed
+        assert!(phases
+            .postponed_tables
+            .contains(&"default.kafka_src".to_string()));
+        assert!(phases
+            .postponed_tables
+            .contains(&"default.nats_src".to_string()));
+        assert!(phases
+            .postponed_tables
+            .contains(&"default.rabbitmq_src".to_string()));
+        assert!(phases
+            .postponed_tables
+            .contains(&"default.s3queue_src".to_string()));
     }
 
     #[test]
