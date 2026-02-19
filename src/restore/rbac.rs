@@ -183,11 +183,7 @@ pub async fn restore_rbac(
             // Remove stale *.list files
             for entry in std::fs::read_dir(&dst)? {
                 let entry = entry?;
-                if entry
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "list")
-                {
+                if entry.path().extension().is_some_and(|ext| ext == "list") {
                     std::fs::remove_file(entry.path())?;
                 }
             }
@@ -200,11 +196,10 @@ pub async fn restore_rbac(
 
         // Chown access dir to ClickHouse user
         let data_path = PathBuf::from(&config.clickhouse.data_path);
-        let (ch_uid, ch_gid) =
-            detect_clickhouse_ownership(&data_path).unwrap_or_else(|e| {
-                warn!(error = %e, "Failed to detect ClickHouse ownership, skipping chown");
-                (None, None)
-            });
+        let (ch_uid, ch_gid) = detect_clickhouse_ownership(&data_path).unwrap_or_else(|e| {
+            warn!(error = %e, "Failed to detect ClickHouse ownership, skipping chown");
+            (None, None)
+        });
         if ch_uid.is_some() || ch_gid.is_some() {
             let dst_clone = access_dst;
             tokio::task::spawn_blocking(move || -> Result<()> {
@@ -439,10 +434,7 @@ mod tests {
     #[test]
     fn test_make_drop_ddl_quota() {
         let ddl = make_drop_ddl("quota", "daily_quota");
-        assert_eq!(
-            ddl,
-            Some("DROP QUOTA IF EXISTS `daily_quota`".to_string())
-        );
+        assert_eq!(ddl, Some("DROP QUOTA IF EXISTS `daily_quota`".to_string()));
     }
 
     #[test]

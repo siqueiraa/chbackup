@@ -16,6 +16,7 @@ src/backup/
   diff.rs         -- Incremental diff logic: diff_parts() compares current vs base manifest
   freeze.rs       -- FreezeGuard pattern for safe FREEZE/UNFREEZE lifecycle
   mutations.rs    -- Pre-flight pending mutation check (design 3.1)
+  rbac.rs         -- RBAC, config file, named collection, and function backup (Phase 4e)
   sync_replica.rs -- SYSTEM SYNC REPLICA for Replicated engines (design 3.2)
 ```
 
@@ -60,6 +61,12 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
   metadata.json                         -- BackupManifest
   metadata/{db}/{table}.json            -- Per-table metadata
   shadow/{db}/{table}/{part_name}/...   -- Hardlinked data files
+  access/users.jsonl                    -- RBAC users (Phase 4e, when --rbac)
+  access/roles.jsonl                    -- RBAC roles (Phase 4e, when --rbac)
+  access/row_policies.jsonl             -- RBAC row policies (Phase 4e, when --rbac)
+  access/settings_profiles.jsonl        -- RBAC settings profiles (Phase 4e, when --rbac)
+  access/quotas.jsonl                   -- RBAC quotas (Phase 4e, when --rbac)
+  configs/...                           -- ClickHouse config files (Phase 4e, when --configs)
 ```
 
 ### Partition-Level Freeze (Phase 2d)
@@ -82,8 +89,17 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
   - Remaining inconsistencies are logged as warnings per table/column
 - The check runs BEFORE FREEZE to avoid wasting time on tables that will fail on restore
 
+### RBAC, Config, Named Collections, and Functions Backup (rbac.rs, Phase 4e)
+- `backup_rbac_and_configs(config, ch, backup_dir, manifest, rbac, configs, named_collections) -> Result<()>` -- Orchestrates all Phase 4e backup subsystems. Called after manifest creation but before the diff step. Each subsystem is gated by its CLI flag OR the corresponding `*_backup_always` config value.
+- **RBAC backup** (`backup_rbac()`): Queries `ch.query_rbac_objects(entity_type)` for each of 5 entity types (USER, ROLE, ROW POLICY, SETTINGS PROFILE, QUOTA). Serializes results as JSONL files to `{backup_dir}/access/{entity_type}.jsonl`. Each line is a JSON object with `entity_type`, `name`, `create_statement` fields. Sets `manifest.rbac = Some(RbacInfo { path: "access/" })`.
+- **Config backup** (`backup_configs()`): Uses `spawn_blocking` + `walkdir` to copy all files from `config.clickhouse.config_dir` to `{backup_dir}/configs/`, preserving directory structure. Skips with warning if config dir does not exist.
+- **Named collections backup** (`backup_named_collections()`): Calls `ch.query_named_collections()` to get Vec of CREATE DDL strings. Stores directly in `manifest.named_collections`.
+- **Functions backup** (`backup_functions()`): Calls `ch.query_user_defined_functions()` to get Vec of CREATE DDL strings. Stores in `manifest.functions`. Always runs regardless of flags (zero-cost DDL in manifest). This completes the round-trip: backup captures functions, restore recreates them (previously `manifest.functions` was always empty during backup).
+- `RbacEntry` struct (private): `entity_type`, `name`, `create_statement` -- serialized to JSONL format.
+- `RBAC_ENTITY_TYPES` constant: Maps SQL entity types to lowercase identifiers and JSONL filenames.
+
 ### Public API
-- `create(config, ch, backup_name, table_pattern, schema_only, diff_from: Option<&str>, partitions: Option<&str>, skip_check_parts_columns: bool) -> Result<BackupManifest>` -- Main entry point; supports partition-level freeze and parts column check (Phase 2d)
+- `create(config, ch, backup_name, table_pattern, schema_only, diff_from: Option<&str>, partitions: Option<&str>, skip_check_parts_columns: bool, rbac: bool, configs: bool, named_collections: bool) -> Result<BackupManifest>` -- Main entry point; supports partition-level freeze, parts column check (Phase 2d), and RBAC/config/named-collections backup (Phase 4e)
 - `diff_parts(current, base) -> DiffResult` -- Incremental comparison of current vs base manifest parts
 - `compute_crc64(path) -> Result<u64>` -- File-level CRC64
 - `compute_crc64_bytes(data) -> u64` -- In-memory CRC64

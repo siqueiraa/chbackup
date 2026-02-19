@@ -893,9 +893,18 @@ impl ChClient {
 
         let mut results = Vec::with_capacity(names.len());
         for name_row in &names {
-            let show_sql = format!("SHOW CREATE {} {}", entity_type, quote_identifier(&name_row.name));
+            let show_sql = format!(
+                "SHOW CREATE {} {}",
+                entity_type,
+                quote_identifier(&name_row.name)
+            );
 
-            match self.inner.query(&show_sql).fetch_one::<ShowCreateRow>().await {
+            match self
+                .inner
+                .query(&show_sql)
+                .fetch_one::<ShowCreateRow>()
+                .await
+            {
                 Ok(row) => {
                     results.push((name_row.name.clone(), row.statement));
                 }
@@ -951,7 +960,12 @@ impl ChClient {
                 quote_identifier(&name_row.name)
             );
 
-            match self.inner.query(&show_sql).fetch_one::<ShowCreateRow>().await {
+            match self
+                .inner
+                .query(&show_sql)
+                .fetch_one::<ShowCreateRow>()
+                .await
+            {
                 Ok(row) => {
                     results.push(row.statement);
                 }
@@ -997,12 +1011,14 @@ impl ChClient {
 
         let mut results = Vec::with_capacity(names.len());
         for name_row in &names {
-            let show_sql = format!(
-                "SHOW CREATE FUNCTION {}",
-                quote_identifier(&name_row.name)
-            );
+            let show_sql = format!("SHOW CREATE FUNCTION {}", quote_identifier(&name_row.name));
 
-            match self.inner.query(&show_sql).fetch_one::<ShowCreateRow>().await {
+            match self
+                .inner
+                .query(&show_sql)
+                .fetch_one::<ShowCreateRow>()
+                .await
+            {
                 Ok(row) => {
                     results.push(row.statement);
                 }

@@ -30,8 +30,11 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
 3. For each table, for each part:
    - **Local disk parts**: download compressed archive, decompress to local
    - **S3 disk parts** (Phase 2c): download only metadata files (data objects stay in backup bucket until restore)
-4. Save manifest and per-table metadata locally
-5. Return backup directory path
+4. Download RBAC and config directories (Phase 4e):
+   - If `manifest.rbac.is_some()`: download `{backup_name}/access/*` to `{backup_dir}/access/`
+   - Always attempt `{backup_name}/configs/*` download (no-op if no configs in S3)
+5. Save manifest and per-table metadata locally
+6. Return backup directory path
 
 ### S3 Disk Metadata-Only Download (Phase 2c)
 - S3 disk parts are detected via `object_disk::is_s3_disk(disk_type)` combined with `part.s3_objects.is_some()`
@@ -68,6 +71,9 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
 
 ### URL Encoding
 - `url_encode()` preserves `/` (unlike upload's `url_encode_component`) since it handles full paths
+
+### Simple Directory Download (Phase 4e)
+- `download_simple_directory(s3, backup_name, local_dir, prefix)` -- Downloads all files under `{backup_name}/{prefix}/` from S3 to `{local_dir}/{prefix}/`. Uses `s3.list_objects()` to enumerate files, then `s3.get_object()` for each. Creates local directory structure as needed. No-op if no objects exist under the prefix. Called after part downloads complete for `access/` and `configs/` directories.
 
 ### Public API
 - `download(config, s3, backup_name, resume: bool) -> Result<PathBuf>` -- Main entry point with resume support (Phase 2d)

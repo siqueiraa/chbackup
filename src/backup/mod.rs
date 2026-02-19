@@ -541,9 +541,15 @@ pub async fn create(
 
     // 13a. Backup RBAC, configs, named collections (populates manifest fields)
     rbac::backup_rbac_and_configs(
-        config, ch, &backup_dir, &mut manifest,
-        rbac, configs, named_collections,
-    ).await?;
+        config,
+        ch,
+        &backup_dir,
+        &mut manifest,
+        rbac,
+        configs,
+        named_collections,
+    )
+    .await?;
 
     // 13b. Apply incremental diff if --diff-from is specified
     if let Some(base_name) = diff_from {

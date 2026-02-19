@@ -40,6 +40,8 @@ src/clickhouse/
 - `PartRow` -- From `system.parts`: name, partition_id, active (Phase 2d)
 - `ColumnInconsistency` -- Query result: database, table, column, types (Phase 2d)
 - `DiskSpaceRow` -- From `system.disks`: name, path, free_space (Phase 2d)
+- `NameRow` -- (private) Single `name` column, used by RBAC/named-collection/function queries (Phase 4e)
+- `ShowCreateRow` -- (private) Single `statement` column, returned by `SHOW CREATE ...` queries (Phase 4e)
 
 All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 
@@ -91,6 +93,12 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `check_zk_replica_exists(zk_path, replica_name) -> Result<bool>` -- Query system.zookeeper for replica existence; returns false on query error (system.zookeeper may be unavailable) (Phase 4d, ZK conflict resolution)
 - `query_database_engine(db) -> Result<String>` -- Query system.databases for engine type; returns empty string if not found (Phase 4d, DatabaseReplicated detection)
 - `execute_mutation(db, table, command) -> Result<()>` -- ALTER TABLE {command} SETTINGS mutations_sync=2; waits for mutation completion (Phase 4d, mutation re-apply)
+- `query_rbac_objects(entity_type: &str) -> Result<Vec<(String, String)>>` -- Query RBAC objects by entity type (USER/ROLE/ROW POLICY/SETTINGS PROFILE/QUOTA). Lists names from corresponding system table, then `SHOW CREATE {entity_type}` for each. Returns Vec of (name, DDL) tuples. Graceful degradation: returns empty Vec on query error (Phase 4e)
+- `query_named_collections() -> Result<Vec<String>>` -- Query `system.named_collections` for names, then `SHOW CREATE NAMED COLLECTION` for each. Returns Vec of CREATE DDL strings. Graceful degradation on error (Phase 4e)
+- `query_user_defined_functions() -> Result<Vec<String>>` -- Query `system.functions WHERE origin = 'SQLUserDefined'` for names, then `SHOW CREATE FUNCTION` for each. Returns Vec of CREATE DDL strings. Graceful degradation on error (Phase 4e)
+
+### SQL Utility Functions
+- `quote_identifier(name) -> String` -- Wraps name in backticks, escaping internal backticks by doubling them. Used by RBAC queries for safe identifier quoting (Phase 4e)
 
 ### Error Handling
 - All methods return `anyhow::Result` with `.context()` annotations

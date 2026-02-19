@@ -26,7 +26,11 @@ const RBAC_ENTITY_TYPES: &[(&str, &str, &str)] = &[
     ("USER", "user", "users.jsonl"),
     ("ROLE", "role", "roles.jsonl"),
     ("ROW POLICY", "row_policy", "row_policies.jsonl"),
-    ("SETTINGS PROFILE", "settings_profile", "settings_profiles.jsonl"),
+    (
+        "SETTINGS PROFILE",
+        "settings_profile",
+        "settings_profiles.jsonl",
+    ),
     ("QUOTA", "quota", "quotas.jsonl"),
 ];
 
@@ -158,11 +162,13 @@ async fn backup_configs(config: &Config, backup_dir: &Path) -> Result<()> {
                     .context("Failed to compute relative path for config file")?;
                 let dest = configs_target_clone.join(rel);
                 if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("Failed to create directory {}", parent.display())
+                    })?;
                 }
-                std::fs::copy(entry.path(), &dest)
-                    .with_context(|| format!("Failed to copy config file {}", entry.path().display()))?;
+                std::fs::copy(entry.path(), &dest).with_context(|| {
+                    format!("Failed to copy config file {}", entry.path().display())
+                })?;
                 count += 1;
             }
         }
@@ -188,7 +194,10 @@ async fn backup_named_collections(ch: &ChClient, manifest: &mut BackupManifest) 
     let count = collections.len();
     manifest.named_collections = collections;
 
-    info!(count = count, "Named collections backup: {} collections", count);
+    info!(
+        count = count,
+        "Named collections backup: {} collections", count
+    );
     Ok(())
 }
 
@@ -268,7 +277,11 @@ mod tests {
 
         // Verify filenames end with .jsonl
         for &(_, _, filename) in RBAC_ENTITY_TYPES {
-            assert!(filename.ends_with(".jsonl"), "Expected .jsonl suffix: {}", filename);
+            assert!(
+                filename.ends_with(".jsonl"),
+                "Expected .jsonl suffix: {}",
+                filename
+            );
         }
     }
 }

@@ -17,6 +17,7 @@ src/restore/
   remap.rs    -- Table/database remap, DDL rewriting, ON CLUSTER injection, ZK param parsing, Distributed cluster rewrite
   schema.rs   -- CREATE/DROP DATABASE/TABLE, ZK conflict resolution, DatabaseReplicated detection, create_ddl_objects, create_functions
   attach.rs   -- Hardlink parts to detached/, chown, ATTACH PART
+  rbac.rs     -- RBAC restore, config restore, named collections restore, restart_command execution (Phase 4e)
   sort.rs     -- SortPartsByMinBlock for correct attachment order
 ```
 
@@ -56,6 +57,10 @@ Phase 2.5: Re-apply pending mutations (reapply_pending_mutations, after all data
 Phase 2b:  CREATE postponed tables    (streaming engines, refreshable MVs -- Phase 4c)
 Phase 3:   CREATE DDL-only objects    (topologically sorted, with ON CLUSTER)
 Phase 4:   CREATE functions           (from manifest.functions, with ON CLUSTER)
+Phase 4b:  Restore named collections (from manifest.named_collections DDL, with ON CLUSTER)
+Phase 4c:  Restore RBAC              (DDL-based from access/*.jsonl, with rbac_resolve_conflicts)
+Phase 4d:  Restore config files      (file copy from configs/ to config_dir)
+Phase 4e:  Execute restart commands   (exec:/sql: prefixed commands, semicolon-separated)
 ```
 - `classify_restore_tables()` splits filtered table keys into `RestorePhases` (data_tables, postponed_tables, ddl_only_tables)
 - Phase 0 (Mode A) runs `drop_tables()` (reverse engine priority with retry loop) then `drop_databases()`, gated by `rm && !data_only`
@@ -175,11 +180,30 @@ After all data parts are attached (Phase 2) and before Phase 2b, `reapply_pendin
 - When remap is active, uses destination db/table for the ALTER TABLE statement
 - Skipped when `schema_only == true`
 
+### RBAC, Config, Named Collections Restore and Restart Command (rbac.rs, Phase 4e)
+Phase 4e adds four restore extensions wired into the restore orchestrator after `create_functions()` (Phase 4), in both the normal and schema-only restore paths:
+
+- **`restore_named_collections(ch, manifest, on_cluster)`**: Follows `create_functions()` pattern. Iterates `manifest.named_collections` DDL entries, executes each via `ch.execute_ddl()`. Supports ON CLUSTER injection via `add_on_cluster_clause()`. Failures logged as warnings (non-fatal).
+- **`restore_rbac(ch, config, backup_dir, resolve_conflicts)`**: DDL-based RBAC restore from `.jsonl` files in `{backup_dir}/access/`. Parses `RbacEntry` structs (entity_type, name, create_statement) from JSONL. Conflict resolution via `rbac_resolve_conflicts` config:
+  - `"recreate"` (default): `DROP IF EXISTS` then `CREATE` for each entity
+  - `"ignore"`: Skip on error (object already exists)
+  - `"fail"`: Return error on any failure
+  - After restore: removes stale `.list` files from ClickHouse's `{data_path}/access/`, creates `need_rebuild_lists.mark`, chowns to ClickHouse uid/gid (uses `detect_clickhouse_ownership()` from attach.rs)
+- **`restore_configs(config, backup_dir)`**: Copies files from `{backup_dir}/configs/` to `config.clickhouse.config_dir` using `spawn_blocking` + `walkdir`, preserving directory structure.
+- **`execute_restart_commands(ch, restart_command)`**: Semicolon-separated commands with prefix routing:
+  - `exec:` prefix: Execute as shell command via `sh -c` (default if no prefix)
+  - `sql:` prefix: Execute as ClickHouse DDL via `ch.execute_ddl()`
+  - All failures are non-fatal (logged as warnings per design 5.6)
+- **`make_drop_ddl(entity_type, name)`**: Generates `DROP {entity} IF EXISTS` DDL for RBAC entities. Backtick-quotes names. Returns `None` for unknown entity types.
+- **`chown_recursive(dir, uid, gid)`**: Recursively chowns a directory using `nix::unistd::chown` via `walkdir`.
+- Phase 4e extensions are gated by CLI flags OR `*_backup_always` config values (same OR logic as backup side)
+- `restart_command` execution is triggered only when RBAC or config restore actually occurred (checked via `access/` or `configs/` directory existence)
+
 ### Detached Path Resolution
 Queries `system.tables` for `data_paths` column to find the table's data directory, then appends `detached/{part_name}/`.
 
 ### Public API
-- `restore(config, ch, backup_name, table_pattern, schema_only, data_only, rm, resume, rename_as: Option<&str>, database_mapping: Option<&HashMap<String, String>>) -> Result<()>` -- Main entry point with Mode A/B support (Phase 4d), resume (Phase 2d), and remap (Phase 4a); 10 parameters
+- `restore(config, ch, backup_name, table_pattern, schema_only, data_only, rm, resume, rename_as: Option<&str>, database_mapping: Option<&HashMap<String, String>>, rbac: bool, configs: bool, named_collections: bool) -> Result<()>` -- Main entry point with Mode A/B support (Phase 4d), resume (Phase 2d), remap (Phase 4a), and RBAC/config/named-collections restore (Phase 4e); 13 parameters
 - `create_databases(ch, manifest, remap, on_cluster, replicated_databases) -> Result<()>` -- DDL for databases (remap-aware, ON CLUSTER)
 - `create_tables(ch, manifest, filter, data_only, remap, on_cluster, replicated_databases, macros, dist_cluster) -> Result<()>` -- DDL for tables (remap-aware, ON CLUSTER, ZK conflict resolution, Distributed cluster rewrite)
 - `create_ddl_objects(ch, manifest, ddl_keys, remap, on_cluster, replicated_databases) -> Result<()>` -- Phase 3: DDL-only objects with retry loop (remap-aware, ON CLUSTER)
@@ -206,6 +230,10 @@ Queries `system.tables` for `data_paths` column to find the table's data directo
 - `resolve_zk_macros(template, macros) -> String` -- Substitute `{key}` macros in ZK path template (Phase 4d)
 - `add_on_cluster_clause(ddl, cluster) -> String` -- Inject ON CLUSTER into DDL statements (Phase 4d)
 - `rewrite_distributed_cluster(ddl, new_cluster) -> String` -- Rewrite cluster name in Distributed engine DDL (Phase 4d)
+- `restore_named_collections(ch, manifest, on_cluster) -> Result<()>` -- Restore named collections from manifest DDL with ON CLUSTER support (Phase 4e)
+- `restore_rbac(ch, config, backup_dir, resolve_conflicts) -> Result<()>` -- DDL-based RBAC restore from .jsonl files with conflict resolution (Phase 4e)
+- `restore_configs(config, backup_dir) -> Result<()>` -- Copy config files from backup to ClickHouse config dir (Phase 4e)
+- `execute_restart_commands(ch, restart_command) -> Result<()>` -- Execute semicolon-separated restart commands with exec:/sql: prefix routing (Phase 4e)
 - `attach_parts(params) -> Result<u64>` -- Hardlink + ATTACH PART (borrowed params), returns count
 - `attach_parts_owned(params) -> Result<u64>` -- Hardlink + ATTACH PART (owned params for tokio::spawn); handles both local and S3 disk parts; skips already-attached parts when resume is active (Phase 2d)
 - `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries; includes `s3_client`, `disk_type_map`, `disk_remote_paths`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming` for Phase 2c; `already_attached`, `restore_state_path` for Phase 2d

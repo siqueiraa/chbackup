@@ -77,17 +77,17 @@ Bounded `VecDeque<ActionEntry>` with configurable capacity (default 100). Tracks
 Conditionally applied to the entire router when `config.api.username` AND `config.api.password` are both non-empty. Uses axum's `middleware::from_fn_with_state`. Decodes `Authorization: Basic <base64>` header via `base64::engine::general_purpose::STANDARD`. Returns 401 with `WWW-Authenticate: Basic` header on failure.
 
 ### Compound Operations
-- `create_remote`: chains `backup::create()` then `upload::upload()` in a single spawned task
-- `restore_remote`: chains `download::download()` then `restore::restore()` in a single spawned task; passes `rename_as` and `database_mapping` remap parameters to the restore step (Phase 4a)
+- `create_remote`: chains `backup::create()` then `upload::upload()` in a single spawned task; passes `rbac`, `configs`, `named_collections` flags to `create()` (Phase 4e)
+- `restore_remote`: chains `download::download()` then `restore::restore()` in a single spawned task; passes `rename_as`, `database_mapping` remap parameters and `rbac`, `configs`, `named_collections` flags to the restore step (Phase 4a, 4e)
 - If the first step fails, the operation is marked as failed and the second step is skipped
 
 ### Restore Remap Parameters (routes.rs, Phase 4a)
 Both restore endpoints accept remap parameters for table/database renaming:
 
-- **`RestoreRequest`** (for `POST /api/v1/restore/{name}`): Fields: `tables`, `schema`, `data_only`, `rename_as` (optional, `--as` flag value), `database_mapping` (optional, `-m` flag value as `"src:dst,..."` string), `rm`. The `database_mapping` string is parsed via `remap::parse_database_mapping()` inside the spawned task; parse errors cause immediate `fail_op`.
-- **`RestoreRemoteRequest`** (for `POST /api/v1/restore_remote/{name}`): Fields: `tables`, `schema`, `data_only`, `rename_as` (optional), `database_mapping` (optional), `rm` (optional, Phase 4d -- Mode A destructive restore). All optional fields use `#[serde(default)]` for backward compatibility.
+- **`RestoreRequest`** (for `POST /api/v1/restore/{name}`): Fields: `tables`, `schema`, `data_only`, `rename_as` (optional, `--as` flag value), `database_mapping` (optional, `-m` flag value as `"src:dst,..."` string), `rm`, `rbac` (optional), `configs` (optional), `named_collections` (optional). The `database_mapping` string is parsed via `remap::parse_database_mapping()` inside the spawned task; parse errors cause immediate `fail_op`.
+- **`RestoreRemoteRequest`** (for `POST /api/v1/restore_remote/{name}`): Fields: `tables`, `schema`, `data_only`, `rename_as` (optional), `database_mapping` (optional), `rm` (optional, Phase 4d -- Mode A destructive restore), `rbac` (optional), `configs` (optional), `named_collections` (optional). All optional fields use `#[serde(default)]` for backward compatibility.
 
-Auto-resume (`auto_resume()` in state.rs) passes `None` for both `rename_as` and `database_mapping`, and `false` for `rm` since resume restores to original names and should never drop tables.
+Auto-resume (`auto_resume()` in state.rs) passes `None` for both `rename_as` and `database_mapping`, `false` for `rm`, and `false` for `rbac`, `configs`, `named_collections` since resume restores to original names and should never drop tables or re-apply RBAC/configs.
 
 ### Auto-Resume on Restart (state.rs)
 When `config.api.complete_resumable_after_restart` is true, `auto_resume()` scans `{data_path}/backup/` for state files (`upload.state.json`, `download.state.json`, `restore.state.json`) and spawns corresponding operations with `resume=true`. Operations go through `try_start_op()` respecting concurrency limits. Small delay (100ms) between spawned operations.
@@ -162,6 +162,14 @@ Endpoints for future phases return 501 Not Implemented:
 
 ### Sync Function Handling
 Sync functions from `list` module (`delete_local`, `clean_broken_local`) are called via `tokio::task::spawn_blocking` to avoid blocking the async runtime.
+
+### RBAC/Config/Named Collections Request Fields (Phase 4e)
+All four operation request types (`CreateRequest`, `RestoreRequest`, `CreateRemoteRequest`, `RestoreRemoteRequest`) include three optional boolean fields added in Phase 4e:
+- `rbac: Option<bool>` -- Enable RBAC backup/restore (default: false via `unwrap_or(false)`)
+- `configs: Option<bool>` -- Enable config file backup/restore (default: false)
+- `named_collections: Option<bool>` -- Enable named collections backup/restore (default: false)
+
+These fields are `Option<bool>` for backward compatibility -- existing API clients that omit these fields get `None`, which defaults to `false`. The `*_backup_always` config overrides still apply on the implementation side.
 
 ### Response Types for Integration Tables
 - `ListResponse` matches ALL columns of `system.backup_list` (name, created, location, size, data_size, object_disk_size, metadata_size, rbac_size, config_size, compressed_size, required)

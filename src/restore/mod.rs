@@ -270,8 +270,7 @@ pub async fn restore(
 
         // Phase 4e: Named collections (schema-only path)
         if !data_only
-            && (named_collections_restore
-                || config.clickhouse.named_collections_backup_always)
+            && (named_collections_restore || config.clickhouse.named_collections_backup_always)
         {
             rbac::restore_named_collections(ch, &manifest, on_cluster).await?;
         }

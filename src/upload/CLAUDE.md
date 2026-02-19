@@ -33,6 +33,12 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 {backup_name}/objects/{original_relative_path}             -- data objects
 {backup_name}/data/{url_encode(db)}/{url_encode(table)}/{disk_name}/{part_name}/  -- metadata files
 
+# RBAC files (Phase 4e, uncompressed):
+{backup_name}/access/{filename}.jsonl                      -- RBAC entity JSONL files
+
+# Config files (Phase 4e, uncompressed):
+{backup_name}/configs/{relative_path}                      -- ClickHouse config files
+
 {backup_name}/metadata.json  (uploaded LAST)
 ```
 
@@ -81,6 +87,9 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 - If crash occurs between steps 1 and 2: backup has `.tmp` file but no `metadata.json` -> marked as broken by `list` command
 - If crash occurs between steps 2 and 3: `.tmp` file is orphaned but harmless, cleaned by `clean_broken`
 - Logs `"Manifest uploaded atomically"` on success
+
+### Simple Directory Upload (Phase 4e)
+- `upload_simple_directory(s3, backup_name, local_dir, prefix)` -- Uploads all files from a local directory to S3 under `{backup_name}/{prefix}/`. Uses `spawn_blocking` + `walkdir` for directory traversal, then sequential `put_object` for each file. No compression (RBAC/config files are small text files). Called after part upload completes but before atomic manifest upload for `access/` and `configs/` directories.
 
 ### Public API
 - `upload(config, s3, backup_name, backup_dir, delete_local, diff_from_remote: Option<&str>, resume: bool) -> Result<()>` -- Main entry point with resume and atomic manifest (Phase 2d)
