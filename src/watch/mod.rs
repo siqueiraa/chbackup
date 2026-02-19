@@ -421,6 +421,7 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             false, // rbac (watch mode does not support RBAC backup)
             false, // configs (watch mode does not support config backup)
             false, // named_collections (watch mode does not support named collections backup)
+            &ctx.config.backup.skip_projections,
         )
         .await;
 

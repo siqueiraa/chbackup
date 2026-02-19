@@ -327,6 +327,7 @@ pub async fn create_backup(
             req.rbac.unwrap_or(false),
             req.configs.unwrap_or(false),
             req.named_collections.unwrap_or(false),
+            &state_clone.config.backup.skip_projections,
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -673,6 +674,7 @@ pub async fn create_remote(
             req.rbac.unwrap_or(false),
             req.configs.unwrap_or(false),
             req.named_collections.unwrap_or(false),
+            &state_clone.config.backup.skip_projections,
         )
         .await;
 

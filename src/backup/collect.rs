@@ -122,6 +122,7 @@ pub fn collect_parts(
     disk_paths: &HashMap<String, String>,
     skip_disks: &[String],
     skip_disk_types: &[String],
+    skip_projections: &[String],
 ) -> Result<HashMap<String, Vec<CollectedPart>>> {
     let uuid_map = build_uuid_map(tables);
     let mut result: HashMap<String, Vec<CollectedPart>> = HashMap::new();
@@ -305,7 +306,7 @@ pub fn collect_parts(
                             .join(url_encode_path(&table))
                             .join(&part_name);
 
-                        hardlink_dir(&part_entry.path(), &staging_dir)?;
+                        hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
 
                         let part_info = PartInfo {
                             name: part_name,
@@ -395,13 +396,19 @@ fn collect_s3_part_metadata(part_dir: &Path) -> Result<(Vec<S3ObjectInfo>, u64)>
 ///
 /// Creates dst_dir and any needed subdirectories. On EXDEV (cross-device)
 /// error, falls back to copying.
-fn hardlink_dir(src_dir: &Path, dst_dir: &Path) -> Result<()> {
+///
+/// If `skip_proj_patterns` is non-empty, any subdirectory ending in `.proj`
+/// whose stem matches one of the patterns is skipped entirely (not hardlinked).
+/// The special pattern `*` matches all projections.
+fn hardlink_dir(src_dir: &Path, dst_dir: &Path, skip_proj_patterns: &[String]) -> Result<()> {
     std::fs::create_dir_all(dst_dir)
         .with_context(|| format!("Failed to create staging dir: {}", dst_dir.display()))?;
 
-    for entry in WalkDir::new(src_dir) {
-        let entry =
-            entry.with_context(|| format!("Failed to walk directory: {}", src_dir.display()))?;
+    let mut walker = WalkDir::new(src_dir).into_iter();
+
+    while let Some(entry_result) = walker.next() {
+        let entry = entry_result
+            .with_context(|| format!("Failed to walk directory: {}", src_dir.display()))?;
 
         let relative = entry
             .path()
@@ -411,6 +418,22 @@ fn hardlink_dir(src_dir: &Path, dst_dir: &Path) -> Result<()> {
         let target = dst_dir.join(relative);
 
         if entry.file_type().is_dir() {
+            // Check if this directory is a .proj directory that should be skipped
+            if !skip_proj_patterns.is_empty() {
+                if let Some(dir_name) = entry.path().file_name().and_then(|n| n.to_str()) {
+                    if let Some(stem) = dir_name.strip_suffix(".proj") {
+                        if should_skip_projection(stem, skip_proj_patterns) {
+                            info!(
+                                projection = %dir_name,
+                                path = %entry.path().display(),
+                                "Skipping projection directory"
+                            );
+                            walker.skip_current_dir();
+                            continue;
+                        }
+                    }
+                }
+            }
             std::fs::create_dir_all(&target)?;
         } else {
             // Try hardlink first, fall back to copy on cross-device
@@ -438,6 +461,24 @@ fn hardlink_dir(src_dir: &Path, dst_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Check whether a projection stem should be skipped based on the patterns.
+///
+/// Patterns support glob matching via `glob::Pattern`. The special pattern `*`
+/// matches all projections.
+fn should_skip_projection(stem: &str, patterns: &[String]) -> bool {
+    for pattern in patterns {
+        if pattern == "*" {
+            return true;
+        }
+        if let Ok(glob_pat) = glob::Pattern::new(pattern) {
+            if glob_pat.matches(stem) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Calculate the total size of all files in a directory.
@@ -510,7 +551,7 @@ mod tests {
         std::fs::create_dir(src_dir.path().join("subdir")).unwrap();
         std::fs::write(src_dir.path().join("subdir/file2.txt"), b"world").unwrap();
 
-        hardlink_dir(src_dir.path(), &dst_path).unwrap();
+        hardlink_dir(src_dir.path(), &dst_path, &[]).unwrap();
 
         assert!(dst_path.join("file1.txt").exists());
         assert!(dst_path.join("subdir/file2.txt").exists());
@@ -610,6 +651,7 @@ mod tests {
             &disk_paths,
             &[],
             &[],
+            &[],
         )
         .unwrap();
 
@@ -688,6 +730,7 @@ mod tests {
             &disk_paths,
             &[],
             &[],
+            &[],
         )
         .unwrap();
 
@@ -712,6 +755,92 @@ mod tests {
             .join("202401_1_50_3")
             .join("data.bin");
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn test_hardlink_dir_skips_projections() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst_path = dst_dir.path().join("linked");
+
+        // Create source files including a .proj subdirectory
+        std::fs::write(src_dir.path().join("data.bin"), b"data").unwrap();
+        std::fs::write(src_dir.path().join("checksums.txt"), b"checksums").unwrap();
+        std::fs::create_dir(src_dir.path().join("my_agg.proj")).unwrap();
+        std::fs::write(
+            src_dir.path().join("my_agg.proj/data.bin"),
+            b"proj data",
+        )
+        .unwrap();
+
+        // Skip ALL projections
+        hardlink_dir(src_dir.path(), &dst_path, &["*".to_string()]).unwrap();
+
+        assert!(dst_path.join("data.bin").exists());
+        assert!(dst_path.join("checksums.txt").exists());
+        assert!(
+            !dst_path.join("my_agg.proj").exists(),
+            "Projection directory should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_skip_projections_empty_list_keeps_all() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst_path = dst_dir.path().join("linked");
+
+        std::fs::write(src_dir.path().join("data.bin"), b"data").unwrap();
+        std::fs::create_dir(src_dir.path().join("my_agg.proj")).unwrap();
+        std::fs::write(
+            src_dir.path().join("my_agg.proj/data.bin"),
+            b"proj data",
+        )
+        .unwrap();
+
+        // Empty skip list -- keep all projections
+        hardlink_dir(src_dir.path(), &dst_path, &[]).unwrap();
+
+        assert!(dst_path.join("data.bin").exists());
+        assert!(
+            dst_path.join("my_agg.proj").exists(),
+            "Projection directory should be preserved"
+        );
+        assert!(dst_path.join("my_agg.proj/data.bin").exists());
+    }
+
+    #[test]
+    fn test_skip_projections_glob_pattern() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst_path = dst_dir.path().join("linked");
+
+        std::fs::write(src_dir.path().join("data.bin"), b"data").unwrap();
+        std::fs::create_dir(src_dir.path().join("my_agg.proj")).unwrap();
+        std::fs::write(
+            src_dir.path().join("my_agg.proj/data.bin"),
+            b"proj data",
+        )
+        .unwrap();
+        std::fs::create_dir(src_dir.path().join("other.proj")).unwrap();
+        std::fs::write(
+            src_dir.path().join("other.proj/data.bin"),
+            b"other proj",
+        )
+        .unwrap();
+
+        // Skip only projections matching "my_*"
+        hardlink_dir(src_dir.path(), &dst_path, &["my_*".to_string()]).unwrap();
+
+        assert!(dst_path.join("data.bin").exists());
+        assert!(
+            !dst_path.join("my_agg.proj").exists(),
+            "my_agg.proj should be skipped"
+        );
+        assert!(
+            dst_path.join("other.proj").exists(),
+            "other.proj should be preserved"
+        );
     }
 
     #[test]

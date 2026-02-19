@@ -74,6 +74,7 @@ pub async fn create(
     rbac: bool,
     configs: bool,
     named_collections: bool,
+    skip_projections: &[String],
 ) -> Result<BackupManifest> {
     info!(
         backup_name = %backup_name,
@@ -342,6 +343,7 @@ pub async fn create(
         let disk_map_clone = disk_map.clone();
         let skip_disks_clone = config.clickhouse.skip_disks.clone();
         let skip_disk_types_clone = config.clickhouse.skip_disk_types.clone();
+        let skip_projections_clone = skip_projections.to_vec();
         let partition_ids_clone = partition_ids.clone();
         let deps_clone = deps_arc.clone();
 
@@ -456,6 +458,7 @@ pub async fn create(
                     &disk_map_clone,
                     &skip_disks_clone,
                     &skip_disk_types_clone,
+                    &skip_projections_clone,
                 )
             })
             .await

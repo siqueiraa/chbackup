@@ -131,10 +131,6 @@ async fn main() -> Result<()> {
             resume,
             backup_name,
         } => {
-            // Warn about Phase 2+ flags that are not yet implemented
-            if skip_projections.is_some() {
-                warn!("--skip-projections flag is not yet implemented, ignoring");
-            }
             let name = resolve_backup_name(backup_name);
             let ch = ChClient::new(&config.clickhouse)?;
 
@@ -143,6 +139,12 @@ async fn main() -> Result<()> {
             if resume {
                 info!("--resume flag has no effect on the create command");
             }
+
+            // Merge CLI --skip-projections with config.backup.skip_projections
+            let effective_skip_projections = merge_skip_projections(
+                skip_projections.as_deref(),
+                &config.backup.skip_projections,
+            );
 
             let _manifest = backup::create(
                 &config,
@@ -156,6 +158,7 @@ async fn main() -> Result<()> {
                 rbac,
                 configs,
                 named_collections,
+                &effective_skip_projections,
             )
             .await?;
 
@@ -276,14 +279,15 @@ async fn main() -> Result<()> {
             resume,
             backup_name,
         } => {
-            // Warn about unimplemented flags
-            if skip_projections.is_some() {
-                warn!("--skip-projections flag is not yet implemented, ignoring");
-            }
-
             let name = resolve_backup_name(backup_name);
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
+
+            // Merge CLI --skip-projections with config.backup.skip_projections
+            let effective_skip_projections = merge_skip_projections(
+                skip_projections.as_deref(),
+                &config.backup.skip_projections,
+            );
 
             // Step 1: Create local backup (no local diff-from for create_remote)
             let _manifest = backup::create(
@@ -298,6 +302,7 @@ async fn main() -> Result<()> {
                 rbac,
                 configs,
                 named_collections,
+                &effective_skip_projections,
             )
             .await?;
 
@@ -639,5 +644,20 @@ fn map_cli_location(loc: cli::Location) -> list::Location {
     match loc {
         cli::Location::Local => list::Location::Local,
         cli::Location::Remote => list::Location::Remote,
+    }
+}
+
+/// Merge the CLI `--skip-projections` flag with `config.backup.skip_projections`.
+///
+/// If the CLI flag is provided, its comma-separated patterns are used.
+/// Otherwise, the config list is used. If both are empty, an empty Vec is returned.
+fn merge_skip_projections(cli_flag: Option<&str>, config_list: &[String]) -> Vec<String> {
+    match cli_flag {
+        Some(patterns) => patterns
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        None => config_list.to_vec(),
     }
 }
