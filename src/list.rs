@@ -36,6 +36,8 @@ pub struct BackupSummary {
     pub compressed_size: u64,
     /// Number of tables in the backup.
     pub table_count: usize,
+    /// Size of the manifest metadata in bytes.
+    pub metadata_size: u64,
     /// Whether the backup manifest is missing or corrupt.
     pub is_broken: bool,
     /// Reason why the backup is broken (e.g., "metadata.json not found").
@@ -150,6 +152,7 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                         size: total_uncompressed_size(&manifest),
                         compressed_size: manifest.compressed_size,
                         table_count: manifest.tables.len(),
+                        metadata_size: manifest.metadata_size,
                         is_broken: false,
                         broken_reason: None,
                     });
@@ -167,6 +170,7 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                         size: 0,
                         compressed_size: 0,
                         table_count: 0,
+                        metadata_size: 0,
                         is_broken: true,
                         broken_reason: Some(reason),
                     });
@@ -185,6 +189,7 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                     size: 0,
                     compressed_size: 0,
                     table_count: 0,
+                    metadata_size: 0,
                     is_broken: true,
                     broken_reason: Some(reason),
                 });
@@ -813,6 +818,7 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
             size: 0,
             compressed_size: 0,
             table_count: 0,
+            metadata_size: 0,
             is_broken: true,
             broken_reason: Some("metadata.json not found".to_string()),
         };
@@ -825,6 +831,7 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
             size: total_uncompressed_size(&manifest),
             compressed_size: manifest.compressed_size,
             table_count: manifest.tables.len(),
+            metadata_size: manifest.metadata_size,
             is_broken: false,
             broken_reason: None,
         },
@@ -842,6 +849,7 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
                 size: 0,
                 compressed_size: 0,
                 table_count: 0,
+                metadata_size: 0,
                 is_broken: true,
                 broken_reason: Some(reason),
             }
@@ -1093,6 +1101,7 @@ mod tests {
             size: 1_048_576,           // 1 MB
             compressed_size: 524_288,  // 512 KB
             table_count: 3,
+            metadata_size: 0,
             is_broken: false,
             broken_reason: None,
         }];
@@ -1696,5 +1705,54 @@ mod tests {
         // part1 should NOT be in unreferenced (it's still needed by another backup)
         assert!(!unreferenced
             .contains(&&"backup-a/data/default/trades/default/part1.tar.lz4".to_string()));
+    }
+
+    #[test]
+    fn test_backup_summary_has_metadata_size() {
+        let summary = BackupSummary {
+            name: "test".to_string(),
+            timestamp: None,
+            size: 1000,
+            compressed_size: 500,
+            table_count: 2,
+            metadata_size: 256,
+            is_broken: false,
+            broken_reason: None,
+        };
+        assert_eq!(summary.metadata_size, 256);
+    }
+
+    #[test]
+    fn test_parse_backup_summary_populates_metadata_size() {
+        // Create a backup directory with a manifest that has metadata_size
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("test-backup");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let manifest = crate::manifest::BackupManifest {
+            manifest_version: 1,
+            name: "test-backup".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: String::new(),
+            chbackup_version: String::new(),
+            data_format: "lz4".to_string(),
+            compressed_size: 500,
+            metadata_size: 1024,
+            disks: std::collections::HashMap::new(),
+            disk_types: std::collections::HashMap::new(),
+            disk_remote_paths: std::collections::HashMap::new(),
+            tables: std::collections::HashMap::new(),
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+        };
+
+        let metadata_path = backup_dir.join("metadata.json");
+        manifest.save_to_file(&metadata_path).unwrap();
+
+        let summary = parse_backup_summary("test-backup", &metadata_path);
+        assert!(!summary.is_broken);
+        assert_eq!(summary.metadata_size, 1024);
     }
 }

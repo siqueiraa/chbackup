@@ -716,6 +716,7 @@ mod tests {
             size: 0,
             compressed_size: 0,
             table_count: 0,
+            metadata_size: 0,
             is_broken: broken,
             broken_reason: if broken {
                 Some("test".to_string())

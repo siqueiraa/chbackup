@@ -9,6 +9,7 @@ pub mod lock;
 pub mod logging;
 pub mod manifest;
 pub mod object_disk;
+pub mod progress;
 pub mod rate_limiter;
 pub mod restore;
 pub mod resume;
@@ -195,6 +196,7 @@ mod tests {
             size: 1024,
             compressed_size: 512,
             table_count: 3,
+            metadata_size: 256,
             is_broken: false,
             broken_reason: None,
         };
