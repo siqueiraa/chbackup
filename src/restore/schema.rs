@@ -838,4 +838,61 @@ mod tests {
         let result = parse_replicated_params(ddl);
         assert!(result.is_none());
     }
+
+    /// Test the ZK conflict resolution flow (pure logic, no ChClient).
+    /// Verifies: parse DDL -> resolve macros -> produce correct resolved path and replica.
+    #[test]
+    fn test_resolve_zk_conflict_flow() {
+        use std::collections::HashMap;
+
+        // Step 1: Parse replicated params from DDL
+        let ddl = "CREATE TABLE default.trades (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/{database}/{table}', '{replica}') ORDER BY id";
+        let (path_template, replica_template) = parse_replicated_params(ddl).unwrap();
+        assert_eq!(path_template, "/clickhouse/tables/{shard}/{database}/{table}");
+        assert_eq!(replica_template, "{replica}");
+
+        // Step 2: Resolve macros
+        let mut macros = HashMap::new();
+        macros.insert("shard".to_string(), "01".to_string());
+        macros.insert("replica".to_string(), "r1".to_string());
+        macros.insert("database".to_string(), "default".to_string());
+        macros.insert("table".to_string(), "trades".to_string());
+
+        let resolved_path = resolve_zk_macros(&path_template, &macros);
+        let resolved_replica = resolve_zk_macros(&replica_template, &macros);
+
+        assert_eq!(resolved_path, "/clickhouse/tables/01/default/trades");
+        assert_eq!(resolved_replica, "r1");
+
+        // Step 3: The actual ZK check + DROP REPLICA would require a live ChClient.
+        // We verify the flow produces the correct inputs for check_zk_replica_exists()
+        // and drop_replica_from_zkpath().
+    }
+
+    /// Test that non-replicated tables are skipped in ZK conflict check.
+    #[test]
+    fn test_resolve_zk_skip_non_replicated() {
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = MergeTree() ORDER BY id";
+        let result = parse_replicated_params(ddl);
+        assert!(result.is_none(), "Non-replicated engines should return None");
+
+        // resolve_zk_conflict() returns Ok(()) immediately for non-Replicated engines
+        // (can't test async here, but the guard is parse_replicated_params returning None)
+    }
+
+    /// Test ZK conflict resolution with UUID macro in ZK path.
+    #[test]
+    fn test_resolve_zk_conflict_with_uuid() {
+        use std::collections::HashMap;
+
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{uuid}', '{replica}') ORDER BY id";
+        let (path_template, _) = parse_replicated_params(ddl).unwrap();
+
+        let mut macros = HashMap::new();
+        macros.insert("replica".to_string(), "r1".to_string());
+        macros.insert("uuid".to_string(), "abc-123-def".to_string());
+
+        let resolved_path = resolve_zk_macros(&path_template, &macros);
+        assert_eq!(resolved_path, "/clickhouse/tables/abc-123-def");
+    }
 }
