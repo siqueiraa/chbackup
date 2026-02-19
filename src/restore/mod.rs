@@ -183,8 +183,7 @@ pub async fn restore(
         // Query system.parts for authoritative view of already-attached parts
         // When remap is active, query using the *destination* db/table names
         for table_key in &table_keys {
-            let (orig_db, orig_table) =
-                table_key.split_once('.').unwrap_or(("default", table_key));
+            let (orig_db, orig_table) = table_key.split_once('.').unwrap_or(("default", table_key));
             let (query_db, query_table) = match remap_ref {
                 Some(rc) if rc.is_active() => {
                     let (d, t) = rc.remap_table_key(table_key);

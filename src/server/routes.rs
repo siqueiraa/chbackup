@@ -552,18 +552,16 @@ pub async fn restore_backup(
 
         // Parse remap parameters
         let db_mapping = match &req.database_mapping {
-            Some(s) if !s.is_empty() => {
-                match crate::restore::remap::parse_database_mapping(s) {
-                    Ok(map) => Some(map),
-                    Err(e) => {
-                        warn!(error = %e, "Invalid database_mapping parameter");
-                        state_clone
-                            .fail_op(id, format!("invalid database_mapping: {}", e))
-                            .await;
-                        return;
-                    }
+            Some(s) if !s.is_empty() => match crate::restore::remap::parse_database_mapping(s) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    warn!(error = %e, "Invalid database_mapping parameter");
+                    state_clone
+                        .fail_op(id, format!("invalid database_mapping: {}", e))
+                        .await;
+                    return;
                 }
-            }
+            },
             _ => None,
         };
 
@@ -767,18 +765,16 @@ pub async fn restore_remote(
 
         // Parse remap parameters
         let db_mapping = match &req.database_mapping {
-            Some(s) if !s.is_empty() => {
-                match crate::restore::remap::parse_database_mapping(s) {
-                    Ok(map) => Some(map),
-                    Err(e) => {
-                        warn!(error = %e, "Invalid database_mapping parameter");
-                        state_clone
-                            .fail_op(id, format!("invalid database_mapping: {}", e))
-                            .await;
-                        return;
-                    }
+            Some(s) if !s.is_empty() => match crate::restore::remap::parse_database_mapping(s) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    warn!(error = %e, "Invalid database_mapping parameter");
+                    state_clone
+                        .fail_op(id, format!("invalid database_mapping: {}", e))
+                        .await;
+                    return;
                 }
-            }
+            },
             _ => None,
         };
 

@@ -140,12 +140,7 @@ pub async fn create_tables(
         let exists = ch
             .table_exists(&dst_db, &dst_table)
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to check if table {}.{} exists",
-                    dst_db, dst_table
-                )
-            })?;
+            .with_context(|| format!("Failed to check if table {}.{} exists", dst_db, dst_table))?;
 
         if exists {
             debug!(

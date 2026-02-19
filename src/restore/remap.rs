@@ -49,13 +49,23 @@ impl RemapConfig {
                 let (src_db, src_table) = match pattern.split_once('.') {
                     Some((db, tbl)) => (db.to_string(), tbl.to_string()),
                     None => {
-                        bail!("--as flag requires -t pattern in db.table format, got '{}'", pattern);
+                        bail!(
+                            "--as flag requires -t pattern in db.table format, got '{}'",
+                            pattern
+                        );
                     }
                 };
 
                 // Validate -t is a single table (no wildcards)
-                if src_table.contains('*') || src_table.contains('?') || src_db.contains('*') || src_db.contains('?') {
-                    bail!("--as flag requires -t to specify a single table (no wildcards), got '{}'", pattern);
+                if src_table.contains('*')
+                    || src_table.contains('?')
+                    || src_db.contains('*')
+                    || src_db.contains('?')
+                {
+                    bail!(
+                        "--as flag requires -t to specify a single table (no wildcards), got '{}'",
+                        pattern
+                    );
                 }
 
                 // Parse destination from --as value
@@ -574,9 +584,13 @@ mod tests {
 
     #[test]
     fn test_remap_config_new_no_flags() {
-        let result =
-            RemapConfig::new(None, None, None, "/clickhouse/tables/{shard}/{database}/{table}")
-                .unwrap();
+        let result = RemapConfig::new(
+            None,
+            None,
+            None,
+            "/clickhouse/tables/{shard}/{database}/{table}",
+        )
+        .unwrap();
         assert!(result.is_none());
     }
 
@@ -757,7 +771,8 @@ mod tests {
 
     #[test]
     fn test_rewrite_ddl_simple_mergetree() {
-        let ddl = "CREATE TABLE src_db.src_table (id UInt64, name String) ENGINE = MergeTree ORDER BY id";
+        let ddl =
+            "CREATE TABLE src_db.src_table (id UInt64, name String) ENGINE = MergeTree ORDER BY id";
         let result = rewrite_create_table_ddl(
             ddl,
             "src_db",
@@ -846,7 +861,9 @@ mod tests {
             "/clickhouse/tables/{shard}/{database}/{table}",
         );
         assert!(
-            result.contains("ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/dst_db/dst_table'"),
+            result.contains(
+                "ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/dst_db/dst_table'"
+            ),
             "ZK path should use dst values: {}",
             result
         );
@@ -938,8 +955,7 @@ mod tests {
     #[test]
     fn test_rewrite_ddl_no_uuid() {
         // DDL without UUID should work fine
-        let ddl =
-            "CREATE TABLE src_db.src_table (id UInt64) ENGINE = MergeTree ORDER BY id";
+        let ddl = "CREATE TABLE src_db.src_table (id UInt64) ENGINE = MergeTree ORDER BY id";
         let result = rewrite_create_table_ddl(
             ddl,
             "src_db",
