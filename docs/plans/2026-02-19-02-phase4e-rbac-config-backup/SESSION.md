@@ -92,8 +92,8 @@
 
 ```
 Group A (Sequential -- core pipeline):
-  - Task 1: ChClient query methods for RBAC and named collections
-  - Task 2: Backup RBAC, config files, named collections (depends on Task 1)
+  - Task 1: ChClient query methods for RBAC, named collections, and functions
+  - Task 2: Backup RBAC, config files, named collections, functions (depends on Task 1)
   - Task 3: Upload/download access/ and configs/ directories (depends on Task 2)
   - Task 4: Restore RBAC, configs, named collections, restart_command (depends on Tasks 1, 3)
 
@@ -110,8 +110,8 @@ Group C (Final -- depends on Group B):
 
 | Task | Description | Status | Commit | Acceptance |
 |------|-------------|--------|--------|------------|
-| 1 | ChClient query methods for RBAC and named collections | pending | - | F001 |
-| 2 | Backup RBAC, config files, named collections | pending | - | F002 |
+| 1 | ChClient query methods for RBAC, named collections, and functions | pending | - | F001 |
+| 2 | Backup RBAC, config files, named collections, functions | pending | - | F002 |
 | 3 | Upload/download access/ and configs/ directories | pending | - | F003 |
 | 4 | Restore RBAC, configs, named collections, restart_command | pending | - | F004, F005 |
 | 5 | Wire flags through main.rs, server routes, watch mode | pending | - | F006 |
@@ -142,47 +142,53 @@ Group C (Final -- depends on Group B):
 
 ## Current Focus
 
-Plan validated. Awaiting execution (Phase 9+).
+Plan re-validated after PLAN.md updates. acceptance.json updated to match. Awaiting execution (Phase 9+).
 
 ---
 
 ## Codex Plan Review
 
-**Iterations:** 1
+**Iterations:** 2 (1 original + 1 re-validation after PLAN.md updates)
 **Final Status:** PASS
-**Review Tool:** Claude (fallback)
+**Review Tool:** Claude (fallback -- Codex failed with exit code 1)
 
 **Gap Analysis Results:**
 
 | Category | Status | Findings |
 |----------|--------|----------|
-| Task Dependency | PASS | All types/methods available before use. Task 1 methods used by Tasks 2,4. Task 2 signature change wired by Task 5. |
-| Data Flow | PASS | Vec<String> flows consistently for named_collections. Option<RbacInfo> for rbac. manifest fields match across tasks. |
-| Test Coverage | PASS | Each task has named test functions with specific assertions. |
-| Integration | PASS | New modules (backup/rbac.rs, restore/rbac.rs) explicitly wired via `pub mod rbac` in Tasks 2,4. All 10 call sites listed. |
-| Error Handling | PASS | Graceful degradation for CH queries (return empty Vec). restart_command errors logged and ignored per design 5.6. |
+| Task Dependency | PASS | All types/methods available before use. Task 1 methods (query_rbac_objects, query_named_collections, query_user_defined_functions) used by Tasks 2,4. Signature changes wired by Task 5. All 10 call sites verified in codebase. |
+| Data Flow | PASS | Vec<(String,String)> for RBAC objects -> .jsonl serialization -> .jsonl deserialization. Vec<String> for named_collections and functions flows through manifest fields (manifest.rs:73,77). |
+| Test Coverage | PASS | Each task has named test functions. Task 4 has 9 tests covering all conflict resolution modes. Minor: Task 1 missing explicit graceful degradation error path test (compiler-enforced via pattern matching). |
+| Integration | PASS | New modules (backup/rbac.rs, restore/rbac.rs) wired via `pub mod rbac`. All 5 backup::create() callers and 5 restore::restore() callers identified and listed. |
+| Error Handling | PASS | Graceful degradation for CH queries (return empty Vec, matching get_macros() pattern). restart_command errors logged and ignored per design 5.6. rbac_resolve_conflicts handles recreate/ignore/fail. |
 | State Transition | PASS | No state machine flags in this plan. |
-| Pattern Conformance | PASS | restore_named_collections follows create_functions pattern exactly. ChClient queries follow list_tables pattern. |
-| Risk Gaps | FOUND | See warnings below. |
-| Performance Gaps | PASS | RBAC/config files are small; sequential upload/download is appropriate. |
+| Pattern Conformance | PASS | restore_named_collections follows create_functions pattern. ChClient queries follow get_macros graceful degradation. upload/download use spawn_blocking + walkdir. |
+| Risk Gaps | FOUND | restart_command exec: prefix runs arbitrary shell (by design per doc 5.6). |
+| Performance Gaps | FOUND | query_rbac_objects has N+1 SHOW CREATE pattern (acceptable for typical < 100 RBAC objects). |
 
 **Blocking Gaps:** 0
-**Warning Gaps:** 3
+**Warning Gaps:** 2
 **Self-healing triggered:** no
 
-### Warnings
+### Issues Fixed During Re-Validation (Round 2)
 
-1. **restore_rbac() signature mismatch in code sketch**: Function signature takes `resolve_conflicts: &str` but the wiring call at line 757 passes only 2 args (`config, &backup_dir`). The developer must either remove the parameter or add it to the call. The compiler will catch this. The function body also does not use `resolve_conflicts` for file-based operations.
+1. **F001 missing query_user_defined_functions**: Updated description and structural check to include the functions query method added by PLAN.md update.
 
-2. **schema_only path missing Phase 4 extensions**: There are TWO `create_functions()` call sites in restore/mod.rs -- line 264 (schema_only early return) and line 649 (normal path). The plan only wires named collections/RBAC/config after line 649. Named collections (DDL-based) should also be wired in the schema_only path after line 264. RBAC/config file restore can arguably be excluded from schema_only.
+2. **F002 missing .jsonl and functions references**: Updated description to mention .jsonl format. Updated structural check to verify RbacEntry struct and backup_functions function.
 
-3. **F006 structural check sensitivity**: The original F006 structural grep (`grep -c 'not yet implemented, ignoring'`) matched ALL 17 warn stubs including 5 out-of-scope stubs (skip-projections x2, skip-empty-tables x2, hardlink-exists-files x1). Fixed to only match rbac/configs/named-collections stubs.
+3. **F004 missing DDL-based RBAC restore with rbac_resolve_conflicts**: Updated description to reference DDL-based restore from .jsonl files. Updated structural check to verify restore_rbac and make_drop_ddl. Updated behavioral check to include rbac_restore tests.
 
-### Issues Fixed During Validation
+4. **F005 missing schema-only path wiring**: Updated description to mention both normal and schema-only paths. Updated structural check to verify restore_named_collections appears 2 times in mod.rs (normal + schema-only).
 
-1. **acceptance.json F006 structural command**: Changed from broad `'not yet implemented, ignoring'` grep to specific `'rbac flag is not yet implemented|configs flag is not yet implemented|named-collections flag is not yet implemented'` pattern.
+5. **F006 runtime pattern mismatch**: Changed "RBAC restore complete" to "RBAC restore:" to match actual log format. Added "Functions backup:" pattern that was in PLAN.md Expected Runtime Logs but missing from acceptance.json.
 
-2. **acceptance.json not_applicable runtime layers**: Added `alternative_verification` field with `command` and `expected` to all 6 not_applicable runtime layers (F001-F005, FDOC) to satisfy schema requirements.
+### Previous Warnings (From Round 1, Now Resolved)
+
+1. **restore_rbac() signature mismatch**: PLAN.md was updated to show correct 4-arg call including `resolve_conflicts`. Resolved.
+
+2. **schema_only path missing Phase 4 extensions**: PLAN.md was updated to include Phase 4 extensions in schema-only path (after line 264). Resolved.
+
+3. **F006 structural check sensitivity**: Fixed in Round 1 to only match rbac/configs/named-collections stubs. Still correct.
 
 ---
 
@@ -194,3 +200,4 @@ Plan validated. Awaiting execution (Phase 9+).
 - Watch mode does NOT support RBAC/config backup (passes false, false, false)
 - auto_resume in server/state.rs also passes false, false, false for RBAC flags
 - Design doc reference: sections 3.4 (step 4), 5.6, 7.1, 12
+- Functions backup added: manifest.functions was always Vec::new() during backup; Task 2 now populates it

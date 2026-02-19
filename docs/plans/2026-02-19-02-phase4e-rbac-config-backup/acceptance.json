@@ -6,16 +6,16 @@
     {
       "id": "F001",
       "category": "feature",
-      "description": "ChClient has query methods for RBAC entities and named collections",
+      "description": "ChClient has query methods for RBAC entities, named collections, and user-defined functions",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
         "layers": [
           {
             "name": "structural",
-            "command": "grep -c 'pub async fn query_rbac_objects' src/clickhouse/client.rs && grep -c 'pub async fn query_named_collections' src/clickhouse/client.rs",
-            "expected": "1\n1",
-            "fail_message": "query_rbac_objects or query_named_collections method not found in ChClient"
+            "command": "grep -c 'pub async fn query_rbac_objects' src/clickhouse/client.rs && grep -c 'pub async fn query_named_collections' src/clickhouse/client.rs && grep -c 'pub async fn query_user_defined_functions' src/clickhouse/client.rs",
+            "expected": "1\n1\n1",
+            "fail_message": "query_rbac_objects, query_named_collections, or query_user_defined_functions method not found in ChClient"
           },
           {
             "name": "compilation",
@@ -47,16 +47,16 @@
     {
       "id": "F002",
       "category": "feature",
-      "description": "Backup creates access/ and configs/ directories with RBAC objects, config files, and named collections in manifest",
+      "description": "Backup creates access/ directory with .jsonl RBAC files, copies config files, populates manifest.named_collections and manifest.functions",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
         "layers": [
           {
             "name": "structural",
-            "command": "grep -c 'pub async fn backup_rbac_and_configs' src/backup/rbac.rs && grep -c 'pub mod rbac' src/backup/mod.rs && grep -c 'rbac: bool' src/backup/mod.rs",
-            "expected": "1\n1\n1",
-            "fail_message": "backup_rbac_and_configs function or module wiring not found"
+            "command": "grep -c 'pub async fn backup_rbac_and_configs' src/backup/rbac.rs && grep -c 'pub mod rbac' src/backup/mod.rs && grep -c 'RbacEntry' src/backup/rbac.rs && grep -c 'backup_functions' src/backup/rbac.rs",
+            "expected": "1\n1\n1\n1",
+            "fail_message": "backup_rbac_and_configs, RbacEntry, or backup_functions not found in backup/rbac.rs"
           },
           {
             "name": "compilation",
@@ -129,16 +129,16 @@
     {
       "id": "F004",
       "category": "feature",
-      "description": "Restore named collections with ON CLUSTER support and conflict resolution",
+      "description": "Restore named collections with ON CLUSTER support, and DDL-based RBAC restore with rbac_resolve_conflicts (recreate/ignore/fail) from .jsonl files",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
         "layers": [
           {
             "name": "structural",
-            "command": "grep -c 'pub async fn restore_named_collections' src/restore/rbac.rs",
-            "expected": "1",
-            "fail_message": "restore_named_collections function not found"
+            "command": "grep -c 'pub async fn restore_named_collections' src/restore/rbac.rs && grep -c 'pub async fn restore_rbac' src/restore/rbac.rs && grep -c 'make_drop_ddl' src/restore/rbac.rs",
+            "expected": "1\n1\n1",
+            "fail_message": "restore_named_collections, restore_rbac, or make_drop_ddl not found in restore/rbac.rs"
           },
           {
             "name": "compilation",
@@ -148,14 +148,14 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --lib restore_named_collections -- --nocapture 2>&1 | grep -c 'test result: ok'",
-            "expected": "1",
-            "fail_message": "restore_named_collections tests failed"
+            "command": "cargo test --lib restore_named_collections -- --nocapture 2>&1 | grep -c 'test result: ok' && cargo test --lib rbac_restore -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1\n1",
+            "fail_message": "restore_named_collections or rbac_restore tests failed"
           },
           {
             "name": "runtime",
             "status": "not_applicable",
-            "justification": "Named collections restore requires live ClickHouse; unit tests verify DDL generation and conflict resolution logic",
+            "justification": "Named collections and RBAC restore requires live ClickHouse; unit tests verify DDL generation, .jsonl parsing, and conflict resolution logic",
             "alternative_verification": {
               "command": "cargo test --lib restore_named_collections -- --nocapture 2>&1 | grep -c 'test result: ok'",
               "expected": "1"
@@ -170,16 +170,16 @@
     {
       "id": "F005",
       "category": "feature",
-      "description": "Restore RBAC files, config files, and execute restart_command with exec:/sql: prefixes",
+      "description": "Restore config files, execute restart_command with exec:/sql: prefixes, and Phase 4 extensions wired in both normal and schema-only restore paths",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
         "layers": [
           {
             "name": "structural",
-            "command": "grep -c 'pub async fn restore_rbac' src/restore/rbac.rs && grep -c 'pub async fn restore_configs' src/restore/rbac.rs && grep -c 'pub async fn execute_restart_commands' src/restore/rbac.rs",
-            "expected": "1\n1\n1",
-            "fail_message": "restore_rbac, restore_configs, or execute_restart_commands not found"
+            "command": "grep -c 'pub async fn restore_configs' src/restore/rbac.rs && grep -c 'pub async fn execute_restart_commands' src/restore/rbac.rs && grep -c 'restore_named_collections' src/restore/mod.rs",
+            "expected": "1\n1\n2",
+            "fail_message": "restore_configs or execute_restart_commands not found, or Phase 4 extensions not wired in both restore paths (expected 2 occurrences in mod.rs for normal + schema-only)"
           },
           {
             "name": "compilation",
@@ -196,7 +196,7 @@
           {
             "name": "runtime",
             "status": "not_applicable",
-            "justification": "RBAC/config restore requires filesystem access to ClickHouse data directory and running ClickHouse for restart; unit tests verify file operations and command parsing",
+            "justification": "Config restore and restart_command require filesystem access to ClickHouse data directory and running ClickHouse; unit tests verify file operations and command parsing",
             "alternative_verification": {
               "command": "cargo test --lib execute_restart_commands -- --nocapture 2>&1 | grep -c 'test result: ok'",
               "expected": "1"
@@ -239,7 +239,7 @@
             "binary": "chbackup",
             "build_command": "cargo build --release 2>&1 | tail -1",
             "wait_seconds": 5,
-            "patterns": ["RBAC backup:", "Config backup:", "Named collections backup:", "Uploaded access/ directory", "Uploaded configs/ directory", "Downloaded access/ directory", "Downloaded configs/ directory", "Named collection creation phase complete", "RBAC restore complete", "Config restore complete", "Executing restart command"],
+            "patterns": ["RBAC backup:", "Config backup:", "Named collections backup:", "Functions backup:", "Uploaded access/ directory", "Uploaded configs/ directory", "Downloaded access/ directory", "Downloaded configs/ directory", "Named collection creation phase complete", "RBAC restore:", "Config restore complete", "Executing restart command"],
             "forbidden": [],
             "cleanup_markers": false,
             "fail_message": "Runtime integration requires real ClickHouse + S3 (CI test)"
