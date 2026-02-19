@@ -32,6 +32,30 @@ pub fn data_table_priority(table_key: &str) -> u8 {
     }
 }
 
+/// Returns true for streaming engines that must be postponed until after data
+/// tables are fully attached (Phase 2b). These engines consume data from
+/// external sources (Kafka, NATS, RabbitMQ) or watch S3 paths (S3Queue), so
+/// creating them before data is attached can cause premature consumption.
+pub fn is_streaming_engine(engine: &str) -> bool {
+    matches!(engine, "Kafka" | "NATS" | "RabbitMQ" | "S3Queue")
+}
+
+/// Returns true if the table manifest represents a refreshable materialized view.
+///
+/// Refreshable MVs have `engine == "MaterializedView"` and contain the `REFRESH`
+/// keyword in their DDL. They are postponed to Phase 2b to prevent the refresh
+/// scheduler from running queries against incomplete data.
+///
+/// Detection is case-insensitive and checks for REFRESH preceded by whitespace
+/// or at a line boundary (to avoid false positives from column/table names).
+pub fn is_refreshable_mv(tm: &TableManifest) -> bool {
+    if tm.engine != "MaterializedView" {
+        return false;
+    }
+    let ddl_upper = tm.ddl.to_uppercase();
+    ddl_upper.contains(" REFRESH ") || ddl_upper.contains("\nREFRESH ")
+}
+
 /// Engine priority for Phase 3 (DDL-only objects). Lower = created first.
 /// Per design doc 5.1:
 /// 0: Dictionary
@@ -434,5 +458,49 @@ mod tests {
         assert_eq!(sorted[0], "default.user_dict");
         assert_eq!(sorted[1], "default.my_view");
         assert_eq!(sorted[2], "default.dist_table");
+    }
+
+    #[test]
+    fn test_is_streaming_engine() {
+        // Streaming engines -> true
+        assert!(is_streaming_engine("Kafka"));
+        assert!(is_streaming_engine("NATS"));
+        assert!(is_streaming_engine("RabbitMQ"));
+        assert!(is_streaming_engine("S3Queue"));
+
+        // Non-streaming engines -> false
+        assert!(!is_streaming_engine("MergeTree"));
+        assert!(!is_streaming_engine("MaterializedView"));
+        assert!(!is_streaming_engine("View"));
+        assert!(!is_streaming_engine("ReplicatedMergeTree"));
+        assert!(!is_streaming_engine("Dictionary"));
+        assert!(!is_streaming_engine("Distributed"));
+    }
+
+    #[test]
+    fn test_is_refreshable_mv() {
+        // Refreshable MV with REFRESH clause -> true
+        let mut tm = make_table_manifest("MaterializedView", true, vec![]);
+        tm.ddl = "CREATE MATERIALIZED VIEW default.refresh_mv REFRESH EVERY 1 HOUR ENGINE = MergeTree() ORDER BY symbol AS SELECT symbol, count() FROM default.trades GROUP BY symbol".to_string();
+        assert!(is_refreshable_mv(&tm));
+
+        // Regular MV without REFRESH -> false
+        let tm_regular = make_table_manifest("MaterializedView", true, vec![]);
+        assert!(!is_refreshable_mv(&tm_regular));
+
+        // Non-MV table with REFRESH in DDL (edge case) -> false
+        let mut tm_non_mv = make_table_manifest("MergeTree", false, vec![]);
+        tm_non_mv.ddl = "CREATE TABLE test (id UInt64, refresh_col String) ENGINE = MergeTree() ORDER BY id SETTINGS refresh_interval = 10".to_string();
+        assert!(!is_refreshable_mv(&tm_non_mv));
+
+        // Case-insensitive REFRESH -> true
+        let mut tm_lower = make_table_manifest("MaterializedView", true, vec![]);
+        tm_lower.ddl = "CREATE MATERIALIZED VIEW default.mv refresh every 5 minutes ENGINE = MergeTree() AS SELECT * FROM t".to_string();
+        assert!(is_refreshable_mv(&tm_lower));
+
+        // REFRESH on newline -> true
+        let mut tm_newline = make_table_manifest("MaterializedView", true, vec![]);
+        tm_newline.ddl = "CREATE MATERIALIZED VIEW default.mv\nREFRESH EVERY 1 HOUR\nENGINE = MergeTree()\nAS SELECT * FROM t".to_string();
+        assert!(is_refreshable_mv(&tm_newline));
     }
 }
