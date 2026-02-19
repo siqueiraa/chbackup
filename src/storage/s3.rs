@@ -78,8 +78,52 @@ impl S3Client {
 
         let sdk_config = loader.load().await;
 
+        // If assume_role_arn is set, use STS to assume the role and get temporary credentials.
+        let effective_sdk_config = if !config.assume_role_arn.is_empty() {
+            let arn = &config.assume_role_arn;
+            info!(assume_role_arn = %arn, "Assuming IAM role via STS");
+
+            let sts_client = aws_sdk_sts::Client::new(&sdk_config);
+            let sts_resp = sts_client
+                .assume_role()
+                .role_arn(arn)
+                .role_session_name("chbackup")
+                .send()
+                .await
+                .with_context(|| format!("STS AssumeRole failed for ARN: {}", arn))?;
+
+            let sts_creds = sts_resp
+                .credentials()
+                .ok_or_else(|| anyhow::anyhow!("STS AssumeRole returned no credentials for ARN: {}", arn))?;
+
+            let access_key = sts_creds.access_key_id().to_string();
+            let secret_key = sts_creds.secret_access_key().to_string();
+            let session_token = sts_creds.session_token().to_string();
+
+            info!(assume_role_arn = %arn, "Successfully assumed IAM role");
+
+            // Rebuild SDK config with the temporary credentials from STS
+            let assumed_credentials = aws_sdk_s3::config::Credentials::new(
+                &access_key,
+                &secret_key,
+                Some(session_token),
+                None, // expiry handled by caller if needed
+                "chbackup-assume-role",
+            );
+
+            let mut assumed_loader =
+                aws_config::from_env().region(Region::new(config.region.clone()));
+            if !config.endpoint.is_empty() {
+                assumed_loader = assumed_loader.endpoint_url(&config.endpoint);
+            }
+            assumed_loader = assumed_loader.credentials_provider(assumed_credentials);
+            assumed_loader.load().await
+        } else {
+            sdk_config
+        };
+
         // Build S3-specific config with force_path_style.
-        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&sdk_config)
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&effective_sdk_config)
             .force_path_style(config.force_path_style);
 
         // Re-apply endpoint at the S3 config level if provided, since the SDK
