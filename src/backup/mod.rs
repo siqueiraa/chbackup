@@ -117,6 +117,19 @@ pub async fn create(
     // 3. List all user tables
     let all_tables = ch.list_tables().await?;
 
+    // 3b. Query table dependencies (CH 23.3+)
+    let deps_map = ch
+        .query_table_dependencies()
+        .await
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "Failed to query table dependencies (CH < 23.3?), dependencies will be empty");
+            HashMap::new()
+        });
+    info!(
+        tables_with_deps = deps_map.values().filter(|v| !v.is_empty()).count(),
+        "Queried table dependencies"
+    );
+
     // 4. Filter tables by pattern, skip_tables, skip_table_engines
     let pattern = table_pattern.unwrap_or(&config.backup.tables);
     let filter = TableFilter::new(pattern);
@@ -230,6 +243,10 @@ pub async fn create(
             data_tables.push((*table_row).clone());
         } else {
             // Schema-only or metadata-only table -- no FREEZE needed
+            let table_deps = deps_map.get(&full_name).cloned().unwrap_or_default();
+            if !table_deps.is_empty() {
+                info!(table = %full_name, deps = ?table_deps, "Populated dependencies for metadata-only table");
+            }
             table_manifests.insert(
                 full_name,
                 TableManifest {
@@ -246,7 +263,7 @@ pub async fn create(
                     parts: HashMap::new(),
                     pending_mutations: Vec::new(),
                     metadata_only: is_metadata_only,
-                    dependencies: Vec::new(),
+                    dependencies: table_deps,
                 },
             );
         }
@@ -266,6 +283,7 @@ pub async fn create(
     );
 
     let all_tables_arc = Arc::new(all_tables.clone());
+    let deps_arc = Arc::new(deps_map);
     let mut handles = Vec::with_capacity(data_tables.len());
 
     for table_row in &data_tables {
@@ -285,6 +303,7 @@ pub async fn create(
         let skip_disks_clone = config.clickhouse.skip_disks.clone();
         let skip_disk_types_clone = config.clickhouse.skip_disk_types.clone();
         let partition_ids_clone = partition_ids.clone();
+        let deps_clone = deps_arc.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -428,7 +447,7 @@ pub async fn create(
                 parts: parts_by_disk,
                 pending_mutations: all_mutations_clone,
                 metadata_only: false,
-                dependencies: Vec::new(),
+                dependencies: deps_clone.get(&full_name).cloned().unwrap_or_default(),
             };
 
             Ok(Some((freeze_info, full_name, table_manifest)))
@@ -802,5 +821,57 @@ mod tests {
         assert_eq!(actionable.len(), 1);
         assert_eq!(actionable[0].column, "amount");
         assert_eq!(actionable[0].types, vec!["Float64", "Decimal(18,2)"]);
+    }
+
+    #[test]
+    fn test_dependency_population_from_map() {
+        // Given a dependency map (as returned by query_table_dependencies()),
+        // verify that the lookup + unwrap_or_default pattern works correctly.
+        let mut deps_map: HashMap<String, Vec<String>> = HashMap::new();
+        deps_map.insert(
+            "default.user_dict".to_string(),
+            vec!["default.users".to_string()],
+        );
+        deps_map.insert(
+            "default.trades_view".to_string(),
+            vec!["default.trades".to_string(), "default.users".to_string()],
+        );
+
+        // Table with dependencies
+        let deps1 = deps_map
+            .get("default.user_dict")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(deps1, vec!["default.users"]);
+
+        // Table with multiple dependencies
+        let deps2 = deps_map
+            .get("default.trades_view")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            deps2,
+            vec!["default.trades", "default.users"]
+        );
+
+        // Table with no dependencies (not in map)
+        let deps3 = deps_map
+            .get("default.trades")
+            .cloned()
+            .unwrap_or_default();
+        assert!(deps3.is_empty());
+
+        // Verify these can be used in TableManifest
+        let tm = TableManifest {
+            ddl: "CREATE DICTIONARY ...".to_string(),
+            uuid: None,
+            engine: "Dictionary".to_string(),
+            total_bytes: 0,
+            parts: HashMap::new(),
+            pending_mutations: Vec::new(),
+            metadata_only: true,
+            dependencies: deps1,
+        };
+        assert_eq!(tm.dependencies, vec!["default.users"]);
     }
 }
