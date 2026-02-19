@@ -185,6 +185,133 @@ pub async fn create_tables(
     Ok(())
 }
 
+/// Create DDL-only objects (Phase 3: dictionaries, views, MVs) in caller-provided order.
+///
+/// Objects are created sequentially in the provided order (which should be
+/// topologically sorted by dependencies). On failure, objects are queued for
+/// retry -- this handles the fallback case where dependency info is unavailable
+/// and the topological sort was approximate (engine-priority only).
+///
+/// Max 10 retry rounds. Each round retries all previously-failed objects.
+/// If a round makes zero progress (no new successes), the function returns
+/// an error with the remaining failures.
+pub async fn create_ddl_objects(
+    ch: &ChClient,
+    manifest: &BackupManifest,
+    ddl_keys: &[String],
+    remap: Option<&RemapConfig>,
+) -> Result<()> {
+    if ddl_keys.is_empty() {
+        return Ok(());
+    }
+
+    let mut pending: Vec<String> = ddl_keys.to_vec();
+    let max_rounds = 10;
+
+    for round in 0..max_rounds {
+        let mut failed: Vec<(String, String)> = Vec::new(); // (key, error_msg)
+        let mut created_this_round = 0u32;
+
+        for table_key in &pending {
+            let table_manifest = match manifest.tables.get(table_key) {
+                Some(tm) => tm,
+                None => continue,
+            };
+
+            let (src_db, src_table) = table_key.split_once('.').unwrap_or(("default", table_key));
+            let (dst_db, dst_table) = match remap {
+                Some(rc) if rc.is_active() => rc.remap_table_key(table_key),
+                _ => (src_db.to_string(), src_table.to_string()),
+            };
+
+            let exists = ch.table_exists(&dst_db, &dst_table).await.unwrap_or(false);
+            if exists {
+                debug!(
+                    table = %format!("{}.{}", dst_db, dst_table),
+                    "DDL object already exists"
+                );
+                created_this_round += 1; // Count as progress
+                continue;
+            }
+
+            if table_manifest.ddl.is_empty() {
+                warn!(table = %table_key, "DDL object has no DDL in manifest");
+                continue;
+            }
+
+            let ddl = match remap {
+                Some(rc) if rc.is_active() && (src_db != dst_db || src_table != dst_table) => {
+                    let rewritten = rewrite_create_table_ddl(
+                        &table_manifest.ddl,
+                        src_db,
+                        src_table,
+                        &dst_db,
+                        &dst_table,
+                        &rc.default_replica_path,
+                    );
+                    ensure_if_not_exists_table(&rewritten)
+                }
+                _ => ensure_if_not_exists_table(&table_manifest.ddl),
+            };
+
+            let dst_key = format!("{}.{}", dst_db, dst_table);
+            match ch.execute_ddl(&ddl).await {
+                Ok(()) => {
+                    info!(
+                        table = %dst_key,
+                        engine = %table_manifest.engine,
+                        "Created DDL object"
+                    );
+                    created_this_round += 1;
+                }
+                Err(e) => {
+                    if round == 0 {
+                        debug!(
+                            table = %dst_key,
+                            error = %e,
+                            round = round,
+                            "DDL creation failed, will retry"
+                        );
+                    }
+                    failed.push((table_key.clone(), e.to_string()));
+                }
+            }
+        }
+
+        if failed.is_empty() {
+            break;
+        }
+
+        if created_this_round == 0 && round > 0 {
+            // No progress this round -- give up
+            let failed_keys: Vec<&str> = failed.iter().map(|(k, _)| k.as_str()).collect();
+            anyhow::bail!(
+                "Failed to create {} DDL-only objects after {} retry rounds: {:?}. Last errors: {}",
+                failed.len(),
+                round + 1,
+                failed_keys,
+                failed
+                    .iter()
+                    .map(|(k, e)| format!("{}: {}", k, e))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+
+        info!(
+            round = round,
+            created = created_this_round,
+            remaining = failed.len(),
+            "DDL creation retry round"
+        );
+
+        pending = failed.into_iter().map(|(k, _)| k).collect();
+    }
+
+    info!(count = ddl_keys.len(), "DDL-only objects created");
+    Ok(())
+}
+
 /// Ensure a CREATE DATABASE statement has IF NOT EXISTS.
 fn ensure_if_not_exists_database(ddl: &str) -> String {
     if ddl.contains("IF NOT EXISTS") {
@@ -258,5 +385,35 @@ mod tests {
         let ddl = "CREATE DICTIONARY default.my_dict (id UInt64, name String) PRIMARY KEY id";
         let result = ensure_if_not_exists_table(ddl);
         assert!(result.contains("CREATE DICTIONARY IF NOT EXISTS"));
+    }
+
+    /// Verify DDL preparation for all DDL-only object types used by create_ddl_objects.
+    #[test]
+    fn test_create_ddl_objects_ddl_preparation() {
+        // Views, dictionaries, materialized views are all handled by ensure_if_not_exists_table
+        let cases = vec![
+            (
+                "CREATE VIEW default.v AS SELECT 1",
+                "CREATE VIEW IF NOT EXISTS",
+            ),
+            (
+                "CREATE DICTIONARY default.d (id UInt64) PRIMARY KEY id",
+                "CREATE DICTIONARY IF NOT EXISTS",
+            ),
+            (
+                "CREATE MATERIALIZED VIEW default.mv TO default.t AS SELECT 1",
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS",
+            ),
+        ];
+
+        for (input, expected_prefix) in cases {
+            let result = ensure_if_not_exists_table(input);
+            assert!(
+                result.contains(expected_prefix),
+                "Expected '{}' in result for input: {}",
+                expected_prefix,
+                input
+            );
+        }
     }
 }
