@@ -13,7 +13,7 @@ Phase 1 implements Mode B only (non-destructive). Mode A (`--rm` DROP) is Phase 
 ```
 src/restore/
   mod.rs      -- Entry point: restore() orchestrates phased restore flow
-  topo.rs     -- Table classification, topological sort, engine priority (Phase 4b)
+  topo.rs     -- Table classification, topological sort, engine priority, streaming engine detection (Phase 4b+4c)
   remap.rs    -- Table/database remap: DDL rewriting, name mapping for --as and -m flags
   schema.rs   -- CREATE DATABASE, CREATE TABLE, create_ddl_objects, create_functions (remap-aware)
   attach.rs   -- Hardlink parts to detached/, chown, ATTACH PART
@@ -38,28 +38,43 @@ All functions are pure (no async, no I/O) for easy unit testing. DDL rewriting u
   4. Distributed engine database/table reference update (second and third positional args)
 - **`rewrite_create_database_ddl()`**: Rewrites database name in `CREATE DATABASE` DDL (backtick-quoted and unquoted)
 
-### Phased Restore Architecture (Phase 4b, mod.rs)
+### Phased Restore Architecture (Phase 4b+4c, mod.rs)
 The restore flow is structured into explicit phases per design doc 5.1/5.5/5.6:
 ```
-Phase 1: CREATE databases           (existing -- create_databases)
-Phase 2: CREATE + ATTACH data tables (sorted by engine priority via classify_restore_tables)
-Phase 3: CREATE DDL-only objects     (topologically sorted by dependencies via topological_sort + create_ddl_objects)
-Phase 4: CREATE functions            (from manifest.functions via create_functions)
+Phase 1:  CREATE databases           (create_databases)
+Phase 2:  CREATE + ATTACH data tables (sorted by engine priority via classify_restore_tables)
+Phase 2b: CREATE postponed tables     (streaming engines, refreshable MVs -- Phase 4c)
+Phase 3:  CREATE DDL-only objects     (topologically sorted by dependencies via topological_sort + create_ddl_objects)
+Phase 4:  CREATE functions            (from manifest.functions via create_functions)
 ```
-- `classify_restore_tables()` splits filtered table keys into `RestorePhases` (data_tables, ddl_only_tables, postponed_tables)
+- `classify_restore_tables()` splits filtered table keys into `RestorePhases` (data_tables, postponed_tables, ddl_only_tables)
 - Phase 2 passes `phases.data_tables` to `create_tables()` and the data attach loop (instead of all table_keys)
+- Phase 2b creates postponed tables (streaming engines + refreshable MVs) AFTER all data is attached but BEFORE DDL-only objects. This prevents streaming engines from consuming data prematurely during restore.
 - Phase 3 runs `topological_sort()` on `phases.ddl_only_tables`, then `create_ddl_objects()` on the sorted result
 - Phase 4 calls `create_functions()` for manifest.functions DDL
-- Schema-only mode (`--schema-only`) creates all schema (Phases 1-4) but skips data attach
-- Data-only mode (`--data-only`) skips Phases 1, 3, and 4
-- Resume state only queries `system.parts` for data tables (DDL-only objects have no parts)
+- Schema-only mode (`--schema-only`) creates all schema (Phases 1-4) but skips data attach. Phase 2b runs AFTER Phase 3 DDL-only objects (since DDL-only objects like regular MVs may be targets that streaming engines write to).
+- Data-only mode (`--data-only`) skips Phases 1, 2b, 3, and 4
+- Resume state only queries `system.parts` for data tables (DDL-only and postponed objects have no parts)
 
 ### Table Classification and Topological Sort (topo.rs)
-- **`RestorePhases`** struct: `data_tables: Vec<String>`, `ddl_only_tables: Vec<String>`, `postponed_tables: Vec<String>` (postponed is empty until Phase 4c)
-- **`classify_restore_tables(manifest, table_keys)`**: Splits tables by `metadata_only` flag. Data tables sorted by `data_table_priority()` (regular=0, `.inner` tables=1). Logs classification counts.
+- **`RestorePhases`** struct: `data_tables: Vec<String>`, `ddl_only_tables: Vec<String>`, `postponed_tables: Vec<String>`
+- **`classify_restore_tables(manifest, table_keys)`**: Splits tables using a priority decision tree: (1) streaming engine -> postponed, (2) refreshable MV -> postponed, (3) metadata_only -> ddl_only, (4) else -> data. Data tables sorted by `data_table_priority()` (regular=0, `.inner` tables=1). Logs classification counts including postponed.
+- **`is_streaming_engine(engine)`**: Returns true for Kafka, NATS, RabbitMQ, S3Queue. These engines consume data from external sources and must not be created until data tables are fully attached.
+- **`is_refreshable_mv(tm)`**: Returns true if `tm.engine == "MaterializedView"` AND DDL contains the `REFRESH` keyword (case-insensitive, preceded by whitespace or newline). Refreshable MVs run scheduled queries that should not execute against incomplete data.
 - **`data_table_priority(table_key)`**: Returns 0 for regular tables, 1 for `.inner`/`.inner_id` tables (MV storage targets created before MVs)
 - **`engine_restore_priority(engine)`**: Per design doc 5.1: Dictionary=0, View/MaterializedView/LiveView/WindowView=1, Distributed/Merge=2, other=3
 - **`topological_sort(tables, keys)`**: Kahn's algorithm with engine-priority tie-breaking. If no tables have dependencies (CH < 23.3 or old manifest), falls back to engine-priority-only sorting. Detects cycles by checking for remaining nodes with non-zero in-degree; appends cyclic nodes in engine-priority order with a warning log.
+
+### Streaming Engine Postponement (Phase 4c, topo.rs + mod.rs)
+Streaming engines (Kafka, NATS, RabbitMQ, S3Queue) and refreshable materialized views are postponed to Phase 2b to prevent premature data consumption during restore. The classification decision tree in `classify_restore_tables()` checks streaming engine and refreshable MV status BEFORE the `metadata_only` check, ensuring these tables are routed to `postponed_tables` regardless of their `metadata_only` flag.
+
+Key behaviors:
+- Streaming engines are identified by exact engine name match via `is_streaming_engine()` using `matches!()` macro
+- Refreshable MVs are identified by engine == "MaterializedView" AND case-insensitive detection of ` REFRESH ` or `\nREFRESH ` in the DDL string (whitespace/newline boundary prevents false positives from column names)
+- In full restore mode: Phase 2b runs after data attachment, before Phase 3 DDL-only objects
+- In schema-only mode: Phase 2b runs after Phase 3 DDL-only objects (since those may be targets streaming engines write to)
+- In data-only mode: Phase 2b is skipped (guarded by `!data_only` check; `create_tables()` also has internal `data_only` guard)
+- Phase 2b reuses the existing `create_tables()` function -- no special DDL handling needed
 
 ### Schema Creation (schema.rs)
 - `create_databases()`: Executes DDL from `manifest.databases[]` with `IF NOT EXISTS` safety. When remap is active, creates target databases with rewritten DDL; tracks created databases to avoid duplicates.
@@ -115,7 +130,9 @@ Queries `system.tables` for `data_paths` column to find the table's data directo
 - `create_tables(ch, manifest, filter, data_only, remap: Option<&RemapConfig>) -> Result<()>` -- DDL for tables (remap-aware)
 - `create_ddl_objects(ch, manifest, ddl_keys, remap: Option<&RemapConfig>) -> Result<()>` -- Phase 3: DDL-only objects with retry loop (remap-aware)
 - `create_functions(ch, manifest) -> Result<()>` -- Phase 4: functions from manifest.functions DDL
-- `classify_restore_tables(manifest, table_keys) -> RestorePhases` -- Split tables into data/DDL-only/postponed phases
+- `classify_restore_tables(manifest, table_keys) -> RestorePhases` -- Split tables into data/postponed/DDL-only phases using streaming engine and refreshable MV detection
+- `is_streaming_engine(engine) -> bool` -- Returns true for Kafka, NATS, RabbitMQ, S3Queue (Phase 4c)
+- `is_refreshable_mv(tm: &TableManifest) -> bool` -- Returns true for MaterializedView with REFRESH clause in DDL (Phase 4c)
 - `topological_sort(tables, keys) -> Result<Vec<String>>` -- Kahn's algorithm with engine-priority fallback and cycle detection
 - `data_table_priority(table_key) -> u8` -- Priority for Phase 2 ordering (0=regular, 1=.inner)
 - `engine_restore_priority(engine) -> u8` -- Priority for Phase 3 tie-breaking (0=Dictionary, 1=View/MV, 2=Distributed/Merge, 3=other)
