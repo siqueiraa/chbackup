@@ -268,6 +268,8 @@ async fn main() -> Result<()> {
                 schema,
                 data_only,
                 effective_resume,
+                None,
+                None,
             )
             .await?;
 
@@ -338,7 +340,8 @@ async fn main() -> Result<()> {
         }
 
         Command::RestoreRemote { backup_name, .. } => {
-            info!(backup_name = ?backup_name, "restore_remote: not implemented in Phase 1");
+            let _ = backup_name;
+            info!("restore_remote: not implemented in Phase 1");
         }
 
         Command::List { location } => {

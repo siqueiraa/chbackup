@@ -3,6 +3,9 @@
 //! Implements Mode B (non-destructive) restore:
 //! - Creates databases if they don't exist
 //! - Creates tables if they don't exist (skips existing tables)
+//! - When remap is active, rewrites DDL for target database/table names
+
+use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -10,18 +13,59 @@ use tracing::{debug, info, warn};
 use crate::clickhouse::client::ChClient;
 use crate::manifest::{BackupManifest, DatabaseInfo};
 
+use super::remap::{rewrite_create_database_ddl, rewrite_create_table_ddl, RemapConfig};
+
 /// Create databases from the manifest.
 ///
 /// For each database in the manifest, checks if it already exists and
 /// creates it if not. The DDL is wrapped with IF NOT EXISTS for safety.
-pub async fn create_databases(ch: &ChClient, manifest: &BackupManifest) -> Result<()> {
+///
+/// When `remap` is active, databases are created with remapped names and
+/// rewritten DDL. Target databases that don't exist in the manifest (produced
+/// by database mapping) are also created.
+pub async fn create_databases(
+    ch: &ChClient,
+    manifest: &BackupManifest,
+    remap: Option<&RemapConfig>,
+) -> Result<()> {
     if manifest.databases.is_empty() {
         debug!("No databases to create");
         return Ok(());
     }
 
+    // Track which databases we've already created (to avoid duplicates with remap)
+    let mut created: HashSet<String> = HashSet::new();
+
     for db_info in &manifest.databases {
-        create_database(ch, db_info).await?;
+        match remap {
+            Some(rc) if rc.is_active() => {
+                // Check if this database is remapped
+                let (dst_db, _) = rc.remap_table_key(&format!("{}.dummy", db_info.name));
+                if dst_db != db_info.name {
+                    // Create the target database with rewritten DDL
+                    if !created.contains(&dst_db) {
+                        let rewritten_ddl =
+                            rewrite_create_database_ddl(&db_info.ddl, &db_info.name, &dst_db);
+                        let remapped_info = DatabaseInfo {
+                            name: dst_db.clone(),
+                            ddl: rewritten_ddl,
+                        };
+                        create_database(ch, &remapped_info).await?;
+                        created.insert(dst_db);
+                    }
+                } else {
+                    // No mapping for this database -- create as-is
+                    if !created.contains(&db_info.name) {
+                        create_database(ch, db_info).await?;
+                        created.insert(db_info.name.clone());
+                    }
+                }
+            }
+            _ => {
+                // No remap -- create as-is
+                create_database(ch, db_info).await?;
+            }
+        }
     }
 
     info!(
@@ -64,12 +108,14 @@ async fn create_database(ch: &ChClient, db_info: &DatabaseInfo) -> Result<()> {
 /// already exists and creates it if not. Metadata-only tables (views,
 /// dictionaries) are also created since they may have DDL.
 ///
-/// Returns the list of table keys that were processed.
+/// When `remap` is active, table DDL is rewritten to target the new
+/// database/table names, with UUID removal and ZK path/Distributed engine updates.
 pub async fn create_tables(
     ch: &ChClient,
     manifest: &BackupManifest,
     table_keys: &[String],
     data_only: bool,
+    remap: Option<&RemapConfig>,
 ) -> Result<()> {
     if data_only {
         debug!("Data-only mode, skipping table creation");
@@ -82,16 +128,30 @@ pub async fn create_tables(
             None => continue,
         };
 
-        let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
+        let (src_db, src_table) = table_key.split_once('.').unwrap_or(("default", table_key));
 
-        // Check if table already exists
+        // Determine destination db/table (may be remapped)
+        let (dst_db, dst_table) = match remap {
+            Some(rc) if rc.is_active() => rc.remap_table_key(table_key),
+            _ => (src_db.to_string(), src_table.to_string()),
+        };
+
+        // Check if target table already exists
         let exists = ch
-            .table_exists(db, table)
+            .table_exists(&dst_db, &dst_table)
             .await
-            .with_context(|| format!("Failed to check if table {}.{} exists", db, table))?;
+            .with_context(|| {
+                format!(
+                    "Failed to check if table {}.{} exists",
+                    dst_db, dst_table
+                )
+            })?;
 
         if exists {
-            debug!(table = %table_key, "Table already exists, skipping CREATE");
+            debug!(
+                table = %format!("{}.{}", dst_db, dst_table),
+                "Table already exists, skipping CREATE"
+            );
             continue;
         }
 
@@ -103,13 +163,27 @@ pub async fn create_tables(
             continue;
         }
 
-        // Ensure the DDL has IF NOT EXISTS for safety
-        let ddl = ensure_if_not_exists_table(&table_manifest.ddl);
+        // Build DDL: rewrite if remap is active, otherwise just ensure IF NOT EXISTS
+        let ddl = match remap {
+            Some(rc) if rc.is_active() && (src_db != dst_db || src_table != dst_table) => {
+                let rewritten = rewrite_create_table_ddl(
+                    &table_manifest.ddl,
+                    src_db,
+                    src_table,
+                    &dst_db,
+                    &dst_table,
+                    &rc.default_replica_path,
+                );
+                ensure_if_not_exists_table(&rewritten)
+            }
+            _ => ensure_if_not_exists_table(&table_manifest.ddl),
+        };
 
-        info!(table = %table_key, "Creating table");
+        let dst_key = format!("{}.{}", dst_db, dst_table);
+        info!(table = %dst_key, "Creating table");
         ch.execute_ddl(&ddl)
             .await
-            .with_context(|| format!("Failed to create table {} with DDL: {}", table_key, ddl))?;
+            .with_context(|| format!("Failed to create table {} with DDL: {}", dst_key, ddl))?;
     }
 
     info!(count = table_keys.len(), "Table creation phase complete");

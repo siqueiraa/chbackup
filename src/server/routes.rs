@@ -544,9 +544,6 @@ pub async fn restore_backup(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        if req.database_mapping.is_some() {
-            warn!("database_mapping is not yet implemented (Phase 4a), ignoring");
-        }
         if req.rm.unwrap_or(false) {
             warn!("rm flag is not yet implemented (Phase 4d), ignoring");
         }
@@ -563,6 +560,8 @@ pub async fn restore_backup(
             req.schema.unwrap_or(false),
             req.data_only.unwrap_or(false),
             effective_resume,
+            None,
+            None,
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -780,6 +779,8 @@ pub async fn restore_remote(
             req.schema.unwrap_or(false),
             req.data_only.unwrap_or(false),
             effective_resume,
+            None,
+            None,
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();

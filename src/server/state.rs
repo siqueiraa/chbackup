@@ -391,6 +391,8 @@ pub async fn auto_resume(state: &AppState) {
                         false, // schema_only
                         false, // data_only
                         true,  // resume = true
+                        None,  // rename_as (auto-resume restores to original names)
+                        None,  // database_mapping (auto-resume restores to original names)
                     )
                     .await;
 

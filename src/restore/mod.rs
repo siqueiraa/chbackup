@@ -38,6 +38,7 @@ use crate::table_filter::TableFilter;
 use attach::{
     attach_parts_owned, detect_clickhouse_ownership, get_table_data_path, OwnedAttachParams,
 };
+use remap::RemapConfig;
 use schema::{create_databases, create_tables};
 
 /// Restore a backup to ClickHouse.
@@ -55,6 +56,9 @@ use schema::{create_databases, create_tables};
 /// * `schema_only` - If true, only restore schema (no data)
 /// * `data_only` - If true, only restore data (no schema creation)
 /// * `resume` - If true, load resume state and skip already-attached parts
+/// * `rename_as` - Optional `--as` value for single table rename (e.g. "dst_db.dst_table")
+/// * `database_mapping` - Optional database mapping from `-m` flag (pre-parsed HashMap)
+#[allow(clippy::too_many_arguments)]
 pub async fn restore(
     config: &Config,
     ch: &ChClient,
@@ -63,6 +67,8 @@ pub async fn restore(
     schema_only: bool,
     data_only: bool,
     resume: bool,
+    rename_as: Option<&str>,
+    database_mapping: Option<&HashMap<String, String>>,
 ) -> Result<()> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = PathBuf::from(data_path).join("backup").join(backup_name);
@@ -119,13 +125,28 @@ pub async fn restore(
         "Tables matched filter"
     );
 
+    // 2b. Build remap configuration from CLI flags
+    let db_mapping_str = database_mapping.map(|m| {
+        m.iter()
+            .map(|(k, v)| format!("{}:{}", k, v))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let remap_config = RemapConfig::new(
+        rename_as,
+        table_pattern,
+        db_mapping_str.as_deref(),
+        &config.clickhouse.default_replica_path,
+    )?;
+    let remap_ref = remap_config.as_ref();
+
     // 3. CREATE databases (Phase 1: create databases from manifest)
     if !data_only {
-        create_databases(ch, &manifest).await?;
+        create_databases(ch, &manifest, remap_ref).await?;
     }
 
     // 4. CREATE tables
-    create_tables(ch, &manifest, &table_keys, data_only).await?;
+    create_tables(ch, &manifest, &table_keys, data_only, remap_ref).await?;
 
     // 5. Attach data parts (skip if schema_only)
     if schema_only {
@@ -160,9 +181,18 @@ pub async fn restore(
         }
 
         // Query system.parts for authoritative view of already-attached parts
+        // When remap is active, query using the *destination* db/table names
         for table_key in &table_keys {
-            let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
-            match ch.query_system_parts(db, table).await {
+            let (orig_db, orig_table) =
+                table_key.split_once('.').unwrap_or(("default", table_key));
+            let (query_db, query_table) = match remap_ref {
+                Some(rc) if rc.is_active() => {
+                    let (d, t) = rc.remap_table_key(table_key);
+                    (d, t)
+                }
+                _ => (orig_db.to_string(), orig_table.to_string()),
+            };
+            match ch.query_system_parts(&query_db, &query_table).await {
                 Ok(parts) => {
                     if !parts.is_empty() {
                         let part_names: HashSet<String> =
@@ -278,7 +308,13 @@ pub async fn restore(
             continue;
         }
 
-        let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
+        let (src_db, src_table) = table_key.split_once('.').unwrap_or(("default", table_key));
+
+        // Determine destination db/table (may be remapped)
+        let (dst_db, dst_table) = match remap_ref {
+            Some(rc) if rc.is_active() => rc.remap_table_key(table_key),
+            _ => (src_db.to_string(), src_table.to_string()),
+        };
 
         // Collect all parts from all disks into a flat list
         let all_parts: Vec<_> = table_manifest
@@ -292,29 +328,30 @@ pub async fn restore(
             continue;
         }
 
-        // Find the table's data path from live table info
-        let table_data_path = find_table_data_path(&live_tables, db, table, data_path);
+        // Find the table's data path from live table info (use destination db/table)
+        let table_data_path = find_table_data_path(&live_tables, &dst_db, &dst_table, data_path);
 
-        // Find the table's UUID from live tables (needed for S3 restore path derivation)
-        let table_uuid =
-            find_table_uuid(&live_tables, db, table).or_else(|| table_manifest.uuid.clone());
+        // Find the table's UUID from live tables (use destination db/table)
+        let table_uuid = find_table_uuid(&live_tables, &dst_db, &dst_table)
+            .or_else(|| table_manifest.uuid.clone());
 
         info!(
-            table = %table_key,
+            table = %format!("{}.{}", dst_db, dst_table),
+            source = %table_key,
             parts = all_parts.len(),
             data_path = %table_data_path.display(),
             "Restoring table data"
         );
 
-        // Get already-attached parts for this table (from resume state)
+        // Get already-attached parts for this table (keyed by *original* table key)
         let table_already_attached = already_attached.get(table_key).cloned().unwrap_or_default();
 
         restore_items.push((
             table_key.clone(),
             OwnedAttachParams {
                 ch: ch.clone(),
-                db: db.to_string(),
-                table: table.to_string(),
+                db: dst_db,
+                table: dst_table,
                 parts: all_parts,
                 backup_dir: backup_dir.clone(),
                 table_data_path,
