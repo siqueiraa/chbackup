@@ -160,6 +160,9 @@ async fn main() -> Result<()> {
                 diff_from.as_deref(),
                 partitions.as_deref(),
                 skip_check_parts_columns,
+                false, // rbac (Phase 4e -- wired in Task 5)
+                false, // configs (Phase 4e -- wired in Task 5)
+                false, // named_collections (Phase 4e -- wired in Task 5)
             )
             .await?;
 
@@ -314,6 +317,9 @@ async fn main() -> Result<()> {
                 None,  // diff_from (create_remote uses diff_from_remote on upload side)
                 None,  // partitions (create_remote doesn't support --partitions)
                 skip_check_parts_columns,
+                false, // rbac (Phase 4e -- wired in Task 5)
+                false, // configs (Phase 4e -- wired in Task 5)
+                false, // named_collections (Phase 4e -- wired in Task 5)
             )
             .await?;
 

@@ -324,6 +324,9 @@ pub async fn create_backup(
             req.diff_from.as_deref(),
             req.partitions.as_deref(),
             req.skip_check_parts_columns.unwrap_or(false),
+            false, // rbac (Phase 4e -- wired in Task 5)
+            false, // configs (Phase 4e -- wired in Task 5)
+            false, // named_collections (Phase 4e -- wired in Task 5)
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -658,6 +661,9 @@ pub async fn create_remote(
             None,  // diff_from (create_remote uses diff_from_remote on upload side)
             None,  // partitions (create_remote doesn't support --partitions)
             req.skip_check_parts_columns.unwrap_or(false),
+            false, // rbac (Phase 4e -- wired in Task 5)
+            false, // configs (Phase 4e -- wired in Task 5)
+            false, // named_collections (Phase 4e -- wired in Task 5)
         )
         .await;
 

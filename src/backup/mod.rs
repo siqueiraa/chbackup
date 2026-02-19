@@ -15,6 +15,7 @@ pub mod collect;
 pub mod diff;
 pub mod freeze;
 pub mod mutations;
+pub mod rbac;
 pub mod sync_replica;
 
 use std::collections::HashMap;
@@ -70,6 +71,9 @@ pub async fn create(
     diff_from: Option<&str>,
     partitions: Option<&str>,
     skip_check_parts_columns: bool,
+    rbac: bool,
+    configs: bool,
+    named_collections: bool,
 ) -> Result<BackupManifest> {
     info!(
         backup_name = %backup_name,
@@ -534,6 +538,12 @@ pub async fn create(
         named_collections: Vec::new(),
         rbac: None,
     };
+
+    // 13a. Backup RBAC, configs, named collections (populates manifest fields)
+    rbac::backup_rbac_and_configs(
+        config, ch, &backup_dir, &mut manifest,
+        rbac, configs, named_collections,
+    ).await?;
 
     // 13b. Apply incremental diff if --diff-from is specified
     if let Some(base_name) = diff_from {
