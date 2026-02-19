@@ -169,12 +169,25 @@ pub async fn start_server(
         };
 
         let watch_status_clone = watch_status.clone();
+        let watch_is_main = config.api.watch_is_main_process;
         tokio::spawn(async move {
             let exit = watch::run_watch_loop(ctx).await;
             // Mark watch as inactive on exit
             let mut ws = watch_status_clone.lock().await;
             ws.active = false;
             ws.state = "inactive".to_string();
+            drop(ws);
+
+            let should_shutdown = watch_is_main
+                && !matches!(exit, watch::WatchLoopExit::Shutdown | watch::WatchLoopExit::Stopped);
+
+            info!(
+                watch_is_main_process = watch_is_main,
+                shutting_down = should_shutdown,
+                "Watch loop exited, watch_is_main_process={}, shutting down={}",
+                watch_is_main,
+                should_shutdown
+            );
 
             match exit {
                 watch::WatchLoopExit::Shutdown => {
@@ -186,6 +199,11 @@ pub async fn start_server(
                 watch::WatchLoopExit::Stopped => {
                     info!("Watch loop stopped via API");
                 }
+            }
+
+            if should_shutdown {
+                info!("watch_is_main_process is true, terminating server process");
+                std::process::exit(0);
             }
         });
 
@@ -351,11 +369,24 @@ pub async fn spawn_watch_from_state(
     };
 
     let watch_status_clone = watch_status;
+    let watch_is_main = config.api.watch_is_main_process;
     tokio::spawn(async move {
         let exit = watch::run_watch_loop(ctx).await;
         let mut ws = watch_status_clone.lock().await;
         ws.active = false;
         ws.state = "inactive".to_string();
+        drop(ws);
+
+        let should_shutdown = watch_is_main
+            && !matches!(exit, watch::WatchLoopExit::Shutdown | watch::WatchLoopExit::Stopped);
+
+        info!(
+            watch_is_main_process = watch_is_main,
+            shutting_down = should_shutdown,
+            "Watch loop exited, watch_is_main_process={}, shutting down={}",
+            watch_is_main,
+            should_shutdown
+        );
 
         match exit {
             watch::WatchLoopExit::Shutdown => {
@@ -367,6 +398,11 @@ pub async fn spawn_watch_from_state(
             watch::WatchLoopExit::Stopped => {
                 info!("Watch loop stopped via API");
             }
+        }
+
+        if should_shutdown {
+            info!("watch_is_main_process is true, terminating server process");
+            std::process::exit(0);
         }
     });
 }
