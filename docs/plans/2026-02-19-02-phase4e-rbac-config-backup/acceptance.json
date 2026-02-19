@@ -1,0 +1,294 @@
+{
+  "plan": "2026-02-19-02-phase4e-rbac-config-backup",
+  "status": {"pass": 0, "fail": 7, "total": 7},
+  "last_updated": "2026-02-19T00:00:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "feature",
+      "description": "ChClient has query methods for RBAC entities and named collections",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub async fn query_rbac_objects' src/clickhouse/client.rs && grep -c 'pub async fn query_named_collections' src/clickhouse/client.rs",
+            "expected": "1\n1",
+            "fail_message": "query_rbac_objects or query_named_collections method not found in ChClient"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after adding ChClient methods"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib query_rbac -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "ChClient RBAC query tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "ChClient methods require live ClickHouse connection for real testing; unit tests verify SQL generation and error handling only",
+            "alternative_verification": {
+              "command": "cargo test --lib query_rbac -- --nocapture 2>&1 | grep -c 'test result: ok'",
+              "expected": "1"
+            },
+            "covered_by": ["F002"]
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": null
+    },
+    {
+      "id": "F002",
+      "category": "feature",
+      "description": "Backup creates access/ and configs/ directories with RBAC objects, config files, and named collections in manifest",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub async fn backup_rbac_and_configs' src/backup/rbac.rs && grep -c 'pub mod rbac' src/backup/mod.rs && grep -c 'rbac: bool' src/backup/mod.rs",
+            "expected": "1\n1\n1",
+            "fail_message": "backup_rbac_and_configs function or module wiring not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors in backup RBAC module"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib backup_rbac -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "Backup RBAC unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Backup requires live ClickHouse for RBAC system table queries; integration test coverage deferred to CI with real ClickHouse",
+            "alternative_verification": {
+              "command": "cargo test --lib backup_rbac -- --nocapture 2>&1 | grep -c 'test result: ok'",
+              "expected": "1"
+            },
+            "covered_by": ["F006"]
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": null
+    },
+    {
+      "id": "F003",
+      "category": "feature",
+      "description": "Upload and download pipelines handle access/ and configs/ directories",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'upload_simple_directory' src/upload/mod.rs && grep -c 'download_simple_directory' src/download/mod.rs",
+            "expected": "1\n1",
+            "fail_message": "upload_simple_directory or download_simple_directory function not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors in upload/download module"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib upload_access -- --nocapture 2>&1 | grep -c 'test result: ok' ; cargo test --lib download_access -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1\n1",
+            "fail_message": "Upload/download access directory tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Upload/download require real S3 connection; integration test coverage deferred to CI",
+            "alternative_verification": {
+              "command": "cargo test --lib upload_access -- --nocapture 2>&1 | grep -c 'test result: ok'",
+              "expected": "1"
+            },
+            "covered_by": ["F006"]
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": null
+    },
+    {
+      "id": "F004",
+      "category": "feature",
+      "description": "Restore named collections with ON CLUSTER support and conflict resolution",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub async fn restore_named_collections' src/restore/rbac.rs",
+            "expected": "1",
+            "fail_message": "restore_named_collections function not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors in restore RBAC module"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib restore_named_collections -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "restore_named_collections tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Named collections restore requires live ClickHouse; unit tests verify DDL generation and conflict resolution logic",
+            "alternative_verification": {
+              "command": "cargo test --lib restore_named_collections -- --nocapture 2>&1 | grep -c 'test result: ok'",
+              "expected": "1"
+            },
+            "covered_by": ["F006"]
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": null
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "Restore RBAC files, config files, and execute restart_command with exec:/sql: prefixes",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub async fn restore_rbac' src/restore/rbac.rs && grep -c 'pub async fn restore_configs' src/restore/rbac.rs && grep -c 'pub async fn execute_restart_commands' src/restore/rbac.rs",
+            "expected": "1\n1\n1",
+            "fail_message": "restore_rbac, restore_configs, or execute_restart_commands not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors in restore RBAC module"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib execute_restart_commands -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "execute_restart_commands tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "RBAC/config restore requires filesystem access to ClickHouse data directory and running ClickHouse for restart; unit tests verify file operations and command parsing",
+            "alternative_verification": {
+              "command": "cargo test --lib execute_restart_commands -- --nocapture 2>&1 | grep -c 'test result: ok'",
+              "expected": "1"
+            },
+            "covered_by": ["F006"]
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": null
+    },
+    {
+      "id": "F006",
+      "category": "feature",
+      "description": "All 12 RBAC/configs/named-collections warn stubs removed from main.rs, flags wired through to backup::create and restore::restore at all call sites",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'rbac flag is not yet implemented\\|configs flag is not yet implemented\\|named-collections flag is not yet implemented' src/main.rs || echo 0",
+            "expected": "0",
+            "fail_message": "Still have RBAC/configs/named-collections 'not yet implemented' warnings in main.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after wiring flags"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib test_create_request -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "Server request type tests failed"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release 2>&1 | tail -1",
+            "wait_seconds": 5,
+            "patterns": ["RBAC backup:", "Config backup:", "Named collections backup:", "Uploaded access/ directory", "Uploaded configs/ directory", "Downloaded access/ directory", "Downloaded configs/ directory", "Named collection creation phase complete", "RBAC restore complete", "Config restore complete", "Executing restart command"],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "Runtime integration requires real ClickHouse + S3 (CI test)"
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": null
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for all modified modules",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "for m in src/backup src/restore src/clickhouse src/upload src/download src/server; do test -f \"$m/CLAUDE.md\" || echo \"MISSING: $m/CLAUDE.md\"; done && echo PASS",
+            "expected": "PASS",
+            "fail_message": "One or more CLAUDE.md files missing"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "for m in src/backup src/restore src/clickhouse src/upload src/download src/server; do grep -q 'Parent Context' \"$m/CLAUDE.md\" && grep -q 'Directory Structure' \"$m/CLAUDE.md\" && grep -q 'Key Patterns' \"$m/CLAUDE.md\" && grep -q 'Parent Rules' \"$m/CLAUDE.md\" || echo \"FAIL: $m missing required sections\"; done && echo VALID",
+            "expected": "VALID",
+            "fail_message": "CLAUDE.md missing required sections"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Documentation file - no runtime behavior",
+            "alternative_verification": {
+              "command": "grep -q 'rbac' src/backup/CLAUDE.md && grep -q 'rbac' src/restore/CLAUDE.md && echo PASS || echo FAIL",
+              "expected": "PASS"
+            },
+            "covered_by": ["F006"]
+          }
+        ]
+      },
+      "related_tasks": [6],
+      "verified_at": null
+    }
+  ]
+}
