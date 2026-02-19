@@ -54,6 +54,7 @@ use schema::{
     create_databases, create_ddl_objects, create_functions, create_tables,
     detect_replicated_databases, drop_databases, drop_tables, is_replicated_engine,
 };
+use sort::PartSortKey;
 use topo::{classify_restore_tables, topological_sort};
 
 /// Restore a backup to ClickHouse.
@@ -90,6 +91,8 @@ pub async fn restore(
     rbac_restore: bool,
     configs_restore: bool,
     named_collections_restore: bool,
+    partitions: Option<&str>,
+    skip_empty_tables: bool,
 ) -> Result<()> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = PathBuf::from(data_path).join("backup").join(backup_name);
@@ -146,6 +149,19 @@ pub async fn restore(
         total_tables = manifest.tables.len(),
         "Tables matched filter"
     );
+
+    // 2a. Parse partition filter list (for --partitions on restore)
+    let partition_filter: Vec<String> = match partitions {
+        Some(s) if !s.is_empty() => {
+            let parts: Vec<String> = s.split(',').map(|p| p.trim().to_string()).collect();
+            info!(
+                partitions = ?parts,
+                "Filtering restore by partition IDs"
+            );
+            parts
+        }
+        _ => Vec::new(),
+    };
 
     // 2b. Build remap configuration from CLI flags
     let db_mapping_str = database_mapping.map(|m| {
@@ -462,14 +478,39 @@ pub async fn restore(
         };
 
         // Collect all parts from all disks into a flat list
-        let all_parts: Vec<_> = table_manifest
+        let mut all_parts: Vec<_> = table_manifest
             .parts
             .values()
             .flat_map(|parts| parts.iter().cloned())
             .collect();
 
+        // Filter parts by partition if --partitions is specified
+        if !partition_filter.is_empty() {
+            let before_count = all_parts.len();
+            all_parts.retain(|part| {
+                if let Some(key) = PartSortKey::from_part_name(&part.name) {
+                    partition_filter.contains(&key.partition)
+                } else {
+                    // Can't parse partition from name -- keep the part
+                    true
+                }
+            });
+            if all_parts.len() < before_count {
+                info!(
+                    table = %table_key,
+                    before = before_count,
+                    after = all_parts.len(),
+                    "Filtered parts by partition"
+                );
+            }
+        }
+
         if all_parts.is_empty() {
-            debug!(table = %table_key, "No data parts, skipping");
+            if skip_empty_tables {
+                info!(table = %table_key, "Skipping table with zero parts (--skip-empty-tables)");
+            } else {
+                debug!(table = %table_key, "No data parts, skipping");
+            }
             continue;
         }
 
@@ -515,6 +556,35 @@ pub async fn restore(
                 jitter_factor,
             },
         ));
+    }
+
+    // 5a-2. check_replicas_before_attach: warn about out-of-sync replicas
+    if config.clickhouse.check_replicas_before_attach {
+        for (table_key, params) in &restore_items {
+            if is_replicated_engine(&params.engine) {
+                match ch.check_replica_sync(&params.db, &params.table).await {
+                    Ok(true) => {
+                        debug!(table = %table_key, "Replica is in sync");
+                    }
+                    Ok(false) => {
+                        warn!(
+                            table = %table_key,
+                            db = %params.db,
+                            table_name = %params.table,
+                            "Replica is NOT in sync -- replication queue is non-empty. \
+                             Proceeding with restore anyway (non-fatal)."
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            table = %table_key,
+                            error = %e,
+                            "Failed to check replica sync status, proceeding with restore"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // 5b. ATTACH TABLE mode: for Replicated tables when restore_as_attach is enabled

@@ -41,11 +41,39 @@ use self::freeze::{FreezeGuard, FreezeInfo};
 /// Parse a comma-separated partition list into a vector of partition IDs.
 ///
 /// Trims whitespace from each partition ID. Returns an empty vec if input is None or empty.
+/// Special case: if any partition ID is "all", returns an empty vec to trigger
+/// whole-table FREEZE (unpartitioned tables use partition_id="all" in system.parts).
 fn parse_partition_list(partitions: Option<&str>) -> Vec<String> {
     match partitions {
-        Some(s) if !s.is_empty() => s.split(',').map(|p| p.trim().to_string()).collect(),
+        Some(s) if !s.is_empty() => {
+            let parts: Vec<String> = s.split(',').map(|p| p.trim().to_string()).collect();
+            // "all" means whole-table freeze (for unpartitioned MergeTree tables)
+            if parts.iter().any(|p| p == "all") {
+                info!(
+                    "Partition 'all' specified -- using whole-table FREEZE for unpartitioned tables"
+                );
+                Vec::new()
+            } else {
+                parts
+            }
+        }
         _ => Vec::new(),
     }
+}
+
+/// Check if a FREEZE error is ignorable (table/partition not found).
+///
+/// Returns true for:
+/// - Code 60: UNKNOWN_TABLE
+/// - Code 81: UNKNOWN_DATABASE
+/// - Code 218: CANNOT_FREEZE_PARTITION (partition doesn't exist or has no data)
+fn is_ignorable_freeze_error(err_msg: &str) -> bool {
+    err_msg.contains("UNKNOWN_TABLE")
+        || err_msg.contains("UNKNOWN_DATABASE")
+        || err_msg.contains("Code: 60")
+        || err_msg.contains("Code: 81")
+        || err_msg.contains("CANNOT_FREEZE_PARTITION")
+        || err_msg.contains("Code: 218")
 }
 
 /// Create a local backup.
@@ -346,6 +374,8 @@ pub async fn create(
         let skip_projections_clone = skip_projections.to_vec();
         let partition_ids_clone = partition_ids.clone();
         let deps_clone = deps_arc.clone();
+        let freeze_by_part = config.clickhouse.freeze_by_part;
+        let freeze_by_part_where = config.clickhouse.freeze_by_part_where.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -356,8 +386,43 @@ pub async fn create(
             let full_name = format!("{}.{}", db, table);
             let fname = freeze_name(&backup_name_owned, &db, &table);
 
+            // Determine effective partition list:
+            // 1. CLI --partitions takes precedence (already parsed)
+            // 2. If freeze_by_part is true and no CLI partitions, query system.parts
+            // 3. Otherwise, whole-table freeze (empty partition list)
+            let effective_partitions = if !partition_ids_clone.is_empty() {
+                partition_ids_clone
+            } else if freeze_by_part {
+                // Query system.parts for distinct partition IDs
+                match ch
+                    .query_distinct_partitions(&db, &table, &freeze_by_part_where)
+                    .await
+                {
+                    Ok(discovered) => {
+                        info!(
+                            db = %db,
+                            table = %table,
+                            partition_count = discovered.len(),
+                            "freeze_by_part: discovered partitions from system.parts"
+                        );
+                        discovered
+                    }
+                    Err(e) => {
+                        warn!(
+                            db = %db,
+                            table = %table,
+                            error = %e,
+                            "freeze_by_part: failed to query partitions, falling back to whole-table FREEZE"
+                        );
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
             // FREEZE the table (whole-table or per-partition)
-            let frozen = if partition_ids_clone.is_empty() {
+            let frozen = if effective_partitions.is_empty() {
                 // Whole-table FREEZE
                 info!(
                     db = %db,
@@ -371,12 +436,7 @@ pub async fn create(
                     Ok(()) => true,
                     Err(e) => {
                         let err_msg = format!("{e:#}");
-                        if ignore_not_exists
-                            && (err_msg.contains("UNKNOWN_TABLE")
-                                || err_msg.contains("UNKNOWN_DATABASE")
-                                || err_msg.contains("Code: 60")
-                                || err_msg.contains("Code: 81"))
-                        {
+                        if ignore_not_exists && is_ignorable_freeze_error(&err_msg) {
                             warn!(
                                 db = %db,
                                 table = %table,
@@ -392,7 +452,7 @@ pub async fn create(
             } else {
                 // Per-partition FREEZE
                 let mut any_frozen = false;
-                for partition_id in &partition_ids_clone {
+                for partition_id in &effective_partitions {
                     info!(
                         db = %db,
                         table = %table,
@@ -409,12 +469,7 @@ pub async fn create(
                         }
                         Err(e) => {
                             let err_msg = format!("{e:#}");
-                            if ignore_not_exists
-                                && (err_msg.contains("UNKNOWN_TABLE")
-                                    || err_msg.contains("UNKNOWN_DATABASE")
-                                    || err_msg.contains("Code: 60")
-                                    || err_msg.contains("Code: 81"))
-                            {
+                            if ignore_not_exists && is_ignorable_freeze_error(&err_msg) {
                                 warn!(
                                     db = %db,
                                     table = %table,
@@ -533,8 +588,24 @@ pub async fn create(
     // Clear the guard so Drop doesn't warn
     let _ = std::mem::take(&mut freeze_guard);
 
-    // Propagate the first error if any task failed
+    // Propagate the first error if any task failed -- clean up backup dir first
     if let Some(e) = first_error {
+        // Remove the partially-created backup directory (shadow cleanup is
+        // the caller's responsibility via `clean` command).
+        if backup_dir.exists() {
+            if let Err(rm_err) = std::fs::remove_dir_all(&backup_dir) {
+                warn!(
+                    path = %backup_dir.display(),
+                    error = %rm_err,
+                    "Failed to clean up backup directory after error"
+                );
+            } else {
+                info!(
+                    path = %backup_dir.display(),
+                    "Removed partial backup directory after error"
+                );
+            }
+        }
         return Err(e);
     }
 
@@ -801,6 +872,42 @@ mod tests {
             sql2,
             "ALTER TABLE `default`.`trades` FREEZE PARTITION '202402' WITH NAME 'chbackup_daily_default_trades'"
         );
+    }
+
+    #[test]
+    fn test_partition_list_all_triggers_whole_table_freeze() {
+        // "all" partition ID should result in empty vec (whole-table freeze)
+        let result = parse_partition_list(Some("all"));
+        assert!(result.is_empty(), "partition 'all' should result in empty vec for whole-table freeze");
+
+        // "all" mixed with other partitions should still trigger whole-table
+        let mixed = parse_partition_list(Some("202401,all,202403"));
+        assert!(mixed.is_empty(), "partition 'all' in a list should result in empty vec");
+
+        // Normal partitions should not be affected
+        let normal = parse_partition_list(Some("202401,202402"));
+        assert_eq!(normal.len(), 2);
+    }
+
+    #[test]
+    fn test_is_ignorable_freeze_error() {
+        // Code 60: UNKNOWN_TABLE
+        assert!(is_ignorable_freeze_error("Code: 60. DB::Exception: Table default.trades does not exist. (UNKNOWN_TABLE)"));
+        assert!(is_ignorable_freeze_error("Code: 60"));
+
+        // Code 81: UNKNOWN_DATABASE
+        assert!(is_ignorable_freeze_error("Code: 81. DB::Exception: Database mydb does not exist. (UNKNOWN_DATABASE)"));
+        assert!(is_ignorable_freeze_error("UNKNOWN_DATABASE"));
+
+        // Code 218: CANNOT_FREEZE_PARTITION
+        assert!(is_ignorable_freeze_error("Code: 218. DB::Exception: CANNOT_FREEZE_PARTITION"));
+        assert!(is_ignorable_freeze_error("Code: 218"));
+        assert!(is_ignorable_freeze_error("CANNOT_FREEZE_PARTITION"));
+
+        // Non-ignorable errors should return false
+        assert!(!is_ignorable_freeze_error("Code: 999. Some other error"));
+        assert!(!is_ignorable_freeze_error("Connection timeout"));
+        assert!(!is_ignorable_freeze_error(""));
     }
 
     #[test]
