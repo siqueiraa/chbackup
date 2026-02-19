@@ -1,13 +1,23 @@
 //! Restore: phased restore with dependency-aware DDL ordering.
 //!
-//! Implements Mode B (non-destructive) restore flow from design doc sections 5.1/5.5/5.6:
-//! 1. Read manifest from `{backup_dir}/metadata.json`
-//! 2. Phase 1: CREATE databases from manifest.databases DDL
-//! 3. Phase 2: CREATE + ATTACH data tables (sorted by engine priority)
+//! Implements Mode B (non-destructive) and Mode A (destructive `--rm`) restore
+//! from design doc sections 5.1/5.2/5.3/5.5/5.6/5.7:
+//!
+//! 0. Phase 0: DROP tables/databases (Mode A only)
+//! 1. Phase 1: CREATE databases from manifest.databases DDL
+//! 2. Phase 2: CREATE + ATTACH data tables (sorted by engine priority)
+//! 3. Phase 2.5: Re-apply pending mutations
 //! 4. Phase 2b: CREATE postponed tables (streaming engines, refreshable MVs)
 //! 5. Phase 3: CREATE DDL-only objects (topologically sorted by dependencies)
 //! 6. Phase 4: CREATE functions from manifest.functions
 //! 7. Log summary
+//!
+//! Cross-cutting features:
+//! - ON CLUSTER DDL: `restore_schema_on_cluster` config appends ON CLUSTER clause
+//! - DatabaseReplicated: Detected via `system.databases`, skips ON CLUSTER
+//! - ZK conflict resolution: Check/drop replica before Replicated table CREATE
+//! - Distributed cluster rewrite: `restore_distributed_cluster` config
+//! - ATTACH TABLE mode: `restore_as_attach` config for Replicated tables
 
 pub mod attach;
 pub mod remap;
@@ -40,7 +50,8 @@ use attach::{
 };
 use remap::{parse_replicated_params, resolve_zk_macros, RemapConfig};
 use schema::{
-    create_databases, create_ddl_objects, create_functions, create_tables, is_replicated_engine,
+    create_databases, create_ddl_objects, create_functions, create_tables,
+    detect_replicated_databases, drop_databases, drop_tables, is_replicated_engine,
 };
 use topo::{classify_restore_tables, topological_sort};
 
@@ -150,9 +161,43 @@ pub async fn restore(
     // 2c. Classify tables into restore phases
     let phases = classify_restore_tables(&manifest, &table_keys);
 
+    // 2d. Derive ON CLUSTER and DatabaseReplicated config
+    let on_cluster = if config.clickhouse.restore_schema_on_cluster.is_empty() {
+        None
+    } else {
+        Some(config.clickhouse.restore_schema_on_cluster.as_str())
+    };
+
+    let replicated_databases = if on_cluster.is_some() {
+        detect_replicated_databases(ch, &manifest).await
+    } else {
+        HashSet::new()
+    };
+
+    // 2e. Get macros for ZK path resolution (needed for ZK conflict check and ATTACH TABLE mode)
+    let macros = ch.get_macros().await.unwrap_or_default();
+
+    // 2f. Distributed cluster rewrite config
+    let dist_cluster = &config.clickhouse.restore_distributed_cluster;
+
+    // Phase 0: DROP (Mode A only)
+    if rm && !data_only {
+        info!("Phase 0: Dropping tables and databases (Mode A --rm)");
+        drop_tables(
+            ch,
+            &manifest,
+            &table_keys,
+            remap_ref,
+            on_cluster,
+            &replicated_databases,
+        )
+        .await?;
+        drop_databases(ch, &manifest, remap_ref, on_cluster, &replicated_databases).await?;
+    }
+
     // Phase 1: CREATE databases
     if !data_only {
-        create_databases(ch, &manifest, remap_ref).await?;
+        create_databases(ch, &manifest, remap_ref, on_cluster, &replicated_databases).await?;
     }
 
     // Phase 2: CREATE data tables (not DDL-only objects)
@@ -161,7 +206,18 @@ pub async fn restore(
         "Phase 2: {} data tables",
         phases.data_tables.len()
     );
-    create_tables(ch, &manifest, &phases.data_tables, data_only, remap_ref).await?;
+    create_tables(
+        ch,
+        &manifest,
+        &phases.data_tables,
+        data_only,
+        remap_ref,
+        on_cluster,
+        &replicated_databases,
+        &macros,
+        dist_cluster,
+    )
+    .await?;
 
     // Schema-only mode: also create DDL-only objects but skip data attach
     if schema_only {
@@ -172,7 +228,15 @@ pub async fn restore(
                 "Phase 3: {} DDL-only objects",
                 sorted_ddl.len()
             );
-            create_ddl_objects(ch, &manifest, &sorted_ddl, remap_ref).await?;
+            create_ddl_objects(
+                ch,
+                &manifest,
+                &sorted_ddl,
+                remap_ref,
+                on_cluster,
+                &replicated_databases,
+            )
+            .await?;
         }
         // Phase 2b: Postponed tables (streaming engines, refreshable MVs)
         // In schema-only mode, created AFTER DDL-only objects since those may be
@@ -189,11 +253,15 @@ pub async fn restore(
                 &phases.postponed_tables,
                 data_only,
                 remap_ref,
+                on_cluster,
+                &replicated_databases,
+                &macros,
+                dist_cluster,
             )
             .await?;
         }
         if !data_only && !manifest.functions.is_empty() {
-            create_functions(ch, &manifest).await?;
+            create_functions(ch, &manifest, on_cluster).await?;
         }
         info!("Schema-only mode, skipping data restore");
         return Ok(());
@@ -549,6 +617,10 @@ pub async fn restore(
             &phases.postponed_tables,
             data_only,
             remap_ref,
+            on_cluster,
+            &replicated_databases,
+            &macros,
+            dist_cluster,
         )
         .await?;
     }
@@ -561,12 +633,20 @@ pub async fn restore(
             "Phase 3: {} DDL-only objects",
             sorted_ddl.len()
         );
-        create_ddl_objects(ch, &manifest, &sorted_ddl, remap_ref).await?;
+        create_ddl_objects(
+            ch,
+            &manifest,
+            &sorted_ddl,
+            remap_ref,
+            on_cluster,
+            &replicated_databases,
+        )
+        .await?;
     }
 
     // Phase 4: Functions
     if !data_only && !manifest.functions.is_empty() {
-        create_functions(ch, &manifest).await?;
+        create_functions(ch, &manifest, on_cluster).await?;
     }
 
     info!(

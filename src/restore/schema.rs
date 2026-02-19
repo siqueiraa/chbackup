@@ -8,7 +8,7 @@
 //! - ZK conflict resolution for Replicated tables
 //! - DatabaseReplicated detection
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -17,8 +17,9 @@ use crate::clickhouse::client::ChClient;
 use crate::manifest::{BackupManifest, DatabaseInfo};
 
 use super::remap::{
-    parse_replicated_params, resolve_zk_macros, rewrite_create_database_ddl,
-    rewrite_create_table_ddl, RemapConfig,
+    add_on_cluster_clause, parse_replicated_params, resolve_zk_macros,
+    rewrite_create_database_ddl, rewrite_create_table_ddl, rewrite_distributed_cluster,
+    RemapConfig,
 };
 use super::topo::sort_tables_for_drop;
 
@@ -30,10 +31,16 @@ use super::topo::sort_tables_for_drop;
 /// When `remap` is active, databases are created with remapped names and
 /// rewritten DDL. Target databases that don't exist in the manifest (produced
 /// by database mapping) are also created.
+///
+/// When `on_cluster` is set, appends ON CLUSTER clause to DDL unless the
+/// database is in `replicated_databases` (DatabaseReplicated handles its own
+/// replication).
 pub async fn create_databases(
     ch: &ChClient,
     manifest: &BackupManifest,
     remap: Option<&RemapConfig>,
+    on_cluster: Option<&str>,
+    replicated_databases: &HashSet<String>,
 ) -> Result<()> {
     if manifest.databases.is_empty() {
         debug!("No databases to create");
@@ -57,20 +64,32 @@ pub async fn create_databases(
                             name: dst_db.clone(),
                             ddl: rewritten_ddl,
                         };
-                        create_database(ch, &remapped_info).await?;
+                        create_database_with_cluster(
+                            ch,
+                            &remapped_info,
+                            on_cluster,
+                            replicated_databases,
+                        )
+                        .await?;
                         created.insert(dst_db);
                     }
                 } else {
                     // No mapping for this database -- create as-is
                     if !created.contains(&db_info.name) {
-                        create_database(ch, db_info).await?;
+                        create_database_with_cluster(
+                            ch,
+                            db_info,
+                            on_cluster,
+                            replicated_databases,
+                        )
+                        .await?;
                         created.insert(db_info.name.clone());
                     }
                 }
             }
             _ => {
                 // No remap -- create as-is
-                create_database(ch, db_info).await?;
+                create_database_with_cluster(ch, db_info, on_cluster, replicated_databases).await?;
             }
         }
     }
@@ -82,8 +101,13 @@ pub async fn create_databases(
     Ok(())
 }
 
-/// Create a single database from its DDL.
-async fn create_database(ch: &ChClient, db_info: &DatabaseInfo) -> Result<()> {
+/// Create a single database from its DDL, optionally with ON CLUSTER.
+async fn create_database_with_cluster(
+    ch: &ChClient,
+    db_info: &DatabaseInfo,
+    on_cluster: Option<&str>,
+    replicated_databases: &HashSet<String>,
+) -> Result<()> {
     // Check if database already exists
     let exists = ch
         .database_exists(&db_info.name)
@@ -96,7 +120,24 @@ async fn create_database(ch: &ChClient, db_info: &DatabaseInfo) -> Result<()> {
     }
 
     // Ensure the DDL has IF NOT EXISTS for safety
-    let ddl = ensure_if_not_exists_database(&db_info.ddl);
+    let mut ddl = ensure_if_not_exists_database(&db_info.ddl);
+
+    // Apply ON CLUSTER if configured and database is not DatabaseReplicated
+    if let Some(cluster) = on_cluster {
+        if !replicated_databases.contains(&db_info.name) {
+            ddl = add_on_cluster_clause(&ddl, cluster);
+            info!(
+                database = %db_info.name,
+                cluster = %cluster,
+                "ON CLUSTER DDL for database creation"
+            );
+        } else {
+            info!(
+                database = %db_info.name,
+                "DatabaseReplicated detected, skipping ON CLUSTER for database"
+            );
+        }
+    }
 
     info!(database = %db_info.name, "Creating database");
     ch.execute_ddl(&ddl).await.with_context(|| {
@@ -413,12 +454,22 @@ pub fn is_replicated_engine(engine: &str) -> bool {
 ///
 /// When `remap` is active, table DDL is rewritten to target the new
 /// database/table names, with UUID removal and ZK path/Distributed engine updates.
+///
+/// When `on_cluster` is set, appends ON CLUSTER clause to DDL unless the
+/// table's database is in `replicated_databases`. For Replicated tables,
+/// ZK conflict resolution runs before CREATE. For Distributed tables,
+/// `dist_cluster` rewrites the cluster name.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_tables(
     ch: &ChClient,
     manifest: &BackupManifest,
     table_keys: &[String],
     data_only: bool,
     remap: Option<&RemapConfig>,
+    on_cluster: Option<&str>,
+    replicated_databases: &HashSet<String>,
+    macros: &HashMap<String, String>,
+    dist_cluster: &str,
 ) -> Result<()> {
     if data_only {
         debug!("Data-only mode, skipping table creation");
@@ -461,8 +512,35 @@ pub async fn create_tables(
             continue;
         }
 
+        // ZK conflict resolution for Replicated tables (before CREATE)
+        if is_replicated_engine(&table_manifest.engine) {
+            // Build macro map with database/table context
+            let mut table_macros = macros.clone();
+            table_macros
+                .entry("database".to_string())
+                .or_insert_with(|| dst_db.clone());
+            table_macros
+                .entry("table".to_string())
+                .or_insert_with(|| dst_table.clone());
+
+            if let Err(e) = resolve_zk_conflict(
+                ch,
+                &table_manifest.ddl,
+                &table_macros,
+                table_manifest.uuid.as_deref(),
+            )
+            .await
+            {
+                warn!(
+                    table = %format!("{}.{}", dst_db, dst_table),
+                    error = %e,
+                    "ZK conflict resolution failed (non-fatal, proceeding with CREATE)"
+                );
+            }
+        }
+
         // Build DDL: rewrite if remap is active, otherwise just ensure IF NOT EXISTS
-        let ddl = match remap {
+        let mut ddl = match remap {
             Some(rc) if rc.is_active() && (src_db != dst_db || src_table != dst_table) => {
                 let rewritten = rewrite_create_table_ddl(
                     &table_manifest.ddl,
@@ -476,6 +554,26 @@ pub async fn create_tables(
             }
             _ => ensure_if_not_exists_table(&table_manifest.ddl),
         };
+
+        // Rewrite Distributed cluster name if configured
+        if !dist_cluster.is_empty() {
+            let rewritten = rewrite_distributed_cluster(&ddl, dist_cluster);
+            if rewritten != ddl {
+                info!(
+                    table = %format!("{}.{}", dst_db, dst_table),
+                    cluster = %dist_cluster,
+                    "Rewriting Distributed cluster name"
+                );
+                ddl = rewritten;
+            }
+        }
+
+        // Apply ON CLUSTER if configured and database is not DatabaseReplicated
+        if let Some(cluster) = on_cluster {
+            if !replicated_databases.contains(&dst_db) {
+                ddl = add_on_cluster_clause(&ddl, cluster);
+            }
+        }
 
         let dst_key = format!("{}.{}", dst_db, dst_table);
         info!(table = %dst_key, "Creating table");
@@ -503,6 +601,8 @@ pub async fn create_ddl_objects(
     manifest: &BackupManifest,
     ddl_keys: &[String],
     remap: Option<&RemapConfig>,
+    on_cluster: Option<&str>,
+    replicated_databases: &HashSet<String>,
 ) -> Result<()> {
     if ddl_keys.is_empty() {
         return Ok(());
@@ -542,7 +642,7 @@ pub async fn create_ddl_objects(
                 continue;
             }
 
-            let ddl = match remap {
+            let mut ddl = match remap {
                 Some(rc) if rc.is_active() && (src_db != dst_db || src_table != dst_table) => {
                     let rewritten = rewrite_create_table_ddl(
                         &table_manifest.ddl,
@@ -556,6 +656,13 @@ pub async fn create_ddl_objects(
                 }
                 _ => ensure_if_not_exists_table(&table_manifest.ddl),
             };
+
+            // Apply ON CLUSTER if configured and database is not DatabaseReplicated
+            if let Some(cluster) = on_cluster {
+                if !replicated_databases.contains(&dst_db) {
+                    ddl = add_on_cluster_clause(&ddl, cluster);
+                }
+            }
 
             let dst_key = format!("{}.{}", dst_db, dst_table);
             match ch.execute_ddl(&ddl).await {
@@ -619,7 +726,13 @@ pub async fn create_ddl_objects(
 ///
 /// Each entry in `manifest.functions` is a complete `CREATE FUNCTION` DDL statement.
 /// Functions are created sequentially since they typically have no inter-dependencies.
-pub async fn create_functions(ch: &ChClient, manifest: &BackupManifest) -> Result<()> {
+///
+/// When `on_cluster` is set, appends ON CLUSTER clause to function DDL.
+pub async fn create_functions(
+    ch: &ChClient,
+    manifest: &BackupManifest,
+    on_cluster: Option<&str>,
+) -> Result<()> {
     if manifest.functions.is_empty() {
         debug!("No functions to create");
         return Ok(());
@@ -627,7 +740,11 @@ pub async fn create_functions(ch: &ChClient, manifest: &BackupManifest) -> Resul
 
     let mut created = 0u32;
     for func_ddl in &manifest.functions {
-        match ch.execute_ddl(func_ddl).await {
+        let ddl = match on_cluster {
+            Some(cluster) => add_on_cluster_clause(func_ddl, cluster),
+            None => func_ddl.clone(),
+        };
+        match ch.execute_ddl(&ddl).await {
             Ok(()) => {
                 info!(ddl = %func_ddl, "Created function");
                 created += 1;
