@@ -25,8 +25,9 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let username = &state.config.api.username;
-    let password = &state.config.api.password;
+    let config = state.config.load();
+    let username = &config.api.username;
+    let password = &config.api.password;
 
     // No auth required if both username and password are empty
     if username.is_empty() && password.is_empty() {

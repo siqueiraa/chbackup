@@ -14,6 +14,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use std::sync::Arc;
+
 use crate::list;
 
 use super::actions::ActionStatus;
@@ -101,7 +103,8 @@ pub async fn health() -> &'static str {
 
 /// GET /api/v1/version -- return chbackup and ClickHouse versions
 pub async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
-    let ch_version = match state.ch.get_version().await {
+    let ch = state.ch.load();
+    let ch_version = match ch.get_version().await {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "Failed to query ClickHouse version");
@@ -235,7 +238,8 @@ pub async fn list_backups(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<ListResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let data_path = &state.config.clickhouse.data_path;
+    let config = state.config.load();
+    let data_path = &config.clickhouse.data_path;
     let mut results = Vec::new();
 
     let show_local = params.location.is_none() || params.location.as_deref() == Some("local");
@@ -255,7 +259,8 @@ pub async fn list_backups(
     }
 
     if show_remote {
-        match list::list_remote(&state.s3).await {
+        let s3 = state.s3.load();
+        match list::list_remote(&s3).await {
             Ok(summaries) => {
                 for s in summaries {
                     results.push(summary_to_list_response(s, "remote"));
@@ -314,10 +319,12 @@ pub async fn create_backup(
 
         info!(backup_name = %backup_name, "Starting create operation");
 
+        let config = state_clone.config.load();
+        let ch = state_clone.ch.load();
         let start_time = std::time::Instant::now();
         let result = crate::backup::create(
-            &state_clone.config,
-            &state_clone.ch,
+            &config,
+            &ch,
             &backup_name,
             req.tables.as_deref(),
             req.schema.unwrap_or(false),
@@ -327,7 +334,7 @@ pub async fn create_backup(
             req.rbac.unwrap_or(false),
             req.configs.unwrap_or(false),
             req.named_collections.unwrap_or(false),
-            &state_clone.config.backup.skip_projections,
+            &config.backup.skip_projections,
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -401,15 +408,17 @@ pub async fn upload_backup(
     tokio::spawn(async move {
         info!(backup_name = %name, "Starting upload operation");
 
-        let backup_dir = std::path::PathBuf::from(&state_clone.config.clickhouse.data_path)
+        let config = state_clone.config.load();
+        let s3 = state_clone.s3.load();
+        let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
             .join("backup")
             .join(&name);
 
-        let effective_resume = state_clone.config.general.use_resumable_state;
+        let effective_resume = config.general.use_resumable_state;
         let start_time = std::time::Instant::now();
         let result = crate::upload::upload(
-            &state_clone.config,
-            &state_clone.s3,
+            &config,
+            &s3,
             &name,
             &backup_dir,
             req.delete_local.unwrap_or(false),
@@ -481,11 +490,13 @@ pub async fn download_backup(
     tokio::spawn(async move {
         info!(backup_name = %name, hardlink_exists_files = hardlink, "Starting download operation");
 
-        let effective_resume = state_clone.config.general.use_resumable_state;
+        let config = state_clone.config.load();
+        let s3 = state_clone.s3.load();
+        let effective_resume = config.general.use_resumable_state;
         let start_time = std::time::Instant::now();
         let result = crate::download::download(
-            &state_clone.config,
-            &state_clone.s3,
+            &config,
+            &s3,
             &name,
             effective_resume,
             hardlink,
@@ -566,11 +577,13 @@ pub async fn restore_backup(
             _ => None,
         };
 
-        let effective_resume = state_clone.config.general.use_resumable_state;
+        let config = state_clone.config.load();
+        let ch = state_clone.ch.load();
+        let effective_resume = config.general.use_resumable_state;
         let start_time = std::time::Instant::now();
         let result = crate::restore::restore(
-            &state_clone.config,
-            &state_clone.ch,
+            &config,
+            &ch,
             &name,
             req.tables.as_deref(),
             req.schema.unwrap_or(false),
@@ -657,12 +670,15 @@ pub async fn create_remote(
 
         info!(backup_name = %backup_name, "Starting create_remote operation");
 
+        let config = state_clone.config.load();
+        let ch = state_clone.ch.load();
+        let s3 = state_clone.s3.load();
         let start_time = std::time::Instant::now();
 
         // Step 1: Create local backup
         let create_result = crate::backup::create(
-            &state_clone.config,
-            &state_clone.ch,
+            &config,
+            &ch,
             &backup_name,
             req.tables.as_deref(),
             false, // schema_only
@@ -672,7 +688,7 @@ pub async fn create_remote(
             req.rbac.unwrap_or(false),
             req.configs.unwrap_or(false),
             req.named_collections.unwrap_or(false),
-            &state_clone.config.backup.skip_projections,
+            &config.backup.skip_projections,
         )
         .await;
 
@@ -693,14 +709,14 @@ pub async fn create_remote(
         };
 
         // Step 2: Upload to S3
-        let backup_dir = std::path::PathBuf::from(&state_clone.config.clickhouse.data_path)
+        let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
             .join("backup")
             .join(&backup_name);
 
-        let effective_resume = state_clone.config.general.use_resumable_state;
+        let effective_resume = config.general.use_resumable_state;
         let upload_result = crate::upload::upload(
-            &state_clone.config,
-            &state_clone.s3,
+            &config,
+            &s3,
             &backup_name,
             &backup_dir,
             req.delete_source.unwrap_or(false),
@@ -793,13 +809,16 @@ pub async fn restore_remote(
             _ => None,
         };
 
+        let config = state_clone.config.load();
+        let ch = state_clone.ch.load();
+        let s3 = state_clone.s3.load();
         let start_time = std::time::Instant::now();
 
         // Step 1: Download from S3
-        let effective_resume = state_clone.config.general.use_resumable_state;
+        let effective_resume = config.general.use_resumable_state;
         let download_result = crate::download::download(
-            &state_clone.config,
-            &state_clone.s3,
+            &config,
+            &s3,
             &name,
             effective_resume,
             false,
@@ -821,8 +840,8 @@ pub async fn restore_remote(
 
         // Step 2: Restore with remap
         let restore_result = crate::restore::restore(
-            &state_clone.config,
-            &state_clone.ch,
+            &config,
+            &ch,
             &name,
             req.tables.as_deref(),
             req.schema.unwrap_or(false),
@@ -922,7 +941,9 @@ pub async fn delete_backup(
     tokio::spawn(async move {
         info!(backup_name = %name, location = %location, "Starting delete operation");
 
-        let data_path = state_clone.config.clickhouse.data_path.clone();
+        let config = state_clone.config.load();
+        let s3 = state_clone.s3.load();
+        let data_path = config.clickhouse.data_path.clone();
         let start_time = std::time::Instant::now();
         let result = match loc {
             list::Location::Local => {
@@ -932,7 +953,7 @@ pub async fn delete_backup(
                     .await
                     .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
             }
-            list::Location::Remote => list::delete_remote(&state_clone.s3, &name).await,
+            list::Location::Remote => list::delete_remote(&s3, &name).await,
         };
         let duration = start_time.elapsed().as_secs_f64();
 
@@ -988,8 +1009,9 @@ pub async fn clean_remote_broken(
     tokio::spawn(async move {
         info!("Starting clean_broken_remote operation");
 
+        let s3 = state_clone.s3.load();
         let start_time = std::time::Instant::now();
-        let result = list::clean_broken_remote(&state_clone.s3).await;
+        let result = list::clean_broken_remote(&s3).await;
         let duration = start_time.elapsed().as_secs_f64();
 
         match result {
@@ -1046,7 +1068,8 @@ pub async fn clean_local_broken(
     tokio::spawn(async move {
         info!("Starting clean_broken_local operation");
 
-        let data_path = state_clone.config.clickhouse.data_path.clone();
+        let config = state_clone.config.load();
+        let data_path = config.clickhouse.data_path.clone();
         let start_time = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
             .await
@@ -1118,9 +1141,11 @@ pub async fn clean(
     tokio::spawn(async move {
         info!("Starting clean operation");
 
+        let config = state_clone.config.load();
+        let ch = state_clone.ch.load();
         let start_time = std::time::Instant::now();
-        let data_path = state_clone.config.clickhouse.data_path.clone();
-        let result = list::clean_shadow(&state_clone.ch, &data_path, None).await;
+        let data_path = config.clickhouse.data_path.clone();
+        let result = list::clean_shadow(&ch, &data_path, None).await;
         let duration = start_time.elapsed().as_secs_f64();
 
         match result {
@@ -1184,9 +1209,86 @@ pub struct ReloadResponse {
     pub status: String,
 }
 
-/// POST /api/v1/restart -- server restart (not yet implemented)
-pub async fn restart_stub() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented")
+/// Response for POST /api/v1/restart
+#[derive(Debug, Serialize)]
+pub struct RestartResponse {
+    pub status: String,
+}
+
+/// POST /api/v1/restart -- reload config and reconnect clients
+///
+/// Re-reads the config file, creates fresh ChClient and S3Client instances,
+/// pings ClickHouse to verify connectivity, then atomically swaps the new
+/// config and clients into AppState. On error, the old clients remain active.
+pub async fn restart(
+    State(state): State<AppState>,
+) -> Result<Json<RestartResponse>, (StatusCode, Json<ErrorResponse>)> {
+    info!("Restart requested: reloading config and reconnecting clients");
+
+    // Load config from disk
+    let config = crate::config::Config::load(&state.config_path, &[])
+        .map_err(|e| {
+            warn!(error = %e, "Restart failed: config load error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("config load error: {}", e),
+                }),
+            )
+        })?;
+
+    config.validate().map_err(|e| {
+        warn!(error = %e, "Restart failed: config validation error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("config validation error: {}", e),
+            }),
+        )
+    })?;
+
+    // Create new clients
+    let ch = crate::clickhouse::ChClient::new(&config.clickhouse).map_err(|e| {
+        warn!(error = %e, "Restart failed: ChClient creation error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("ChClient creation error: {}", e),
+            }),
+        )
+    })?;
+
+    let s3 = crate::storage::S3Client::new(&config.s3).await.map_err(|e| {
+        warn!(error = %e, "Restart failed: S3Client creation error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("S3Client creation error: {}", e),
+            }),
+        )
+    })?;
+
+    // Verify ClickHouse connectivity
+    ch.ping().await.map_err(|e| {
+        warn!(error = %e, "Restart failed: ClickHouse ping failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("ClickHouse ping failed: {}", e),
+            }),
+        )
+    })?;
+
+    // Atomically swap config and clients
+    state.config.store(Arc::new(config));
+    state.ch.store(Arc::new(ch));
+    state.s3.store(Arc::new(s3));
+
+    info!("Restart completed: config reloaded and clients reconnected");
+
+    Ok(Json(RestartResponse {
+        status: "restarted".to_string(),
+    }))
 }
 
 /// GET /api/v1/tables -- table listing (Phase 4f)
@@ -1216,7 +1318,8 @@ pub async fn watch_start(
     }
 
     // Query macros from ClickHouse for template resolution
-    let macros = state.ch.get_macros().await.unwrap_or_default();
+    let ch = state.ch.load();
+    let macros = ch.get_macros().await.unwrap_or_default();
 
     let config_path = state.config_path.clone();
     super::spawn_watch_from_state(&mut state, config_path, macros).await;
@@ -1343,7 +1446,8 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 /// Also updates the `in_progress` gauge from `current_op`.
 async fn refresh_backup_counts(state: &AppState, metrics: &Metrics) {
     // Refresh local backup count (sync function -- use spawn_blocking)
-    let data_path = state.config.clickhouse.data_path.clone();
+    let config = state.config.load();
+    let data_path = config.clickhouse.data_path.clone();
     match tokio::task::spawn_blocking(move || crate::list::list_local(&data_path)).await {
         Ok(Ok(summaries)) => metrics.number_backups_local.set(summaries.len() as i64),
         Ok(Err(e)) => warn!(error = %e, "Failed to refresh local backup count for metrics"),
@@ -1351,7 +1455,8 @@ async fn refresh_backup_counts(state: &AppState, metrics: &Metrics) {
     }
 
     // Refresh remote backup count (async)
-    match crate::list::list_remote(&state.s3).await {
+    let s3 = state.s3.load();
+    match crate::list::list_remote(&s3).await {
         Ok(summaries) => metrics.number_backups_remote.set(summaries.len() as i64),
         Err(e) => warn!(error = %e, "Failed to refresh remote backup count for metrics"),
     }
@@ -1581,12 +1686,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remaining_stub_endpoints_return_501() {
-        let (status, _body) = restart_stub().await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-
+    async fn test_tables_stub_returns_501() {
         let (status, _body) = tables_stub().await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn test_restart_response_serialization() {
+        let response = RestartResponse {
+            status: "restarted".to_string(),
+        };
+        let json = serde_json::to_string(&response).expect("RestartResponse should serialize");
+        assert!(json.contains("\"status\":\"restarted\""));
     }
 
     #[test]

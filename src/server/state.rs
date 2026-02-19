@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -55,11 +56,15 @@ impl Default for WatchStatus {
 ///
 /// Must be `Clone` for axum `State` extractor. All inner fields are
 /// `Arc`-wrapped or implement `Clone`.
+///
+/// The `config`, `ch`, and `s3` fields use `ArcSwap` to enable hot-swapping
+/// via the `/api/v1/restart` endpoint. Handlers read them via `.load()` which
+/// returns a `Guard<Arc<T>>` that derefs to `T`.
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
-    pub ch: ChClient,
-    pub s3: S3Client,
+    pub config: Arc<ArcSwap<Config>>,
+    pub ch: Arc<ArcSwap<ChClient>>,
+    pub s3: Arc<ArcSwap<S3Client>>,
     pub action_log: Arc<Mutex<ActionLog>>,
     pub current_op: Arc<Mutex<Option<RunningOp>>>,
     pub op_semaphore: Arc<Semaphore>,
@@ -116,9 +121,9 @@ impl AppState {
         };
 
         Self {
-            config,
-            ch,
-            s3,
+            config: Arc::new(ArcSwap::from_pointee((*config).clone())),
+            ch: Arc::new(ArcSwap::from_pointee(ch)),
+            s3: Arc::new(ArcSwap::from_pointee(s3)),
             action_log: Arc::new(Mutex::new(ActionLog::new(100))),
             current_op: Arc::new(Mutex::new(None)),
             op_semaphore: Arc::new(Semaphore::new(permits)),
@@ -262,12 +267,13 @@ pub fn scan_resumable_state_files(data_path: &str) -> Vec<ResumableOp> {
 /// If `config.api.complete_resumable_after_restart` is false, this is a no-op.
 /// Otherwise, scans for state files and spawns the corresponding operations.
 pub async fn auto_resume(state: &AppState) {
-    if !state.config.api.complete_resumable_after_restart {
+    let config = state.config.load();
+    if !config.api.complete_resumable_after_restart {
         tracing::info!("Auto-resume disabled by configuration");
         return;
     }
 
-    let data_path = &state.config.clickhouse.data_path;
+    let data_path = &config.clickhouse.data_path;
     let ops = scan_resumable_state_files(data_path);
 
     if ops.is_empty() {
@@ -303,14 +309,16 @@ pub async fn auto_resume(state: &AppState) {
 
                     tracing::info!(backup_name = %backup_name, "Auto-resume: resuming upload");
 
+                    let config = state_clone.config.load();
+                    let s3 = state_clone.s3.load();
                     let backup_dir =
-                        std::path::PathBuf::from(&state_clone.config.clickhouse.data_path)
+                        std::path::PathBuf::from(&config.clickhouse.data_path)
                             .join("backup")
                             .join(&backup_name);
 
                     let result = crate::upload::upload(
-                        &state_clone.config,
-                        &state_clone.s3,
+                        &config,
+                        &s3,
                         &backup_name,
                         &backup_dir,
                         false, // delete_local
@@ -347,9 +355,11 @@ pub async fn auto_resume(state: &AppState) {
 
                     tracing::info!(backup_name = %backup_name, "Auto-resume: resuming download");
 
+                    let config = state_clone.config.load();
+                    let s3 = state_clone.s3.load();
                     let result = crate::download::download(
-                        &state_clone.config,
-                        &state_clone.s3,
+                        &config,
+                        &s3,
                         &backup_name,
                         true,  // resume = true
                         false, // hardlink_exists_files = false
@@ -384,9 +394,11 @@ pub async fn auto_resume(state: &AppState) {
 
                     tracing::info!(backup_name = %backup_name, "Auto-resume: resuming restore");
 
+                    let config = state_clone.config.load();
+                    let ch = state_clone.ch.load();
                     let result = crate::restore::restore(
-                        &state_clone.config,
-                        &state_clone.ch,
+                        &config,
+                        &ch,
                         &backup_name,
                         None,  // tables
                         false, // schema_only

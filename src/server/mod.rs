@@ -83,13 +83,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/watch/start", post(routes::watch_start))
         .route("/api/v1/watch/stop", post(routes::watch_stop))
         .route("/api/v1/watch/status", get(routes::watch_status))
+        // Restart endpoint
+        .route("/api/v1/restart", post(routes::restart))
         // Stub endpoints (not yet implemented)
-        .route("/api/v1/restart", post(routes::restart_stub))
         .route("/api/v1/tables", get(routes::tables_stub))
         .route("/metrics", get(routes::metrics));
 
     // Conditionally apply auth middleware
-    let has_auth = !state.config.api.username.is_empty() && !state.config.api.password.is_empty();
+    let config = state.config.load();
+    let has_auth = !config.api.username.is_empty() && !config.api.password.is_empty();
 
     let router = if has_auth {
         info!("API authentication enabled");
@@ -330,10 +332,13 @@ pub async fn spawn_watch_from_state(
         ws.state = "idle".to_string();
     }
 
+    let config = state.config.load_full();
+    let ch = state.ch.load_full();
+    let s3 = state.s3.load_full();
     let ctx = watch::WatchContext {
-        config: state.config.clone(),
-        ch: state.ch.clone(),
-        s3: state.s3.clone(),
+        config: Arc::clone(&config),
+        ch: ChClient::clone(&ch),
+        s3: S3Client::clone(&s3),
         metrics: state.metrics.clone(),
         state: watch::WatchState::Idle,
         consecutive_errors: 0,

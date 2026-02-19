@@ -742,6 +742,7 @@ name = "chbackup"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "aws-config",
  "aws-sdk-s3",
  "axum",

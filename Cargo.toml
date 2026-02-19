@@ -78,5 +78,8 @@ prometheus = "0.13"
 # Progress bar
 indicatif = "0.17"
 
+# Atomic swap for hot-swappable server state
+arc-swap = "1"
+
 [dev-dependencies]
 tempfile = "3"
