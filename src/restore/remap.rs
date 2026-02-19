@@ -262,6 +262,228 @@ pub fn rewrite_create_database_ddl(ddl: &str, src_db: &str, dst_db: &str) -> Str
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4d: DDL helpers for ON CLUSTER, ZK, Distributed cluster rewrite
+// ---------------------------------------------------------------------------
+
+/// Parse the ZK path and replica name from a Replicated*MergeTree DDL.
+///
+/// Returns `None` if not a Replicated engine or if using short syntax (empty parens).
+/// Extracts the FIRST and SECOND single-quoted arguments after the Replicated engine `(`.
+pub fn parse_replicated_params(ddl: &str) -> Option<(String, String)> {
+    // Find "Replicated" engine marker
+    let replicated_idx = find_case_sensitive(ddl, "Replicated")?;
+
+    // Find the opening paren after the engine name
+    let after_engine = &ddl[replicated_idx..];
+    let paren_offset = after_engine.find('(')?;
+    let paren_pos = replicated_idx + paren_offset;
+
+    // Check for empty parens (short syntax)
+    let after_paren = &ddl[(paren_pos + 1)..];
+    let trimmed = after_paren.trim_start();
+    if trimmed.starts_with(')') {
+        return None;
+    }
+
+    // Find the first single-quoted string (ZK path)
+    let first_quote = after_paren.find('\'')?;
+    let path_start = paren_pos + 1 + first_quote;
+    let remaining = &ddl[(path_start + 1)..];
+    let end_quote = remaining.find('\'')?;
+    let zk_path = &ddl[(path_start + 1)..(path_start + 1 + end_quote)];
+
+    // Find the second single-quoted string (replica name)
+    let after_first = &ddl[(path_start + 1 + end_quote + 1)..];
+    let second_quote = after_first.find('\'')?;
+    let replica_start = path_start + 1 + end_quote + 1 + second_quote;
+    let remaining2 = &ddl[(replica_start + 1)..];
+    let end_quote2 = remaining2.find('\'')?;
+    let replica = &ddl[(replica_start + 1)..(replica_start + 1 + end_quote2)];
+
+    Some((zk_path.to_string(), replica.to_string()))
+}
+
+/// Resolve macros in a ZK path template.
+///
+/// Substitutes `{key}` patterns from the provided map. Commonly used keys:
+/// `{database}`, `{table}`, `{shard}`, `{replica}`, `{uuid}`.
+/// Unknown macros are left as-is.
+pub fn resolve_zk_macros(template: &str, macros: &HashMap<String, String>) -> String {
+    let mut result = template.to_string();
+    for (key, value) in macros {
+        let pattern = format!("{{{}}}", key);
+        result = result.replace(&pattern, value);
+    }
+    result
+}
+
+/// Inject ON CLUSTER clause into a DDL statement.
+///
+/// Works for CREATE TABLE, CREATE DATABASE, DROP TABLE, DROP DATABASE, and
+/// their IF [NOT] EXISTS variants.
+/// Returns the DDL unchanged if ON CLUSTER is already present.
+pub fn add_on_cluster_clause(ddl: &str, cluster: &str) -> String {
+    // Check if already has ON CLUSTER
+    if ddl.contains("ON CLUSTER") {
+        return ddl.to_string();
+    }
+
+    let on_cluster_str = format!(" ON CLUSTER '{}'", cluster);
+
+    // Try each pattern in order: find where to insert the ON CLUSTER clause.
+    // The clause goes after the object identifier (which follows CREATE/DROP and any IF [NOT] EXISTS).
+    // Strategy: find the first backtick-quoted identifier or bare identifier after the keyword block.
+
+    // Patterns we support (case-sensitive):
+    // CREATE TABLE IF NOT EXISTS `db`.`table` ...
+    // CREATE TABLE `db`.`table` ...
+    // CREATE DATABASE IF NOT EXISTS `db` ...
+    // CREATE DATABASE `db` ...
+    // DROP TABLE IF EXISTS `db`.`table` ...
+    // DROP TABLE `db`.`table` ...
+    // DROP DATABASE IF EXISTS `db` ...
+    // DROP DATABASE `db` ...
+    // CREATE MATERIALIZED VIEW ...
+    // CREATE VIEW ...
+    // CREATE DICTIONARY ...
+
+    // Find the keyword sequence end and then skip past the object name
+    let prefixes = [
+        "CREATE TABLE IF NOT EXISTS",
+        "CREATE TABLE",
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS",
+        "CREATE MATERIALIZED VIEW",
+        "CREATE VIEW IF NOT EXISTS",
+        "CREATE VIEW",
+        "CREATE DICTIONARY IF NOT EXISTS",
+        "CREATE DICTIONARY",
+        "CREATE DATABASE IF NOT EXISTS",
+        "CREATE DATABASE",
+        "DROP TABLE IF EXISTS",
+        "DROP TABLE",
+        "DROP DATABASE IF EXISTS",
+        "DROP DATABASE",
+    ];
+
+    for prefix in &prefixes {
+        if !ddl.starts_with(prefix) {
+            continue;
+        }
+
+        let after_prefix = &ddl[prefix.len()..];
+        let trimmed = after_prefix.trim_start();
+        let spaces_len = after_prefix.len() - trimmed.len();
+        let name_start = prefix.len() + spaces_len;
+
+        // Skip the object name (could be `db`.`table` or just `db` or db.table)
+        let name_end = skip_object_name(&ddl[name_start..]);
+        let insert_pos = name_start + name_end;
+
+        let mut result = String::with_capacity(ddl.len() + on_cluster_str.len());
+        result.push_str(&ddl[..insert_pos]);
+        result.push_str(&on_cluster_str);
+        result.push_str(&ddl[insert_pos..]);
+        return result;
+    }
+
+    // Fallback: return unchanged
+    ddl.to_string()
+}
+
+/// Skip past an object name in DDL. Returns the number of bytes consumed.
+///
+/// Handles:
+/// - Backtick-quoted: `` `db`.`table` ``
+/// - Unquoted: `db.table` or `db`
+fn skip_object_name(s: &str) -> usize {
+    let mut pos = 0;
+    let bytes = s.as_bytes();
+
+    // Loop to handle `db`.`table` or db.table patterns
+    loop {
+        if pos >= bytes.len() {
+            break;
+        }
+
+        if bytes[pos] == b'`' {
+            // Backtick-quoted identifier
+            pos += 1; // skip opening backtick
+            while pos < bytes.len() && bytes[pos] != b'`' {
+                pos += 1;
+            }
+            if pos < bytes.len() {
+                pos += 1; // skip closing backtick
+            }
+        } else if bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_' || bytes[pos] == b'.' {
+            // Unquoted identifier character (including dot for db.table)
+            while pos < bytes.len()
+                && (bytes[pos].is_ascii_alphanumeric()
+                    || bytes[pos] == b'_'
+                    || bytes[pos] == b'.')
+            {
+                pos += 1;
+            }
+        } else {
+            break;
+        }
+
+        // Check for dot separator between backtick-quoted parts
+        if pos < bytes.len() && bytes[pos] == b'.' {
+            pos += 1; // skip dot
+            continue; // continue to next part
+        }
+
+        break;
+    }
+
+    pos
+}
+
+/// Rewrite the cluster name in a Distributed engine DDL.
+///
+/// Changes `Distributed('old_cluster', ...)` to `Distributed('new_cluster', ...)`.
+/// Returns DDL unchanged if not a Distributed engine or cluster not found.
+pub fn rewrite_distributed_cluster(ddl: &str, new_cluster: &str) -> String {
+    // Find "Distributed(" marker
+    let dist_idx = match find_distributed_engine(ddl) {
+        Some(idx) => idx,
+        None => return ddl.to_string(),
+    };
+
+    // Find the opening paren
+    let after_dist = &ddl[dist_idx..];
+    let paren_offset = match after_dist.find('(') {
+        Some(p) => p,
+        None => return ddl.to_string(),
+    };
+    let paren_pos = dist_idx + paren_offset;
+
+    // The first argument after '(' is the cluster name
+    let inner_start = paren_pos + 1;
+    let inner = &ddl[inner_start..];
+
+    // Find the first single-quoted argument (cluster name)
+    let first_quote = match inner.find('\'') {
+        Some(q) => q,
+        None => return ddl.to_string(),
+    };
+    let cluster_start = inner_start + first_quote;
+    let after_quote = &ddl[(cluster_start + 1)..];
+    let end_quote = match after_quote.find('\'') {
+        Some(q) => q,
+        None => return ddl.to_string(),
+    };
+    let cluster_end = cluster_start + 1 + end_quote;
+
+    // Replace the cluster name
+    let mut result = String::with_capacity(ddl.len());
+    result.push_str(&ddl[..=cluster_start]); // up to and including opening quote
+    result.push_str(new_cluster);
+    result.push_str(&ddl[cluster_end..]); // from closing quote onward
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -1054,6 +1276,187 @@ mod tests {
         assert_eq!(strip_quotes("'hello'"), "hello");
         assert_eq!(strip_quotes("hello"), "hello");
         assert_eq!(strip_quotes(" 'hello' "), "hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4d: parse_replicated_params tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_replicated_params_standard() {
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/default/t', '{replica}') ORDER BY id";
+        let result = parse_replicated_params(ddl);
+        assert!(result.is_some());
+        let (path, replica) = result.unwrap();
+        assert_eq!(path, "/clickhouse/tables/{shard}/default/t");
+        assert_eq!(replica, "{replica}");
+    }
+
+    #[test]
+    fn test_parse_replicated_params_replacing() {
+        let ddl = "CREATE TABLE default.t (id UInt64, ver UInt64) ENGINE = ReplicatedReplacingMergeTree('/path/to/table', 'r1', ver) ORDER BY id";
+        let result = parse_replicated_params(ddl);
+        assert!(result.is_some());
+        let (path, replica) = result.unwrap();
+        assert_eq!(path, "/path/to/table");
+        assert_eq!(replica, "r1");
+    }
+
+    #[test]
+    fn test_parse_replicated_params_empty_parens() {
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = ReplicatedMergeTree() ORDER BY id";
+        let result = parse_replicated_params(ddl);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_replicated_params_no_replicated() {
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = MergeTree() ORDER BY id";
+        let result = parse_replicated_params(ddl);
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4d: resolve_zk_macros tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_zk_macros() {
+        let mut macros = HashMap::new();
+        macros.insert("database".to_string(), "mydb".to_string());
+        macros.insert("table".to_string(), "mytable".to_string());
+        macros.insert("shard".to_string(), "01".to_string());
+        macros.insert("replica".to_string(), "r1".to_string());
+        macros.insert("uuid".to_string(), "abc-123".to_string());
+
+        let result =
+            resolve_zk_macros("/clickhouse/tables/{shard}/{database}/{table}", &macros);
+        assert_eq!(result, "/clickhouse/tables/01/mydb/mytable");
+    }
+
+    #[test]
+    fn test_resolve_zk_macros_partial() {
+        let mut macros = HashMap::new();
+        macros.insert("shard".to_string(), "01".to_string());
+        // {database} and {table} not in map -- should be left as-is
+        let result = resolve_zk_macros(
+            "/clickhouse/tables/{shard}/{database}/{table}",
+            &macros,
+        );
+        assert_eq!(result, "/clickhouse/tables/01/{database}/{table}");
+    }
+
+    #[test]
+    fn test_resolve_zk_macros_empty() {
+        let macros = HashMap::new();
+        let result = resolve_zk_macros("/clickhouse/tables/{shard}", &macros);
+        assert_eq!(result, "/clickhouse/tables/{shard}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4d: add_on_cluster_clause tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_on_cluster_clause_create_table() {
+        let ddl = "CREATE TABLE `default`.`trades` (id UInt64) ENGINE = MergeTree ORDER BY id";
+        let result = add_on_cluster_clause(ddl, "my_cluster");
+        assert!(
+            result.contains("ON CLUSTER 'my_cluster'"),
+            "Should contain ON CLUSTER: {}",
+            result
+        );
+        assert!(result.starts_with("CREATE TABLE `default`.`trades` ON CLUSTER 'my_cluster'"));
+    }
+
+    #[test]
+    fn test_add_on_cluster_clause_create_table_if_not_exists() {
+        let ddl = "CREATE TABLE IF NOT EXISTS `default`.`trades` (id UInt64) ENGINE = MergeTree ORDER BY id";
+        let result = add_on_cluster_clause(ddl, "c1");
+        assert!(result.contains("ON CLUSTER 'c1'"), "Result: {}", result);
+        assert!(result.starts_with("CREATE TABLE IF NOT EXISTS `default`.`trades` ON CLUSTER 'c1'"));
+    }
+
+    #[test]
+    fn test_add_on_cluster_clause_drop_table() {
+        let ddl = "DROP TABLE IF EXISTS `default`.`trades` SYNC";
+        let result = add_on_cluster_clause(ddl, "cluster1");
+        assert_eq!(
+            result,
+            "DROP TABLE IF EXISTS `default`.`trades` ON CLUSTER 'cluster1' SYNC"
+        );
+    }
+
+    #[test]
+    fn test_add_on_cluster_clause_create_database() {
+        let ddl = "CREATE DATABASE IF NOT EXISTS `mydb` ENGINE = Atomic";
+        let result = add_on_cluster_clause(ddl, "c1");
+        assert_eq!(
+            result,
+            "CREATE DATABASE IF NOT EXISTS `mydb` ON CLUSTER 'c1' ENGINE = Atomic"
+        );
+    }
+
+    #[test]
+    fn test_add_on_cluster_clause_drop_database() {
+        let ddl = "DROP DATABASE IF EXISTS `mydb` SYNC";
+        let result = add_on_cluster_clause(ddl, "c1");
+        assert_eq!(
+            result,
+            "DROP DATABASE IF EXISTS `mydb` ON CLUSTER 'c1' SYNC"
+        );
+    }
+
+    #[test]
+    fn test_add_on_cluster_clause_already_present() {
+        let ddl = "CREATE TABLE `db`.`t` ON CLUSTER 'existing' (id UInt64) ENGINE = MergeTree";
+        let result = add_on_cluster_clause(ddl, "new_cluster");
+        assert_eq!(result, ddl, "Should not modify DDL with existing ON CLUSTER");
+    }
+
+    #[test]
+    fn test_add_on_cluster_clause_unquoted_names() {
+        let ddl = "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id";
+        let result = add_on_cluster_clause(ddl, "c1");
+        assert!(result.contains("ON CLUSTER 'c1'"), "Result: {}", result);
+        assert!(result.starts_with("CREATE TABLE default.trades ON CLUSTER 'c1'"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4d: rewrite_distributed_cluster tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_distributed_cluster() {
+        let ddl = "CREATE TABLE default.dist (id UInt64) ENGINE = Distributed('old_cluster', default, trades, rand())";
+        let result = rewrite_distributed_cluster(ddl, "new_cluster");
+        assert!(
+            result.contains("'new_cluster'"),
+            "Should contain new_cluster: {}",
+            result
+        );
+        assert!(
+            !result.contains("'old_cluster'"),
+            "Should not contain old_cluster: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_distributed_cluster_no_distributed() {
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = MergeTree ORDER BY id";
+        let result = rewrite_distributed_cluster(ddl, "new_cluster");
+        assert_eq!(result, ddl, "Non-Distributed DDL should be unchanged");
+    }
+
+    #[test]
+    fn test_rewrite_distributed_cluster_preserves_args() {
+        let ddl = "CREATE TABLE default.dist ENGINE = Distributed('prod_cluster', 'mydb', 'mytable', rand())";
+        let result = rewrite_distributed_cluster(ddl, "staging_cluster");
+        assert!(result.contains("'staging_cluster'"));
+        assert!(result.contains("'mydb'"));
+        assert!(result.contains("'mytable'"));
+        assert!(result.contains("rand()"));
     }
 
     #[test]
