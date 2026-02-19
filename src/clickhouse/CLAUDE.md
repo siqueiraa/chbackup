@@ -50,6 +50,13 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `unfreeze_sql(db, table, freeze_name) -> String` -- ALTER TABLE UNFREEZE WITH NAME
 - `freeze_partition_sql(db, table, partition, freeze_name) -> String` -- ALTER TABLE FREEZE PARTITION (Phase 2d)
 - `integration_table_ddl(api_host, api_port) -> (String, String)` -- Generate DDL for `system.backup_list` (URL engine -> `/api/v1/list`) and `system.backup_actions` (URL engine -> `/api/v1/actions`) (Phase 3a)
+- `drop_table_sql(db, table, on_cluster) -> String` -- DROP TABLE IF EXISTS with optional ON CLUSTER clause (Phase 4d)
+- `drop_database_sql(db, on_cluster) -> String` -- DROP DATABASE IF EXISTS with optional ON CLUSTER clause (Phase 4d)
+- `detach_table_sync_sql(db, table) -> String` -- DETACH TABLE SYNC (Phase 4d)
+- `attach_table_sql(db, table) -> String` -- ATTACH TABLE (entire table, not a part) (Phase 4d)
+- `system_restore_replica_sql(db, table) -> String` -- SYSTEM RESTORE REPLICA (Phase 4d)
+- `drop_replica_from_zkpath_sql(replica_name, zk_path) -> String` -- SYSTEM DROP REPLICA FROM ZKPATH (Phase 4d)
+- `execute_mutation_sql(db, table, command) -> String` -- ALTER TABLE ... {command} SETTINGS mutations_sync=2 (Phase 4d)
 
 ### Public API
 - `new(config) -> Result<Self>` -- Build from ClickHouseConfig (with TLS env var wiring)
@@ -75,6 +82,15 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `drop_integration_tables() -> Result<()>` -- Drop both integration tables (called on server shutdown)
 - `database_exists(db) -> Result<bool>` -- Check system.databases
 - `table_exists(db, table) -> Result<bool>` -- Check system.tables
+- `drop_table(db, table, on_cluster: Option<&str>) -> Result<()>` -- DROP TABLE IF EXISTS with optional ON CLUSTER, SYNC (Phase 4d, Mode A)
+- `drop_database(db, on_cluster: Option<&str>) -> Result<()>` -- DROP DATABASE IF EXISTS with optional ON CLUSTER, SYNC (Phase 4d, Mode A)
+- `detach_table_sync(db, table) -> Result<()>` -- DETACH TABLE SYNC (Phase 4d, ATTACH TABLE mode)
+- `attach_table(db, table) -> Result<()>` -- ATTACH TABLE (entire table, not a part) (Phase 4d, ATTACH TABLE mode)
+- `system_restore_replica(db, table) -> Result<()>` -- SYSTEM RESTORE REPLICA, rebuilds replica metadata from local parts (Phase 4d, ATTACH TABLE mode)
+- `drop_replica_from_zkpath(replica_name, zk_path) -> Result<()>` -- SYSTEM DROP REPLICA FROM ZKPATH, removes replica from ZooKeeper (Phase 4d, ZK conflict resolution)
+- `check_zk_replica_exists(zk_path, replica_name) -> Result<bool>` -- Query system.zookeeper for replica existence; returns false on query error (system.zookeeper may be unavailable) (Phase 4d, ZK conflict resolution)
+- `query_database_engine(db) -> Result<String>` -- Query system.databases for engine type; returns empty string if not found (Phase 4d, DatabaseReplicated detection)
+- `execute_mutation(db, table, command) -> Result<()>` -- ALTER TABLE {command} SETTINGS mutations_sync=2; waits for mutation completion (Phase 4d, mutation re-apply)
 
 ### Error Handling
 - All methods return `anyhow::Result` with `.context()` annotations

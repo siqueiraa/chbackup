@@ -87,8 +87,8 @@ src/
   backup/            -- create command: parallel FREEZE, disk-aware shadow walk, hardlink/S3 metadata, CRC64, UNFREEZE
   upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart, CopyObject for S3 disk parts
   download/          -- download command: parallel S3 GetObject, LZ4+untar decompress, metadata-only for S3 disk parts
-  restore/           -- restore command: CREATE DB/TABLE, parallel hardlink+ATTACH PART, UUID-isolated S3 CopyObject restore
-  clickhouse/        -- ChClient wrapper (FREEZE/UNFREEZE, DDL, queries, DiskRow with remote_path, get_macros)
+  restore/           -- restore command: Mode A (--rm DROP) + Mode B (non-destructive), ON CLUSTER, ZK conflict resolution, ATTACH TABLE mode, mutation re-apply, parallel hardlink+ATTACH PART, UUID-isolated S3 CopyObject restore
+  clickhouse/        -- ChClient wrapper (FREEZE/UNFREEZE, DDL, DROP, DETACH/ATTACH TABLE, ZK queries, mutation exec, get_macros)
   storage/           -- S3Client wrapper (put, get, list, delete, head, multipart, copy_object)
   watch/             -- Watch mode scheduler: state machine loop, name template resolution, resume state, config hot-reload
   server/            -- HTTP API server: axum routes, AppState, metrics, auth, watch lifecycle endpoints
@@ -102,7 +102,7 @@ Each directory module has its own `CLAUDE.md` with detailed API and pattern docu
 create:   Config -> ChClient -> [parts_columns check] -> FREEZE (whole-table or per-partition) -> walk shadow (all disks, with disk filtering) -> hardlink (local) / parse metadata (S3 disk) -> CRC64 -> UNFREEZE -> BackupManifest -> JSON
 upload:   BackupManifest(JSON) -> [load resume state] -> local parts: tar+lz4 compress -> S3Client.put_object | S3 disk parts: S3Client.copy_object -> [save state per-part] -> manifest atomic upload (.tmp+copy+delete) -> [delete state]
 download: S3Client.get_object(manifest) -> [disk space pre-flight] -> BackupManifest -> [load resume state] -> local parts: S3Client.get_object -> lz4+untar -> [CRC64 verify] | S3 disk parts: metadata only -> [save state per-part] -> [delete state]
-restore:  BackupManifest(JSON) -> [load resume state + query system.parts] -> CREATE DB/TABLE -> local parts: hardlink to detached/ | S3 disk parts: CopyObject to UUID paths + rewrite metadata -> ATTACH PART -> [save state per-part] -> chown -> [delete state]
+restore:  BackupManifest(JSON) -> [load resume state + query system.parts] -> [Phase 0: DROP tables/dbs if --rm] -> [detect DatabaseReplicated] -> CREATE DB/TABLE (with ON CLUSTER, ZK conflict resolution, Distributed cluster rewrite) -> [ATTACH TABLE mode for Replicated] | local parts: hardlink to detached/ | S3 disk parts: CopyObject to UUID paths + rewrite metadata -> ATTACH PART -> [mutation re-apply] -> [save state per-part] -> chown -> [delete state]
 list:     scan local dirs + S3Client.list -> display (with broken backup detection)
 delete:   rm local dir or S3Client.delete_objects
 clean_broken: list -> filter is_broken -> delete each
@@ -145,11 +145,15 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **Watch config hot-reload**: SIGHUP (Unix) or `/api/v1/reload` triggers `Config::load()` + `validate()` at next sleep entry; current cycle completes first (design 10.8); logs old->new values for key parameters
 - **Watch server integration**: `start_server()` optionally spawns watch loop as background task; `spawn_watch_from_state()` enables dynamic start via API; channels (`watch::Sender<bool>`) for shutdown/reload signaling
 - **Watch env var overlay**: `WATCH_INTERVAL` and `FULL_INTERVAL` env vars are mapped in `apply_env_overlay()` for K8s deployments where config file overlay is less ergonomic than environment variables
+- **Mode A restore (--rm)**: Phase 0 DROP phase uses reverse engine priority order (Distributed first, data tables last) with retry loop for dependency failures. `drop_tables()` and `drop_databases()` in `schema.rs` follow the same retry pattern as `create_ddl_objects()`. System databases are never dropped.
+- **ON CLUSTER DDL**: `add_on_cluster_clause()` injects `ON CLUSTER '{cluster}'` into CREATE/DROP DDL when `restore_schema_on_cluster` config is set. Skipped for DatabaseReplicated databases (detected via `query_database_engine()`).
+- **ZK conflict resolution**: Before creating Replicated tables, `resolve_zk_conflict()` parses ZK path + replica from DDL, resolves macros via `system.macros`, checks `system.zookeeper` for existing replicas, and `SYSTEM DROP REPLICA` if conflict. All ZK failures are non-fatal.
+- **ATTACH TABLE mode**: When `restore_as_attach` config is true, Replicated*MergeTree tables use DETACH TABLE SYNC -> DROP REPLICA -> hardlink to data dir -> ATTACH TABLE -> SYSTEM RESTORE REPLICA instead of per-part ATTACH. Falls back to normal flow on failure.
+- **Mutation re-apply**: After all data attached, `reapply_pending_mutations()` re-applies `pending_mutations` from manifest via `ALTER TABLE ... {command} SETTINGS mutations_sync=2`. Sequential per-table, failures are warnings (not fatal per design 5.7).
+- **Distributed cluster rewrite**: `rewrite_distributed_cluster()` changes the cluster name in Distributed engine DDL when `restore_distributed_cluster` config is set
 
 ## Remaining Limitations
 
-- No Mode A restore / --rm (Phase 4d)
-- No table remap / --as (Phase 4a)
 - No RBAC/config backup (Phase 4e)
 - No parallel ATTACH within a single table (deferred -- tables parallel is sufficient)
 - No streaming multipart upload (Phase 2a buffers compressed data, then decides single vs multipart)
