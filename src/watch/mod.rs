@@ -418,9 +418,9 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             diff_from.as_deref(),
             None,  // partitions
             false, // skip_check_parts_columns (let config.clickhouse.check_parts_columns control)
-            false, // rbac (Phase 4e -- wired in Task 5)
-            false, // configs (Phase 4e -- wired in Task 5)
-            false, // named_collections (Phase 4e -- wired in Task 5)
+            false, // rbac (watch mode does not support RBAC backup)
+            false, // configs (watch mode does not support config backup)
+            false, // named_collections (watch mode does not support named collections backup)
         )
         .await;
 

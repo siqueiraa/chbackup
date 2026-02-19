@@ -133,15 +133,6 @@ async fn main() -> Result<()> {
             if skip_projections.is_some() {
                 warn!("--skip-projections flag is not yet implemented, ignoring");
             }
-            if rbac {
-                warn!("--rbac flag is not yet implemented, ignoring");
-            }
-            if configs {
-                warn!("--configs flag is not yet implemented, ignoring");
-            }
-            if named_collections {
-                warn!("--named-collections flag is not yet implemented, ignoring");
-            }
             let name = resolve_backup_name(backup_name);
             let ch = ChClient::new(&config.clickhouse)?;
 
@@ -160,9 +151,9 @@ async fn main() -> Result<()> {
                 diff_from.as_deref(),
                 partitions.as_deref(),
                 skip_check_parts_columns,
-                false, // rbac (Phase 4e -- wired in Task 5)
-                false, // configs (Phase 4e -- wired in Task 5)
-                false, // named_collections (Phase 4e -- wired in Task 5)
+                rbac,
+                configs,
+                named_collections,
             )
             .await?;
 
@@ -238,15 +229,6 @@ async fn main() -> Result<()> {
             if partitions.is_some() {
                 warn!("--partitions flag is not yet implemented for restore, ignoring");
             }
-            if rbac {
-                warn!("--rbac flag is not yet implemented, ignoring");
-            }
-            if configs {
-                warn!("--configs flag is not yet implemented, ignoring");
-            }
-            if named_collections {
-                warn!("--named-collections flag is not yet implemented, ignoring");
-            }
             if skip_empty_tables {
                 warn!("--skip-empty-tables flag is not yet implemented, ignoring");
             }
@@ -271,9 +253,9 @@ async fn main() -> Result<()> {
                 effective_resume,
                 rename_as.as_deref(),
                 db_mapping.as_ref(),
-                false, // rbac_restore (Phase 4e -- wired in Task 5)
-                false, // configs_restore (Phase 4e -- wired in Task 5)
-                false, // named_collections_restore (Phase 4e -- wired in Task 5)
+                rbac,
+                configs,
+                named_collections,
             )
             .await?;
 
@@ -293,15 +275,6 @@ async fn main() -> Result<()> {
             backup_name,
         } => {
             // Warn about unimplemented flags
-            if rbac {
-                warn!("--rbac flag is not yet implemented, ignoring");
-            }
-            if configs {
-                warn!("--configs flag is not yet implemented, ignoring");
-            }
-            if named_collections {
-                warn!("--named-collections flag is not yet implemented, ignoring");
-            }
             if skip_projections.is_some() {
                 warn!("--skip-projections flag is not yet implemented, ignoring");
             }
@@ -320,9 +293,9 @@ async fn main() -> Result<()> {
                 None,  // diff_from (create_remote uses diff_from_remote on upload side)
                 None,  // partitions (create_remote doesn't support --partitions)
                 skip_check_parts_columns,
-                false, // rbac (Phase 4e -- wired in Task 5)
-                false, // configs (Phase 4e -- wired in Task 5)
-                false, // named_collections (Phase 4e -- wired in Task 5)
+                rbac,
+                configs,
+                named_collections,
             )
             .await?;
 
@@ -359,15 +332,6 @@ async fn main() -> Result<()> {
             backup_name,
         } => {
             // Warn about unimplemented flags
-            if rbac {
-                warn!("--rbac flag is not yet implemented, ignoring");
-            }
-            if configs {
-                warn!("--configs flag is not yet implemented, ignoring");
-            }
-            if named_collections {
-                warn!("--named-collections flag is not yet implemented, ignoring");
-            }
             if skip_empty_tables {
                 warn!("--skip-empty-tables flag is not yet implemented, ignoring");
             }
@@ -397,9 +361,9 @@ async fn main() -> Result<()> {
                 effective_resume,
                 rename_as.as_deref(),
                 db_mapping.as_ref(),
-                false, // rbac_restore (Phase 4e -- wired in Task 5)
-                false, // configs_restore (Phase 4e -- wired in Task 5)
-                false, // named_collections_restore (Phase 4e -- wired in Task 5)
+                rbac,
+                configs,
+                named_collections,
             )
             .await?;
 

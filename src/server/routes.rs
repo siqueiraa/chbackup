@@ -324,9 +324,9 @@ pub async fn create_backup(
             req.diff_from.as_deref(),
             req.partitions.as_deref(),
             req.skip_check_parts_columns.unwrap_or(false),
-            false, // rbac (Phase 4e -- wired in Task 5)
-            false, // configs (Phase 4e -- wired in Task 5)
-            false, // named_collections (Phase 4e -- wired in Task 5)
+            req.rbac.unwrap_or(false),
+            req.configs.unwrap_or(false),
+            req.named_collections.unwrap_or(false),
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -375,6 +375,9 @@ pub struct CreateRequest {
     pub partitions: Option<String>,
     pub backup_name: Option<String>,
     pub skip_check_parts_columns: Option<bool>,
+    pub rbac: Option<bool>,
+    pub configs: Option<bool>,
+    pub named_collections: Option<bool>,
 }
 
 /// POST /api/v1/upload/{name} -- upload a local backup to S3
@@ -577,9 +580,9 @@ pub async fn restore_backup(
             effective_resume,
             req.rename_as.as_deref(),
             db_mapping.as_ref(),
-            false, // rbac_restore (Phase 4e -- wired in Task 5)
-            false, // configs_restore (Phase 4e -- wired in Task 5)
-            false, // named_collections_restore (Phase 4e -- wired in Task 5)
+            req.rbac.unwrap_or(false),
+            req.configs.unwrap_or(false),
+            req.named_collections.unwrap_or(false),
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -627,6 +630,9 @@ pub struct RestoreRequest {
     #[serde(default)]
     pub database_mapping: Option<String>,
     pub rm: Option<bool>,
+    pub rbac: Option<bool>,
+    pub configs: Option<bool>,
+    pub named_collections: Option<bool>,
 }
 
 /// POST /api/v1/create_remote -- create local backup then upload to S3
@@ -664,9 +670,9 @@ pub async fn create_remote(
             None,  // diff_from (create_remote uses diff_from_remote on upload side)
             None,  // partitions (create_remote doesn't support --partitions)
             req.skip_check_parts_columns.unwrap_or(false),
-            false, // rbac (Phase 4e -- wired in Task 5)
-            false, // configs (Phase 4e -- wired in Task 5)
-            false, // named_collections (Phase 4e -- wired in Task 5)
+            req.rbac.unwrap_or(false),
+            req.configs.unwrap_or(false),
+            req.named_collections.unwrap_or(false),
         )
         .await;
 
@@ -747,6 +753,9 @@ pub struct CreateRemoteRequest {
     pub backup_name: Option<String>,
     pub delete_source: Option<bool>,
     pub skip_check_parts_columns: Option<bool>,
+    pub rbac: Option<bool>,
+    pub configs: Option<bool>,
+    pub named_collections: Option<bool>,
 }
 
 /// POST /api/v1/restore_remote/{name} -- download then restore
@@ -821,9 +830,9 @@ pub async fn restore_remote(
             effective_resume,
             req.rename_as.as_deref(),
             db_mapping.as_ref(),
-            false, // rbac_restore (Phase 4e -- wired in Task 5)
-            false, // configs_restore (Phase 4e -- wired in Task 5)
-            false, // named_collections_restore (Phase 4e -- wired in Task 5)
+            req.rbac.unwrap_or(false),
+            req.configs.unwrap_or(false),
+            req.named_collections.unwrap_or(false),
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -872,6 +881,9 @@ pub struct RestoreRemoteRequest {
     pub database_mapping: Option<String>,
     #[serde(default)]
     pub rm: Option<bool>,
+    pub rbac: Option<bool>,
+    pub configs: Option<bool>,
+    pub named_collections: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,6 +1468,34 @@ mod tests {
         assert!(req.tables.is_none());
         assert!(req.diff_from.is_none());
         assert!(req.schema.is_none());
+    }
+
+    #[test]
+    fn test_create_request_has_rbac_fields() {
+        let json = r#"{
+            "backup_name": "test-backup",
+            "rbac": true,
+            "configs": true,
+            "named_collections": false
+        }"#;
+        let req: CreateRequest =
+            serde_json::from_str(json).expect("Should parse CreateRequest with RBAC fields");
+        assert_eq!(req.rbac, Some(true));
+        assert_eq!(req.configs, Some(true));
+        assert_eq!(req.named_collections, Some(false));
+
+        // Verify defaults when fields are omitted
+        let json_empty = r#"{}"#;
+        let req_empty: CreateRequest =
+            serde_json::from_str(json_empty).expect("Should parse empty CreateRequest");
+        assert!(req_empty.rbac.is_none());
+        assert!(req_empty.configs.is_none());
+        assert!(req_empty.named_collections.is_none());
+
+        // Verify unwrap_or(false) pattern used in route handlers
+        assert!(!req_empty.rbac.unwrap_or(false));
+        assert!(!req_empty.configs.unwrap_or(false));
+        assert!(!req_empty.named_collections.unwrap_or(false));
     }
 
     #[test]
