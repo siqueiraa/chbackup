@@ -7,7 +7,7 @@
 **Started:** -
 **Completed:** -
 **Elapsed:** -
-**Last Updated:** 2026-02-19T14:00:00Z
+**Last Updated:** 2026-02-19T15:00:00Z
 
 ---
 
@@ -31,10 +31,11 @@
 | 6 | Create SESSION.md | done |
 | 7 | Create HANDOFF.md | done |
 | 7.5 | Cross-Task Consistency Validation | done |
-| 8 | Commit Plan Files | pending |
-| 8.4 | File Structure Validation | pending |
-| 8.5 | acceptance.json Validation | pending |
-| 8.6 | Codex Plan Review | pending |
+| 8 | Commit Plan Files | done |
+| 8.3 | Red State Verification | done |
+| 8.4 | File Structure Validation | done |
+| 8.5 | acceptance.json Validation | done |
+| 8.6 | Codex Plan Review | done |
 | 9 | Present Plan | pending |
 
 **Status values:** pending, done, skipped (reason)
@@ -67,7 +68,7 @@
 | plan-discovery | 0-0.8 | done |
 | plan-analysis | 1-2 | done |
 | plan-writer | 3-7.5 | done |
-| plan-validator | 8-8.6 | pending |
+| plan-validator | 8-8.6 | done |
 
 ---
 
@@ -155,7 +156,31 @@ Group D (Independent -- Final):
 
 ## Current Focus
 
-Plan creation complete. Awaiting validation (Phase 8) and user approval (Phase 9).
+Plan validated. Awaiting user approval (Phase 9).
+
+---
+
+## Codex Plan Review
+**Iterations:** 1
+**Final Status:** PASS
+**Review Tool:** Claude
+
+**Gap Analysis Results:**
+| Category | Status | Findings |
+|----------|--------|----------|
+| Task Dependency | PASS | All new methods/functions defined in preceding tasks before consumption |
+| Data Flow | PASS | Return types match across task boundaries (Option<(String,String)>, Vec<String>, HashSet<String>) |
+| Test Coverage | PASS | All 10 tasks have explicit TDD steps with named test functions |
+| Integration | PASS | All new components are instantiated and wired in restore() orchestrator (Task 9) |
+| Error Handling | PASS | ZK check gracefully degrades, mutation failures are warnings, ATTACH TABLE has fallback |
+| State Transition | PASS | No state flags in this plan (all request-response operations) |
+| Pattern Conformance | PASS | ChClient methods follow execute_ddl pattern, remap functions follow pure-function pattern |
+| Risk Gaps | PASS | Backward compatibility addressed (5 call sites identified), no auth/injection concerns |
+| Performance Gaps | PASS | No blocking in async, no N+1 patterns, mutation sequential by design |
+
+**Blocking Gaps:** 0
+**Warning Gaps:** 0
+**Self-healing triggered:** no
 
 ---
 
@@ -167,3 +192,6 @@ Plan creation complete. Awaiting validation (Phase 8) and user approval (Phase 9
 - Config fields `restore_as_attach`, `restore_schema_on_cluster`, `restore_distributed_cluster` already exist -- no config changes needed.
 - `MutationInfo` struct already exists in manifest.rs with correct fields.
 - `RestoreRemoteRequest` in routes.rs needs `rm: Option<bool>` field added (Task 8).
+- acceptance.json fixed during Phase 8.5: added `alternative_verification` to all 9 not_applicable runtime layers.
+- Red State Verification: All feature structural checks correctly fail (code does not exist yet). F008 correctly shows 2 "rm flag is not yet implemented" warnings in pre-implementation state.
+- FDOC structural check: CLAUDE.md files exist but content not yet updated for Phase 4d (expected for documentation category).
