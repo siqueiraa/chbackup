@@ -550,6 +550,18 @@ pub async fn download(
         total_compressed_bytes += compressed_size;
     }
 
+    // 5a. Download access/ directory (RBAC files) if present in manifest
+    if manifest.rbac.is_some() {
+        download_simple_directory(s3, backup_name, &backup_dir, "access").await?;
+        info!("Downloaded access/ directory from S3");
+    }
+
+    // 5b. Download configs/ directory (check if any configs/ keys exist in S3)
+    download_simple_directory(s3, backup_name, &backup_dir, "configs").await?;
+    if backup_dir.join("configs").exists() {
+        info!("Downloaded configs/ directory from S3");
+    }
+
     // 6. Save per-table metadata (sequential)
     for (table_key, table_manifest) in &manifest.tables {
         let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
@@ -590,6 +602,56 @@ pub async fn download(
     );
 
     Ok(backup_dir)
+}
+
+/// Download all files under `{backup_name}/{prefix}/` from S3 to `{local_dir}/{prefix}/`.
+///
+/// Lists objects with the S3 prefix, creates the local directory structure, and
+/// downloads each file. If no objects exist under the prefix, this is a no-op.
+async fn download_simple_directory(
+    s3: &S3Client,
+    backup_name: &str,
+    local_dir: &Path,
+    prefix: &str,
+) -> Result<()> {
+    let s3_prefix = format!("{}/{}/", backup_name, prefix);
+    let objects = s3
+        .list_objects(&s3_prefix)
+        .await
+        .with_context(|| format!("Failed to list S3 objects under {}", s3_prefix))?;
+
+    if objects.is_empty() {
+        debug!(prefix = %prefix, "No {} files found in S3", prefix);
+        return Ok(());
+    }
+
+    let target_dir = local_dir.join(prefix);
+    std::fs::create_dir_all(&target_dir)
+        .with_context(|| format!("Failed to create {} directory", prefix))?;
+
+    for obj in &objects {
+        let data = s3
+            .get_object(&obj.key)
+            .await
+            .with_context(|| format!("Failed to download {}", obj.key))?;
+        // Extract relative path after the prefix
+        let rel_path = obj.key.strip_prefix(&s3_prefix).unwrap_or(&obj.key);
+        let file_path = target_dir.join(rel_path);
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&file_path, &data)
+            .with_context(|| format!("Failed to write {}", file_path.display()))?;
+    }
+
+    debug!(
+        prefix = %prefix,
+        count = objects.len(),
+        "Downloaded {} files from S3",
+        objects.len()
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]

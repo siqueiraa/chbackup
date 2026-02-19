@@ -725,6 +725,20 @@ pub async fn upload(
     manifest.compressed_size = total_compressed_size;
     manifest.data_format = data_format.clone();
 
+    // 5a. Upload access/ directory (RBAC files) if present
+    let access_dir = backup_dir.join("access");
+    if access_dir.exists() {
+        upload_simple_directory(s3, backup_name, &access_dir, "access").await?;
+        info!("Uploaded access/ directory to S3");
+    }
+
+    // 5b. Upload configs/ directory if present
+    let configs_dir = backup_dir.join("configs");
+    if configs_dir.exists() {
+        upload_simple_directory(s3, backup_name, &configs_dir, "configs").await?;
+        info!("Uploaded configs/ directory to S3");
+    }
+
     // 6. Upload manifest LAST with atomic pattern (per design 3.6)
     //    Upload to .tmp key, CopyObject to final key, delete .tmp
     let manifest_key = format!("{}/metadata.json", backup_name);
@@ -889,6 +903,48 @@ fn find_part_dir(backup_dir: &Path, db: &str, table: &str, part_name: &str) -> R
 
     // Return the URL-encoded path (caller will check existence)
     Ok(path)
+}
+
+/// Upload all files from a local directory to S3 under `{backup_name}/{prefix}/`.
+///
+/// Files are uploaded sequentially (these are small RBAC/config files, no parallelism needed).
+/// Uses `spawn_blocking` for directory walk, then `put_object` for each file.
+async fn upload_simple_directory(
+    s3: &S3Client,
+    backup_name: &str,
+    local_dir: &Path,
+    prefix: &str,
+) -> Result<()> {
+    let local_dir_owned = local_dir.to_path_buf();
+    let entries: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(&local_dir_owned)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_file() {
+                let rel = entry
+                    .path()
+                    .strip_prefix(&local_dir_owned)
+                    .map_err(|e| anyhow::anyhow!("Failed to strip prefix: {}", e))?;
+                let data = std::fs::read(entry.path())
+                    .with_context(|| format!("Failed to read {}", entry.path().display()))?;
+                files.push((rel.to_string_lossy().to_string(), data));
+            }
+        }
+        Ok::<_, anyhow::Error>(files)
+    })
+    .await
+    .context("spawn_blocking panicked during directory walk")??;
+
+    for (rel_path, data) in entries {
+        let key = format!("{}/{}/{}", backup_name, prefix, rel_path);
+        s3.put_object(&key, data)
+            .await
+            .with_context(|| format!("Failed to upload {}/{}", prefix, rel_path))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
