@@ -45,6 +45,8 @@
 | Concurrency utils | `futures` (v0.3, for `try_join_all`) |
 | Glob matching | `glob` (v0.3, for table filter `-t` flag) |
 | Unix permissions | `nix` (v0.29, chown for restore) |
+| Progress bar | `indicatif` (v0.17, TTY-aware, disabled in server mode) |
+| Hot-swap state | `arc-swap` (v1, atomic pointer swap for server restart) |
 
 ## Design Doc Gotchas
 
@@ -65,6 +67,7 @@ Things that are easy to get wrong when reading the design doc:
 **Phase 2d** (resume & reliability): Complete -- Resumable upload/download/restore via state files, atomic manifest upload (.tmp+CopyObject+delete), post-download CRC64 verification with retry, disk space pre-flight check, partition-level FREEZE, disk filtering (skip_disks/skip_disk_types), parts column consistency check, broken backup cleanup (clean_broken), ClickHouse TLS support.
 **Phase 3d** (watch mode): Complete -- Watch state machine loop with full+incremental backup chains, name template resolution ({type}/{time:FORMAT}/{shard} macros), resume-on-restart from remote backup listing, SIGHUP config hot-reload, API endpoints (watch/start, watch/stop, watch/status, reload), server --watch flag, Prometheus watch metrics.
 **Phase 3e** (docker/deploy): Complete -- Production Dockerfile, GitHub Actions CI with ClickHouse version matrix, K8s sidecar example, integration test seed data and round-trip smoke tests, WATCH_INTERVAL/FULL_INTERVAL env var overlay.
+**Phase 5** (polish gaps): Complete -- API tables/restart endpoints (replacing 501 stubs), --skip-projections flag, --hardlink-exists-files download dedup, progress bar (indicatif), structured exit codes (0/1/2/3/4/130/143), metadata_size in list API response.
 
 ## Source Module Map
 
@@ -75,7 +78,7 @@ src/
   cli.rs             -- clap derive CLI definitions
   concurrency.rs     -- Effective concurrency accessors (upload, download, max_connections, object_disk_copy)
   config.rs          -- Config loader (~106 params, env overlay)
-  error.rs           -- ChBackupError (thiserror)
+  error.rs           -- ChBackupError (thiserror), exit_code_from_error() for structured exit codes
   lock.rs            -- PidLock (three-tier scope)
   logging.rs         -- tracing init (text/JSON)
   manifest.rs        -- BackupManifest, TableManifest, PartInfo, S3ObjectInfo, DatabaseInfo (serde JSON)
@@ -83,6 +86,7 @@ src/
   rate_limiter.rs    -- Token-bucket rate limiter (shared via Arc, 0 = unlimited)
   resume.rs          -- Resume state types (UploadState, DownloadState, RestoreState), atomic save/load, graceful degradation
   table_filter.rs    -- Glob pattern matching for -t flag, disk exclusion checks
+  progress.rs        -- ProgressTracker (indicatif wrapper, TTY-aware, Clone for spawned tasks)
   list.rs            -- list + delete + clean_broken + retention + GC + clean_shadow (local dir scan + S3)
   backup/            -- create command: parallel FREEZE, disk-aware shadow walk, hardlink/S3 metadata, CRC64, UNFREEZE
   upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart, CopyObject for S3 disk parts
@@ -151,12 +155,18 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **ATTACH TABLE mode**: When `restore_as_attach` config is true, Replicated*MergeTree tables use DETACH TABLE SYNC -> DROP REPLICA -> hardlink to data dir -> ATTACH TABLE -> SYSTEM RESTORE REPLICA instead of per-part ATTACH. Falls back to normal flow on failure.
 - **Mutation re-apply**: After all data attached, `reapply_pending_mutations()` re-applies `pending_mutations` from manifest via `ALTER TABLE ... {command} SETTINGS mutations_sync=2`. Sequential per-table, failures are warnings (not fatal per design 5.7).
 - **Distributed cluster rewrite**: `rewrite_distributed_cluster()` changes the cluster name in Distributed engine DDL when `restore_distributed_cluster` config is set
+- **ArcSwap hot-swap** (Phase 5): `AppState.config`, `AppState.ch`, `AppState.s3` use `Arc<ArcSwap<T>>` for atomic pointer swap via `store()`/`load()`. The `/api/v1/restart` endpoint reloads config, creates new clients, pings ClickHouse, then atomically swaps all three. On error, old clients remain active (no partial state).
+- **ProgressTracker** (Phase 5): `progress.rs` wraps `indicatif::ProgressBar` with TTY detection and `disable` flag. `Clone` via `Arc<ProgressBar>`. Integrated into upload and download parallel pipelines -- each spawned task calls `tracker.inc()` after successful part processing. Disabled in non-TTY (server mode, piped output) or when `config.general.disable_progress_bar` is true.
+- **Structured exit codes** (Phase 5): `main()` wraps `run()` and maps errors to exit codes via `exit_code_from_error()` in `error.rs`. Downcasts `anyhow::Error` to `ChBackupError` for variant-specific codes: `LockError` -> 4, `BackupError`/`ManifestError` containing "not found" -> 3, all others -> 1. Clap handles code 2 (usage). SIGINT/SIGTERM handled by tokio signal handlers for codes 130/143.
+- **Hardlink dedup** (Phase 5): `--hardlink-exists-files` flag enables post-download deduplication. `find_existing_part()` scans `{data_path}/backup/*/shadow/{table_key}/{part_name}/` (excluding current backup), computes CRC64 of `checksums.txt`, returns first match. `hardlink_existing_part()` creates hardlinks (with EXDEV fallback). Checked before each part download in the parallel pipeline.
+- **Skip projections** (Phase 5): `--skip-projections` flag (CLI comma-separated or `config.backup.skip_projections` list) filters `.proj` subdirectories during `hardlink_dir()` shadow walk. `should_skip_projection()` uses `glob::Pattern` matching on the stem (name without `.proj`). Special value `*` skips all projections. `WalkDir::skip_current_dir()` prevents descending into skipped directories.
 
 ## Remaining Limitations
 
-- No RBAC/config backup (Phase 4e)
 - No parallel ATTACH within a single table (deferred -- tables parallel is sufficient)
 - No streaming multipart upload (Phase 2a buffers compressed data, then decides single vs multipart)
+- API tables endpoint has no pagination (returns all tables in a single response)
+- rbac_size and config_size in list API response are hardcoded to 0 (requires scanning directory sizes)
 
 ## Build & Test
 

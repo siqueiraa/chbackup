@@ -96,6 +96,13 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 - If crash occurs between steps 2 and 3: `.tmp` file is orphaned but harmless, cleaned by `clean_broken`
 - Logs `"Manifest uploaded atomically"` on success
 
+### Progress Bar Integration (Phase 5)
+- `ProgressTracker` from `progress.rs` is created before the parallel upload loop
+- Disabled when `config.general.disable_progress_bar` is true or when not running in a TTY
+- `Clone`d into each spawned upload task (both local and S3 disk CopyObject tasks); `tracker.inc()` called after each successful part upload
+- `tracker.finish()` called after all tasks from both queues join
+- Shows: operation label, progress bar, percentage, part count, throughput, ETA
+
 ### Simple Directory Upload (Phase 4e)
 - `upload_simple_directory(s3, backup_name, local_dir, prefix)` -- Uploads all files from a local directory to S3 under `{backup_name}/{prefix}/`. Uses `spawn_blocking` + `walkdir` for directory traversal, then sequential `put_object` for each file. No compression (RBAC/config files are small text files). Called after part upload completes but before atomic manifest upload for `access/` and `configs/` directories.
 

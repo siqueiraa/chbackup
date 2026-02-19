@@ -20,11 +20,11 @@ src/server/
 
 ## Key Patterns
 
-### AppState Sharing (state.rs)
+### AppState Sharing with ArcSwap (state.rs)
 `AppState` is the central shared state for all axum handlers, extracted via `State<AppState>`. It must be `Clone` for axum. All inner fields are `Arc`-wrapped or natively `Clone`:
-- `config: Arc<Config>` -- immutable configuration
-- `ch: ChClient` -- ClickHouse client (Clone)
-- `s3: S3Client` -- S3 client (Clone)
+- `config: Arc<ArcSwap<Config>>` -- hot-swappable configuration (Phase 5)
+- `ch: Arc<ArcSwap<ChClient>>` -- hot-swappable ClickHouse client (Phase 5)
+- `s3: Arc<ArcSwap<S3Client>>` -- hot-swappable S3 client (Phase 5)
 - `action_log: Arc<Mutex<ActionLog>>` -- operation history ring buffer
 - `current_op: Arc<Mutex<Option<RunningOp>>>` -- currently running operation for kill support
 - `op_semaphore: Arc<Semaphore>` -- concurrency control (1 permit when `allow_parallel=false`)
@@ -35,6 +35,8 @@ src/server/
 - `config_path: PathBuf` -- path to config file, used for config reload
 
 Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) since locks are held across `.await` points.
+
+**ArcSwap access pattern** (Phase 5): Handlers read config/clients via `.load()` which returns a `Guard<Arc<T>>` that derefs to `T`. The `/api/v1/restart` endpoint atomically swaps new values via `.store(Arc::new(new_value))`. All handler call sites use `state.config.load()`, `state.ch.load()`, `state.s3.load()` instead of direct field access. `load_full()` is used in `spawn_watch_from_state()` where an owned `Arc<T>` is needed (for cloning into background tasks).
 
 ### Operation Lifecycle (state.rs)
 Every mutating operation follows a three-phase lifecycle:
@@ -155,10 +157,14 @@ A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 met
 - `GET /api/v1/watch/status` -- Returns JSON with state, last_full, last_incr, consecutive_errors, next_in
 - `POST /api/v1/reload` -- Sends reload signal to watch loop (or re-reads config if watch inactive)
 
-### Stub Endpoints
-Endpoints for future phases return 501 Not Implemented:
-- `/api/v1/restart` (server restart logic)
-- `/api/v1/tables` (Phase 4f)
+### Restart Endpoint (Phase 5)
+`POST /api/v1/restart` -- Reloads config from disk, creates new `ChClient` and `S3Client`, pings ClickHouse to verify connectivity, then atomically swaps all three via `ArcSwap::store()`. Returns `RestartResponse { status: "restarted" }` on success, 500 with error message on failure (old clients remain active -- no partial state). Uses `Config::load()` + `validate()` for config validation before swap.
+
+### Tables Endpoint (Phase 5)
+`GET /api/v1/tables` -- Supports two modes via `TablesParams` query parameters:
+- **Live mode** (default): Queries `system.tables` via `ChClient`. If `all=true`, calls `list_all_tables()` (includes system tables); otherwise `list_tables()`. Optional `table` param applies `TableFilter` for glob filtering.
+- **Remote mode** (`backup` param set): Downloads manifest from S3 (`{backup_name}/metadata.json`), iterates `manifest.tables`, applies `TableFilter` if `table` param set. Returns table info derived from manifest (engine, total_bytes from sum of part sizes).
+- Returns `Vec<TablesResponseEntry>` with fields: `database`, `name`, `engine`, `uuid`, `data_paths`, `total_bytes`.
 
 ### Sync Function Handling
 Sync functions from `list` module (`delete_local`, `clean_broken_local`) are called via `tokio::task::spawn_blocking` to avoid blocking the async runtime.
@@ -172,9 +178,12 @@ All four operation request types (`CreateRequest`, `RestoreRequest`, `CreateRemo
 These fields are `Option<bool>` for backward compatibility -- existing API clients that omit these fields get `None`, which defaults to `false`. The `*_backup_always` config overrides still apply on the implementation side.
 
 ### Response Types for Integration Tables
-- `ListResponse` matches ALL columns of `system.backup_list` (name, created, location, size, data_size, object_disk_size, metadata_size, rbac_size, config_size, compressed_size, required)
+- `ListResponse` matches ALL columns of `system.backup_list` (name, created, location, size, data_size, object_disk_size, metadata_size, rbac_size, config_size, compressed_size, required). `metadata_size` is populated from `BackupSummary.metadata_size` (Phase 5); `rbac_size` and `config_size` remain 0 (TODO: requires scanning directory sizes and adding manifest field respectively)
 - `ActionResponse` matches ALL columns of `system.backup_actions` (command, start, finish, status, error)
 - Both derive `Serialize` + `Deserialize` for bidirectional JSON compatibility with ClickHouse URL engine
+
+### Download Handler Hardlink Support (Phase 5)
+The download handler (`download_backup`) passes the `hardlink_exists_files` flag from `DownloadRequest` through to `download::download()`. Auto-resume in `state.rs` passes `false` for `hardlink_exists_files` (resume should not hardlink, it re-downloads).
 
 ### Public API
 - `build_router(state: AppState) -> Router` -- Assembles all routes with optional auth middleware
@@ -194,7 +203,7 @@ These fields are `Option<bool>` for backward compatibility -- existing API clien
 - 400 Bad Request for invalid inputs (unknown location, empty command)
 - 401 Unauthorized for auth failures
 - 404 Not Found for kill with no running operation
-- 501 Not Implemented for stub endpoints
+- 500 Internal Server Error for restart failures (old clients remain active)
 - Integration table DDL failures are warnings, not fatal errors
 
 ## Parent Rules

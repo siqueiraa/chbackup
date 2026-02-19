@@ -75,6 +75,22 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
   - On insufficient space: returns an error with details (required vs available)
   - On `statvfs` failure (e.g., NFS): logs warning and continues (best-effort)
 
+### Hardlink Dedup (Phase 5)
+- `--hardlink-exists-files` flag enables post-download deduplication via hardlinks to existing local backups
+- Before downloading each local disk part, `find_existing_part()` scans `{data_path}/backup/*/shadow/{table_key}/{part_name}/` (excluding the current backup)
+- For each candidate: computes CRC64 of `checksums.txt`, compares against the manifest's expected CRC64
+- If a match is found: `hardlink_existing_part()` creates hardlinks from the existing part to the target directory (with EXDEV copy fallback), skipping the S3 download entirely
+- Parts with `checksum_crc64 == 0` are skipped (no valid CRC to compare)
+- The check runs inside the parallel task via `spawn_blocking`, before the S3 `get_object` call
+- Performance note: scans all local backups for each part (O(backups * parts)), acceptable because directory listing is fast and typically few backups exist locally
+
+### Progress Bar Integration (Phase 5)
+- `ProgressTracker` from `progress.rs` is created before the parallel download loop
+- Disabled when `config.general.disable_progress_bar` is true or when not running in a TTY
+- `Clone`d into each spawned download task; `tracker.inc()` called after each successful part download
+- `tracker.finish()` called after all tasks join
+- Shows: operation label, progress bar, percentage, part count, throughput, ETA
+
 ### URL Encoding
 - `url_encode()` preserves `/` (unlike upload's `url_encode_component`) since it handles full paths
 
@@ -82,7 +98,7 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
 - `download_simple_directory(s3, backup_name, local_dir, prefix)` -- Downloads all files under `{backup_name}/{prefix}/` from S3 to `{local_dir}/{prefix}/`. Uses `s3.list_objects()` to enumerate files, then `s3.get_object()` for each. Creates local directory structure as needed. No-op if no objects exist under the prefix. Called after part downloads complete for `access/` and `configs/` directories.
 
 ### Public API
-- `download(config, s3, backup_name, resume: bool) -> Result<PathBuf>` -- Main entry point with resume support (Phase 2d)
+- `download(config, s3, backup_name, resume: bool, hardlink_exists_files: bool) -> Result<PathBuf>` -- Main entry point with resume support (Phase 2d) and hardlink dedup (Phase 5)
 - `decompress_part(data, output_dir, data_format) -> Result<()>` -- Sync multi-format decompression (lz4, zstd, gzip, none) (Phase 4f)
 - `compress_part(part_dir, archive_name, data_format, compression_level) -> Result<Vec<u8>>` -- Sync multi-format compression (for testing) (Phase 4f)
 - `decompress_lz4(data) -> Result<Vec<u8>>` -- Raw LZ4 frame decompression

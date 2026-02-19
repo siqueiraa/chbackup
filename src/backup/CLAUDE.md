@@ -42,6 +42,16 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - CRC64 checksum computed from `checksums.txt` for both local and S3 disk parts
 - Part size for S3 disk parts: sum of all `ObjectRef.size` values from parsed metadata
 
+### Projection Filtering (collect.rs, Phase 5)
+- `--skip-projections` flag (CLI comma-separated) and `config.backup.skip_projections` (YAML list) control projection directory exclusion
+- During `hardlink_dir()`, subdirectories ending in `.proj` are checked against the skip patterns
+- Pattern matching uses `glob::Pattern` on the stem (name without `.proj` suffix): e.g., pattern `my_*` matches `my_agg.proj`
+- Special value `*` skips ALL projection directories
+- Uses `WalkDir::skip_current_dir()` to avoid descending into skipped projection trees (no unnecessary I/O)
+- `should_skip_projection(stem, patterns)` helper performs the glob matching
+- `merge_skip_projections()` in `main.rs` merges CLI flag with config list (CLI takes precedence)
+- Empty pattern list means all projections are preserved (default behavior)
+
 ### CRC64 Checksum (checksum.rs)
 - Uses `crc::Crc::<u64>::new(&crc::CRC_64_XZ)` for ClickHouse-compatible checksums
 - Computes CRC64 of the `checksums.txt` file content for each part
@@ -106,11 +116,11 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - `RBAC_ENTITY_TYPES` constant: Maps SQL entity types to lowercase identifiers and JSONL filenames.
 
 ### Public API
-- `create(config, ch, backup_name, table_pattern, schema_only, diff_from: Option<&str>, partitions: Option<&str>, skip_check_parts_columns: bool, rbac: bool, configs: bool, named_collections: bool) -> Result<BackupManifest>` -- Main entry point; supports partition-level freeze, parts column check (Phase 2d), and RBAC/config/named-collections backup (Phase 4e)
+- `create(config, ch, backup_name, table_pattern, schema_only, diff_from: Option<&str>, partitions: Option<&str>, skip_check_parts_columns: bool, rbac: bool, configs: bool, named_collections: bool, skip_projections: &[String]) -> Result<BackupManifest>` -- Main entry point; supports partition-level freeze, parts column check (Phase 2d), RBAC/config/named-collections backup (Phase 4e), and projection filtering (Phase 5)
 - `diff_parts(current, base) -> DiffResult` -- Incremental comparison of current vs base manifest parts
 - `compute_crc64(path) -> Result<u64>` -- File-level CRC64
 - `compute_crc64_bytes(data) -> u64` -- In-memory CRC64
-- `collect_parts(data_path, freeze_name, backup_dir, tables, disk_type_map, disk_paths) -> Result<HashMap<String, Vec<CollectedPart>>>` -- Walk all disk shadow directories, detect S3 disk parts, hardlink local parts (Phase 2c updated signature)
+- `collect_parts(data_path, freeze_name, backup_dir, tables, disk_type_map, disk_paths, skip_projections: &[String]) -> Result<HashMap<String, Vec<CollectedPart>>>` -- Walk all disk shadow directories, detect S3 disk parts, hardlink local parts, filter projections (Phase 2c + Phase 5 updated signature)
 - `CollectedPart` -- Struct with `database`, `table`, `part_info: PartInfo`, `disk_name: String`
 - `freeze_table(ch, db, table, freeze_name) -> Result<()>` -- Issue FREEZE
 - `check_mutations(ch, targets, timeout) -> Result<()>` -- Mutation pre-flight
