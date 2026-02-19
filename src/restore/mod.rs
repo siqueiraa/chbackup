@@ -4,9 +4,10 @@
 //! 1. Read manifest from `{backup_dir}/metadata.json`
 //! 2. Phase 1: CREATE databases from manifest.databases DDL
 //! 3. Phase 2: CREATE + ATTACH data tables (sorted by engine priority)
-//! 4. Phase 3: CREATE DDL-only objects (topologically sorted by dependencies)
-//! 5. Phase 4: CREATE functions from manifest.functions
-//! 6. Log summary
+//! 4. Phase 2b: CREATE postponed tables (streaming engines, refreshable MVs)
+//! 5. Phase 3: CREATE DDL-only objects (topologically sorted by dependencies)
+//! 6. Phase 4: CREATE functions from manifest.functions
+//! 7. Log summary
 
 pub mod attach;
 pub mod remap;
@@ -166,6 +167,17 @@ pub async fn restore(
                 sorted_ddl.len()
             );
             create_ddl_objects(ch, &manifest, &sorted_ddl, remap_ref).await?;
+        }
+        // Phase 2b: Postponed tables (streaming engines, refreshable MVs)
+        // In schema-only mode, created AFTER DDL-only objects since those may be
+        // targets that streaming engines write to.
+        if !data_only && !phases.postponed_tables.is_empty() {
+            info!(
+                count = phases.postponed_tables.len(),
+                "Phase 2b: {} postponed tables (schema-only)",
+                phases.postponed_tables.len()
+            );
+            create_tables(ch, &manifest, &phases.postponed_tables, data_only, remap_ref).await?;
         }
         if !data_only && !manifest.functions.is_empty() {
             create_functions(ch, &manifest).await?;
@@ -429,6 +441,17 @@ pub async fn restore(
     let tables_restored = results.len() as u64;
     for (_table_key, attached) in &results {
         total_attached += attached;
+    }
+
+    // Phase 2b: Postponed tables (streaming engines, refreshable MVs)
+    // Created AFTER all data is attached, BEFORE DDL-only objects (#1235)
+    if !data_only && !phases.postponed_tables.is_empty() {
+        info!(
+            count = phases.postponed_tables.len(),
+            "Phase 2b: {} postponed tables",
+            phases.postponed_tables.len()
+        );
+        create_tables(ch, &manifest, &phases.postponed_tables, data_only, remap_ref).await?;
     }
 
     // Phase 3: DDL-only objects (topologically sorted)
