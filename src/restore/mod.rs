@@ -424,6 +424,7 @@ pub async fn restore(
     let object_disk_concurrency =
         effective_object_disk_server_side_copy_concurrency(config) as usize;
     let allow_streaming = config.s3.allow_object_disk_streaming;
+    let (_, _, jitter_factor) = crate::config::effective_retries(config);
 
     // Build shared resume state tracker (for parallel tasks to update)
     let resume_state: Option<Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>> = if resume {
@@ -511,6 +512,7 @@ pub async fn restore(
                 parts_by_disk: table_manifest.parts.clone(),
                 already_attached: table_already_attached,
                 resume_state: resume_state.clone(),
+                jitter_factor,
             },
         ));
     }

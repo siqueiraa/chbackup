@@ -819,7 +819,7 @@ impl S3Client {
     /// Copy an object with retry and conditional streaming fallback.
     ///
     /// Retries `copy_object()` up to 3 times with exponential backoff
-    /// (100ms, 400ms, 1600ms) per design doc section 5.4 step 3d.
+    /// (100ms, 400ms, 1600ms) plus jitter per design doc section 5.4 step 3d.
     ///
     /// On final failure:
     /// - If `allow_streaming` is true: falls back to `copy_object_streaming()`
@@ -832,6 +832,19 @@ impl S3Client {
         dest_key: &str,
         allow_streaming: bool,
     ) -> Result<()> {
+        self.copy_object_with_retry_jitter(source_bucket, source_key, dest_key, allow_streaming, 0.0)
+            .await
+    }
+
+    /// Copy with retry, backoff, and configurable jitter factor.
+    pub async fn copy_object_with_retry_jitter(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        dest_key: &str,
+        allow_streaming: bool,
+        jitter_factor: f64,
+    ) -> Result<()> {
         let backoff_ms = [100u64, 400, 1600];
 
         for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
@@ -839,13 +852,14 @@ impl S3Client {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if attempt < backoff_ms.len() - 1 {
+                        let actual_delay = crate::config::apply_jitter(*delay_ms, jitter_factor);
                         debug!(
                             attempt = attempt + 1,
-                            delay_ms = delay_ms,
+                            delay_ms = actual_delay,
                             error = %e,
                             "CopyObject failed, retrying after backoff"
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
                     } else if allow_streaming {
                         warn!(
                             source_bucket = %source_bucket,

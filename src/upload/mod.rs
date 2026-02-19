@@ -451,6 +451,7 @@ pub async fn upload(
     let s3_chunk_size = config.s3.chunk_size;
     let s3_max_parts_count = config.s3.max_parts_count;
     let allow_object_disk_streaming = config.s3.allow_object_disk_streaming;
+    let (_, _, jitter_factor) = crate::config::effective_retries(config);
 
     // Shared resume state for tracking completed parts across parallel tasks
     let resume_state = if use_resume {
@@ -642,11 +643,12 @@ pub async fn upload(
                 // Dest key: {backup_name}/objects/{relative_path}
                 let dest_key = format!("{}/objects/{}", item.backup_name, s3_obj.path);
 
-                s3.copy_object_with_retry(
+                s3.copy_object_with_retry_jitter(
                     &item.source_bucket,
                     &source_key,
                     &dest_key,
                     allow_object_disk_streaming,
+                    jitter_factor,
                 )
                 .await
                 .with_context(|| {

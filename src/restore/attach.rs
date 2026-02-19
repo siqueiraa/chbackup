@@ -95,6 +95,8 @@ pub struct OwnedAttachParams {
     /// Shared resume state for tracking attached parts across parallel tasks.
     /// When set, each successful ATTACH is recorded and persisted.
     pub resume_state: Option<Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>>,
+    /// Jitter factor for retry backoff (0.0 = no jitter).
+    pub jitter_factor: f64,
 }
 
 /// Derive the UUID-based S3 path prefix for restore.
@@ -129,6 +131,7 @@ struct S3RestoreParams<'a> {
     allow_streaming: bool,
     clickhouse_uid: Option<u32>,
     clickhouse_gid: Option<u32>,
+    jitter_factor: f64,
 }
 
 /// Restore S3 disk parts for a single table.
@@ -144,6 +147,7 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
     let table = p.table;
     let uuid_prefix = uuid_s3_prefix(p.table_uuid);
     let allow_streaming = p.allow_streaming;
+    let jitter_factor = p.jitter_factor;
 
     // Same-name optimization: list existing objects at the UUID prefix
     // This is a single ListObjectsV2 per table, not per-object HeadObject
@@ -246,11 +250,12 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                         .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
 
                     s3_clone
-                        .copy_object_with_retry(
+                        .copy_object_with_retry_jitter(
                             &source_bucket,
                             &source_key,
                             &dest_key,
                             allow_streaming,
+                            jitter_factor,
                         )
                         .await
                         .with_context(|| {
@@ -403,6 +408,7 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
             allow_streaming: params.allow_object_disk_streaming,
             clickhouse_uid: params.clickhouse_uid,
             clickhouse_gid: params.clickhouse_gid,
+            jitter_factor: params.jitter_factor,
         };
         restore_s3_disk_parts(&s3_params).await?;
     }
@@ -971,6 +977,7 @@ mod tests {
             parts_by_disk: HashMap::new(),
             already_attached: HashSet::new(),
             resume_state: None,
+            jitter_factor: 0.0,
         };
 
         assert_eq!(params.object_disk_server_side_copy_concurrency, 32);
@@ -1009,6 +1016,7 @@ mod tests {
             parts_by_disk: HashMap::new(),
             already_attached: already.clone(),
             resume_state: None,
+            jitter_factor: 0.0,
         };
 
         assert_eq!(params.already_attached.len(), 2);

@@ -1290,6 +1290,49 @@ pub fn parse_duration_secs(s: &str) -> Result<u64> {
     Ok(num * multiplier)
 }
 
+/// Resolve effective retry configuration.
+///
+/// Returns `(retries_count, base_delay_secs, jitter_factor)`.
+/// `backup.*` overrides `general.*` when non-zero.
+pub fn effective_retries(config: &Config) -> (u32, u64, f64) {
+    let retries = if config.backup.retries_on_failure > 0 {
+        config.backup.retries_on_failure
+    } else {
+        config.general.retries_on_failure
+    };
+
+    let base_delay_secs = parse_duration_secs(&config.backup.retries_duration).unwrap_or(10);
+
+    // backup.retries_jitter is 0.0-1.0 (fraction), general.retries_jitter is 0-100 (percent)
+    let jitter = if config.backup.retries_jitter > 0.0 {
+        config.backup.retries_jitter
+    } else {
+        config.general.retries_jitter as f64 / 100.0
+    };
+
+    (retries, base_delay_secs, jitter)
+}
+
+/// Apply jitter to a delay duration.
+///
+/// Returns `base_delay * (1.0 + random_fraction * jitter_factor)`.
+/// Uses a simple XorShift-based PRNG seeded from the current time to avoid
+/// adding a `rand` dependency.
+pub fn apply_jitter(base_delay_ms: u64, jitter_factor: f64) -> u64 {
+    if jitter_factor <= 0.0 || base_delay_ms == 0 {
+        return base_delay_ms;
+    }
+    // Simple pseudo-random: use current nanoseconds as entropy source
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    // Map to 0.0..1.0 range
+    let random_fraction = (nanos as f64) / (u32::MAX as f64);
+    let jittered = base_delay_ms as f64 * (1.0 + random_fraction * jitter_factor);
+    jittered as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
