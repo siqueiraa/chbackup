@@ -40,6 +40,8 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 
 # Compression
 lz4_flex = "0.11"
+flate2 = "1"
+zstd = "0.13"
 
 # Directory walks
 walkdir = "2"
