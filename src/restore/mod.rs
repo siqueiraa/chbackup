@@ -11,6 +11,7 @@
 //! 4. Log summary
 
 pub mod attach;
+pub mod remap;
 pub mod schema;
 pub mod sort;
 
