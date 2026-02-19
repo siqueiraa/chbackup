@@ -93,6 +93,15 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - `check_mutations(ch, targets, timeout) -> Result<()>` -- Mutation pre-flight
 - `sync_replicas(ch, tables) -> Result<()>` -- Replica sync pre-flight
 
+### Dependency Population (Phase 4b)
+- After `list_tables()`, calls `ch.query_table_dependencies()` to get a `HashMap<String, Vec<String>>` mapping `"db.table"` to its dependencies
+- On query failure (CH < 23.3), falls back to empty map with a warning (dependencies will be `Vec::new()`)
+- Logs `tables_with_deps` count at info level
+- For metadata-only tables: looks up `deps_map.get(&full_name).cloned().unwrap_or_default()` directly
+- For data tables inside `tokio::spawn`: wraps `deps_map` in `Arc<HashMap>` (`deps_arc`), clones `Arc` into each spawn, then looks up `deps_clone.get(&full_name).cloned().unwrap_or_default()`
+- This populates `TableManifest.dependencies` which was previously always `Vec::new()`
+- Dependencies are serialized in the manifest and consumed by `restore/topo.rs` for topological sort
+
 ### Parallel FREEZE Pattern (Phase 2a)
 - Tables are frozen and collected in parallel, bounded by `effective_max_connections(config)` via a `tokio::Semaphore`
 - Each `tokio::spawn` task: acquires permit -> FREEZE -> `collect_parts` (via `spawn_blocking`) -> returns `(FreezeInfo, full_name, TableManifest)`

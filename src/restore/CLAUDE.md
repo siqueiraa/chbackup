@@ -12,9 +12,10 @@ Phase 1 implements Mode B only (non-destructive). Mode A (`--rm` DROP) is Phase 
 
 ```
 src/restore/
-  mod.rs      -- Entry point: restore() orchestrates the full restore flow
+  mod.rs      -- Entry point: restore() orchestrates phased restore flow
+  topo.rs     -- Table classification, topological sort, engine priority (Phase 4b)
   remap.rs    -- Table/database remap: DDL rewriting, name mapping for --as and -m flags
-  schema.rs   -- CREATE DATABASE and CREATE TABLE from manifest DDL (remap-aware)
+  schema.rs   -- CREATE DATABASE, CREATE TABLE, create_ddl_objects, create_functions (remap-aware)
   attach.rs   -- Hardlink parts to detached/, chown, ATTACH PART
   sort.rs     -- SortPartsByMinBlock for correct attachment order
 ```
@@ -37,9 +38,34 @@ All functions are pure (no async, no I/O) for easy unit testing. DDL rewriting u
   4. Distributed engine database/table reference update (second and third positional args)
 - **`rewrite_create_database_ddl()`**: Rewrites database name in `CREATE DATABASE` DDL (backtick-quoted and unquoted)
 
+### Phased Restore Architecture (Phase 4b, mod.rs)
+The restore flow is structured into explicit phases per design doc 5.1/5.5/5.6:
+```
+Phase 1: CREATE databases           (existing -- create_databases)
+Phase 2: CREATE + ATTACH data tables (sorted by engine priority via classify_restore_tables)
+Phase 3: CREATE DDL-only objects     (topologically sorted by dependencies via topological_sort + create_ddl_objects)
+Phase 4: CREATE functions            (from manifest.functions via create_functions)
+```
+- `classify_restore_tables()` splits filtered table keys into `RestorePhases` (data_tables, ddl_only_tables, postponed_tables)
+- Phase 2 passes `phases.data_tables` to `create_tables()` and the data attach loop (instead of all table_keys)
+- Phase 3 runs `topological_sort()` on `phases.ddl_only_tables`, then `create_ddl_objects()` on the sorted result
+- Phase 4 calls `create_functions()` for manifest.functions DDL
+- Schema-only mode (`--schema-only`) creates all schema (Phases 1-4) but skips data attach
+- Data-only mode (`--data-only`) skips Phases 1, 3, and 4
+- Resume state only queries `system.parts` for data tables (DDL-only objects have no parts)
+
+### Table Classification and Topological Sort (topo.rs)
+- **`RestorePhases`** struct: `data_tables: Vec<String>`, `ddl_only_tables: Vec<String>`, `postponed_tables: Vec<String>` (postponed is empty until Phase 4c)
+- **`classify_restore_tables(manifest, table_keys)`**: Splits tables by `metadata_only` flag. Data tables sorted by `data_table_priority()` (regular=0, `.inner` tables=1). Logs classification counts.
+- **`data_table_priority(table_key)`**: Returns 0 for regular tables, 1 for `.inner`/`.inner_id` tables (MV storage targets created before MVs)
+- **`engine_restore_priority(engine)`**: Per design doc 5.1: Dictionary=0, View/MaterializedView/LiveView/WindowView=1, Distributed/Merge=2, other=3
+- **`topological_sort(tables, keys)`**: Kahn's algorithm with engine-priority tie-breaking. If no tables have dependencies (CH < 23.3 or old manifest), falls back to engine-priority-only sorting. Detects cycles by checking for remaining nodes with non-zero in-degree; appends cyclic nodes in engine-priority order with a warning log.
+
 ### Schema Creation (schema.rs)
 - `create_databases()`: Executes DDL from `manifest.databases[]` with `IF NOT EXISTS` safety. When remap is active, creates target databases with rewritten DDL; tracks created databases to avoid duplicates.
 - `create_tables()`: For each filtered table, checks existence first, then executes the stored `CREATE TABLE` DDL. When remap is active, rewrites DDL before execution and checks existence using destination db/table names.
+- `create_ddl_objects()`: Phase 3 DDL-only object creation with retry-loop fallback. Creates objects sequentially in caller-provided (topologically sorted) order. On failure, queues for retry (max 10 rounds). Each round retries failed objects; if zero progress in a round after round 0, bails with error listing remaining failures. Handles remap via `rewrite_create_table_ddl()`. Checks `table_exists()` before creation to count already-existing objects as progress.
+- `create_functions()`: Phase 4 function creation. Iterates `manifest.functions` DDL entries, executes each via `ch.execute_ddl()`. Failures are logged as warnings and skipped (function may already exist). Logs creation count summary.
 
 ### Part Attachment (attach.rs)
 - Uses `AttachParams` struct to bundle all parameters for a table's attachment
@@ -87,6 +113,13 @@ Queries `system.tables` for `data_paths` column to find the table's data directo
 - `restore(config, ch, backup_name, table_pattern, schema_only, data_only, resume, rename_as: Option<&str>, database_mapping: Option<&HashMap<String, String>>) -> Result<()>` -- Main entry point with resume support (Phase 2d) and remap support (Phase 4a); 9 parameters
 - `create_databases(ch, manifest, remap: Option<&RemapConfig>) -> Result<()>` -- DDL for databases (remap-aware)
 - `create_tables(ch, manifest, filter, data_only, remap: Option<&RemapConfig>) -> Result<()>` -- DDL for tables (remap-aware)
+- `create_ddl_objects(ch, manifest, ddl_keys, remap: Option<&RemapConfig>) -> Result<()>` -- Phase 3: DDL-only objects with retry loop (remap-aware)
+- `create_functions(ch, manifest) -> Result<()>` -- Phase 4: functions from manifest.functions DDL
+- `classify_restore_tables(manifest, table_keys) -> RestorePhases` -- Split tables into data/DDL-only/postponed phases
+- `topological_sort(tables, keys) -> Result<Vec<String>>` -- Kahn's algorithm with engine-priority fallback and cycle detection
+- `data_table_priority(table_key) -> u8` -- Priority for Phase 2 ordering (0=regular, 1=.inner)
+- `engine_restore_priority(engine) -> u8` -- Priority for Phase 3 tie-breaking (0=Dictionary, 1=View/MV, 2=Distributed/Merge, 3=other)
+- `RestorePhases` -- Classification result struct: data_tables, ddl_only_tables, postponed_tables
 - `RemapConfig::new(rename_as_str, table_pattern, db_mapping_str, default_replica_path) -> Result<Option<Self>>` -- Build remap config from CLI flags (returns None when no remap active)
 - `RemapConfig::remap_table_key(original_key) -> (String, String)` -- Map manifest key to destination db/table
 - `parse_database_mapping(s) -> Result<HashMap<String, String>>` -- Parse `-m` CLI value
