@@ -550,6 +550,23 @@ pub async fn restore_backup(
 
         info!(backup_name = %name, "Starting restore operation");
 
+        // Parse remap parameters
+        let db_mapping = match &req.database_mapping {
+            Some(s) if !s.is_empty() => {
+                match crate::restore::remap::parse_database_mapping(s) {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        warn!(error = %e, "Invalid database_mapping parameter");
+                        state_clone
+                            .fail_op(id, format!("invalid database_mapping: {}", e))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let effective_resume = state_clone.config.general.use_resumable_state;
         let start_time = std::time::Instant::now();
         let result = crate::restore::restore(
@@ -560,8 +577,8 @@ pub async fn restore_backup(
             req.schema.unwrap_or(false),
             req.data_only.unwrap_or(false),
             effective_resume,
-            None,
-            None,
+            req.rename_as.as_deref(),
+            db_mapping.as_ref(),
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -604,6 +621,9 @@ pub struct RestoreRequest {
     pub tables: Option<String>,
     pub schema: Option<bool>,
     pub data_only: Option<bool>,
+    #[serde(default)]
+    pub rename_as: Option<String>,
+    #[serde(default)]
     pub database_mapping: Option<String>,
     pub rm: Option<bool>,
 }
@@ -745,6 +765,23 @@ pub async fn restore_remote(
     tokio::spawn(async move {
         info!(backup_name = %name, "Starting restore_remote operation");
 
+        // Parse remap parameters
+        let db_mapping = match &req.database_mapping {
+            Some(s) if !s.is_empty() => {
+                match crate::restore::remap::parse_database_mapping(s) {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        warn!(error = %e, "Invalid database_mapping parameter");
+                        state_clone
+                            .fail_op(id, format!("invalid database_mapping: {}", e))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let start_time = std::time::Instant::now();
 
         // Step 1: Download from S3
@@ -770,7 +807,7 @@ pub async fn restore_remote(
             return;
         }
 
-        // Step 2: Restore
+        // Step 2: Restore with remap
         let restore_result = crate::restore::restore(
             &state_clone.config,
             &state_clone.ch,
@@ -779,8 +816,8 @@ pub async fn restore_remote(
             req.schema.unwrap_or(false),
             req.data_only.unwrap_or(false),
             effective_resume,
-            None,
-            None,
+            req.rename_as.as_deref(),
+            db_mapping.as_ref(),
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -823,6 +860,10 @@ pub struct RestoreRemoteRequest {
     pub tables: Option<String>,
     pub schema: Option<bool>,
     pub data_only: Option<bool>,
+    #[serde(default)]
+    pub rename_as: Option<String>,
+    #[serde(default)]
+    pub database_mapping: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,11 +1463,12 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_request_accepts_unimplemented_fields() {
+    fn test_restore_request_accepts_all_fields() {
         let json = r#"{
             "tables": "default.*",
             "schema": false,
             "data_only": true,
+            "rename_as": "staging.users",
             "database_mapping": "source_db:target_db",
             "rm": true
         }"#;
@@ -1435,8 +1477,23 @@ mod tests {
         assert_eq!(req.tables.as_deref(), Some("default.*"));
         assert_eq!(req.schema, Some(false));
         assert_eq!(req.data_only, Some(true));
+        assert_eq!(req.rename_as.as_deref(), Some("staging.users"));
         assert_eq!(req.database_mapping.as_deref(), Some("source_db:target_db"));
         assert_eq!(req.rm, Some(true));
+    }
+
+    #[test]
+    fn test_restore_remote_request_accepts_remap_fields() {
+        let json = r#"{
+            "tables": "prod.*",
+            "rename_as": "staging.users",
+            "database_mapping": "prod:staging"
+        }"#;
+        let req: RestoreRemoteRequest = serde_json::from_str(json)
+            .expect("Should parse RestoreRemoteRequest with remap fields");
+        assert_eq!(req.tables.as_deref(), Some("prod.*"));
+        assert_eq!(req.rename_as.as_deref(), Some("staging.users"));
+        assert_eq!(req.database_mapping.as_deref(), Some("prod:staging"));
     }
 
     #[test]
