@@ -1,0 +1,417 @@
+{
+  "plan": "2026-02-19-02-phase4d-advanced-restore",
+  "status": {"pass": 0, "fail": 10, "total": 10},
+  "last_updated": "2026-02-19T14:00:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "feature",
+      "description": "ChClient new methods for Mode A, ZK, ATTACH TABLE, DatabaseReplicated, mutations",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub async fn drop_table\\|pub async fn drop_database\\|pub async fn detach_table_sync\\|pub async fn attach_table\\|pub async fn system_restore_replica\\|pub async fn drop_replica_from_zkpath\\|pub async fn check_zk_replica_exists\\|pub async fn query_database_engine\\|pub async fn execute_mutation' src/clickhouse/client.rs",
+            "expected": "9",
+            "fail_message": "Not all 9 new ChClient methods found in client.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding ChClient methods"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- clickhouse::client::tests::test_drop_table_sql test_drop_database_sql test_detach_table_sql test_attach_table_sql test_restore_replica_sql test_drop_replica_sql test_execute_mutation_sql 2>&1 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "ChClient SQL generation tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "ChClient methods require live ClickHouse for runtime testing; covered by integration tests",
+            "alternative_verification": {
+              "command": "cargo test --lib -- clickhouse::client::tests 2>&1 | grep 'test result:' | head -1",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": null
+    },
+    {
+      "id": "F002",
+      "category": "feature",
+      "description": "DDL helpers: parse_replicated_params, resolve_zk_macros, add_on_cluster_clause, rewrite_distributed_cluster",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub fn parse_replicated_params\\|pub fn resolve_zk_macros\\|pub fn add_on_cluster_clause\\|pub fn rewrite_distributed_cluster' src/restore/remap.rs",
+            "expected": "4",
+            "fail_message": "Not all 4 new remap functions found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding remap functions"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- restore::remap::tests::test_parse_replicated_params restore::remap::tests::test_resolve_zk_macros restore::remap::tests::test_add_on_cluster restore::remap::tests::test_rewrite_distributed_cluster 2>&1 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "Remap DDL helper tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Pure string manipulation functions with no runtime behavior",
+            "alternative_verification": {
+              "command": "cargo test --lib -- restore::remap::tests 2>&1 | grep 'test result:' | head -1",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": null
+    },
+    {
+      "id": "F003",
+      "category": "feature",
+      "description": "Reverse DROP ordering: engine_drop_priority and sort_tables_for_drop",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub fn engine_drop_priority\\|pub fn sort_tables_for_drop' src/restore/topo.rs",
+            "expected": "2",
+            "fail_message": "Not both new topo functions found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding topo functions"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- restore::topo::tests::test_reverse_drop_priority restore::topo::tests::test_sort_tables_for_drop 2>&1 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "Drop ordering tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Pure sorting functions with no runtime behavior",
+            "alternative_verification": {
+              "command": "cargo test --lib -- restore::topo::tests 2>&1 | grep 'test result:' | head -1",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": null
+    },
+    {
+      "id": "F004",
+      "category": "feature",
+      "description": "Mode A DROP phase: drop_tables and drop_databases in schema.rs",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub async fn drop_tables\\|pub async fn drop_databases' src/restore/schema.rs",
+            "expected": "2",
+            "fail_message": "drop_tables and/or drop_databases not found in schema.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding drop functions"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- restore::schema::tests::test_drop 2>&1 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "Drop tables/databases tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Requires live ClickHouse for DROP execution",
+            "alternative_verification": {
+              "command": "cargo test --lib -- restore::schema::tests 2>&1 | grep 'test result:' | head -1",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": null
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "ZK conflict resolution and DatabaseReplicated detection",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'async fn resolve_zk_conflict\\|pub async fn detect_replicated_databases' src/restore/schema.rs",
+            "expected": "2",
+            "fail_message": "resolve_zk_conflict and/or detect_replicated_databases not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding ZK resolution"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- restore::schema::tests::test_resolve_zk restore::schema::tests::test_is_replicated_engine 2>&1 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "ZK conflict resolution tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Requires live ZooKeeper for system.zookeeper queries",
+            "alternative_verification": {
+              "command": "cargo test --lib -- restore::schema::tests 2>&1 | grep 'test result:' | head -1",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": null
+    },
+    {
+      "id": "F006",
+      "category": "feature",
+      "description": "ATTACH TABLE mode for Replicated engines",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'ATTACH TABLE mode\\|restore_as_attach\\|detach_table_sync\\|system_restore_replica' src/restore/mod.rs",
+            "expected": "4",
+            "fail_message": "ATTACH TABLE mode code paths not found in mod.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding ATTACH TABLE mode"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- restore::tests::test_is_replicated_engine 2>&1 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "Replicated engine detection tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Requires live Replicated tables with ZooKeeper for DETACH/ATTACH/RESTORE REPLICA",
+            "alternative_verification": {
+              "command": "cargo test --lib -- restore::tests 2>&1 | grep 'test result:' | head -1",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [6],
+      "verified_at": null
+    },
+    {
+      "id": "F007",
+      "category": "feature",
+      "description": "Pending mutation re-application after ATTACH",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pending_mutations\\|Re-applying.*mutation\\|execute_mutation' src/restore/mod.rs",
+            "expected": "3",
+            "fail_message": "Mutation re-apply code not found in mod.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding mutation re-apply"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- restore::tests::test_mutation_reapply 2>&1 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "Mutation re-apply tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Mutation execution requires live ClickHouse with actual data",
+            "alternative_verification": {
+              "command": "cargo test --lib -- restore::tests 2>&1 | grep 'test result:' | head -1",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [7],
+      "verified_at": null
+    },
+    {
+      "id": "F008",
+      "category": "feature",
+      "description": "Wire rm parameter through restore() and all 5 call sites",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'rm flag is not yet implemented' src/main.rs",
+            "expected": "0",
+            "fail_message": "Old --rm warning still present in main.rs (should be removed)"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after wiring rm parameter"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test 2>&1 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "Test suite failed after rm parameter wiring"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Parameter wiring is compile-time correctness; runtime behavior tested by F009",
+            "alternative_verification": {
+              "command": "cargo check 2>&1 | tail -1",
+              "expected": "Finished"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [8],
+      "verified_at": null
+    },
+    {
+      "id": "F009",
+      "category": "feature",
+      "description": "Full integration of Mode A, ON CLUSTER, DatabaseReplicated, ZK, ATTACH TABLE, Distributed cluster rewrite, mutations in restore()",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'Phase 0.*DROP\\|on_cluster\\|replicated_databases\\|dist_cluster\\|resolve_zk_conflict\\|restore_as_attach\\|pending_mutations' src/restore/mod.rs",
+            "expected": "7",
+            "fail_message": "Not all integration points found in restore() orchestrator"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors in final integration"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test 2>&1 | grep 'test result:' | grep -c 'ok' || echo 0",
+            "expected": "1",
+            "fail_message": "Full test suite failed after integration"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release 2>&1 | tail -3",
+            "wait_seconds": 5,
+            "patterns": ["Phase 0: Dropping"],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "Runtime verification: chbackup restore --rm does not produce expected log output"
+          }
+        ]
+      },
+      "related_tasks": [9],
+      "verified_at": null
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for all modified modules",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f src/restore/CLAUDE.md && test -f src/clickhouse/CLAUDE.md && echo PASS || echo FAIL",
+            "expected": "PASS",
+            "fail_message": "One or more CLAUDE.md files missing"
+          },
+          {
+            "name": "compilation",
+            "command": "echo N/A - documentation only",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -q 'Mode A' src/restore/CLAUDE.md && grep -q 'drop_table' src/clickhouse/CLAUDE.md && grep -q 'ON CLUSTER' src/restore/CLAUDE.md && grep -q 'execute_mutation' src/clickhouse/CLAUDE.md && echo VALID || echo INVALID",
+            "expected": "VALID",
+            "fail_message": "CLAUDE.md missing key Phase 4d pattern documentation"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Documentation file - no runtime behavior",
+            "alternative_verification": {
+              "command": "grep -c 'Mode A\\|ON CLUSTER\\|ATTACH TABLE\\|mutation' src/restore/CLAUDE.md",
+              "expected": "4"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [10],
+      "verified_at": null
+    }
+  ]
+}
