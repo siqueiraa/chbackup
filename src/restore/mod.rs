@@ -38,8 +38,10 @@ use crate::table_filter::TableFilter;
 use attach::{
     attach_parts_owned, detect_clickhouse_ownership, get_table_data_path, OwnedAttachParams,
 };
-use remap::RemapConfig;
-use schema::{create_databases, create_ddl_objects, create_functions, create_tables};
+use remap::{parse_replicated_params, resolve_zk_macros, RemapConfig};
+use schema::{
+    create_databases, create_ddl_objects, create_functions, create_tables, is_replicated_engine,
+};
 use topo::{classify_restore_tables, topological_sort};
 
 /// Restore a backup to ClickHouse.
@@ -404,13 +406,84 @@ pub async fn restore(
         ));
     }
 
+    // 5b. ATTACH TABLE mode: for Replicated tables when restore_as_attach is enabled
+    let restore_as_attach = config.clickhouse.restore_as_attach;
+    let mut attach_table_results: Vec<(String, u64)> = Vec::new();
+
+    if restore_as_attach {
+        // Get macros for ZK path resolution (needed for DROP REPLICA in ATTACH TABLE mode)
+        let macros = ch.get_macros().await.unwrap_or_default();
+
+        let mut normal_items: Vec<(String, OwnedAttachParams)> = Vec::new();
+
+        for (table_key, params) in restore_items {
+            if is_replicated_engine(&params.engine) {
+                // Try ATTACH TABLE mode for Replicated tables
+                let table_manifest = manifest.tables.get(&table_key);
+                let ddl = table_manifest.map_or("", |tm| tm.ddl.as_str());
+                let all_parts: Vec<_> = table_manifest
+                    .map(|tm| {
+                        tm.parts
+                            .values()
+                            .flat_map(|parts| parts.iter().cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let (src_db, src_table) =
+                    table_key.split_once('.').unwrap_or(("default", &table_key));
+
+                match try_attach_table_mode(
+                    ch,
+                    src_db,
+                    src_table,
+                    &params.db,
+                    &params.table,
+                    ddl,
+                    &params.engine,
+                    &macros,
+                    &all_parts,
+                    &backup_dir,
+                    &params.table_data_path,
+                    ch_uid,
+                    ch_gid,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        let count = all_parts.len() as u64;
+                        attach_table_results.push((table_key, count));
+                    }
+                    Ok(false) => {
+                        // Not eligible -- fall back to normal attach
+                        normal_items.push((table_key, params));
+                    }
+                    Err(e) => {
+                        warn!(
+                            table = %table_key,
+                            error = %e,
+                            "ATTACH TABLE mode failed, falling back to per-part ATTACH"
+                        );
+                        normal_items.push((table_key, params));
+                    }
+                }
+            } else {
+                normal_items.push((table_key, params));
+            }
+        }
+
+        restore_items = normal_items;
+    }
+
     let max_conn = effective_max_connections(config) as usize;
     let table_count = restore_items.len();
 
-    info!(
-        "Restoring {} tables (max_connections={})",
-        table_count, max_conn
-    );
+    if table_count > 0 {
+        info!(
+            "Restoring {} tables via per-part ATTACH (max_connections={})",
+            table_count, max_conn
+        );
+    }
 
     // 6. Parallel table restore with semaphore
     let semaphore = Arc::new(Semaphore::new(max_conn));
@@ -437,11 +510,14 @@ pub async fn restore(
     }
 
     // Await all restore tasks
-    let results: Vec<(String, u64)> = try_join_all(handles)
+    let mut results: Vec<(String, u64)> = try_join_all(handles)
         .await
         .context("A restore task panicked")?
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
+
+    // Merge ATTACH TABLE mode results
+    results.extend(attach_table_results);
 
     // 7. Tally totals
     let mut total_attached = 0u64;
@@ -531,6 +607,133 @@ fn find_table_uuid(
         }
     }
     None
+}
+
+/// Attempt ATTACH TABLE mode for a Replicated table.
+///
+/// Flow: DETACH TABLE SYNC -> DROP REPLICA from ZK -> hardlink parts to data dir ->
+/// ATTACH TABLE -> SYSTEM RESTORE REPLICA
+///
+/// Returns `Ok(true)` if ATTACH TABLE mode was used successfully.
+/// Returns `Ok(false)` if the table is not eligible (non-Replicated or no DDL).
+/// Returns `Err` on unrecoverable failure.
+#[allow(clippy::too_many_arguments)]
+async fn try_attach_table_mode(
+    ch: &ChClient,
+    src_db: &str,
+    src_table: &str,
+    dst_db: &str,
+    dst_table: &str,
+    ddl: &str,
+    engine: &str,
+    macros: &HashMap<String, String>,
+    parts: &[crate::manifest::PartInfo],
+    backup_dir: &Path,
+    table_data_path: &Path,
+    ch_uid: Option<u32>,
+    ch_gid: Option<u32>,
+) -> Result<bool> {
+    if !is_replicated_engine(engine) {
+        return Ok(false);
+    }
+
+    let dst_key = format!("{}.{}", dst_db, dst_table);
+    info!(table = %dst_key, "ATTACH TABLE mode: Replicated engine detected");
+
+    // Step 1: DETACH TABLE SYNC
+    info!(table = %dst_key, "ATTACH TABLE mode: detaching table");
+    ch.detach_table_sync(dst_db, dst_table)
+        .await
+        .with_context(|| {
+            format!("ATTACH TABLE mode: failed to DETACH TABLE {}", dst_key)
+        })?;
+
+    // Step 2: DROP REPLICA from ZK
+    if let Some((zk_path_template, replica_template)) = parse_replicated_params(ddl) {
+        let resolved_path = resolve_zk_macros(&zk_path_template, macros);
+        let resolved_replica = resolve_zk_macros(&replica_template, macros);
+
+        info!(
+            table = %dst_key,
+            zk_path = %resolved_path,
+            replica = %resolved_replica,
+            "ATTACH TABLE mode: dropping ZK replica"
+        );
+        if let Err(e) = ch
+            .drop_replica_from_zkpath(&resolved_replica, &resolved_path)
+            .await
+        {
+            warn!(
+                error = %e,
+                "ATTACH TABLE mode: DROP REPLICA failed (non-fatal, continuing)"
+            );
+        }
+    }
+
+    // Step 3: Hardlink parts to the table's data directory (NOT detached/)
+    // ATTACH TABLE reads from the main data directory, not detached/
+    let url_db = attach::url_encode(src_db);
+    let url_table = attach::url_encode(src_table);
+    let shadow_base = backup_dir.join("shadow").join(&url_db).join(&url_table);
+    let data_path = table_data_path.to_owned();
+
+    // Run hardlinking in spawn_blocking since it's sync I/O
+    let parts_owned: Vec<String> = parts.iter().map(|p| p.name.clone()).collect();
+    let hardlink_result = tokio::task::spawn_blocking(move || -> Result<u64> {
+        let mut linked = 0u64;
+        for part_name in &parts_owned {
+            let part_src = shadow_base.join(part_name);
+            let part_dst = data_path.join(part_name);
+
+            if part_dst.exists() {
+                linked += 1;
+                continue;
+            }
+
+            if !part_src.exists() {
+                continue;
+            }
+
+            attach::hardlink_or_copy_dir(&part_src, &part_dst)?;
+            attach::chown_recursive(&part_dst, ch_uid, ch_gid)?;
+            linked += 1;
+        }
+        Ok(linked)
+    })
+    .await
+    .context("ATTACH TABLE mode: hardlink task panicked")??;
+
+    debug!(
+        table = %dst_key,
+        linked = hardlink_result,
+        "ATTACH TABLE mode: hardlinked parts to data directory"
+    );
+
+    // Step 4: ATTACH TABLE
+    info!(table = %dst_key, "ATTACH TABLE mode: attaching table");
+    ch.attach_table(dst_db, dst_table)
+        .await
+        .with_context(|| {
+            format!("ATTACH TABLE mode: failed to ATTACH TABLE {}", dst_key)
+        })?;
+
+    // Step 5: SYSTEM RESTORE REPLICA
+    info!(table = %dst_key, "ATTACH TABLE mode: restoring replica");
+    ch.system_restore_replica(dst_db, dst_table)
+        .await
+        .with_context(|| {
+            format!(
+                "ATTACH TABLE mode: failed to SYSTEM RESTORE REPLICA {}",
+                dst_key
+            )
+        })?;
+
+    info!(
+        table = %dst_key,
+        parts = parts.len(),
+        "ATTACH TABLE mode: complete"
+    );
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -670,5 +873,55 @@ mod tests {
 
         delete_state_file(&state_path);
         assert!(!state_path.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4d: ATTACH TABLE mode tests
+    // -----------------------------------------------------------------------
+
+    /// Test that is_replicated_engine correctly identifies Replicated engine variants.
+    #[test]
+    fn test_is_replicated_engine_detection() {
+        // All Replicated* variants should be detected
+        assert!(is_replicated_engine("ReplicatedMergeTree"));
+        assert!(is_replicated_engine("ReplicatedReplacingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedSummingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedAggregatingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedCollapsingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedVersionedCollapsingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedGraphiteMergeTree"));
+
+        // Non-Replicated engines should NOT trigger ATTACH TABLE mode
+        assert!(!is_replicated_engine("MergeTree"));
+        assert!(!is_replicated_engine("ReplacingMergeTree"));
+        assert!(!is_replicated_engine("AggregatingMergeTree"));
+        assert!(!is_replicated_engine("CollapsingMergeTree"));
+        assert!(!is_replicated_engine("View"));
+        assert!(!is_replicated_engine("MaterializedView"));
+        assert!(!is_replicated_engine("Dictionary"));
+        assert!(!is_replicated_engine("Distributed"));
+        assert!(!is_replicated_engine("Kafka"));
+        assert!(!is_replicated_engine("Memory"));
+    }
+
+    /// Test that ATTACH TABLE mode is skipped for non-Replicated engines.
+    #[test]
+    fn test_attach_table_mode_skips_non_replicated() {
+        // Non-Replicated engines: is_replicated_engine returns false
+        // This means try_attach_table_mode would return Ok(false) immediately
+        let engines = [
+            "MergeTree",
+            "ReplacingMergeTree",
+            "View",
+            "Dictionary",
+            "Distributed",
+        ];
+        for engine in &engines {
+            assert!(
+                !is_replicated_engine(engine),
+                "{} should not trigger ATTACH TABLE mode",
+                engine
+            );
+        }
     }
 }

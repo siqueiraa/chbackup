@@ -613,7 +613,7 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
 /// Hardlink all files from source directory to destination directory.
 ///
 /// If hardlink fails with EXDEV (cross-device link), falls back to file copy.
-fn hardlink_or_copy_dir(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn hardlink_or_copy_dir(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("Failed to create destination dir: {}", dst.display()))?;
 
@@ -671,7 +671,7 @@ fn hardlink_or_copy_dir(src: &Path, dst: &Path) -> Result<()> {
 /// If uid and gid are both None, this is a no-op.
 /// If the process is not running as root, chown may fail with EPERM --
 /// in that case we log a warning and continue.
-fn chown_recursive(path: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+pub(crate) fn chown_recursive(path: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
     if uid.is_none() && gid.is_none() {
         return Ok(());
     }
@@ -766,7 +766,7 @@ pub fn get_table_data_path(
 }
 
 /// URL-encode a component for directory paths (same as download module).
-fn url_encode(s: &str) -> String {
+pub(crate) fn url_encode(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.' {
