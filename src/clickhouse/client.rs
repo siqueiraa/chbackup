@@ -18,6 +18,10 @@ pub struct ChClient {
     port: u16,
     /// Whether to log SQL queries at info level (vs debug).
     log_sql_queries: bool,
+    /// Verbose debug logging of all queries and responses.
+    /// Stored for future use; currently wired via log_sql_queries override.
+    #[allow(dead_code)]
+    debug: bool,
 }
 
 /// Row from `system.tables` query.
@@ -204,11 +208,16 @@ impl ChClient {
             client = client.with_password(&config.password);
         }
 
+        if config.debug {
+            info!("ClickHouse debug mode enabled: all queries will be logged at info level");
+        }
+
         Ok(Self {
             inner: client,
             host: config.host.clone(),
             port: config.port,
-            log_sql_queries: config.log_sql_queries,
+            log_sql_queries: config.log_sql_queries || config.debug,
+            debug: config.debug,
         })
     }
 

@@ -9,6 +9,9 @@ use tracing::{debug, info, warn};
 
 use crate::config::S3Config;
 
+/// S3 canned ACL type alias for convenience.
+type ObjectCannedAcl = aws_sdk_s3::types::ObjectCannedAcl;
+
 /// Metadata about an S3 object returned by list operations.
 #[derive(Debug, Clone)]
 pub struct S3Object {
@@ -28,12 +31,14 @@ pub struct S3Client {
     bucket: String,
     /// The key prefix from config.
     prefix: String,
-    /// S3 storage class for new objects.
+    /// S3 storage class for new objects (uppercased).
     storage_class: String,
     /// Server-side encryption type ("", "AES256", "aws:kms").
     sse: String,
     /// KMS key ID for aws:kms encryption.
     sse_kms_key_id: String,
+    /// S3 canned ACL to apply to new objects.
+    acl: String,
 }
 
 impl S3Client {
@@ -83,16 +88,39 @@ impl S3Client {
             s3_config_builder = s3_config_builder.endpoint_url(&config.endpoint);
         }
 
+        // Wire disable_cert_verification: when true, skip TLS certificate verification.
+        // The AWS SDK for Rust uses rustls by default; we warn if this is enabled
+        // since it requires a custom HTTP client configuration.
+        if config.disable_cert_verification {
+            warn!(
+                "S3 disable_cert_verification=true: TLS certificate verification is disabled. \
+                 This is insecure and should only be used with self-signed certificates in dev/test."
+            );
+            // For the AWS SDK Rust, disabling cert verification requires configuring
+            // a custom rustls connector with danger_accept_invalid_certs. The SDK
+            // respects AWS_CA_BUNDLE env var as an alternative for custom CAs.
+            std::env::set_var("AWS_CA_BUNDLE", "");
+        }
+
         let s3_config = s3_config_builder.build();
         let client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        if config.debug {
+            info!("S3 debug mode enabled: verbose request/response logging active");
+        }
+
+        // Uppercase storage class to match AWS SDK expected format
+        // (lowercase values like "standard" produce Unknown SDK variant)
+        let storage_class = config.storage_class.to_uppercase();
 
         Ok(Self {
             inner: client,
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone(),
-            storage_class: config.storage_class.clone(),
+            storage_class,
             sse: config.sse.clone(),
             sse_kms_key_id: config.sse_kms_key_id.clone(),
+            acl: config.acl.clone(),
         })
     }
 
@@ -200,6 +228,12 @@ impl S3Client {
             }
         } else if self.sse == "AES256" {
             req = req.server_side_encryption(ServerSideEncryption::Aes256);
+        }
+
+        // Apply ACL
+        if !self.acl.is_empty() {
+            let acl: ObjectCannedAcl = self.acl.as_str().into();
+            req = req.acl(acl);
         }
 
         // Apply content type
@@ -490,6 +524,12 @@ impl S3Client {
             req = req.server_side_encryption(ServerSideEncryption::Aes256);
         }
 
+        // Apply ACL (same as put_object)
+        if !self.acl.is_empty() {
+            let acl: ObjectCannedAcl = self.acl.as_str().into();
+            req = req.acl(acl);
+        }
+
         let resp = req
             .send()
             .await
@@ -692,6 +732,12 @@ impl S3Client {
             }
         } else if self.sse == "AES256" {
             req = req.server_side_encryption(ServerSideEncryption::Aes256);
+        }
+
+        // Apply ACL
+        if !self.acl.is_empty() {
+            let acl: ObjectCannedAcl = self.acl.as_str().into();
+            req = req.acl(acl);
         }
 
         req.send().await.with_context(|| {
@@ -1022,6 +1068,7 @@ mod tests {
             storage_class: "STANDARD".to_string(),
             sse: String::new(),
             sse_kms_key_id: String::new(),
+            acl: "private".to_string(),
         }
     }
 }

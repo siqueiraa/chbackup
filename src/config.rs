@@ -143,7 +143,7 @@ pub struct ClickHouseConfig {
     pub check_replicas_before_attach: bool,
 
     /// validate column type consistency before backup
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub check_parts_columns: bool,
 
     #[serde(default = "default_mutation_wait_timeout")]
@@ -279,7 +279,7 @@ pub struct S3Config {
     pub disable_cert_verification: bool,
 
     /// S3 ACL ("private", "bucket-owner-full-control", or "" for disabled)
-    #[serde(default)]
+    #[serde(default = "default_s3_acl")]
     pub acl: String,
 
     #[serde(default = "default_storage_class")]
@@ -522,7 +522,7 @@ impl Default for ClickHouseConfig {
             tls_ca: String::new(),
             sync_replicated_tables: true,
             check_replicas_before_attach: true,
-            check_parts_columns: false,
+            check_parts_columns: true,
             mutation_wait_timeout: default_mutation_wait_timeout(),
             restore_as_attach: false,
             restore_schema_on_cluster: String::new(),
@@ -563,7 +563,7 @@ impl Default for S3Config {
             force_path_style: false,
             disable_ssl: false,
             disable_cert_verification: false,
-            acl: String::new(),
+            acl: default_s3_acl(),
             storage_class: default_storage_class(),
             sse: String::new(),
             sse_kms_key_id: String::new(),
@@ -709,7 +709,9 @@ fn default_mutation_wait_timeout() -> String {
 }
 
 fn default_max_connections() -> u32 {
-    1
+    std::thread::available_parallelism()
+        .map(|n| (n.get() as u32 / 2).max(1))
+        .unwrap_or(1)
 }
 
 fn default_restart_command() -> String {
@@ -725,11 +727,12 @@ fn default_skip_tables() -> Vec<String> {
         "system.*".to_string(),
         "INFORMATION_SCHEMA.*".to_string(),
         "information_schema.*".to_string(),
+        "_temporary_and_external_tables.*".to_string(),
     ]
 }
 
 fn default_replica_path() -> String {
-    "/clickhouse/tables/{shard}/{database}/{table}".to_string()
+    "/clickhouse/tables/{cluster}/{shard}/{database}/{table}".to_string()
 }
 
 fn default_replica_name() -> String {
@@ -737,7 +740,7 @@ fn default_replica_name() -> String {
 }
 
 fn default_ch_timeout() -> String {
-    "5m".to_string()
+    "30m".to_string()
 }
 
 fn default_s3_bucket() -> String {
@@ -750,6 +753,10 @@ fn default_s3_region() -> String {
 
 fn default_s3_prefix() -> String {
     "chbackup".to_string()
+}
+
+fn default_s3_acl() -> String {
+    "private".to_string()
 }
 
 fn default_storage_class() -> String {
