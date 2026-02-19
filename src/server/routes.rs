@@ -17,6 +17,8 @@ use tracing::{info, warn};
 use std::sync::Arc;
 
 use crate::list;
+use crate::manifest::BackupManifest;
+use crate::table_filter::TableFilter;
 
 use super::actions::ActionStatus;
 use super::metrics::Metrics;
@@ -77,6 +79,25 @@ pub struct ListResponse {
     pub config_size: u64,
     pub compressed_size: u64,
     pub required: String,
+}
+
+/// Query params for GET /api/v1/tables
+#[derive(Debug, Deserialize)]
+pub struct TablesParams {
+    pub table: Option<String>,
+    pub all: Option<bool>,
+    pub backup: Option<String>,
+}
+
+/// Response entry for GET /api/v1/tables
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TablesResponseEntry {
+    pub database: String,
+    pub name: String,
+    pub engine: String,
+    pub uuid: String,
+    pub data_paths: Vec<String>,
+    pub total_bytes: Option<u64>,
 }
 
 /// Generic error response.
@@ -1291,9 +1312,148 @@ pub async fn restart(
     }))
 }
 
-/// GET /api/v1/tables -- table listing (Phase 4f)
-pub async fn tables_stub() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented (Phase 4f)")
+/// GET /api/v1/tables -- list tables from ClickHouse or from a remote backup manifest.
+///
+/// Supports two modes:
+/// - **Live mode** (default): queries system.tables via ChClient
+/// - **Remote mode** (`?backup=name`): downloads manifest from S3 and lists tables from it
+///
+/// Optional query params:
+/// - `table`: glob pattern to filter tables (e.g. "default.*")
+/// - `all`: include system databases (live mode only)
+/// - `backup`: remote backup name to list tables from
+pub async fn tables(
+    State(state): State<AppState>,
+    Query(params): Query<TablesParams>,
+) -> Result<Json<Vec<TablesResponseEntry>>, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(backup_name) = &params.backup {
+        // Remote mode: download manifest and list tables from it
+        let s3 = state.s3.load();
+        let manifest_key = format!("{}/metadata.json", backup_name);
+        let manifest_data = s3
+            .get_object(&manifest_key)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, backup_name = %backup_name, "Failed to download manifest for tables endpoint");
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("failed to download manifest for backup '{}': {}", backup_name, e),
+                    }),
+                )
+            })?;
+
+        let manifest = BackupManifest::from_json_bytes(&manifest_data).map_err(|e| {
+            warn!(error = %e, "Failed to parse manifest for tables endpoint");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to parse manifest: {}", e),
+                }),
+            )
+        })?;
+
+        let filter = params.table.as_deref().map(TableFilter::new);
+
+        let results: Vec<TablesResponseEntry> = manifest
+            .tables
+            .iter()
+            .filter(|(full_name, _)| {
+                if let Some(ref f) = filter {
+                    let parts: Vec<&str> = full_name.splitn(2, '.').collect();
+                    let (db, tbl) = if parts.len() == 2 {
+                        (parts[0], parts[1])
+                    } else {
+                        (full_name.as_str(), "")
+                    };
+                    f.matches(db, tbl)
+                } else {
+                    true
+                }
+            })
+            .map(|(full_name, tm)| {
+                let parts: Vec<&str> = full_name.splitn(2, '.').collect();
+                let (db, tbl) = if parts.len() == 2 {
+                    (parts[0].to_string(), parts[1].to_string())
+                } else {
+                    (full_name.clone(), String::new())
+                };
+
+                let total: u64 = tm
+                    .parts
+                    .values()
+                    .flat_map(|v| v.iter())
+                    .map(|p| p.size)
+                    .sum();
+
+                TablesResponseEntry {
+                    database: db,
+                    name: tbl,
+                    engine: tm.engine.clone(),
+                    uuid: tm.uuid.clone().unwrap_or_default(),
+                    data_paths: Vec::new(),
+                    total_bytes: Some(total),
+                }
+            })
+            .collect();
+
+        info!(
+            backup_name = %backup_name,
+            count = results.len(),
+            "tables endpoint returning remote backup tables"
+        );
+        Ok(Json(results))
+    } else {
+        // Live mode: query ClickHouse
+        let ch = state.ch.load();
+        let all = params.all.unwrap_or(false);
+
+        let rows = if all {
+            ch.list_all_tables().await
+        } else {
+            ch.list_tables().await
+        }
+        .map_err(|e| {
+            warn!(error = %e, "Failed to query tables for tables endpoint");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to query tables: {}", e),
+                }),
+            )
+        })?;
+
+        let filter = params.table.as_deref().map(TableFilter::new);
+
+        let results: Vec<TablesResponseEntry> = rows
+            .into_iter()
+            .filter(|t| {
+                if let Some(ref f) = filter {
+                    if all {
+                        f.matches_including_system(&t.database, &t.name)
+                    } else {
+                        f.matches(&t.database, &t.name)
+                    }
+                } else {
+                    true
+                }
+            })
+            .map(|t| TablesResponseEntry {
+                database: t.database,
+                name: t.name,
+                engine: t.engine,
+                uuid: t.uuid,
+                data_paths: t.data_paths,
+                total_bytes: t.total_bytes,
+            })
+            .collect();
+
+        info!(
+            count = results.len(),
+            "tables endpoint returning live tables"
+        );
+        Ok(Json(results))
+    }
 }
 
 /// POST /api/v1/watch/start -- start the watch loop
@@ -1685,10 +1845,67 @@ mod tests {
         assert!(invalid_result.is_none());
     }
 
-    #[tokio::test]
-    async fn test_tables_stub_returns_501() {
-        let (status, _body) = tables_stub().await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    #[test]
+    fn test_tables_response_entry_serialization() {
+        let entry = TablesResponseEntry {
+            database: "default".to_string(),
+            name: "users".to_string(),
+            engine: "MergeTree".to_string(),
+            uuid: "abc-123".to_string(),
+            data_paths: vec!["/data/default/users/".to_string()],
+            total_bytes: Some(1024),
+        };
+
+        let json = serde_json::to_string(&entry).expect("TablesResponseEntry should serialize");
+        assert!(json.contains("\"database\":\"default\""));
+        assert!(json.contains("\"name\":\"users\""));
+        assert!(json.contains("\"engine\":\"MergeTree\""));
+        assert!(json.contains("\"uuid\":\"abc-123\""));
+        assert!(json.contains("\"total_bytes\":1024"));
+    }
+
+    #[test]
+    fn test_tables_params_deserialization() {
+        // With all fields
+        let json = r#"{"table": "default.*", "all": true, "backup": "daily-2024-01-15"}"#;
+        let params: TablesParams = serde_json::from_str(json).expect("Should parse TablesParams");
+        assert_eq!(params.table.as_deref(), Some("default.*"));
+        assert_eq!(params.all, Some(true));
+        assert_eq!(params.backup.as_deref(), Some("daily-2024-01-15"));
+
+        // With no fields
+        let json_empty = r#"{}"#;
+        let params_empty: TablesParams =
+            serde_json::from_str(json_empty).expect("Should parse empty TablesParams");
+        assert!(params_empty.table.is_none());
+        assert!(params_empty.all.is_none());
+        assert!(params_empty.backup.is_none());
+    }
+
+    #[test]
+    fn test_tables_response_entry_from_manifest_data() {
+        // Simulate what the tables handler does in remote mode:
+        // convert manifest table data to TablesResponseEntry
+        let full_name = "default.users";
+        let parts: Vec<&str> = full_name.splitn(2, '.').collect();
+        let (db, tbl) = if parts.len() == 2 {
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            (full_name.to_string(), String::new())
+        };
+
+        let entry = TablesResponseEntry {
+            database: db.clone(),
+            name: tbl.clone(),
+            engine: "MergeTree".to_string(),
+            uuid: "".to_string(),
+            data_paths: Vec::new(),
+            total_bytes: Some(2048),
+        };
+
+        assert_eq!(entry.database, "default");
+        assert_eq!(entry.name, "users");
+        assert_eq!(entry.total_bytes, Some(2048));
     }
 
     #[test]
