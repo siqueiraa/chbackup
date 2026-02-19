@@ -20,14 +20,22 @@ src/upload/
 Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4 compress, then single `PutObject`. This avoids streaming multipart complexity (deferred to Phase 2). Acceptable because most ClickHouse parts are <100MB compressed.
 
 ### Compression Pipeline (stream.rs)
-- Uses sync `tar::Builder` + sync `lz4_flex::frame::FrameEncoder` inside `spawn_blocking`
-- Flow: `tar::Builder::new(FrameEncoder::new(Vec::new()))` -> `append_dir_all` -> `finish` -> compressed bytes
+- Supports 4 compression formats: `lz4`, `zstd`, `gzip`, `none` (Phase 4f)
+- Format selected by `config.backup.compression` (`data_format` parameter), level by `config.backup.compression_level`
+- Uses sync `tar::Builder` + format-specific compressor inside `spawn_blocking`
+- Flow: `tar::Builder::new(compressor(Vec::new()))` -> `append_dir_all` -> `finish` -> compressed bytes
 - Archive entry name is the part directory name (e.g., `202401_1_50_3`)
+- Format-specific behavior:
+  - `lz4`: `lz4_flex::frame::FrameEncoder` (ignores compression level)
+  - `zstd`: `zstd::Encoder::new(Vec::new(), level as i32)` with `auto_finish()`
+  - `gzip`: `flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level))`
+  - `none`: tar directly into `Vec<u8>` (no compression)
+- `archive_extension(data_format)` maps format to file extension: `.tar.lz4`, `.tar.zstd`, `.tar.gz`, `.tar`
 
 ### S3 Key Format
 ```
-# Local disk parts (compressed archives):
-{backup_name}/data/{url_encode(db)}/{url_encode(table)}/{part_name}.tar.lz4
+# Local disk parts (compressed archives, extension varies by data_format):
+{backup_name}/data/{url_encode(db)}/{url_encode(table)}/{part_name}{archive_extension(data_format)}
 
 # S3 disk parts (CopyObject, Phase 2c):
 {backup_name}/objects/{original_relative_path}             -- data objects
@@ -93,7 +101,8 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 
 ### Public API
 - `upload(config, s3, backup_name, backup_dir, delete_local, diff_from_remote: Option<&str>, resume: bool) -> Result<()>` -- Main entry point with resume and atomic manifest (Phase 2d)
-- `compress_part(part_dir, archive_name) -> Result<Vec<u8>>` -- Sync tar+LZ4 compression
+- `compress_part(part_dir, archive_name, data_format, compression_level) -> Result<Vec<u8>>` -- Sync multi-format compression (lz4, zstd, gzip, none) (Phase 4f)
+- `archive_extension(data_format) -> &str` -- Maps format name to file extension (e.g., "lz4" -> ".tar.lz4") (Phase 4f)
 
 ### Parallel Upload Pattern (Phase 2a)
 - All parts across all tables are flattened into a single `Vec<UploadWorkItem>` work queue

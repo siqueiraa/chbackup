@@ -39,6 +39,7 @@ src/clickhouse/
 - `DiskRow` -- From `system.disks`: name, path, type_field, remote_path
 - `PartRow` -- From `system.parts`: name, partition_id, active (Phase 2d)
 - `ColumnInconsistency` -- Query result: database, table, column, types (Phase 2d)
+- `JsonColumnInfo` -- Query result: database, table, column, column_type (Phase 4f). Returned by `check_json_columns()` for Object/JSON type detection
 - `DiskSpaceRow` -- From `system.disks`: name, path, free_space (Phase 2d)
 - `NameRow` -- (private) Single `name` column, used by RBAC/named-collection/function queries (Phase 4e)
 - `ShowCreateRow` -- (private) Single `statement` column, returned by `SHOW CREATE ...` queries (Phase 4e)
@@ -68,10 +69,12 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `freeze_partition(db, table, partition, freeze_name) -> Result<()>` -- ALTER TABLE FREEZE PARTITION (Phase 2d)
 - `unfreeze_table(db, table, freeze_name) -> Result<()>` -- ALTER TABLE UNFREEZE
 - `list_tables() -> Result<Vec<TableRow>>` -- Query system.tables (excludes system DBs)
+- `list_all_tables() -> Result<Vec<TableRow>>` -- Query system.tables including system DBs (Phase 4f, for `tables --all` command)
 - `get_table_ddl(db, table) -> Result<String>` -- SHOW CREATE TABLE
 - `check_pending_mutations(targets) -> Result<Vec<MutationRow>>` -- Query system.mutations
 - `query_system_parts(db, table) -> Result<Vec<PartRow>>` -- Query system.parts for active parts (Phase 2d)
 - `check_parts_columns(targets) -> Result<Vec<ColumnInconsistency>>` -- Batch column consistency check (Phase 2d, design 3.3)
+- `check_json_columns(targets) -> Result<Vec<JsonColumnInfo>>` -- Query `system.columns` for columns with Object or JSON types (Phase 4f, design 16.4). Follows same pattern as `check_parts_columns()`: builds IN clause from `targets`, queries with `type LIKE '%Object%' OR type LIKE '%JSON%'`. Warning-only, never blocks backup.
 - `query_disk_free_space() -> Result<Vec<DiskSpaceRow>>` -- Query system.disks with free_space (Phase 2d)
 - `sync_replica(db, table) -> Result<()>` -- SYSTEM SYNC REPLICA
 - `attach_part(db, table, part_name) -> Result<()>` -- ALTER TABLE ATTACH PART

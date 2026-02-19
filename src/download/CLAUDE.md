@@ -20,9 +20,15 @@ src/download/
 Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresses. Acceptable for MVP. Phase 2 will add streaming download for large parts.
 
 ### Decompression Pipeline (stream.rs)
-- Uses sync `lz4_flex::frame::FrameDecoder` + sync `tar::Archive` inside `spawn_blocking`
-- Flow: `FrameDecoder::new(data)` -> `Archive::new(decoder)` -> `unpack(output_dir)`
-- Also exports `compress_part()` and `decompress_lz4()` utilities for testing
+- Supports 4 compression formats: `lz4`, `zstd`, `gzip`, `none` (Phase 4f)
+- Format driven by `manifest.data_format` -- the download pipeline reads the format from the remote manifest and passes it to `decompress_part()` (Phase 4f)
+- Uses sync format-specific decompressor + sync `tar::Archive` inside `spawn_blocking`
+- Format-specific behavior:
+  - `lz4`: `lz4_flex::frame::FrameDecoder::new(data)` -> `Archive::new(decoder)` -> `unpack(output_dir)`
+  - `zstd`: `zstd::Decoder::new(data)` -> `Archive::new(decoder)` -> `unpack(output_dir)`
+  - `gzip`: `flate2::read::GzDecoder::new(data)` -> `Archive::new(decoder)` -> `unpack(output_dir)`
+  - `none`: `std::io::Cursor::new(data)` -> `Archive::new(cursor)` -> `unpack(output_dir)` (just untar)
+- Also exports `compress_part(part_dir, archive_name, data_format, compression_level)` (for testing) and `decompress_lz4()` (standalone utility)
 
 ### Download Flow
 1. Download manifest: `s3.get_object("{backup_name}/metadata.json")` -> parse `BackupManifest`
@@ -77,8 +83,8 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
 
 ### Public API
 - `download(config, s3, backup_name, resume: bool) -> Result<PathBuf>` -- Main entry point with resume support (Phase 2d)
-- `decompress_part(data, output_dir) -> Result<()>` -- Sync LZ4+untar decompression
-- `compress_part(part_dir, archive_name) -> Result<Vec<u8>>` -- Sync tar+LZ4 (for testing)
+- `decompress_part(data, output_dir, data_format) -> Result<()>` -- Sync multi-format decompression (lz4, zstd, gzip, none) (Phase 4f)
+- `compress_part(part_dir, archive_name, data_format, compression_level) -> Result<Vec<u8>>` -- Sync multi-format compression (for testing) (Phase 4f)
 - `decompress_lz4(data) -> Result<Vec<u8>>` -- Raw LZ4 frame decompression
 
 ### Parallel Download Pattern (Phase 2a)

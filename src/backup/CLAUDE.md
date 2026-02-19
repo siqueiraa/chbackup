@@ -89,6 +89,13 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
   - Remaining inconsistencies are logged as warnings per table/column
 - The check runs BEFORE FREEZE to avoid wasting time on tables that will fail on restore
 
+### JSON/Object Column Detection (Phase 4f, design 16.4)
+- After the parts column consistency check, backup pre-flight calls `ch.check_json_columns(&targets)` to detect columns with Object or JSON types
+- Warning-only: never blocks the backup, only logs warnings per column and an aggregate info message
+- Follows the same try/match pattern as `check_parts_columns`: `Ok(json_cols)` -> log warnings per column, `Err(e)` -> warn and continue
+- Uses the same `targets` Vec<(String, String)> already built for the parts column check
+- No config gate -- always runs (zero-cost query)
+
 ### RBAC, Config, Named Collections, and Functions Backup (rbac.rs, Phase 4e)
 - `backup_rbac_and_configs(config, ch, backup_dir, manifest, rbac, configs, named_collections) -> Result<()>` -- Orchestrates all Phase 4e backup subsystems. Called after manifest creation but before the diff step. Each subsystem is gated by its CLI flag OR the corresponding `*_backup_always` config value.
 - **RBAC backup** (`backup_rbac()`): Queries `ch.query_rbac_objects(entity_type)` for each of 5 entity types (USER, ROLE, ROW POLICY, SETTINGS PROFILE, QUOTA). Serializes results as JSONL files to `{backup_dir}/access/{entity_type}.jsonl`. Each line is a JSON object with `entity_type`, `name`, `create_statement` fields. Sets `manifest.rbac = Some(RbacInfo { path: "access/" })`.
