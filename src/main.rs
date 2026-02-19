@@ -17,7 +17,7 @@ use chbackup::{backup, download, list, restore, upload};
 use chrono::Utc;
 use clap::Parser;
 use cli::{Cli, Command};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Extract the command name (as used by [`lock_for_command`]) from a [`Command`].
 fn command_name(cmd: &Command) -> &'static str {
@@ -251,14 +251,6 @@ async fn run() -> Result<()> {
             skip_empty_tables,
             backup_name,
         } => {
-            // Warn about flags not yet implemented
-            if partitions.is_some() {
-                warn!("--partitions flag is not yet implemented for restore, ignoring");
-            }
-            if skip_empty_tables {
-                warn!("--skip-empty-tables flag is not yet implemented, ignoring");
-            }
-
             let name = backup_name_required(backup_name, "restore")?;
             let ch = ChClient::new(&config.clickhouse)?;
 
@@ -282,6 +274,8 @@ async fn run() -> Result<()> {
                 rbac,
                 configs,
                 named_collections,
+                partitions.as_deref(),
+                skip_empty_tables,
             )
             .await?;
 
@@ -359,11 +353,6 @@ async fn run() -> Result<()> {
             resume,
             backup_name,
         } => {
-            // Warn about unimplemented flags
-            if skip_empty_tables {
-                warn!("--skip-empty-tables flag is not yet implemented, ignoring");
-            }
-
             let name = backup_name_required(backup_name, "restore_remote")?;
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
@@ -393,17 +382,20 @@ async fn run() -> Result<()> {
                 rbac,
                 configs,
                 named_collections,
+                None, // partitions (not a flag on restore_remote per design)
+                skip_empty_tables,
             )
             .await?;
 
             info!(backup_name = %name, "RestoreRemote command complete");
         }
 
-        Command::List { location } => {
+        Command::List { location, format } => {
             let s3 = S3Client::new(&config.s3).await?;
             let loc = location.map(map_cli_location);
+            let fmt = map_cli_list_format(format);
 
-            list::list(&config.clickhouse.data_path, &s3, loc.as_ref()).await?;
+            list::list(&config.clickhouse.data_path, &s3, loc.as_ref(), &fmt).await?;
 
             info!("List command complete");
         }
@@ -666,6 +658,17 @@ fn map_cli_location(loc: cli::Location) -> list::Location {
     match loc {
         cli::Location::Local => list::Location::Local,
         cli::Location::Remote => list::Location::Remote,
+    }
+}
+
+/// Map the CLI `ListFormat` enum to the list module's `ListFormat` enum.
+fn map_cli_list_format(fmt: cli::ListFormat) -> list::ListFormat {
+    match fmt {
+        cli::ListFormat::Default => list::ListFormat::Default,
+        cli::ListFormat::Json => list::ListFormat::Json,
+        cli::ListFormat::Yaml => list::ListFormat::Yaml,
+        cli::ListFormat::Csv => list::ListFormat::Csv,
+        cli::ListFormat::Tsv => list::ListFormat::Tsv,
     }
 }
 
