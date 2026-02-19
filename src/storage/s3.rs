@@ -39,6 +39,10 @@ pub struct S3Client {
     sse_kms_key_id: String,
     /// S3 canned ACL to apply to new objects.
     acl: String,
+    /// S3 SDK internal concurrency per upload (from config).
+    concurrency: u32,
+    /// Separate S3 prefix for object disk backup data.
+    object_disk_path: String,
 }
 
 impl S3Client {
@@ -165,6 +169,8 @@ impl S3Client {
             sse: config.sse.clone(),
             sse_kms_key_id: config.sse_kms_key_id.clone(),
             acl: config.acl.clone(),
+            concurrency: config.concurrency,
+            object_disk_path: config.object_disk_path.clone(),
         })
     }
 
@@ -208,6 +214,19 @@ impl S3Client {
     /// Returns the configured key prefix.
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+
+    /// Returns the configured S3 concurrency (for within-file parallelism).
+    pub fn concurrency(&self) -> u32 {
+        self.concurrency
+    }
+
+    /// Returns the configured object disk path prefix.
+    ///
+    /// When non-empty, callers should use this as the key prefix for
+    /// S3 disk object references instead of the default prefix.
+    pub fn object_disk_path(&self) -> &str {
+        &self.object_disk_path
     }
 
     // -- Key helpers --
@@ -1127,6 +1146,8 @@ mod tests {
             sse: String::new(),
             sse_kms_key_id: String::new(),
             acl: "private".to_string(),
+            concurrency: 1,
+            object_disk_path: String::new(),
         }
     }
 }
