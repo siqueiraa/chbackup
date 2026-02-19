@@ -271,6 +271,9 @@ async fn main() -> Result<()> {
                 effective_resume,
                 rename_as.as_deref(),
                 db_mapping.as_ref(),
+                false, // rbac_restore (Phase 4e -- wired in Task 5)
+                false, // configs_restore (Phase 4e -- wired in Task 5)
+                false, // named_collections_restore (Phase 4e -- wired in Task 5)
             )
             .await?;
 
@@ -394,6 +397,9 @@ async fn main() -> Result<()> {
                 effective_resume,
                 rename_as.as_deref(),
                 db_mapping.as_ref(),
+                false, // rbac_restore (Phase 4e -- wired in Task 5)
+                false, // configs_restore (Phase 4e -- wired in Task 5)
+                false, // named_collections_restore (Phase 4e -- wired in Task 5)
             )
             .await?;
 

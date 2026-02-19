@@ -394,6 +394,9 @@ pub async fn auto_resume(state: &AppState) {
                         true,  // resume = true
                         None,  // rename_as (auto-resume restores to original names)
                         None,  // database_mapping (auto-resume restores to original names)
+                        false, // rbac_restore (Phase 4e -- wired in Task 5)
+                        false, // configs_restore (Phase 4e -- wired in Task 5)
+                        false, // named_collections_restore (Phase 4e -- wired in Task 5)
                     )
                     .await;
 

@@ -20,6 +20,7 @@
 //! - ATTACH TABLE mode: `restore_as_attach` config for Replicated tables
 
 pub mod attach;
+pub mod rbac;
 pub mod remap;
 pub mod schema;
 pub mod sort;
@@ -86,6 +87,9 @@ pub async fn restore(
     resume: bool,
     rename_as: Option<&str>,
     database_mapping: Option<&HashMap<String, String>>,
+    rbac_restore: bool,
+    configs_restore: bool,
+    named_collections_restore: bool,
 ) -> Result<()> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = PathBuf::from(data_path).join("backup").join(backup_name);
@@ -263,6 +267,40 @@ pub async fn restore(
         if !data_only && !manifest.functions.is_empty() {
             create_functions(ch, &manifest, on_cluster).await?;
         }
+
+        // Phase 4e: Named collections (schema-only path)
+        if !data_only
+            && (named_collections_restore
+                || config.clickhouse.named_collections_backup_always)
+        {
+            rbac::restore_named_collections(ch, &manifest, on_cluster).await?;
+        }
+
+        // Phase 4e: RBAC restore (schema-only path)
+        if rbac_restore || config.clickhouse.rbac_backup_always {
+            rbac::restore_rbac(
+                ch,
+                config,
+                &backup_dir,
+                &config.clickhouse.rbac_resolve_conflicts,
+            )
+            .await?;
+        }
+
+        // Phase 4e: Config file restore (schema-only path)
+        if configs_restore || config.clickhouse.config_backup_always {
+            rbac::restore_configs(config, &backup_dir).await?;
+        }
+
+        // Phase 4e: Restart command (schema-only path)
+        let did_rbac_schema = (rbac_restore || config.clickhouse.rbac_backup_always)
+            && backup_dir.join("access").exists();
+        let did_configs_schema = (configs_restore || config.clickhouse.config_backup_always)
+            && backup_dir.join("configs").exists();
+        if did_rbac_schema || did_configs_schema {
+            rbac::execute_restart_commands(ch, &config.clickhouse.restart_command).await?;
+        }
+
         info!("Schema-only mode, skipping data restore");
         return Ok(());
     }
@@ -647,6 +685,38 @@ pub async fn restore(
     // Phase 4: Functions
     if !data_only && !manifest.functions.is_empty() {
         create_functions(ch, &manifest, on_cluster).await?;
+    }
+
+    // Phase 4e: Named collections
+    if !data_only
+        && (named_collections_restore || config.clickhouse.named_collections_backup_always)
+    {
+        rbac::restore_named_collections(ch, &manifest, on_cluster).await?;
+    }
+
+    // Phase 4e: RBAC restore
+    if rbac_restore || config.clickhouse.rbac_backup_always {
+        rbac::restore_rbac(
+            ch,
+            config,
+            &backup_dir,
+            &config.clickhouse.rbac_resolve_conflicts,
+        )
+        .await?;
+    }
+
+    // Phase 4e: Config file restore
+    if configs_restore || config.clickhouse.config_backup_always {
+        rbac::restore_configs(config, &backup_dir).await?;
+    }
+
+    // Phase 4e: Restart command (if RBAC or configs were restored)
+    let did_rbac = (rbac_restore || config.clickhouse.rbac_backup_always)
+        && backup_dir.join("access").exists();
+    let did_configs = (configs_restore || config.clickhouse.config_backup_always)
+        && backup_dir.join("configs").exists();
+    if did_rbac || did_configs {
+        rbac::execute_restart_commands(ch, &config.clickhouse.restart_command).await?;
     }
 
     info!(

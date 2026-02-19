@@ -577,6 +577,9 @@ pub async fn restore_backup(
             effective_resume,
             req.rename_as.as_deref(),
             db_mapping.as_ref(),
+            false, // rbac_restore (Phase 4e -- wired in Task 5)
+            false, // configs_restore (Phase 4e -- wired in Task 5)
+            false, // named_collections_restore (Phase 4e -- wired in Task 5)
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -818,6 +821,9 @@ pub async fn restore_remote(
             effective_resume,
             req.rename_as.as_deref(),
             db_mapping.as_ref(),
+            false, // rbac_restore (Phase 4e -- wired in Task 5)
+            false, // configs_restore (Phase 4e -- wired in Task 5)
+            false, // named_collections_restore (Phase 4e -- wired in Task 5)
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
