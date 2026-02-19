@@ -70,6 +70,40 @@ pub fn engine_restore_priority(engine: &str) -> u8 {
     }
 }
 
+/// Engine priority for DROP operations (Mode A). Lower = dropped first.
+///
+/// Reverse of `engine_restore_priority()`:
+/// - 0: Distributed, Merge (depend on nothing, safe to drop first)
+/// - 1: View, MaterializedView, LiveView, WindowView (depend on data tables)
+/// - 2: Dictionary (may be source for views)
+/// - 3: Regular data tables (MergeTree family -- dropped last)
+pub fn engine_drop_priority(engine: &str) -> u8 {
+    match engine {
+        "Distributed" | "Merge" => 0,
+        "View" | "MaterializedView" | "LiveView" | "WindowView" => 1,
+        "Dictionary" => 2,
+        _ => 3, // MergeTree family and other data tables dropped last
+    }
+}
+
+/// Sort table keys for DROP ordering (reverse of restore priority).
+///
+/// Returns tables sorted by `engine_drop_priority`, with DDL-only objects
+/// (Distributed, Views, Dictionaries) first and data tables last.
+pub fn sort_tables_for_drop(
+    manifest: &BackupManifest,
+    table_keys: &[String],
+) -> Vec<String> {
+    let mut sorted = table_keys.to_vec();
+    sorted.sort_by_key(|k| {
+        manifest
+            .tables
+            .get(k)
+            .map_or(3, |tm| engine_drop_priority(&tm.engine))
+    });
+    sorted
+}
+
 /// Classification of tables into restore phases.
 #[derive(Debug, Clone)]
 pub struct RestorePhases {
@@ -629,5 +663,88 @@ mod tests {
         let mut tm_newline = make_table_manifest("MaterializedView", true, vec![]);
         tm_newline.ddl = "CREATE MATERIALIZED VIEW default.mv\nREFRESH EVERY 1 HOUR\nENGINE = MergeTree()\nAS SELECT * FROM t".to_string();
         assert!(is_refreshable_mv(&tm_newline));
+    }
+
+    // -- Phase 4d: DROP ordering tests --
+
+    #[test]
+    fn test_reverse_drop_priority() {
+        // Distributed/Merge should have lowest priority (dropped first)
+        assert_eq!(engine_drop_priority("Distributed"), 0);
+        assert_eq!(engine_drop_priority("Merge"), 0);
+
+        // Views dropped second
+        assert_eq!(engine_drop_priority("View"), 1);
+        assert_eq!(engine_drop_priority("MaterializedView"), 1);
+        assert_eq!(engine_drop_priority("LiveView"), 1);
+        assert_eq!(engine_drop_priority("WindowView"), 1);
+
+        // Dictionary dropped third
+        assert_eq!(engine_drop_priority("Dictionary"), 2);
+
+        // Data tables (MergeTree family) dropped last
+        assert_eq!(engine_drop_priority("MergeTree"), 3);
+        assert_eq!(engine_drop_priority("ReplicatedMergeTree"), 3);
+        assert_eq!(engine_drop_priority("ReplicatedReplacingMergeTree"), 3);
+
+        // Verify reverse of restore priority
+        // Restore: Dictionary(0) < View(1) < Distributed(2)
+        // Drop:    Distributed(0) < View(1) < Dictionary(2)
+        assert!(engine_drop_priority("Distributed") < engine_drop_priority("View"));
+        assert!(engine_drop_priority("View") < engine_drop_priority("Dictionary"));
+        assert!(engine_drop_priority("Dictionary") < engine_drop_priority("MergeTree"));
+    }
+
+    #[test]
+    fn test_sort_tables_for_drop() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "default.trades".to_string(),
+            make_table_manifest("MergeTree", false, vec![]),
+        );
+        tables.insert(
+            "default.dist".to_string(),
+            make_table_manifest("Distributed", true, vec![]),
+        );
+        tables.insert(
+            "default.my_view".to_string(),
+            make_table_manifest("View", true, vec![]),
+        );
+        tables.insert(
+            "default.user_dict".to_string(),
+            make_table_manifest("Dictionary", true, vec![]),
+        );
+        tables.insert(
+            "default.rep_trades".to_string(),
+            make_table_manifest("ReplicatedMergeTree", false, vec![]),
+        );
+
+        let manifest = make_manifest(tables);
+        let all_keys: Vec<String> = manifest.tables.keys().cloned().collect();
+
+        let sorted = sort_tables_for_drop(&manifest, &all_keys);
+
+        // Verify ordering: Distributed(0) -> View(1) -> Dictionary(2) -> data tables(3)
+        assert_eq!(sorted.len(), 5);
+
+        // Distributed should be first
+        assert_eq!(sorted[0], "default.dist");
+        // View should be second
+        assert_eq!(sorted[1], "default.my_view");
+        // Dictionary should be third
+        assert_eq!(sorted[2], "default.user_dict");
+        // Data tables last (order between them doesn't matter)
+        let data_tables = &sorted[3..];
+        assert!(data_tables.contains(&"default.trades".to_string()));
+        assert!(data_tables.contains(&"default.rep_trades".to_string()));
+    }
+
+    #[test]
+    fn test_sort_tables_for_drop_empty() {
+        let tables = HashMap::new();
+        let manifest = make_manifest(tables);
+        let keys: Vec<String> = vec![];
+        let sorted = sort_tables_for_drop(&manifest, &keys);
+        assert!(sorted.is_empty());
     }
 }
