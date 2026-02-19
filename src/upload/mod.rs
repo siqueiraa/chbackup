@@ -64,14 +64,22 @@ fn url_encode_component(s: &str) -> String {
 
 /// Generate the S3 key for a compressed part archive.
 ///
-/// Format: `{backup_name}/data/{url_encode(db)}/{url_encode(table)}/{part_name}.tar.lz4`
-fn s3_key_for_part(backup_name: &str, db: &str, table: &str, part_name: &str) -> String {
+/// Format: `{backup_name}/data/{url_encode(db)}/{url_encode(table)}/{part_name}{extension}`
+/// where `extension` is derived from `data_format` via `stream::archive_extension()`.
+fn s3_key_for_part(
+    backup_name: &str,
+    db: &str,
+    table: &str,
+    part_name: &str,
+    data_format: &str,
+) -> String {
     format!(
-        "{}/data/{}/{}/{}.tar.lz4",
+        "{}/data/{}/{}/{}{}",
         backup_name,
         url_encode_component(db),
         url_encode_component(table),
-        part_name
+        part_name,
+        stream::archive_extension(data_format)
     )
 }
 
@@ -378,7 +386,8 @@ pub async fn upload(
                     }
 
                     // Generate S3 key
-                    let s3_key = s3_key_for_part(backup_name, db, table, &part.name);
+                    let s3_key =
+                        s3_key_for_part(backup_name, db, table, &part.name, data_format);
 
                     // Skip already-completed parts (resume)
                     if completed_keys.contains(&s3_key) {
@@ -455,11 +464,13 @@ pub async fn upload(
     let mut handles: Vec<tokio::task::JoinHandle<UploadResult>> = Vec::with_capacity(total_parts);
 
     // 3a. Spawn local disk upload tasks
+    let compression_level = config.backup.compression_level;
     for item in local_work_items {
         let sem = upload_semaphore.clone();
         let s3 = s3.clone();
         let rate_limiter = rate_limiter.clone();
         let resume_state = resume_state.clone();
+        let data_format_clone = data_format.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -474,11 +485,12 @@ pub async fn upload(
                 "Compressing and uploading part"
             );
 
-            // Compress part using spawn_blocking (sync tar + LZ4)
+            // Compress part using spawn_blocking (sync tar + compression)
             let part_dir = item.part_dir.clone();
             let part_name_for_compress = item.part.name.clone();
+            let fmt = data_format_clone.clone();
             let compressed = tokio::task::spawn_blocking(move || {
-                stream::compress_part(&part_dir, &part_name_for_compress)
+                stream::compress_part(&part_dir, &part_name_for_compress, &fmt, compression_level)
             })
             .await
             .context("Compress task panicked")?
@@ -1007,7 +1019,7 @@ mod tests {
 
     #[test]
     fn test_s3_key_for_part_simple() {
-        let key = s3_key_for_part("daily-20240115", "default", "trades", "202401_1_50_3");
+        let key = s3_key_for_part("daily-20240115", "default", "trades", "202401_1_50_3", "lz4");
         assert_eq!(
             key,
             "daily-20240115/data/default/trades/202401_1_50_3.tar.lz4"
@@ -1016,11 +1028,34 @@ mod tests {
 
     #[test]
     fn test_s3_key_for_part_special_chars() {
-        let key = s3_key_for_part("my-backup", "my db", "my+table", "202401_1_1_0");
+        let key = s3_key_for_part("my-backup", "my db", "my+table", "202401_1_1_0", "lz4");
         assert_eq!(
             key,
             "my-backup/data/my%20db/my%2Btable/202401_1_1_0.tar.lz4"
         );
+    }
+
+    #[test]
+    fn test_s3_key_for_part_with_format() {
+        // lz4
+        let key = s3_key_for_part("daily", "db", "t", "part1", "lz4");
+        assert!(key.ends_with(".tar.lz4"));
+
+        // zstd
+        let key = s3_key_for_part("daily", "db", "t", "part1", "zstd");
+        assert!(key.ends_with(".tar.zstd"));
+
+        // gzip
+        let key = s3_key_for_part("daily", "db", "t", "part1", "gzip");
+        assert!(key.ends_with(".tar.gz"));
+
+        // none
+        let key = s3_key_for_part("daily", "db", "t", "part1", "none");
+        assert!(key.ends_with(".tar"));
+        // Make sure it doesn't end with .tar.something
+        assert!(!key.ends_with(".tar.lz4"));
+        assert!(!key.ends_with(".tar.zstd"));
+        assert!(!key.ends_with(".tar.gz"));
     }
 
     #[test]
@@ -1160,7 +1195,8 @@ mod tests {
         );
 
         // Local disk part: should use standard S3 key format
-        let s3_key = s3_key_for_part("daily-2024-01-15", "default", "trades", &local_part.name);
+        let s3_key =
+            s3_key_for_part("daily-2024-01-15", "default", "trades", &local_part.name, "lz4");
         assert_eq!(
             s3_key,
             "daily-2024-01-15/data/default/trades/202401_1_50_3.tar.lz4"
@@ -1271,11 +1307,11 @@ mod tests {
         let completed_keys: HashSet<String> =
             HashSet::from(["daily/data/default/trades/202401_1_50_3.tar.lz4".to_string()]);
 
-        let s3_key = s3_key_for_part("daily", "default", "trades", "202401_1_50_3");
+        let s3_key = s3_key_for_part("daily", "default", "trades", "202401_1_50_3", "lz4");
         assert!(completed_keys.contains(&s3_key));
 
         // A different part should NOT be in completed_keys
-        let other_key = s3_key_for_part("daily", "default", "trades", "202402_1_1_0");
+        let other_key = s3_key_for_part("daily", "default", "trades", "202402_1_1_0", "lz4");
         assert!(!completed_keys.contains(&other_key));
     }
 

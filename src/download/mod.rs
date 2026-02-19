@@ -306,6 +306,7 @@ pub async fn download(
         let rate_limiter = rate_limiter.clone();
         let backup_dir = backup_dir.clone();
         let resume_state = resume_state.clone();
+        let data_format_clone = manifest.data_format.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -453,8 +454,9 @@ pub async fn download(
                     // Decompress and extract to local directory
                     let shadow_dir_clone = shadow_dir.clone();
                     let part_name_clone = part_name.clone();
+                    let fmt = data_format_clone.clone();
                     tokio::task::spawn_blocking(move || {
-                        stream::decompress_part(&compressed_data, &shadow_dir_clone)
+                        stream::decompress_part(&compressed_data, &shadow_dir_clone, &fmt)
                     })
                     .await
                     .context("Decompress task panicked")?
