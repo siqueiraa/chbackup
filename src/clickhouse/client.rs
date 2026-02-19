@@ -701,6 +701,157 @@ impl ChClient {
         Ok(result)
     }
 
+    // -- DROP operations (Mode A, Phase 4d) --
+
+    /// Drop a table (Mode A).
+    ///
+    /// SQL: `DROP TABLE IF EXISTS \`db\`.\`table\` [ON CLUSTER 'cluster'] SYNC`
+    pub async fn drop_table(
+        &self,
+        db: &str,
+        table: &str,
+        on_cluster: Option<&str>,
+    ) -> Result<()> {
+        let sql = drop_table_sql(db, table, on_cluster);
+        self.log_and_execute(&sql, "DROP TABLE").await
+    }
+
+    /// Drop a database (Mode A).
+    ///
+    /// SQL: `DROP DATABASE IF EXISTS \`db\` [ON CLUSTER 'cluster'] SYNC`
+    pub async fn drop_database(&self, db: &str, on_cluster: Option<&str>) -> Result<()> {
+        let sql = drop_database_sql(db, on_cluster);
+        self.log_and_execute(&sql, "DROP DATABASE").await
+    }
+
+    // -- ATTACH TABLE mode (Phase 4d) --
+
+    /// Detach a table synchronously.
+    ///
+    /// SQL: `DETACH TABLE \`db\`.\`table\` SYNC`
+    pub async fn detach_table_sync(&self, db: &str, table: &str) -> Result<()> {
+        let sql = detach_table_sync_sql(db, table);
+        self.log_and_execute(&sql, "DETACH TABLE SYNC").await
+    }
+
+    /// Attach an entire table (not a part).
+    ///
+    /// SQL: `ATTACH TABLE \`db\`.\`table\``
+    pub async fn attach_table(&self, db: &str, table: &str) -> Result<()> {
+        let sql = attach_table_sql(db, table);
+        self.log_and_execute(&sql, "ATTACH TABLE").await
+    }
+
+    /// Restore replica metadata from local parts.
+    ///
+    /// SQL: `SYSTEM RESTORE REPLICA \`db\`.\`table\``
+    pub async fn system_restore_replica(&self, db: &str, table: &str) -> Result<()> {
+        let sql = system_restore_replica_sql(db, table);
+        self.log_and_execute(&sql, "SYSTEM RESTORE REPLICA").await
+    }
+
+    // -- ZK conflict resolution (Phase 4d) --
+
+    /// Drop a replica from ZooKeeper by explicit ZK path.
+    ///
+    /// SQL: `SYSTEM DROP REPLICA 'replica_name' FROM ZKPATH 'zk_path'`
+    pub async fn drop_replica_from_zkpath(
+        &self,
+        replica_name: &str,
+        zk_path: &str,
+    ) -> Result<()> {
+        let sql = drop_replica_from_zkpath_sql(replica_name, zk_path);
+        self.log_and_execute(&sql, "SYSTEM DROP REPLICA FROM ZKPATH")
+            .await
+    }
+
+    /// Check if a replica exists at a given ZK path.
+    ///
+    /// SQL: `SELECT count() FROM system.zookeeper WHERE path='{zk_path}/replicas' AND name='{replica_name}'`
+    ///
+    /// Returns `false` on query error (system.zookeeper may not be accessible).
+    pub async fn check_zk_replica_exists(
+        &self,
+        zk_path: &str,
+        replica_name: &str,
+    ) -> Result<bool> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct CountRow {
+            cnt: u64,
+        }
+
+        let sql = format!(
+            "SELECT count() as cnt FROM system.zookeeper WHERE path = '{}/replicas' AND name = '{}'",
+            zk_path, replica_name
+        );
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing check_zk_replica_exists");
+        } else {
+            debug!(sql = %sql, "Executing check_zk_replica_exists");
+        }
+
+        match self.inner.query(&sql).fetch_one::<CountRow>().await {
+            Ok(row) => Ok(row.cnt > 0),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    zk_path = %zk_path,
+                    replica = %replica_name,
+                    "Failed to check ZK replica existence (system.zookeeper may be unavailable)"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    // -- DatabaseReplicated detection (Phase 4d) --
+
+    /// Query the engine of a database.
+    ///
+    /// SQL: `SELECT engine FROM system.databases WHERE name = '{db}'`
+    ///
+    /// Returns empty string if database not found.
+    pub async fn query_database_engine(&self, db: &str) -> Result<String> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct EngineRow {
+            engine: String,
+        }
+
+        let sql = format!(
+            "SELECT engine FROM system.databases WHERE name = '{}'",
+            db
+        );
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing query_database_engine");
+        } else {
+            debug!(sql = %sql, "Executing query_database_engine");
+        }
+
+        match self.inner.query(&sql).fetch_one::<EngineRow>().await {
+            Ok(row) => Ok(row.engine),
+            Err(_) => Ok(String::new()),
+        }
+    }
+
+    // -- Mutation execution (Phase 4d) --
+
+    /// Execute a mutation command (ALTER TABLE ... DELETE/UPDATE WHERE ...).
+    ///
+    /// The command is from `MutationInfo.command` (e.g., "DELETE WHERE user_id = 5").
+    ///
+    /// SQL: `ALTER TABLE \`db\`.\`table\` {command} SETTINGS mutations_sync=2`
+    pub async fn execute_mutation(
+        &self,
+        db: &str,
+        table: &str,
+        command: &str,
+    ) -> Result<()> {
+        let sql = execute_mutation_sql(db, table, command);
+        self.log_and_execute(&sql, "MUTATION").await
+    }
+
     /// Query `system.disks` for disk free space information.
     ///
     /// Returns disk name, path, and free space in bytes for each disk.
@@ -772,6 +923,59 @@ pub fn freeze_partition_sql(db: &str, table: &str, partition: &str, freeze_name:
     format!(
         "ALTER TABLE `{}`.`{}` FREEZE PARTITION '{}' WITH NAME '{}'",
         db, table, partition, freeze_name
+    )
+}
+
+/// Generate the SQL for a DROP TABLE command (for testing).
+pub fn drop_table_sql(db: &str, table: &str, on_cluster: Option<&str>) -> String {
+    match on_cluster {
+        Some(cluster) => format!(
+            "DROP TABLE IF EXISTS `{}`.`{}` ON CLUSTER '{}' SYNC",
+            db, table, cluster
+        ),
+        None => format!("DROP TABLE IF EXISTS `{}`.`{}` SYNC", db, table),
+    }
+}
+
+/// Generate the SQL for a DROP DATABASE command (for testing).
+pub fn drop_database_sql(db: &str, on_cluster: Option<&str>) -> String {
+    match on_cluster {
+        Some(cluster) => format!(
+            "DROP DATABASE IF EXISTS `{}` ON CLUSTER '{}' SYNC",
+            db, cluster
+        ),
+        None => format!("DROP DATABASE IF EXISTS `{}` SYNC", db),
+    }
+}
+
+/// Generate the SQL for a DETACH TABLE SYNC command (for testing).
+pub fn detach_table_sync_sql(db: &str, table: &str) -> String {
+    format!("DETACH TABLE `{}`.`{}` SYNC", db, table)
+}
+
+/// Generate the SQL for an ATTACH TABLE command (for testing).
+pub fn attach_table_sql(db: &str, table: &str) -> String {
+    format!("ATTACH TABLE `{}`.`{}`", db, table)
+}
+
+/// Generate the SQL for a SYSTEM RESTORE REPLICA command (for testing).
+pub fn system_restore_replica_sql(db: &str, table: &str) -> String {
+    format!("SYSTEM RESTORE REPLICA `{}`.`{}`", db, table)
+}
+
+/// Generate the SQL for a SYSTEM DROP REPLICA FROM ZKPATH command (for testing).
+pub fn drop_replica_from_zkpath_sql(replica_name: &str, zk_path: &str) -> String {
+    format!(
+        "SYSTEM DROP REPLICA '{}' FROM ZKPATH '{}'",
+        replica_name, zk_path
+    )
+}
+
+/// Generate the SQL for a mutation execution command (for testing).
+pub fn execute_mutation_sql(db: &str, table: &str, command: &str) -> String {
+    format!(
+        "ALTER TABLE `{}`.`{}` {} SETTINGS mutations_sync=2",
+        db, table, command
     )
 }
 
@@ -1250,5 +1454,81 @@ mod tests {
             .collect();
         assert_eq!(macros.get("shard"), Some(&"01".to_string()));
         assert_eq!(macros.get("replica"), Some(&"r1".to_string()));
+    }
+
+    // -- Phase 4d: SQL generation tests for new ChClient methods --
+
+    #[test]
+    fn test_drop_table_sql_generation() {
+        // Without ON CLUSTER
+        let sql = drop_table_sql("default", "trades", None);
+        assert_eq!(sql, "DROP TABLE IF EXISTS `default`.`trades` SYNC");
+
+        // With ON CLUSTER
+        let sql = drop_table_sql("default", "trades", Some("my_cluster"));
+        assert_eq!(
+            sql,
+            "DROP TABLE IF EXISTS `default`.`trades` ON CLUSTER 'my_cluster' SYNC"
+        );
+    }
+
+    #[test]
+    fn test_drop_database_sql_generation() {
+        // Without ON CLUSTER
+        let sql = drop_database_sql("default", None);
+        assert_eq!(sql, "DROP DATABASE IF EXISTS `default` SYNC");
+
+        // With ON CLUSTER
+        let sql = drop_database_sql("mydb", Some("cluster1"));
+        assert_eq!(
+            sql,
+            "DROP DATABASE IF EXISTS `mydb` ON CLUSTER 'cluster1' SYNC"
+        );
+    }
+
+    #[test]
+    fn test_detach_table_sql_generation() {
+        let sql = detach_table_sync_sql("default", "trades");
+        assert_eq!(sql, "DETACH TABLE `default`.`trades` SYNC");
+    }
+
+    #[test]
+    fn test_attach_table_sql_generation() {
+        let sql = attach_table_sql("default", "trades");
+        assert_eq!(sql, "ATTACH TABLE `default`.`trades`");
+    }
+
+    #[test]
+    fn test_restore_replica_sql_generation() {
+        let sql = system_restore_replica_sql("default", "trades");
+        assert_eq!(sql, "SYSTEM RESTORE REPLICA `default`.`trades`");
+    }
+
+    #[test]
+    fn test_drop_replica_sql_generation() {
+        let sql = drop_replica_from_zkpath_sql(
+            "r1",
+            "/clickhouse/tables/01/default/trades",
+        );
+        assert_eq!(
+            sql,
+            "SYSTEM DROP REPLICA 'r1' FROM ZKPATH '/clickhouse/tables/01/default/trades'"
+        );
+    }
+
+    #[test]
+    fn test_execute_mutation_sql_generation() {
+        let sql = execute_mutation_sql("default", "trades", "DELETE WHERE user_id = 5");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`trades` DELETE WHERE user_id = 5 SETTINGS mutations_sync=2"
+        );
+
+        // UPDATE mutation
+        let sql = execute_mutation_sql("logs", "events", "UPDATE status = 'archived' WHERE ts < '2024-01-01'");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `logs`.`events` UPDATE status = 'archived' WHERE ts < '2024-01-01' SETTINGS mutations_sync=2"
+        );
     }
 }
