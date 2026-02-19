@@ -279,9 +279,9 @@ fn summary_to_list_response(s: list::BackupSummary, location: &str) -> ListRespo
         size: s.size,
         data_size: s.size,   // For now, same as size (total uncompressed)
         object_disk_size: 0, // Requires manifest disk_types analysis (future)
-        metadata_size: 0,    // TODO: expose from manifest metadata_size field
-        rbac_size: 0,        // Not implemented until Phase 4e
-        config_size: 0,      // Not implemented until Phase 4e
+        metadata_size: s.metadata_size,
+        rbac_size: 0,        // TODO: requires scanning access/ directory sizes
+        config_size: 0,      // TODO: requires adding config_size to BackupManifest
         compressed_size: s.compressed_size,
         required: String::new(), // No dependency chain tracking yet
     }
@@ -477,12 +477,9 @@ pub async fn download_backup(
     })?;
 
     let state_clone = state.clone();
+    let hardlink = req.hardlink_exists_files.unwrap_or(false);
     tokio::spawn(async move {
-        if req.hardlink_exists_files.unwrap_or(false) {
-            warn!("hardlink_exists_files flag is not yet implemented, ignoring");
-        }
-
-        info!(backup_name = %name, "Starting download operation");
+        info!(backup_name = %name, hardlink_exists_files = hardlink, "Starting download operation");
 
         let effective_resume = state_clone.config.general.use_resumable_state;
         let start_time = std::time::Instant::now();
@@ -491,6 +488,7 @@ pub async fn download_backup(
             &state_clone.s3,
             &name,
             effective_resume,
+            hardlink,
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -804,6 +802,7 @@ pub async fn restore_remote(
             &state_clone.s3,
             &name,
             effective_resume,
+            false,
         )
         .await;
 

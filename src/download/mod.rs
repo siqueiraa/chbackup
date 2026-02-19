@@ -122,6 +122,116 @@ fn check_disk_space(backup_dir: &Path, required_bytes: u64) -> Result<()> {
     }
 }
 
+/// Scan existing local backups for a part with matching name and CRC64.
+///
+/// Searches `{data_path}/backup/*/shadow/{table_key}/{part_name}/` (excluding
+/// `current_backup`) for parts whose `checksums.txt` CRC64 matches `expected_crc`.
+///
+/// Returns the path to the first matching part directory, or `None`.
+fn find_existing_part(
+    data_path: &str,
+    current_backup: &str,
+    table_key: &str,
+    part_name: &str,
+    expected_crc: u64,
+) -> Option<PathBuf> {
+    use crate::backup::checksum::compute_crc64;
+
+    if expected_crc == 0 {
+        return None;
+    }
+
+    let backup_base = Path::new(data_path).join("backup");
+    let entries = match std::fs::read_dir(&backup_base) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+
+    // URL-encode the table_key components for filesystem path
+    let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
+    let url_db = url_encode(db);
+    let url_table = url_encode(table);
+
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        // Skip the current backup being downloaded
+        if name == current_backup {
+            continue;
+        }
+
+        let candidate = backup_base
+            .join(&name)
+            .join("shadow")
+            .join(&url_db)
+            .join(&url_table)
+            .join(part_name);
+
+        if !candidate.is_dir() {
+            continue;
+        }
+
+        let checksums_path = candidate.join("checksums.txt");
+        if !checksums_path.exists() {
+            continue;
+        }
+
+        match compute_crc64(&checksums_path) {
+            Ok(crc) if crc == expected_crc => {
+                return Some(candidate);
+            }
+            _ => continue,
+        }
+    }
+
+    None
+}
+
+/// Hardlink all files from an existing part directory to a target directory.
+///
+/// Walks the source directory recursively and creates hardlinks. Falls back
+/// to file copy on EXDEV (cross-device link, error code 18).
+fn hardlink_existing_part(existing: &Path, target: &Path) -> Result<()> {
+    use walkdir::WalkDir;
+
+    std::fs::create_dir_all(target)
+        .with_context(|| format!("Failed to create target dir: {}", target.display()))?;
+
+    for entry in WalkDir::new(existing).min_depth(1) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(existing)?;
+        let dest = target.join(relative);
+
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&dest)?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if let Err(e) = std::fs::hard_link(entry.path(), &dest) {
+                // EXDEV = cross-device link (error code 18 on Linux/macOS)
+                let is_exdev = e.raw_os_error() == Some(18);
+                if is_exdev {
+                    std::fs::copy(entry.path(), &dest)?;
+                } else {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to hardlink {} -> {}",
+                            entry.path().display(),
+                            dest.display()
+                        )
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Download a backup from S3 to the local filesystem.
 ///
 /// Returns the path to the local backup directory containing the downloaded
@@ -133,11 +243,13 @@ fn check_disk_space(backup_dir: &Path, required_bytes: u64) -> Result<()> {
 /// * `s3` - S3 client for downloading objects
 /// * `backup_name` - Name of the backup to download
 /// * `resume` - If true and use_resumable_state config is set, load resume state
+/// * `hardlink_exists_files` - If true, deduplicate parts via hardlinks to existing backups
 pub async fn download(
     config: &Config,
     s3: &S3Client,
     backup_name: &str,
     resume: bool,
+    hardlink_exists_files: bool,
 ) -> Result<PathBuf> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = Path::new(data_path).join("backup").join(backup_name);
@@ -299,6 +411,7 @@ pub async fn download(
     };
 
     let mut handles = Vec::with_capacity(total_parts);
+    let data_path_str = data_path.to_string();
 
     for item in work_items {
         let sem = semaphore.clone();
@@ -307,6 +420,8 @@ pub async fn download(
         let backup_dir = backup_dir.clone();
         let resume_state = resume_state.clone();
         let data_format_clone = manifest.data_format.clone();
+        let data_path_clone = data_path_str.clone();
+        let backup_name_clone = backup_name.to_string();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -421,6 +536,58 @@ pub async fn download(
                 let part_name = item.part.name.clone();
                 let expected_crc = item.part.checksum_crc64;
                 let backup_key = item.part.backup_key.clone();
+
+                // Hardlink dedup: check if identical part exists in another local backup
+                if hardlink_exists_files {
+                    let dp = data_path_clone.clone();
+                    let bn = backup_name_clone.clone();
+                    let tk = item.table_key.clone();
+                    let pn = part_name.clone();
+                    let sd = shadow_dir.clone();
+                    let ec = expected_crc;
+
+                    let dedup_result = tokio::task::spawn_blocking(move || {
+                        find_existing_part(&dp, &bn, &tk, &pn, ec)
+                            .map(|existing| {
+                                let target = sd.join(&pn);
+                                hardlink_existing_part(&existing, &target).map(|()| existing)
+                            })
+                    })
+                    .await
+                    .context("Dedup task panicked")?;
+
+                    if let Some(result) = dedup_result {
+                        match result {
+                            Ok(existing) => {
+                                info!(
+                                    table = %item.table_key,
+                                    part = %part_name,
+                                    existing = %existing.display(),
+                                    "Hardlink dedup: reusing existing part"
+                                );
+
+                                // Update resume state
+                                if let Some(ref state_mutex) = resume_state {
+                                    let mut guard = state_mutex.lock().await;
+                                    guard.0.completed_keys.insert(backup_key.clone());
+                                    save_state_graceful(&guard.1, &guard.0);
+                                }
+
+                                return Ok::<(String, u64), anyhow::Error>(
+                                    (item.table_key, 0),
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    table = %item.table_key,
+                                    part = %part_name,
+                                    error = %e,
+                                    "Hardlink dedup failed, falling back to download"
+                                );
+                            }
+                        }
+                    }
+                }
 
                 let mut last_error: Option<anyhow::Error> = None;
                 let max_attempts = if expected_crc != 0 {
@@ -898,5 +1065,116 @@ mod tests {
         // Non-existent path should gracefully skip
         let result = check_disk_space(Path::new("/nonexistent/path/xyz"), 1024);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_hardlink_dedup_finds_existing_part() {
+        use crate::backup::checksum::compute_crc64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        // Create an existing backup with a part
+        let existing_backup = dir.path().join("backup").join("old-backup").join("shadow")
+            .join("default").join("trades").join("202401_1_50_3");
+        std::fs::create_dir_all(&existing_backup).unwrap();
+        std::fs::write(existing_backup.join("checksums.txt"), b"checksum data").unwrap();
+        std::fs::write(existing_backup.join("data.bin"), b"binary data").unwrap();
+
+        let expected_crc = compute_crc64(&existing_backup.join("checksums.txt")).unwrap();
+
+        // find_existing_part should find the existing part
+        let result = find_existing_part(
+            data_path,
+            "new-backup",
+            "default.trades",
+            "202401_1_50_3",
+            expected_crc,
+        );
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("202401_1_50_3"));
+    }
+
+    #[test]
+    fn test_hardlink_dedup_skips_current_backup() {
+        use crate::backup::checksum::compute_crc64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        // Create a backup with same name as current
+        let same_backup = dir.path().join("backup").join("my-backup").join("shadow")
+            .join("default").join("trades").join("202401_1_50_3");
+        std::fs::create_dir_all(&same_backup).unwrap();
+        std::fs::write(same_backup.join("checksums.txt"), b"checksum data").unwrap();
+
+        let crc = compute_crc64(&same_backup.join("checksums.txt")).unwrap();
+
+        // Should NOT find it since it's the current backup
+        let result = find_existing_part(
+            data_path,
+            "my-backup",
+            "default.trades",
+            "202401_1_50_3",
+            crc,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_hardlink_dedup_no_match_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        // No backups exist
+        std::fs::create_dir_all(dir.path().join("backup")).unwrap();
+
+        let result = find_existing_part(
+            data_path,
+            "new-backup",
+            "default.trades",
+            "202401_1_50_3",
+            12345,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_hardlink_dedup_zero_crc_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().to_str().unwrap();
+
+        // CRC of 0 means no checksum -> skip dedup
+        let result = find_existing_part(
+            data_path,
+            "new-backup",
+            "default.trades",
+            "202401_1_50_3",
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_hardlink_existing_part() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create source part directory
+        let src = dir.path().join("source_part");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("checksums.txt"), b"checksums").unwrap();
+        std::fs::write(src.join("data.bin"), b"binary data").unwrap();
+
+        // Hardlink to target
+        let target = dir.path().join("target_part");
+        hardlink_existing_part(&src, &target).unwrap();
+
+        // Verify target files exist with correct content
+        assert!(target.join("checksums.txt").exists());
+        assert!(target.join("data.bin").exists());
+        assert_eq!(
+            std::fs::read(target.join("data.bin")).unwrap(),
+            b"binary data"
+        );
     }
 }

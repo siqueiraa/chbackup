@@ -351,7 +351,8 @@ pub async fn auto_resume(state: &AppState) {
                         &state_clone.config,
                         &state_clone.s3,
                         &backup_name,
-                        true, // resume = true
+                        true,  // resume = true
+                        false, // hardlink_exists_files = false
                     )
                     .await;
 

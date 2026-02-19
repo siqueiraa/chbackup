@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use chbackup::clickhouse::{ChClient, TableRow};
 use chbackup::config::Config;
+use chbackup::error::exit_code_from_error;
 use chbackup::lock::{lock_for_command, lock_path_for_scope, PidLock};
 use chbackup::logging;
 use chbackup::manifest::BackupManifest;
@@ -54,7 +55,24 @@ fn backup_name_from_command(cmd: &Command) -> Option<&str> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    let code = match run().await {
+        Ok(()) => 0,
+        Err(e) => {
+            let code = exit_code_from_error(&e);
+            // Use eprintln before logging is initialized for early errors,
+            // and tracing for errors after logging init.
+            eprintln!("Error: {e:#}");
+            info!(exit_code = code, "Exiting with code {}", code);
+            code
+        }
+    };
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // -----------------------------------------------------------------------
@@ -198,15 +216,18 @@ async fn main() -> Result<()> {
             resume,
             backup_name,
         } => {
-            if hardlink_exists_files {
-                warn!("--hardlink-exists-files flag is not yet implemented, ignoring");
-            }
-
             let name = backup_name_required(backup_name, "download")?;
             let s3 = S3Client::new(&config.s3).await?;
 
             let effective_resume = resume && config.general.use_resumable_state;
-            let backup_dir = download::download(&config, &s3, &name, effective_resume).await?;
+            let backup_dir = download::download(
+                &config,
+                &s3,
+                &name,
+                effective_resume,
+                hardlink_exists_files,
+            )
+            .await?;
 
             info!(
                 backup_name = %name,
@@ -354,7 +375,8 @@ async fn main() -> Result<()> {
 
             // Step 1: Download from S3
             let effective_resume = resume && config.general.use_resumable_state;
-            let _backup_dir = download::download(&config, &s3, &name, effective_resume).await?;
+            let _backup_dir =
+                download::download(&config, &s3, &name, effective_resume, false).await?;
 
             // Step 2: Restore with remap
             restore::restore(
