@@ -949,9 +949,11 @@ async fn try_attach_table_mode(
     table_data_path: &Path,
     ch_uid: Option<u32>,
     ch_gid: Option<u32>,
-    _manifest_disks: &HashMap<String, String>,
-    _parts_by_disk: &HashMap<String, Vec<crate::manifest::PartInfo>>,
+    manifest_disks: &HashMap<String, String>,
+    parts_by_disk: &HashMap<String, Vec<crate::manifest::PartInfo>>,
 ) -> Result<bool> {
+    use crate::backup::collect::resolve_shadow_part_path;
+
     if !is_replicated_engine(engine) {
         return Ok(false);
     }
@@ -991,15 +993,34 @@ async fn try_attach_table_mode(
     // ATTACH TABLE reads from the main data directory, not detached/
     let url_db = attach::url_encode(src_db);
     let url_table = attach::url_encode(src_table);
-    let shadow_base = backup_dir.join("shadow").join(&url_db).join(&url_table);
     let data_path = table_data_path.to_owned();
+    let backup_name = backup_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Build part_to_disk reverse map from parts_by_disk
+    let part_to_disk: HashMap<String, String> = parts_by_disk
+        .iter()
+        .flat_map(|(disk, disk_parts)| {
+            disk_parts
+                .iter()
+                .map(move |p| (p.name.clone(), disk.clone()))
+        })
+        .collect();
+
+    // Clone data for spawn_blocking
+    let parts_owned: Vec<String> = parts.iter().map(|p| p.name.clone()).collect();
+    let backup_dir_clone = backup_dir.to_path_buf();
+    let manifest_disks_clone = manifest_disks.clone();
+    let src_db_clone = src_db.to_string();
+    let src_table_clone = src_table.to_string();
 
     // Run hardlinking in spawn_blocking since it's sync I/O
-    let parts_owned: Vec<String> = parts.iter().map(|p| p.name.clone()).collect();
     let hardlink_result = tokio::task::spawn_blocking(move || -> Result<u64> {
         let mut linked = 0u64;
         for part_name in &parts_owned {
-            let part_src = shadow_base.join(part_name);
             let part_dst = data_path.join(part_name);
 
             if part_dst.exists() {
@@ -1007,9 +1028,24 @@ async fn try_attach_table_mode(
                 continue;
             }
 
-            if !part_src.exists() {
-                continue;
-            }
+            let disk_name = part_to_disk
+                .get(part_name)
+                .map(String::as_str)
+                .unwrap_or("default");
+            let part_src = match resolve_shadow_part_path(
+                &backup_dir_clone,
+                &manifest_disks_clone,
+                &backup_name,
+                disk_name,
+                &url_db,
+                &url_table,
+                &src_db_clone,
+                &src_table_clone,
+                part_name,
+            ) {
+                Some(p) => p,
+                None => continue, // Part not found at any location
+            };
 
             attach::hardlink_or_copy_dir(&part_src, &part_dst)?;
             attach::chown_recursive(&part_dst, ch_uid, ch_gid)?;
@@ -1355,5 +1391,92 @@ mod tests {
                 engine
             );
         }
+    }
+
+    /// Test that ATTACH TABLE mode resolves per-disk shadow paths via
+    /// resolve_shadow_part_path(). Verifies the part_to_disk reverse map
+    /// and per-disk path resolution in the spawn_blocking block.
+    #[test]
+    fn test_attach_table_mode_per_disk_shadow() {
+        use crate::backup::collect::{per_disk_backup_dir, resolve_shadow_part_path};
+        use crate::manifest::PartInfo;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_name = "test-attach";
+
+        // Simulate two disks
+        let data_path = tmp.path().join("data");
+        let nvme_path = tmp.path().join("nvme1");
+
+        // backup_dir is {data_path}/backup/{name}
+        let backup_dir = data_path.join("backup").join(backup_name);
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        // Create per-disk shadow dir for nvme1 with a part
+        let per_disk = per_disk_backup_dir(nvme_path.to_str().unwrap(), backup_name);
+        let url_db = "default";
+        let url_table = "trades";
+        let part_name = "202401_1_50_3";
+        let per_disk_part = per_disk
+            .join("shadow")
+            .join(url_db)
+            .join(url_table)
+            .join(part_name);
+        std::fs::create_dir_all(&per_disk_part).unwrap();
+        std::fs::write(per_disk_part.join("checksums.txt"), b"test").unwrap();
+
+        // manifest_disks maps nvme1 to nvme_path
+        let manifest_disks: HashMap<String, String> = HashMap::from([
+            ("default".to_string(), data_path.to_str().unwrap().to_string()),
+            ("nvme1".to_string(), nvme_path.to_str().unwrap().to_string()),
+        ]);
+
+        // Build parts_by_disk
+        let parts_by_disk: HashMap<String, Vec<PartInfo>> = HashMap::from([(
+            "nvme1".to_string(),
+            vec![PartInfo {
+                name: part_name.to_string(),
+                size: 1024,
+                backup_key: String::new(),
+                source: "uploaded".to_string(),
+                checksum_crc64: 12345,
+                s3_objects: None,
+            }],
+        )]);
+
+        // Build part_to_disk reverse map (same logic as try_attach_table_mode)
+        let part_to_disk: HashMap<String, String> = parts_by_disk
+            .iter()
+            .flat_map(|(disk, disk_parts)| {
+                disk_parts
+                    .iter()
+                    .map(move |p| (p.name.clone(), disk.clone()))
+            })
+            .collect();
+
+        assert_eq!(
+            part_to_disk.get(part_name).unwrap(),
+            "nvme1",
+            "part_to_disk should map part to nvme1"
+        );
+
+        // resolve_shadow_part_path should find the part at the per-disk location
+        let disk_name = part_to_disk
+            .get(part_name)
+            .map(String::as_str)
+            .unwrap_or("default");
+        let resolved = resolve_shadow_part_path(
+            &backup_dir,
+            &manifest_disks,
+            backup_name,
+            disk_name,
+            url_db,
+            url_table,
+            "default",
+            "trades",
+            part_name,
+        );
+        assert!(resolved.is_some(), "Should find part at per-disk path");
+        assert_eq!(resolved.unwrap(), per_disk_part);
     }
 }
