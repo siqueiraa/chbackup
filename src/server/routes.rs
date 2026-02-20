@@ -66,6 +66,12 @@ pub struct ListParams {
     pub location: Option<String>,
     /// When true, reverse sort order (newest first instead of oldest first)
     pub desc: Option<bool>,
+    /// Starting offset for pagination (0-based).
+    pub offset: Option<usize>,
+    /// Maximum number of results to return.
+    pub limit: Option<usize>,
+    /// Output format hint (stored for integration table DDL compatibility; API always returns JSON).
+    pub format: Option<String>,
 }
 
 /// Response for GET /api/v1/list -- matches ALL columns of system.backup_list table
@@ -502,7 +508,16 @@ pub async fn post_actions(
 pub async fn list_backups(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
-) -> Result<Json<Vec<ListResponse>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<
+    (
+        [(
+            axum::http::header::HeaderName,
+            axum::http::header::HeaderValue,
+        ); 1],
+        Json<Vec<ListResponse>>,
+    ),
+    (StatusCode, Json<ErrorResponse>),
+> {
     let config = state.config.load();
     let data_path = &config.clickhouse.data_path;
     let mut results = Vec::new();
@@ -542,7 +557,36 @@ pub async fn list_backups(
         results.reverse();
     }
 
-    Ok(Json(results))
+    // Apply pagination (offset/limit) -- same pattern as tables()
+    let total_count = results.len();
+    let offset = params.offset.unwrap_or(0);
+    let results: Vec<ListResponse> = if let Some(limit) = params.limit {
+        info!(
+            offset = offset,
+            limit = limit,
+            total = total_count,
+            "list: offset/limit applied"
+        );
+        results.into_iter().skip(offset).take(limit).collect()
+    } else {
+        if offset > 0 {
+            info!(
+                offset = offset,
+                total = total_count,
+                "list: offset applied"
+            );
+        }
+        results.into_iter().skip(offset).collect()
+    };
+
+    Ok((
+        [(
+            axum::http::header::HeaderName::from_static("x-total-count"),
+            axum::http::header::HeaderValue::from_str(&total_count.to_string())
+                .unwrap_or_else(|_| axum::http::header::HeaderValue::from_static("0")),
+        )],
+        Json(results),
+    ))
 }
 
 /// Convert a BackupSummary to a ListResponse with all integration table columns.
@@ -1993,6 +2037,37 @@ mod tests {
         assert!(json.contains("\"config_size\""));
         assert!(json.contains("\"compressed_size\""));
         assert!(json.contains("\"required\""));
+    }
+
+    #[test]
+    fn test_list_params_deserialization() {
+        // With all fields
+        let json =
+            r#"{"location": "remote", "desc": true, "offset": 5, "limit": 10, "format": "json"}"#;
+        let params: ListParams = serde_json::from_str(json).expect("Should parse ListParams");
+        assert_eq!(params.location.as_deref(), Some("remote"));
+        assert_eq!(params.desc, Some(true));
+        assert_eq!(params.offset, Some(5));
+        assert_eq!(params.limit, Some(10));
+        assert_eq!(params.format.as_deref(), Some("json"));
+
+        // With no fields (all optional)
+        let json_empty = r#"{}"#;
+        let params_empty: ListParams =
+            serde_json::from_str(json_empty).expect("Should parse empty ListParams");
+        assert!(params_empty.location.is_none());
+        assert!(params_empty.desc.is_none());
+        assert!(params_empty.offset.is_none());
+        assert!(params_empty.limit.is_none());
+        assert!(params_empty.format.is_none());
+
+        // With only pagination fields
+        let json_paginated = r#"{"offset": 0, "limit": 100}"#;
+        let params_paginated: ListParams =
+            serde_json::from_str(json_paginated).expect("Should parse paginated ListParams");
+        assert_eq!(params_paginated.offset, Some(0));
+        assert_eq!(params_paginated.limit, Some(100));
+        assert!(params_paginated.location.is_none());
     }
 
     #[test]
