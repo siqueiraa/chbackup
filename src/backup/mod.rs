@@ -18,7 +18,7 @@ pub mod mutations;
 pub mod rbac;
 pub mod sync_replica;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -508,6 +508,7 @@ pub async fn create(
                     &data_path,
                     &fname_for_collect,
                     &backup_dir_clone,
+                    &backup_name_owned,
                     &tables_for_collect,
                     &disk_type_map_clone,
                     &disk_map_clone,
@@ -590,21 +591,46 @@ pub async fn create(
 
     // Propagate the first error if any task failed -- clean up backup dir + shadow
     if let Some(e) = first_error {
-        // Remove the partially-created backup directory
+        // Collect all dirs to clean, deduped by canonical path
+        let mut dirs_to_delete: Vec<PathBuf> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+
+        // Default backup_dir
         if backup_dir.exists() {
-            if let Err(rm_err) = std::fs::remove_dir_all(&backup_dir) {
+            let canonical = std::fs::canonicalize(&backup_dir)
+                .unwrap_or_else(|_| backup_dir.clone());
+            seen.insert(canonical);
+            dirs_to_delete.push(backup_dir.clone());
+        }
+
+        // Per-disk dirs (disk_map is in scope from line ~136)
+        for disk_path in disk_map.values() {
+            let per_disk =
+                collect::per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
+            if per_disk.exists() {
+                let canonical = std::fs::canonicalize(&per_disk)
+                    .unwrap_or_else(|_| per_disk.clone());
+                if seen.insert(canonical) {
+                    dirs_to_delete.push(per_disk);
+                }
+            }
+        }
+
+        for dir in &dirs_to_delete {
+            if let Err(rm_err) = std::fs::remove_dir_all(dir) {
                 warn!(
-                    path = %backup_dir.display(),
+                    path = %dir.display(),
                     error = %rm_err,
-                    "Failed to clean up backup directory after error"
+                    "Failed to clean up backup dir after error"
                 );
             } else {
                 info!(
-                    path = %backup_dir.display(),
-                    "Removed partial backup directory after error"
+                    path = %dir.display(),
+                    "Removed backup dir after error"
                 );
             }
         }
+
         // Clean shadow directories left by this backup's FREEZE operations
         match crate::list::clean_shadow(ch, &config.clickhouse.data_path, Some(backup_name)).await {
             Ok(n) if n > 0 => info!(count = n, "Cleaned shadow directories after backup error"),
@@ -1071,5 +1097,80 @@ mod tests {
             dependencies: deps1,
         };
         assert_eq!(tm.dependencies, vec!["default.users"]);
+    }
+
+    #[test]
+    fn test_create_error_cleanup_per_disk() {
+        // Verify that the error cleanup pattern (used in backup::create() when a
+        // task fails) correctly removes per-disk backup dirs with canonical dedup.
+        //
+        // This tests the cleanup logic in isolation since the full create() requires
+        // a real ClickHouse connection.
+        use std::collections::HashSet;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().join("clickhouse");
+        let nvme1_path = tmp.path().join("nvme1");
+        let backup_name = "test-error";
+
+        // Simulate partial backup creation: default dir + per-disk dir on nvme1
+        let backup_dir = data_path.join("backup").join(backup_name);
+        std::fs::create_dir_all(backup_dir.join("shadow")).unwrap();
+        std::fs::write(backup_dir.join("shadow").join("data.bin"), b"data").unwrap();
+
+        let per_disk_dir = nvme1_path.join("backup").join(backup_name);
+        std::fs::create_dir_all(per_disk_dir.join("shadow")).unwrap();
+        std::fs::write(per_disk_dir.join("shadow").join("data.bin"), b"data").unwrap();
+
+        // Simulate the disk_map as would be in scope during create()
+        let disk_map: HashMap<String, String> = HashMap::from([
+            (
+                "default".to_string(),
+                data_path.to_string_lossy().to_string(),
+            ),
+            (
+                "nvme1".to_string(),
+                nvme1_path.to_string_lossy().to_string(),
+            ),
+        ]);
+
+        assert!(backup_dir.exists());
+        assert!(per_disk_dir.exists());
+
+        // Execute the same cleanup pattern as in create() error path
+        let mut dirs_to_delete: Vec<PathBuf> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+
+        if backup_dir.exists() {
+            let canonical = std::fs::canonicalize(&backup_dir)
+                .unwrap_or_else(|_| backup_dir.clone());
+            seen.insert(canonical);
+            dirs_to_delete.push(backup_dir.clone());
+        }
+
+        for disk_path in disk_map.values() {
+            let per_disk =
+                collect::per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
+            if per_disk.exists() {
+                let canonical = std::fs::canonicalize(&per_disk)
+                    .unwrap_or_else(|_| per_disk.clone());
+                if seen.insert(canonical) {
+                    dirs_to_delete.push(per_disk);
+                }
+            }
+        }
+
+        for dir in &dirs_to_delete {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        assert!(
+            !backup_dir.exists(),
+            "Default backup dir should be cleaned up"
+        );
+        assert!(
+            !per_disk_dir.exists(),
+            "Per-disk backup dir should be cleaned up"
+        );
     }
 }

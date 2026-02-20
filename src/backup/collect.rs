@@ -187,6 +187,7 @@ pub fn collect_parts(
     data_path: &str,
     freeze_name: &str,
     backup_dir: &Path,
+    backup_name: &str,
     tables: &[TableRow],
     disk_type_map: &HashMap<String, String>,
     disk_paths: &HashMap<String, String>,
@@ -370,7 +371,14 @@ pub fn collect_parts(
                         // Local disk part: hardlink files to backup staging
                         let part_size = dir_size(&part_entry.path())?;
 
-                        let staging_dir = backup_dir
+                        let disk_path_trimmed = disk_path.trim_end_matches('/');
+                        let per_disk_dir = per_disk_backup_dir(disk_path_trimmed, backup_name);
+                        info!(
+                            disk = %disk_name,
+                            path = %per_disk_dir.display(),
+                            "staging per-disk backup dir"
+                        );
+                        let staging_dir = per_disk_dir
                             .join("shadow")
                             .join(url_encode_path(&db))
                             .join(url_encode_path(&table))
@@ -402,8 +410,9 @@ pub fn collect_parts(
         }
     }
 
-    // Suppress unused variable warning for disk_path_to_name (reserved for future use)
+    // Suppress unused variable warnings (reserved for future use)
     let _ = &disk_path_to_name;
+    let _ = backup_dir;
 
     Ok(result)
 }
@@ -734,6 +743,7 @@ mod tests {
             &data_path.to_string_lossy(),
             freeze,
             &backup_dir,
+            "test-backup",
             &tables,
             &disk_type_map,
             &disk_paths,
@@ -750,8 +760,15 @@ mod tests {
         assert_eq!(parts[0].disk_name, "default");
         assert!(parts[0].part_info.s3_objects.is_none());
 
-        // Verify hardlink was created in staging
-        let staged = backup_dir
+        // Verify hardlink was created in per-disk staging dir
+        // When disk_path == data_path (default disk), per_disk_backup_dir(disk_path, name)
+        // resolves to {data_path}/backup/{name} which is different from backup_dir
+        // (the test uses a separate backup_dir, so we check the per-disk path).
+        let per_disk_staging = per_disk_backup_dir(
+            data_path.to_str().unwrap(),
+            "test-backup",
+        );
+        let staged = per_disk_staging
             .join("shadow")
             .join("default")
             .join("trades")
@@ -813,6 +830,7 @@ mod tests {
             &local_data.to_string_lossy(),
             freeze,
             &backup_dir,
+            "test-backup",
             &tables,
             &disk_type_map,
             &disk_paths,
@@ -934,6 +952,112 @@ mod tests {
         assert_eq!(part.disk_name, "s3disk");
         assert_eq!(part.database, "default");
         assert_eq!(part.table, "trades");
+    }
+
+    // -- collect_parts per-disk staging test --
+
+    #[test]
+    fn test_collect_parts_per_disk_staging_dir() {
+        // Two "disks" (subdirs on same FS). Verify parts from each disk are
+        // hardlinked to their respective {disk_path}/backup/{name}/shadow/ dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let disk1 = tmp.path().join("disk1"); // default disk
+        let disk2 = tmp.path().join("disk2"); // second NVMe
+
+        std::fs::create_dir_all(&disk1).unwrap();
+        std::fs::create_dir_all(&disk2).unwrap();
+
+        let backup_dir = tmp.path().join("backup_metadata");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let uuid1 = "11111111-1111-1111-1111-111111111111";
+        let uuid2 = "22222222-2222-2222-2222-222222222222";
+        let freeze = "chbackup_test_default_t1";
+
+        // Create shadow on disk1 for table t1
+        create_local_shadow(&disk1, freeze, uuid1, "111", "part_a_1_1_0");
+        // Create shadow on disk2 for table t2
+        create_local_shadow(&disk2, freeze, uuid2, "222", "part_b_1_1_0");
+
+        let tables = vec![
+            TableRow {
+                database: "db1".to_string(),
+                name: "t1".to_string(),
+                engine: "MergeTree".to_string(),
+                create_table_query: "CREATE TABLE ...".to_string(),
+                uuid: uuid1.to_string(),
+                data_paths: vec![format!("{}/store/111/{}/", disk1.display(), uuid1)],
+                total_bytes: Some(100),
+            },
+            TableRow {
+                database: "db1".to_string(),
+                name: "t2".to_string(),
+                engine: "MergeTree".to_string(),
+                create_table_query: "CREATE TABLE ...".to_string(),
+                uuid: uuid2.to_string(),
+                data_paths: vec![format!("{}/store/222/{}/", disk2.display(), uuid2)],
+                total_bytes: Some(100),
+            },
+        ];
+
+        let disk_type_map = HashMap::from([
+            ("default".to_string(), "local".to_string()),
+            ("nvme1".to_string(), "local".to_string()),
+        ]);
+        let disk_paths = HashMap::from([
+            ("default".to_string(), disk1.to_string_lossy().to_string()),
+            ("nvme1".to_string(), disk2.to_string_lossy().to_string()),
+        ]);
+
+        let result = collect_parts(
+            &disk1.to_string_lossy(),
+            freeze,
+            &backup_dir,
+            "my-backup",
+            &tables,
+            &disk_type_map,
+            &disk_paths,
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        // Verify t1 part is staged to disk1's per-disk dir
+        let disk1_staged = per_disk_backup_dir(disk1.to_str().unwrap(), "my-backup")
+            .join("shadow")
+            .join("db1")
+            .join("t1")
+            .join("part_a_1_1_0")
+            .join("data.bin");
+        assert!(
+            disk1_staged.exists(),
+            "Part from disk1 should be staged to disk1's per-disk backup dir"
+        );
+
+        // Verify t2 part is staged to disk2's per-disk dir
+        let disk2_staged = per_disk_backup_dir(disk2.to_str().unwrap(), "my-backup")
+            .join("shadow")
+            .join("db1")
+            .join("t2")
+            .join("part_b_1_1_0")
+            .join("data.bin");
+        assert!(
+            disk2_staged.exists(),
+            "Part from disk2 should be staged to disk2's per-disk backup dir"
+        );
+
+        // Verify parts NOT staged to backup_dir (old behavior)
+        let old_staged = backup_dir.join("shadow").join("db1").join("t1");
+        assert!(
+            !old_staged.exists(),
+            "Parts should NOT be staged to backup_dir anymore"
+        );
+
+        // Verify result map
+        assert_eq!(result.len(), 2);
+        assert!(result.contains_key("db1.t1"));
+        assert!(result.contains_key("db1.t2"));
     }
 
     // -- per_disk_backup_dir tests --

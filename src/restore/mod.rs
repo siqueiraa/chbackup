@@ -35,6 +35,7 @@ use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
+use crate::backup::collect::resolve_shadow_part_path;
 use crate::clickhouse::client::ChClient;
 use crate::concurrency::{
     effective_max_connections, effective_object_disk_server_side_copy_concurrency,
@@ -631,6 +632,8 @@ pub async fn restore(
                     &params.table_data_path,
                     ch_uid,
                     ch_gid,
+                    &manifest.disks,
+                    &params.parts_by_disk,
                 )
                 .await
                 {
@@ -947,6 +950,8 @@ async fn try_attach_table_mode(
     table_data_path: &Path,
     ch_uid: Option<u32>,
     ch_gid: Option<u32>,
+    _manifest_disks: &HashMap<String, String>,
+    _parts_by_disk: &HashMap<String, Vec<crate::manifest::PartInfo>>,
 ) -> Result<bool> {
     if !is_replicated_engine(engine) {
         return Ok(false);
