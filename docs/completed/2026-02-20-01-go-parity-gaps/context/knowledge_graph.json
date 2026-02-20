@@ -1,0 +1,242 @@
+{
+  "plan": "2026-02-20-01-go-parity-gaps",
+  "generated_at": "2026-02-20T09:50:00Z",
+  "verified_symbols": {
+    "Config": {
+      "import": "crate::config::Config",
+      "kind": "struct",
+      "file": "src/config.rs",
+      "line": 8,
+      "verified": true
+    },
+    "GeneralConfig": {
+      "import": "crate::config::GeneralConfig",
+      "kind": "struct",
+      "file": "src/config.rs",
+      "line": 36,
+      "verified": true
+    },
+    "ClickHouseConfig": {
+      "import": "crate::config::ClickHouseConfig",
+      "kind": "struct",
+      "file": "src/config.rs",
+      "line": 98,
+      "verified": true
+    },
+    "S3Config": {
+      "import": "crate::config::S3Config",
+      "kind": "struct",
+      "file": "src/config.rs",
+      "line": 244,
+      "verified": true
+    },
+    "BackupConfig": {
+      "import": "crate::config::BackupConfig",
+      "kind": "struct",
+      "file": "src/config.rs",
+      "line": 326,
+      "verified": true
+    },
+    "RetentionConfig": {
+      "import": "crate::config::RetentionConfig",
+      "kind": "struct",
+      "file": "src/config.rs",
+      "line": 378,
+      "verified": true
+    },
+    "WatchConfig": {
+      "import": "crate::config::WatchConfig",
+      "kind": "struct",
+      "file": "src/config.rs",
+      "line": 393,
+      "verified": true
+    },
+    "ApiConfig": {
+      "import": "crate::config::ApiConfig",
+      "kind": "struct",
+      "file": "src/config.rs",
+      "line": 431,
+      "verified": true
+    },
+    "Cli": {
+      "import": "cli::Cli",
+      "kind": "struct",
+      "file": "src/cli.rs",
+      "line": 22,
+      "verified": true
+    },
+    "Command": {
+      "import": "cli::Command",
+      "kind": "enum",
+      "file": "src/cli.rs",
+      "line": 50,
+      "verified": true
+    },
+    "Location": {
+      "import": "cli::Location",
+      "kind": "enum",
+      "file": "src/cli.rs",
+      "line": 44,
+      "verified": true
+    },
+    "ListFormat": {
+      "import": "cli::ListFormat",
+      "kind": "enum",
+      "file": "src/cli.rs",
+      "line": 5,
+      "verified": true
+    },
+    "S3Client": {
+      "import": "crate::storage::S3Client",
+      "kind": "struct",
+      "file": "src/storage/s3.rs",
+      "verified": true
+    },
+    "ChClient": {
+      "import": "crate::clickhouse::ChClient",
+      "kind": "struct",
+      "file": "src/clickhouse/client.rs",
+      "verified": true
+    },
+    "BackupManifest": {
+      "import": "crate::manifest::BackupManifest",
+      "kind": "struct",
+      "file": "src/manifest.rs",
+      "verified": true
+    },
+    "TableManifest": {
+      "import": "crate::manifest::TableManifest",
+      "kind": "struct",
+      "file": "src/manifest.rs",
+      "verified": true
+    },
+    "BackupSummary": {
+      "import": "crate::list::BackupSummary",
+      "kind": "struct",
+      "file": "src/list.rs",
+      "verified": true
+    },
+    "AppState": {
+      "import": "crate::server::state::AppState",
+      "kind": "struct",
+      "file": "src/server/state.rs",
+      "verified": true
+    },
+    "ListResponse": {
+      "import": "crate::server::routes::ListResponse",
+      "kind": "struct",
+      "file": "src/server/routes.rs",
+      "line": 73,
+      "verified": true
+    },
+    "ActionResponse": {
+      "import": "crate::server::routes::ActionResponse",
+      "kind": "struct",
+      "file": "src/server/routes.rs",
+      "line": 48,
+      "verified": true
+    },
+    "ActionRequest": {
+      "import": "crate::server::routes::ActionRequest",
+      "kind": "struct",
+      "file": "src/server/routes.rs",
+      "line": 59,
+      "verified": true
+    },
+    "ListParams": {
+      "import": "crate::server::routes::ListParams",
+      "kind": "struct",
+      "file": "src/server/routes.rs",
+      "line": 65,
+      "verified": true
+    },
+    "build_router": {
+      "import": "crate::server::build_router",
+      "kind": "function",
+      "file": "src/server/mod.rs",
+      "line": 41,
+      "verified": true
+    },
+    "resolve_name_template": {
+      "import": "crate::watch::resolve_name_template",
+      "kind": "function",
+      "file": "src/watch/mod.rs",
+      "line": 32,
+      "verified": true
+    },
+    "apply_env_overlay": {
+      "import": "Config::apply_env_overlay (private method)",
+      "kind": "method",
+      "file": "src/config.rs",
+      "line": 851,
+      "verified": true,
+      "note": "private method on Config, called internally by Config::load()"
+    },
+    "default_backups_to_keep_remote_general": {
+      "import": "crate::config (private fn)",
+      "kind": "function",
+      "file": "src/config.rs",
+      "line": 651,
+      "verified": true,
+      "returns": "i32",
+      "current_value": 7
+    },
+    "default_compression": {
+      "import": "crate::config (private fn)",
+      "kind": "function",
+      "file": "src/config.rs",
+      "line": 774,
+      "verified": true,
+      "returns": "String",
+      "current_value": "lz4"
+    },
+    "default_ch_port": {
+      "import": "crate::config (private fn)",
+      "kind": "function",
+      "file": "src/config.rs",
+      "line": 691,
+      "verified": true,
+      "returns": "u16",
+      "current_value": 9000
+    },
+    "default_ch_timeout": {
+      "import": "crate::config (private fn)",
+      "kind": "function",
+      "file": "src/config.rs",
+      "line": 742,
+      "verified": true,
+      "returns": "String",
+      "current_value": "30m"
+    },
+    "default_s3_acl": {
+      "import": "crate::config (private fn)",
+      "kind": "function",
+      "file": "src/config.rs",
+      "line": 758,
+      "verified": true,
+      "returns": "String",
+      "current_value": "private"
+    }
+  },
+  "module_map": {
+    "config": "src/config.rs",
+    "cli": "src/cli.rs",
+    "main": "src/main.rs",
+    "server/mod": "src/server/mod.rs",
+    "server/routes": "src/server/routes.rs",
+    "server/state": "src/server/state.rs",
+    "server/auth": "src/server/auth.rs",
+    "server/metrics": "src/server/metrics.rs",
+    "server/actions": "src/server/actions.rs",
+    "storage/s3": "src/storage/s3.rs",
+    "clickhouse/client": "src/clickhouse/client.rs",
+    "watch/mod": "src/watch/mod.rs",
+    "manifest": "src/manifest.rs",
+    "list": "src/list.rs",
+    "backup/mod": "src/backup/mod.rs",
+    "upload/mod": "src/upload/mod.rs",
+    "download/mod": "src/download/mod.rs",
+    "restore/mod": "src/restore/mod.rs",
+    "restore/schema": "src/restore/schema.rs"
+  }
+}

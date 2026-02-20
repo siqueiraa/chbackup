@@ -1,0 +1,217 @@
+{
+  "version": 1,
+  "generated_at": "2026-02-19T12:00:00Z",
+  "verified_symbols": {
+    "BackupManifest": {
+      "import": "crate::manifest::BackupManifest",
+      "kind": "struct",
+      "fields": ["manifest_version", "name", "timestamp", "clickhouse_version", "chbackup_version", "data_format", "compressed_size", "metadata_size", "disks", "disk_types", "disk_remote_paths", "tables", "databases", "functions", "named_collections", "rbac"],
+      "location": "src/manifest.rs:19"
+    },
+    "TableManifest": {
+      "import": "crate::manifest::TableManifest",
+      "kind": "struct",
+      "fields": ["ddl", "uuid", "engine", "total_bytes", "parts", "pending_mutations", "metadata_only", "dependencies"],
+      "location": "src/manifest.rs:86"
+    },
+    "PartInfo": {
+      "import": "crate::manifest::PartInfo",
+      "kind": "struct",
+      "fields": ["name", "size", "backup_key", "source", "checksum_crc64", "s3_objects"],
+      "location": "src/manifest.rs:121"
+    },
+    "S3ObjectInfo": {
+      "import": "crate::manifest::S3ObjectInfo",
+      "kind": "struct",
+      "fields": ["path", "size", "backup_key"],
+      "location": "src/manifest.rs:150"
+    },
+    "DatabaseInfo": {
+      "import": "crate::manifest::DatabaseInfo",
+      "kind": "struct",
+      "fields": ["name", "ddl"],
+      "location": "src/manifest.rs:163"
+    },
+    "MutationInfo": {
+      "import": "crate::manifest::MutationInfo",
+      "kind": "struct",
+      "fields": ["mutation_id", "command", "parts_to_do"],
+      "location": "src/manifest.rs:174"
+    },
+    "RbacInfo": {
+      "import": "crate::manifest::RbacInfo",
+      "kind": "struct",
+      "fields": ["path"],
+      "location": "src/manifest.rs:188"
+    },
+    "TableRow": {
+      "import": "crate::clickhouse::client::TableRow",
+      "kind": "struct",
+      "fields": ["database", "name", "engine", "create_table_query", "uuid", "data_paths", "total_bytes"],
+      "location": "src/clickhouse/client.rs:25",
+      "note": "Does NOT include dependency columns. Changing would break callers."
+    },
+    "ChClient": {
+      "import": "crate::clickhouse::client::ChClient",
+      "kind": "struct",
+      "fields": ["inner", "host", "port", "log_sql_queries"],
+      "location": "src/clickhouse/client.rs:14"
+    },
+    "DiskRow": {
+      "import": "crate::clickhouse::client::DiskRow",
+      "kind": "struct",
+      "fields": ["name", "path", "disk_type", "remote_path"],
+      "location": "src/clickhouse/client.rs:48"
+    },
+    "PartRow": {
+      "import": "crate::clickhouse::client::PartRow",
+      "kind": "struct",
+      "fields": ["name", "partition_id", "active"],
+      "location": "src/clickhouse/client.rs:60"
+    },
+    "RemapConfig": {
+      "import": "crate::restore::remap::RemapConfig",
+      "kind": "struct",
+      "fields": ["rename_as", "database_mapping", "default_replica_path"],
+      "location": "src/restore/remap.rs"
+    },
+    "OwnedAttachParams": {
+      "import": "crate::restore::attach::OwnedAttachParams",
+      "kind": "struct",
+      "fields": ["ch", "db", "table", "parts", "backup_dir", "table_data_path", "clickhouse_uid", "clickhouse_gid", "engine", "s3_client", "disk_type_map", "object_disk_server_side_copy_concurrency", "allow_object_disk_streaming", "disk_remote_paths", "table_uuid", "parts_by_disk", "already_attached", "resume_state"],
+      "location": "src/restore/attach.rs"
+    },
+    "list_tables": {
+      "import": "crate::clickhouse::client::ChClient::list_tables",
+      "kind": "method",
+      "signature": "pub async fn list_tables(&self) -> Result<Vec<TableRow>>",
+      "location": "src/clickhouse/client.rs:250",
+      "callers": ["backup::create (mod.rs:118)", "restore::restore (mod.rs:237)"]
+    },
+    "create_databases": {
+      "import": "crate::restore::schema::create_databases",
+      "kind": "function",
+      "signature": "pub async fn create_databases(ch: &ChClient, manifest: &BackupManifest, remap: Option<&RemapConfig>) -> Result<()>",
+      "location": "src/restore/schema.rs:26"
+    },
+    "create_tables": {
+      "import": "crate::restore::schema::create_tables",
+      "kind": "function",
+      "signature": "pub async fn create_tables(ch: &ChClient, manifest: &BackupManifest, table_keys: &[String], data_only: bool, remap: Option<&RemapConfig>) -> Result<()>",
+      "location": "src/restore/schema.rs:113"
+    },
+    "restore": {
+      "import": "crate::restore::restore",
+      "kind": "function",
+      "signature": "pub async fn restore(config: &Config, ch: &ChClient, backup_name: &str, table_pattern: Option<&str>, schema_only: bool, data_only: bool, resume: bool, rename_as: Option<&str>, database_mapping: Option<&HashMap<String, String>>) -> Result<()>",
+      "location": "src/restore/mod.rs:62"
+    },
+    "is_metadata_only_engine": {
+      "import": "crate::backup::is_metadata_only_engine (private fn)",
+      "kind": "function",
+      "signature": "fn is_metadata_only_engine(engine: &str) -> bool",
+      "location": "src/backup/mod.rs:570",
+      "visibility": "private",
+      "engines_matched": ["View", "MaterializedView", "LiveView", "WindowView", "Dictionary", "Null", "Set", "Join", "Buffer", "Distributed", "Merge"]
+    },
+    "ensure_if_not_exists_table": {
+      "import": "crate::restore::schema",
+      "kind": "function",
+      "signature": "fn ensure_if_not_exists_table(ddl: &str) -> String",
+      "location": "src/restore/schema.rs:198",
+      "visibility": "private"
+    },
+    "sort_parts_by_min_block": {
+      "import": "crate::restore::sort::sort_parts_by_min_block",
+      "kind": "function",
+      "signature": "pub fn sort_parts_by_min_block(parts: &[PartInfo]) -> Vec<PartInfo>",
+      "location": "src/restore/sort.rs:64"
+    },
+    "needs_sequential_attach": {
+      "import": "crate::restore::sort::needs_sequential_attach",
+      "kind": "function",
+      "signature": "pub fn needs_sequential_attach(engine: &str) -> bool",
+      "location": "src/restore/sort.rs:83"
+    },
+    "attach_parts_owned": {
+      "import": "crate::restore::attach::attach_parts_owned",
+      "kind": "function",
+      "signature": "pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64>",
+      "location": "src/restore/attach.rs"
+    },
+    "TableFilter": {
+      "import": "crate::table_filter::TableFilter",
+      "kind": "struct",
+      "location": "src/table_filter.rs"
+    },
+    "Config": {
+      "import": "crate::config::Config",
+      "kind": "struct",
+      "fields": ["general", "clickhouse", "s3", "backup", "retention", "watch", "api"],
+      "location": "src/config.rs"
+    },
+    "get_version": {
+      "import": "crate::clickhouse::client::ChClient::get_version",
+      "kind": "method",
+      "signature": "pub async fn get_version(&self) -> Result<String>",
+      "location": "src/clickhouse/client.rs"
+    },
+    "execute_ddl": {
+      "import": "crate::clickhouse::client::ChClient::execute_ddl",
+      "kind": "method",
+      "signature": "pub async fn execute_ddl(&self, ddl: &str) -> Result<()>",
+      "location": "src/clickhouse/client.rs"
+    }
+  },
+  "new_symbols_to_create": {
+    "DependencyRow": {
+      "target_file": "src/clickhouse/client.rs",
+      "kind": "struct",
+      "fields": ["database", "name", "dependencies_database", "dependencies_table"],
+      "note": "Private to client.rs, used only by query_table_dependencies()"
+    },
+    "query_table_dependencies": {
+      "target_file": "src/clickhouse/client.rs",
+      "kind": "method on ChClient",
+      "signature": "pub async fn query_table_dependencies(&self) -> Result<HashMap<String, Vec<String>>>",
+      "note": "Returns map of 'db.table' -> Vec<'dep_db.dep_table'>"
+    },
+    "RestorePhases": {
+      "target_file": "src/restore/topo.rs",
+      "kind": "struct",
+      "fields": ["data_tables", "postponed_tables", "ddl_only_tables"],
+      "note": "Each field is Vec<String> of table keys, ordered appropriately"
+    },
+    "classify_restore_tables": {
+      "target_file": "src/restore/topo.rs",
+      "kind": "function",
+      "signature": "pub fn classify_restore_tables(manifest: &BackupManifest, table_keys: &[String]) -> RestorePhases"
+    },
+    "topological_sort": {
+      "target_file": "src/restore/topo.rs",
+      "kind": "function",
+      "signature": "pub fn topological_sort(tables: &HashMap<String, TableManifest>, keys: &[String]) -> Result<Vec<String>>"
+    },
+    "engine_restore_priority": {
+      "target_file": "src/restore/topo.rs",
+      "kind": "function",
+      "signature": "pub fn engine_restore_priority(engine: &str) -> u8"
+    },
+    "create_ddl_objects": {
+      "target_file": "src/restore/schema.rs",
+      "kind": "function",
+      "signature": "pub async fn create_ddl_objects(ch: &ChClient, manifest: &BackupManifest, ddl_keys: &[String], remap: Option<&RemapConfig>) -> Result<()>"
+    }
+  },
+  "constraints": [
+    "no_kameo_actors",
+    "sync_io_via_spawn_blocking",
+    "anyhow_result_throughout",
+    "zero_warnings_policy",
+    "clickhouse_21_8_minimum",
+    "dependencies_columns_require_ch_23_3",
+    "list_tables_callers_must_not_break",
+    "restore_fn_signature_must_not_change",
+    "metadata_only_flag_already_in_manifest"
+  ]
+}

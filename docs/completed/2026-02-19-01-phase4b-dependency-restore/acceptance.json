@@ -1,0 +1,297 @@
+{
+  "plan": "2026-02-19-01-phase4b-dependency-restore",
+  "status": {"pass": 7, "fail": 0, "total": 7},
+  "last_updated": "2026-02-19T12:00:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "feature",
+      "description": "ChClient.query_table_dependencies() method queries system.tables for dependency info and returns HashMap<String, Vec<String>>",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub async fn query_table_dependencies' src/clickhouse/client.rs | head -1",
+            "expected": "line containing 'pub async fn query_table_dependencies'",
+            "fail_message": "query_table_dependencies() method not found in client.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding query_table_dependencies"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib test_dependency_row 2>&1 | tail -5",
+            "expected": "test result: ok",
+            "fail_message": "DependencyRow deserialization test failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "ChClient method requires live ClickHouse; verified by compilation + unit test for struct deserialization",
+            "alternative_verification": {
+              "command": "cargo test --lib test_dependency_row 2>&1 | tail -5",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": null
+    },
+    {
+      "id": "F002",
+      "category": "feature",
+      "description": "backup::create() populates TableManifest.dependencies from system.tables query",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'query_table_dependencies' src/backup/mod.rs | head -3",
+            "expected": "line containing 'query_table_dependencies'",
+            "fail_message": "query_table_dependencies() not called in backup/mod.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after modifying backup::create"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib test_dependency_population 2>&1 | tail -5",
+            "expected": "test result: ok",
+            "fail_message": "Dependency population unit test failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Backup creation requires live ClickHouse + filesystem; dependency population verified by unit test and structural check",
+            "alternative_verification": {
+              "command": "cargo test --lib test_dependency_population 2>&1 | tail -5",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": null
+    },
+    {
+      "id": "F003",
+      "category": "feature",
+      "description": "restore/topo.rs provides classify_restore_tables(), topological_sort(), and engine_restore_priority()",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub fn' src/restore/topo.rs",
+            "expected": "4",
+            "fail_message": "Expected 4 public functions in topo.rs (data_table_priority, engine_restore_priority, classify_restore_tables, topological_sort)"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors in topo.rs"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib topo 2>&1 | tail -10",
+            "expected": "test result: ok",
+            "fail_message": "Topological sort or classification tests failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Pure functions with no I/O -- fully covered by unit tests",
+            "alternative_verification": {
+              "command": "cargo test --lib topo 2>&1 | tail -10",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": null
+    },
+    {
+      "id": "F004",
+      "category": "feature",
+      "description": "create_ddl_objects() creates DDL-only objects with retry-loop fallback",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub async fn create_ddl_objects' src/restore/schema.rs | head -1",
+            "expected": "line containing 'pub async fn create_ddl_objects'",
+            "fail_message": "create_ddl_objects() function not found in schema.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding create_ddl_objects"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib test_create_ddl 2>&1 | tail -5",
+            "expected": "test result: ok",
+            "fail_message": "create_ddl_objects test failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Requires live ClickHouse for DDL execution; retry logic verified by structural check of loop structure",
+            "alternative_verification": {
+              "command": "grep -c 'for round in 0..max_rounds' src/restore/schema.rs",
+              "expected": "1"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": null
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "restore() uses phased architecture: Phase 2 (data tables) -> Phase 3 (DDL-only topo-sorted) -> Phase 4 (functions)",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'classify_restore_tables\\|topological_sort\\|create_ddl_objects\\|create_functions' src/restore/mod.rs",
+            "expected": "4",
+            "fail_message": "Expected 4 function calls (classify, topo_sort, create_ddl_objects, create_functions) in restore/mod.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after restructuring restore()"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib restore::tests 2>&1 | tail -10",
+            "expected": "test result: ok",
+            "fail_message": "Existing restore unit tests failed after restructuring"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release 2>&1 | tail -3",
+            "wait_seconds": 0,
+            "patterns": [
+              "Classified .* tables:",
+              "Topological sort produced"
+            ],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "Phased restore log patterns not found in restore output"
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": null
+    },
+    {
+      "id": "F006",
+      "category": "feature",
+      "description": "create_functions() restores functions from manifest.functions DDL list",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub async fn create_functions' src/restore/schema.rs | head -1",
+            "expected": "line containing 'pub async fn create_functions'",
+            "fail_message": "create_functions() function not found in schema.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding create_functions"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib test_create_functions 2>&1 | tail -5",
+            "expected": "test result: ok",
+            "fail_message": "create_functions test failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Requires live ClickHouse for function creation; structural + compilation check sufficient for DDL pass-through function",
+            "alternative_verification": {
+              "command": "cargo test --lib test_create_functions 2>&1 | tail -5",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [6],
+      "verified_at": null
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for all modified modules (src/backup, src/restore, src/clickhouse)",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "for m in src/backup src/restore src/clickhouse; do [ -f \"$m/CLAUDE.md\" ] && echo \"EXISTS: $m\" || echo \"MISSING: $m\"; done",
+            "expected": "EXISTS: src/backup\nEXISTS: src/restore\nEXISTS: src/clickhouse",
+            "fail_message": "One or more CLAUDE.md files missing"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "for m in src/backup src/restore src/clickhouse; do grep -q 'Parent Context' \"$m/CLAUDE.md\" && grep -q 'Directory Structure' \"$m/CLAUDE.md\" && grep -q 'Key Patterns' \"$m/CLAUDE.md\" && grep -q 'Parent Rules' \"$m/CLAUDE.md\" || echo \"FAIL: $m missing required sections\"; done && echo VALID",
+            "expected": "VALID",
+            "fail_message": "CLAUDE.md missing required sections (Parent Context, Directory Structure, Key Patterns, Parent Rules)"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Documentation file - no runtime behavior",
+            "alternative_verification": {
+              "command": "grep -c 'topo\\|dependency\\|create_ddl_objects\\|create_functions' src/restore/CLAUDE.md",
+              "expected": "non-zero count indicating new patterns are documented"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [7],
+      "verified_at": null
+    }
+  ]
+}

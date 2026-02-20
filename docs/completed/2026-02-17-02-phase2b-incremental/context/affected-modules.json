@@ -1,0 +1,34 @@
+{
+  "git_base": "4923a70",
+  "modules": [
+    {
+      "path": "src/backup",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "reason": "Adding diff.rs submodule for part comparison logic"
+    },
+    {
+      "path": "src/upload",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "reason": "Adding diff-from-remote support and carried part filtering"
+    }
+  ],
+  "files_modified_outside_modules": [
+    {
+      "path": "src/main.rs",
+      "reason": "Wire diff-from flags to create(), upload(), implement create_remote handler"
+    },
+    {
+      "path": "src/cli.rs",
+      "reason": "No changes needed -- flags already defined"
+    }
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": ["src/backup", "src/upload"],
+    "total_affected": 2
+  }
+}

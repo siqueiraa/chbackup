@@ -1,0 +1,50 @@
+{
+  "git_base": "HEAD",
+  "modules": [
+    {
+      "path": "src/server",
+      "claude_md": "exists",
+      "triggers": ["new_patterns", "tree_change"],
+      "action": "update",
+      "reason": "Watch loop integration with server, replace stub endpoints, SIGHUP handler, config reload API"
+    },
+    {
+      "path": "src/clickhouse",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "reason": "Add get_macros() method for name template resolution"
+    },
+    {
+      "path": "src/watch",
+      "claude_md": "new_directory",
+      "triggers": [],
+      "action": "create",
+      "reason": "New module for watch state machine, name template, resume logic"
+    }
+  ],
+  "files_modified_outside_modules": [
+    {
+      "path": "src/config.rs",
+      "reason": "Make parse_duration_secs public"
+    },
+    {
+      "path": "src/main.rs",
+      "reason": "Wire standalone watch command, pass --watch flag to server"
+    },
+    {
+      "path": "src/cli.rs",
+      "reason": "Possible CLI adjustments for watch command"
+    },
+    {
+      "path": "src/lib.rs",
+      "reason": "Add pub mod watch declaration"
+    }
+  ],
+  "summary": {
+    "to_create": ["src/watch"],
+    "to_update": ["src/server", "src/clickhouse"],
+    "files_to_modify": ["src/config.rs", "src/main.rs", "src/cli.rs", "src/lib.rs"],
+    "total_affected": 7
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "git_base": "e87552ef",
+  "modules": [
+    {
+      "path": "src/config.rs",
+      "type": "file",
+      "claude_md": "N/A (single file, not directory module)",
+      "triggers": ["env_overlay_extension"],
+      "action": "modify",
+      "changes": "Add WATCH_INTERVAL and FULL_INTERVAL to apply_env_overlay()"
+    }
+  ],
+  "new_files": [
+    {
+      "path": "Dockerfile",
+      "action": "create",
+      "description": "Production multi-stage Dockerfile (design 1.2)"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "action": "create",
+      "description": "GitHub Actions CI with CH version matrix (design 1.4.6)"
+    },
+    {
+      "path": "examples/kubernetes/sidecar.yaml",
+      "action": "create",
+      "description": "K8s sidecar deployment example (design 1.3 + 10.9)"
+    },
+    {
+      "path": "test/fixtures/seed_data.sql",
+      "action": "create",
+      "description": "Deterministic test data for checksum validation (design 1.4.4)"
+    }
+  ],
+  "existing_files_modified": [
+    {
+      "path": "Dockerfile.test",
+      "action": "extend",
+      "description": "Minor updates for CI matrix compatibility"
+    },
+    {
+      "path": "docker-compose.test.yml",
+      "action": "extend",
+      "description": "Minor updates for CI matrix support"
+    },
+    {
+      "path": "test/run_tests.sh",
+      "action": "extend",
+      "description": "Add seed_data.sql loading and round-trip smoke tests"
+    }
+  ],
+  "summary": {
+    "src_files_modified": ["src/config.rs"],
+    "infrastructure_files_created": ["Dockerfile", ".github/workflows/ci.yml", "examples/kubernetes/sidecar.yaml", "test/fixtures/seed_data.sql"],
+    "infrastructure_files_modified": ["Dockerfile.test", "docker-compose.test.yml", "test/run_tests.sh"],
+    "total_affected": 8
+  }
+}

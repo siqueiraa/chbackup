@@ -1,0 +1,253 @@
+{
+  "plan": "2026-02-18-04-phase3e-docker-deploy",
+  "status": {"pass": 6, "fail": 0, "total": 6},
+  "last_updated": "2026-02-18T22:00:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "feature",
+      "description": "WATCH_INTERVAL and FULL_INTERVAL env vars mapped in apply_env_overlay() and tested",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'WATCH_INTERVAL' src/config.rs | grep -c 'env::var'",
+            "expected": "1",
+            "fail_message": "WATCH_INTERVAL env var mapping not found in config.rs apply_env_overlay()"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation failed after config.rs changes"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_watch_env_overlay -- --nocapture 2>&1 | grep -c 'test test_watch_env_overlay ... ok'",
+            "expected": "1",
+            "fail_message": "test_watch_env_overlay test failed or not found"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Config env overlay is tested via unit test; no binary runtime behavior change visible in logs",
+            "alternative_verification": {
+              "command": "cargo test test_watch_env_overlay -- --nocapture 2>&1 | grep -c 'ok'",
+              "expected": "1"
+            },
+            "covered_by": ["F001-behavioral"]
+          }
+        ]
+      },
+      "related_tasks": [1, 2],
+      "verified_at": "2026-02-18T20:50:00Z"
+    },
+    {
+      "id": "F002",
+      "category": "feature",
+      "description": "Production Dockerfile with multi-stage build, musl target, Alpine runtime, clickhouse uid 101",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f Dockerfile && grep -c 'FROM rust:.*alpine AS builder' Dockerfile",
+            "expected": "1",
+            "fail_message": "Dockerfile missing or no multi-stage builder stage"
+          },
+          {
+            "name": "compilation",
+            "command": "grep -c 'x86_64-unknown-linux-musl' Dockerfile",
+            "expected": "2",
+            "fail_message": "Dockerfile does not target x86_64-unknown-linux-musl (expected in cargo build and COPY)"
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -c 'adduser.*101.*clickhouse' Dockerfile",
+            "expected": "1",
+            "fail_message": "Dockerfile missing clickhouse user with uid 101"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Dockerfile is a build artifact; correctness verified via structural and behavioral checks. Docker build test requires Docker daemon and is done in CI.",
+            "alternative_verification": {
+              "command": "test -f Dockerfile && grep -q 'ENTRYPOINT' Dockerfile && echo VERIFIED",
+              "expected": "VERIFIED"
+            },
+            "covered_by": ["F002-structural", "F002-behavioral"]
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": "2026-02-18T21:30:00Z"
+    },
+    {
+      "id": "F003",
+      "category": "feature",
+      "description": "seed_data.sql with deterministic test data and round-trip smoke test in run_tests.sh",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f test/fixtures/seed_data.sql && grep -c 'INSERT INTO' test/fixtures/seed_data.sql",
+            "expected_minimum": "1",
+            "fail_message": "seed_data.sql missing or contains no INSERT statements"
+          },
+          {
+            "name": "compilation",
+            "command": "bash -n test/run_tests.sh 2>&1; echo $?",
+            "expected": "0",
+            "fail_message": "run_tests.sh has bash syntax errors"
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -c 'test_round_trip\\|round.trip' test/run_tests.sh",
+            "expected_minimum": "1",
+            "fail_message": "run_tests.sh missing round-trip test section"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Shell script and SQL fixtures; tested in Docker integration environment via CI, not on local machine",
+            "alternative_verification": {
+              "command": "bash -n test/run_tests.sh 2>&1; echo $?",
+              "expected": "0"
+            },
+            "covered_by": ["F003-structural", "F003-behavioral"]
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": "2026-02-18T21:30:00Z"
+    },
+    {
+      "id": "F004",
+      "category": "feature",
+      "description": "GitHub Actions CI workflow with ClickHouse version matrix",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f .github/workflows/ci.yml && echo EXISTS",
+            "expected": "EXISTS",
+            "fail_message": ".github/workflows/ci.yml does not exist"
+          },
+          {
+            "name": "compilation",
+            "command": "grep -c 'ch_version' .github/workflows/ci.yml",
+            "expected_minimum": "2",
+            "fail_message": "CI workflow missing ch_version matrix configuration"
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -E '23\\.8|24\\.3|24\\.8|25\\.1' .github/workflows/ci.yml | wc -l | tr -d ' '",
+            "expected_minimum": "4",
+            "fail_message": "CI workflow missing one or more required CH versions (23.8, 24.3, 24.8, 25.1)"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "GitHub Actions workflow runs on GitHub infrastructure, not locally. Structural checks verify correct YAML structure.",
+            "alternative_verification": {
+              "command": "test -f .github/workflows/ci.yml && grep -q 'on:' .github/workflows/ci.yml && echo VERIFIED",
+              "expected": "VERIFIED"
+            },
+            "covered_by": ["F004-structural", "F004-behavioral"]
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": "2026-02-18T21:30:00Z"
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "K8s sidecar example manifest with server --watch, env vars, shared volume",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f examples/kubernetes/sidecar.yaml && echo EXISTS",
+            "expected": "EXISTS",
+            "fail_message": "examples/kubernetes/sidecar.yaml does not exist"
+          },
+          {
+            "name": "compilation",
+            "command": "grep -c 'server.*--watch\\|\"server\", \"--watch\"' examples/kubernetes/sidecar.yaml",
+            "expected_minimum": "1",
+            "fail_message": "K8s manifest missing server --watch args"
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -c 'WATCH_INTERVAL\\|FULL_INTERVAL\\|S3_BUCKET\\|secretKeyRef' examples/kubernetes/sidecar.yaml",
+            "expected_minimum": "4",
+            "fail_message": "K8s manifest missing required env vars or secret references"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Example YAML file; not executable without a Kubernetes cluster. Structural validation sufficient.",
+            "alternative_verification": {
+              "command": "test -f examples/kubernetes/sidecar.yaml && grep -q 'kind:' examples/kubernetes/sidecar.yaml && echo VERIFIED",
+              "expected": "VERIFIED"
+            },
+            "covered_by": ["F005-structural", "F005-behavioral"]
+          }
+        ]
+      },
+      "related_tasks": [6],
+      "verified_at": "2026-02-18T21:30:00Z"
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for Phase 3e changes",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'Phase 3e' CLAUDE.md",
+            "expected_minimum": "1",
+            "fail_message": "CLAUDE.md missing Phase 3e reference"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -c 'WATCH_INTERVAL\\|FULL_INTERVAL\\|Dockerfile\\|docker' CLAUDE.md",
+            "expected_minimum": "1",
+            "fail_message": "CLAUDE.md missing Docker/deployment documentation"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Documentation file -- no runtime behavior",
+            "alternative_verification": {
+              "command": "grep -c 'Phase 3e' CLAUDE.md",
+              "expected": "1"
+            },
+            "covered_by": ["FDOC-structural"]
+          }
+        ]
+      },
+      "related_tasks": [7],
+      "verified_at": "2026-02-18T22:00:00Z"
+    }
+  ]
+}

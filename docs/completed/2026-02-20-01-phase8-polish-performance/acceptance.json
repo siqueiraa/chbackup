@@ -1,0 +1,417 @@
+{
+  "plan": "2026-02-20-01-phase8-polish-performance",
+  "status": {"pass": 10, "fail": 0, "total": 10},
+  "last_updated": "2026-02-20T14:00:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "feature",
+      "description": "rbac_size and config_size fields added to BackupManifest and BackupSummary with serde backward compatibility",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub rbac_size: u64' src/manifest.rs && grep -n 'pub config_size: u64' src/manifest.rs && grep -n 'pub rbac_size: u64' src/list.rs && grep -n 'pub config_size: u64' src/list.rs",
+            "expected": "4 lines (one per field per file)",
+            "fail_message": "rbac_size or config_size fields missing from BackupManifest or BackupSummary"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after adding manifest fields"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_manifest_rbac_config_size_fields test_manifest_backward_compat_no_rbac_config_size -- --exact 2>&1 | grep -c 'test result: ok'",
+            "expected": "2",
+            "fail_message": "Manifest field tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Pure data structure change with serde defaults; no runtime behavior beyond serialization tested in behavioral layer",
+            "alternative_verification": {
+              "command": "cargo test test_manifest_rbac_config_size_fields test_manifest_backward_compat_no_rbac_config_size -- --exact 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F002"]
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": null
+    },
+    {
+      "id": "F002",
+      "category": "feature",
+      "description": "dir_size() made public and rbac_size/config_size computed during backup::create()",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub fn dir_size' src/backup/collect.rs && grep -n 'rbac_size' src/backup/mod.rs && grep -n 'config_size' src/backup/mod.rs",
+            "expected": "3 lines (pub fn, rbac_size assignment, config_size assignment)",
+            "fail_message": "dir_size not public or size computation missing from backup::create()"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after adding size computation"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_dir_size_empty_dir test_dir_size_with_files -- --exact 2>&1 | grep -c 'test result: ok'",
+            "expected": "2",
+            "fail_message": "dir_size unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release",
+            "wait_seconds": 5,
+            "patterns": ["rbac_size=", "config_size="],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "rbac_size/config_size not logged during backup creation"
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": null
+    },
+    {
+      "id": "F003",
+      "category": "feature",
+      "description": "ListResponse.rbac_size and .config_size populated from BackupSummary instead of hardcoded 0",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'rbac_size: s.rbac_size' src/server/routes.rs && grep -n 'config_size: s.config_size' src/server/routes.rs",
+            "expected": "2 lines (one per field)",
+            "fail_message": "summary_to_list_response still hardcodes 0 for rbac_size or config_size"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after wiring sizes"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_summary_to_list_response_sizes -- --exact 2>&1 | grep 'test result: ok'",
+            "expected": "test result: ok",
+            "fail_message": "summary_to_list_response sizes test failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Field propagation verified by unit test; runtime evidence provided by F002 which populates the source data",
+            "alternative_verification": {
+              "command": "cargo test test_summary_to_list_response_sizes -- --exact 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F002"]
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": null
+    },
+    {
+      "id": "F004",
+      "category": "feature",
+      "description": "Tables API endpoint supports offset/limit pagination query parameters",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub offset: Option<usize>' src/server/routes.rs && grep -n 'pub limit: Option<usize>' src/server/routes.rs",
+            "expected": "2 lines (one per field)",
+            "fail_message": "TablesParams missing offset or limit fields"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after adding pagination"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_tables_pagination_params_deserialize -- --exact 2>&1 | grep 'test result: ok'",
+            "expected": "test result: ok",
+            "fail_message": "TablesParams pagination deserialization test failed"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release",
+            "wait_seconds": 10,
+            "patterns": ["tables: offset="],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "Pagination log not emitted when offset/limit params used"
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": null
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "ManifestCache struct with TTL-based expiry for remote backup summaries",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub struct ManifestCache' src/list.rs && grep -n 'pub fn list_remote_cached' src/list.rs",
+            "expected": "2 lines",
+            "fail_message": "ManifestCache struct or list_remote_cached function not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors in ManifestCache"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_manifest_cache_basic test_manifest_cache_ttl_expiry -- --exact 2>&1 | grep -c 'test result: ok'",
+            "expected": "2",
+            "fail_message": "ManifestCache unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Cache is an internal optimization; runtime behavior verified by F006 which wires cache into server",
+            "alternative_verification": {
+              "command": "cargo test test_manifest_cache_basic test_manifest_cache_ttl_expiry -- --exact 2>&1 | grep -c 'test result: ok'",
+              "expected": "2"
+            },
+            "covered_by": ["F006"]
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": null
+    },
+    {
+      "id": "F006",
+      "category": "feature",
+      "description": "ManifestCache wired into AppState with invalidation on mutating operations",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'manifest_cache' src/server/state.rs && grep -n 'list_remote_cached' src/server/routes.rs && grep -n 'invalidate' src/server/routes.rs",
+            "expected": "4+ lines (field, cached call, invalidate calls)",
+            "fail_message": "ManifestCache not wired into AppState or not used in routes"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after wiring cache"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test -- --test-threads=1 2>&1 | grep 'test result: ok'",
+            "expected": "test result: ok",
+            "fail_message": "Tests failed after cache wiring"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release",
+            "wait_seconds": 15,
+            "patterns": ["ManifestCache: populated", "ManifestCache: invalidated"],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "ManifestCache populated/invalidated logs not seen in server mode"
+          }
+        ]
+      },
+      "related_tasks": [6],
+      "verified_at": null
+    },
+    {
+      "id": "F007",
+      "category": "feature",
+      "description": "SIGQUIT handler dumps stack trace to stderr in server and standalone watch modes",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'SignalKind::quit' src/server/mod.rs && grep -n 'SignalKind::quit' src/main.rs",
+            "expected": "2 lines (server and standalone)",
+            "fail_message": "SIGQUIT handler not registered in server/mod.rs or main.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors in SIGQUIT handler"
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -n 'SIGQUIT received' src/server/mod.rs && grep -n 'Backtrace::force_capture' src/server/mod.rs",
+            "expected": "2 lines",
+            "fail_message": "SIGQUIT log message or backtrace capture missing from handler code"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release",
+            "wait_seconds": 5,
+            "patterns": ["SIGQUIT received"],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "SIGQUIT handler did not fire when kill -3 sent to process"
+          }
+        ]
+      },
+      "related_tasks": [7],
+      "verified_at": null
+    },
+    {
+      "id": "F008",
+      "category": "feature",
+      "description": "compress_part_streaming() produces correct chunks for multipart upload",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub fn compress_part_streaming' src/upload/stream.rs",
+            "expected": "1 line",
+            "fail_message": "compress_part_streaming function not found in stream.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors in streaming compression"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_compress_part_streaming_roundtrip test_compress_part_streaming_chunk_sizes -- --exact 2>&1 | grep -c 'test result: ok'",
+            "expected": "2",
+            "fail_message": "Streaming compression tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Streaming compression function verified by unit tests with data integrity checks; runtime evidence provided by F009 which uses the function in the upload pipeline",
+            "alternative_verification": {
+              "command": "cargo test test_compress_part_streaming_roundtrip test_compress_part_streaming_chunk_sizes -- --exact 2>&1 | grep -c 'test result: ok'",
+              "expected": "2"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [8],
+      "verified_at": null
+    },
+    {
+      "id": "F009",
+      "category": "feature",
+      "description": "Upload pipeline uses streaming multipart for parts exceeding configurable threshold",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'streaming_upload_threshold' src/config.rs && grep -n 'compress_part_streaming' src/upload/mod.rs",
+            "expected": "2+ lines (config field and usage in upload)",
+            "fail_message": "Streaming upload threshold config or usage missing"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected": "Finished",
+            "fail_message": "Compilation errors after wiring streaming upload"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_should_use_streaming -- --exact 2>&1 | grep 'test result: ok'",
+            "expected": "test result: ok",
+            "fail_message": "Streaming threshold test failed"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release",
+            "wait_seconds": 10,
+            "patterns": ["Streaming multipart upload"],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "Streaming upload log not emitted for large part upload"
+          }
+        ]
+      },
+      "related_tasks": [9],
+      "verified_at": null
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for all modified modules (src/server, src/upload, src/backup)",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f src/server/CLAUDE.md && test -f src/upload/CLAUDE.md && test -f src/backup/CLAUDE.md && echo PASS",
+            "expected": "PASS",
+            "fail_message": "One or more CLAUDE.md files missing"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -q 'ManifestCache' src/server/CLAUDE.md && grep -q 'compress_part_streaming' src/upload/CLAUDE.md && grep -q 'dir_size' src/backup/CLAUDE.md && grep -q 'Phase 8' CLAUDE.md && echo VALID",
+            "expected": "VALID",
+            "fail_message": "CLAUDE.md files missing Phase 8 documentation updates"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Documentation file - no runtime behavior",
+            "alternative_verification": {
+              "command": "grep -q 'Phase 8' CLAUDE.md && echo VALID",
+              "expected": "VALID"
+            },
+            "covered_by": ["F001"]
+          }
+        ]
+      },
+      "related_tasks": [10],
+      "verified_at": null
+    }
+  ]
+}

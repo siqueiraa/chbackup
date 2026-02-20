@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "generated_at": "2026-02-19T12:00:00Z",
+  "verified_symbols": {
+    "RestorePhases": {
+      "import": "crate::restore::topo::RestorePhases",
+      "kind": "struct",
+      "fields": ["data_tables", "postponed_tables", "ddl_only_tables"],
+      "field_types": {
+        "data_tables": "Vec<String>",
+        "postponed_tables": "Vec<String>",
+        "ddl_only_tables": "Vec<String>"
+      },
+      "derives": ["Debug", "Clone"],
+      "location": "src/restore/topo.rs:51"
+    },
+    "classify_restore_tables": {
+      "import": "crate::restore::topo::classify_restore_tables",
+      "kind": "function",
+      "signature": "pub fn(manifest: &BackupManifest, table_keys: &[String]) -> RestorePhases",
+      "location": "src/restore/topo.rs:61",
+      "notes": "Currently hardcodes postponed_tables to Vec::new() at line 89"
+    },
+    "topological_sort": {
+      "import": "crate::restore::topo::topological_sort",
+      "kind": "function",
+      "signature": "pub fn(tables: &HashMap<String, TableManifest>, keys: &[String]) -> Result<Vec<String>>",
+      "location": "src/restore/topo.rs:100"
+    },
+    "engine_restore_priority": {
+      "import": "crate::restore::topo::engine_restore_priority",
+      "kind": "function",
+      "signature": "pub fn(engine: &str) -> u8",
+      "location": "src/restore/topo.rs:40"
+    },
+    "data_table_priority": {
+      "import": "crate::restore::topo::data_table_priority",
+      "kind": "function",
+      "signature": "pub fn(table_key: &str) -> u8",
+      "location": "src/restore/topo.rs:21"
+    },
+    "BackupManifest": {
+      "import": "crate::manifest::BackupManifest",
+      "kind": "struct",
+      "fields": ["manifest_version", "name", "timestamp", "clickhouse_version", "chbackup_version", "data_format", "compressed_size", "metadata_size", "disks", "disk_types", "disk_remote_paths", "tables", "databases", "functions", "named_collections", "rbac"],
+      "location": "src/manifest.rs:19"
+    },
+    "TableManifest": {
+      "import": "crate::manifest::TableManifest",
+      "kind": "struct",
+      "fields": ["ddl", "uuid", "engine", "total_bytes", "parts", "pending_mutations", "metadata_only", "dependencies"],
+      "field_types": {
+        "ddl": "String",
+        "uuid": "Option<String>",
+        "engine": "String",
+        "total_bytes": "u64",
+        "parts": "HashMap<String, Vec<PartInfo>>",
+        "pending_mutations": "Vec<MutationInfo>",
+        "metadata_only": "bool",
+        "dependencies": "Vec<String>"
+      },
+      "derives": ["Debug", "Clone", "PartialEq", "Serialize", "Deserialize"],
+      "location": "src/manifest.rs:86"
+    },
+    "create_tables": {
+      "import": "crate::restore::schema::create_tables",
+      "kind": "function",
+      "signature": "pub async fn(ch: &ChClient, manifest: &BackupManifest, table_keys: &[String], data_only: bool, remap: Option<&RemapConfig>) -> Result<()>",
+      "location": "src/restore/schema.rs:113",
+      "notes": "Generic: works for any table list. Usable for postponed tables."
+    },
+    "create_ddl_objects": {
+      "import": "crate::restore::schema::create_ddl_objects",
+      "kind": "function",
+      "signature": "pub async fn(ch: &ChClient, manifest: &BackupManifest, ddl_keys: &[String], remap: Option<&RemapConfig>) -> Result<()>",
+      "location": "src/restore/schema.rs:198"
+    },
+    "create_functions": {
+      "import": "crate::restore::schema::create_functions",
+      "kind": "function",
+      "signature": "pub async fn(ch: &ChClient, manifest: &BackupManifest) -> Result<()>",
+      "location": "src/restore/schema.rs:319"
+    },
+    "create_databases": {
+      "import": "crate::restore::schema::create_databases",
+      "kind": "function",
+      "signature": "pub async fn(ch: &ChClient, manifest: &BackupManifest, remap: Option<&RemapConfig>) -> Result<()>",
+      "location": "src/restore/schema.rs:26"
+    },
+    "is_metadata_only_engine": {
+      "import": "private: crate::backup::is_metadata_only_engine",
+      "kind": "function",
+      "signature": "fn(engine: &str) -> bool",
+      "location": "src/backup/mod.rs:589",
+      "notes": "Private to backup module. Lists: View, MaterializedView, LiveView, WindowView, Dictionary, Null, Set, Join, Buffer, Distributed, Merge"
+    },
+    "is_engine_excluded": {
+      "import": "crate::table_filter::is_engine_excluded",
+      "kind": "function",
+      "signature": "pub fn(engine: &str, skip_engines: &[String]) -> bool",
+      "location": "src/table_filter.rs:78"
+    },
+    "restore": {
+      "import": "crate::restore::restore",
+      "kind": "function",
+      "signature": "pub async fn(config: &Config, ch: &ChClient, backup_name: &str, table_pattern: Option<&str>, schema_only: bool, data_only: bool, resume: bool, rename_as: Option<&str>, database_mapping: Option<&HashMap<String, String>>) -> Result<()>",
+      "location": "src/restore/mod.rs:62"
+    },
+    "TableRow": {
+      "import": "crate::clickhouse::client::TableRow",
+      "kind": "struct",
+      "fields": ["database", "name", "engine", "create_table_query", "uuid", "data_paths", "total_bytes"],
+      "location": "src/clickhouse/client.rs:25"
+    },
+    "RemapConfig": {
+      "import": "crate::restore::remap::RemapConfig",
+      "kind": "struct",
+      "location": "src/restore/remap.rs"
+    }
+  },
+  "constraints": [
+    "no_actor_pattern",
+    "sync_io_via_spawn_blocking",
+    "zero_warnings_policy",
+    "conventional_commits",
+    "anyhow_result_with_context"
+  ]
+}

@@ -1,0 +1,483 @@
+{
+  "plan": "2026-02-18-03-phase3d-watch-mode",
+  "status": {"pass": 11, "fail": 0, "total": 11},
+  "last_updated": "2026-02-18T22:00:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "refactor",
+      "description": "parse_duration_secs made public + WatchConfig.tables field added",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub fn parse_duration_secs' src/config.rs | head -1",
+            "expected_pattern": "pub fn parse_duration_secs",
+            "fail_message": "parse_duration_secs not made public"
+          },
+          {
+            "name": "structural_2",
+            "command": "grep -A30 'pub struct WatchConfig' src/config.rs | grep 'pub tables:'",
+            "expected_pattern": "pub tables:",
+            "fail_message": "WatchConfig.tables field not added"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors after config changes"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_parse_duration_secs_public_access test_watch_config_tables_field -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "Config tests failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Config-level change with no runtime behavior -- verified by unit tests",
+            "alternative_verification": {
+              "command": "cargo test test_parse_duration_secs_public_access test_watch_config_tables_field -- --nocapture 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": "2026-02-18T20:00:00Z"
+    },
+    {
+      "id": "F002",
+      "category": "feature",
+      "description": "ChClient::get_macros() method queries system.macros",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub async fn get_macros' src/clickhouse/client.rs | head -1",
+            "expected_pattern": "pub async fn get_macros",
+            "fail_message": "get_macros method not found on ChClient"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors after adding get_macros"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_macro_row_deserializable -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "MacroRow deserialization test failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Requires real ClickHouse with system.macros table -- covered by watch loop integration",
+            "alternative_verification": {
+              "command": "cargo test test_macro_row_deserializable -- --nocapture 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": "2026-02-18T20:00:00Z"
+    },
+    {
+      "id": "F003",
+      "category": "feature",
+      "description": "Name template resolution with {type}, {time:FORMAT}, {shard} macros",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub fn resolve_name_template' src/watch/mod.rs | head -1",
+            "expected_pattern": "pub fn resolve_name_template",
+            "fail_message": "resolve_name_template function not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors in watch module"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_resolve_type_macro test_resolve_time_macro test_resolve_shard_macro test_resolve_full_template test_resolve_unknown_macro -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "Name template resolution tests failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Pure function with no I/O -- comprehensively tested by 5 unit tests",
+            "alternative_verification": {
+              "command": "cargo test test_resolve_type_macro test_resolve_time_macro test_resolve_shard_macro test_resolve_full_template test_resolve_unknown_macro -- --nocapture 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": "2026-02-18T20:00:00Z"
+    },
+    {
+      "id": "F004",
+      "category": "feature",
+      "description": "Watch resume state determines next backup type from remote listing",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub fn resume_state\\|pub enum ResumeDecision\\|pub fn resolve_template_prefix' src/watch/mod.rs | wc -l",
+            "expected": "3",
+            "fail_message": "resume_state, ResumeDecision, or resolve_template_prefix not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors in resume_state"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_resume_no_backups test_resume_recent_full_no_incr test_resume_stale_full test_resume_stale_incr test_resume_recent_incr test_resume_filters_by_template_prefix -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "Resume state tests failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Pure function operating on BackupSummary slices -- comprehensively tested by 6 unit tests including template prefix filtering",
+            "alternative_verification": {
+              "command": "cargo test test_resume_no_backups test_resume_recent_full_no_incr test_resume_stale_full test_resume_stale_incr test_resume_recent_incr test_resume_filters_by_template_prefix -- --nocapture 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": "2026-02-18T20:00:00Z"
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "Watch state machine loop with error recovery and metrics updates",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub async fn run_watch_loop\\|pub enum WatchState\\|pub enum WatchLoopExit\\|pub struct WatchContext' src/watch/mod.rs | wc -l",
+            "expected": "4",
+            "fail_message": "Watch loop types or function not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors in watch loop"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_watch_state_enum_values test_force_full_after_error test_consecutive_errors_reset_on_success test_consecutive_errors_abort -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "Watch state machine unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release",
+            "start_command": "./target/release/chbackup watch --watch-interval=10s --full-interval=30s",
+            "wait_seconds": 15,
+            "patterns": [
+              "watch: starting watch loop",
+              "watch: resume state"
+            ],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "Watch loop did not produce expected startup logs"
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": "2026-02-18T21:00:00Z"
+    },
+    {
+      "id": "F006",
+      "category": "feature",
+      "description": "Watch loop updates Prometheus metrics (watch_state, timestamps, errors)",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'watch_state\\|watch_last_full_timestamp\\|watch_last_incremental_timestamp\\|watch_consecutive_errors' src/watch/mod.rs | wc -l",
+            "expected_min": "4",
+            "fail_message": "Watch loop does not reference watch metrics"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_watch_state_enum_values -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "Watch state enum test failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Metrics updates verified through F005 runtime and F008 structural -- metrics are set() calls on existing registered gauges",
+            "alternative_verification": {
+              "command": "grep -c 'watch_state\\|watch_last_full_timestamp\\|watch_last_incremental_timestamp\\|watch_consecutive_errors' src/watch/mod.rs",
+              "expected": "4"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": "2026-02-18T21:00:00Z"
+    },
+    {
+      "id": "F007",
+      "category": "feature",
+      "description": "Module wiring: lib.rs declares watch module, main.rs wires standalone watch command",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub mod watch' src/lib.rs | head -1",
+            "expected_pattern": "pub mod watch",
+            "fail_message": "watch module not declared in lib.rs"
+          },
+          {
+            "name": "structural_2",
+            "command": "grep -n 'Command::Watch' src/main.rs | grep -v 'not implemented' | head -1",
+            "expected_pattern": "Command::Watch",
+            "fail_message": "Command::Watch not wired in main.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors after module wiring"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test 2>&1 | grep -c 'test result: ok'",
+            "expected_min": "1",
+            "fail_message": "Existing tests broken by module wiring"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Wiring-only task -- runtime verified by F005 which exercises the standalone watch command path",
+            "alternative_verification": {
+              "command": "cargo check 2>&1 | tail -1",
+              "expected": "Finished"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [6],
+      "verified_at": "2026-02-18T21:00:00Z"
+    },
+    {
+      "id": "F008",
+      "category": "feature",
+      "description": "AppState extended with watch lifecycle fields (shutdown_tx, reload_tx, WatchStatus)",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'watch_shutdown_tx\\|watch_reload_tx\\|watch_status\\|pub struct WatchStatus' src/server/state.rs | wc -l",
+            "expected_min": "4",
+            "fail_message": "Watch fields not added to AppState or WatchStatus not defined"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors after AppState changes"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_app_state_watch_handle_default_none -- --nocapture 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "AppState watch handle test failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Struct field addition -- verified by unit test and compilation; runtime via F009",
+            "alternative_verification": {
+              "command": "cargo test test_app_state_watch_handle_default_none -- --nocapture 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [7],
+      "verified_at": "2026-02-18T22:00:00Z"
+    },
+    {
+      "id": "F009",
+      "category": "feature",
+      "description": "Server spawns watch loop when --watch flag is set, with SIGHUP handler",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'run_watch_loop\\|SignalKind::hangup\\|watch_shutdown_tx' src/server/mod.rs | wc -l",
+            "expected_min": "3",
+            "fail_message": "Watch loop spawn or SIGHUP handler not found in server/mod.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors after server watch integration"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test 2>&1 | grep -c 'test result: ok'",
+            "expected_min": "1",
+            "fail_message": "Existing tests broken by server changes"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release",
+            "start_command": "./target/release/chbackup server --watch",
+            "wait_seconds": 10,
+            "patterns": [
+              "Starting API server on"
+            ],
+            "forbidden": [],
+            "cleanup_markers": false,
+            "fail_message": "Server with --watch did not start"
+          }
+        ]
+      },
+      "related_tasks": [8],
+      "verified_at": "2026-02-18T22:00:00Z"
+    },
+    {
+      "id": "F010",
+      "category": "feature",
+      "description": "4 API endpoints (watch/start, watch/stop, watch/status, reload) replace stubs",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'watch_start_stub\\|watch_stop_stub\\|watch_status_stub\\|reload_stub' src/server/routes.rs",
+            "expected": "0",
+            "fail_message": "Stub functions still present in routes.rs"
+          },
+          {
+            "name": "structural_2",
+            "command": "grep -n 'pub async fn watch_start\\|pub async fn watch_stop\\|pub async fn watch_status\\|pub async fn reload' src/server/routes.rs | wc -l",
+            "expected_min": "4",
+            "fail_message": "Replacement handler functions not found"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | tail -1",
+            "expected_pattern": "Finished",
+            "fail_message": "Compilation errors after stub replacement"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test 2>&1 | grep -c 'test result: ok'",
+            "expected_min": "1",
+            "fail_message": "Tests broken by stub replacement"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "API endpoints require running server with ClickHouse/S3 -- structural and compilation checks verify handler wiring; runtime behavior covered by F009 server startup",
+            "alternative_verification": {
+              "command": "grep -c 'pub async fn watch_start\\|pub async fn watch_stop\\|pub async fn watch_status\\|pub async fn reload' src/server/routes.rs",
+              "expected": "4"
+            },
+            "covered_by": ["F009"]
+          }
+        ]
+      },
+      "related_tasks": [9],
+      "verified_at": "2026-02-18T22:00:00Z"
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for all modified modules (watch, server, clickhouse)",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f src/watch/CLAUDE.md && test -f src/server/CLAUDE.md && test -f src/clickhouse/CLAUDE.md && echo PASS",
+            "expected": "PASS",
+            "fail_message": "One or more CLAUDE.md files missing"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "for m in src/watch src/server src/clickhouse; do grep -q 'Parent Context' \"$m/CLAUDE.md\" && grep -q 'Directory Structure' \"$m/CLAUDE.md\" && grep -q 'Key Patterns' \"$m/CLAUDE.md\" && grep -q 'Parent Rules' \"$m/CLAUDE.md\" || exit 1; done && echo VALID",
+            "expected": "VALID",
+            "fail_message": "CLAUDE.md missing required sections"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Documentation file - no runtime behavior",
+            "alternative_verification": {
+              "command": "test -f src/watch/CLAUDE.md && echo EXISTS",
+              "expected": "EXISTS"
+            },
+            "covered_by": ["F005"]
+          }
+        ]
+      },
+      "related_tasks": [10],
+      "verified_at": "2026-02-18T23:00:00Z"
+    }
+  ]
+}

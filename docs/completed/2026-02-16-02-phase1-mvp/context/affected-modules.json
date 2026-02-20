@@ -1,0 +1,91 @@
+{
+  "git_base": "880a640",
+  "modules": [
+    {
+      "path": "src/clickhouse",
+      "claude_md": "missing",
+      "triggers": ["new_patterns"],
+      "action": "create",
+      "changes": "Add query methods for FREEZE/UNFREEZE, table listing, mutation check, SYSTEM SYNC REPLICA, ATTACH PART, version query, log_sql_queries wrapper"
+    },
+    {
+      "path": "src/storage",
+      "claude_md": "missing",
+      "triggers": ["new_patterns"],
+      "action": "create",
+      "changes": "Add upload (PutObject), download (GetObject), list (ListObjectsV2), delete (DeleteObject/DeleteObjects) methods to S3Client"
+    },
+    {
+      "path": "src/backup",
+      "claude_md": "new_directory",
+      "triggers": [],
+      "action": "create",
+      "changes": "New module: freeze.rs, mutations.rs, sync_replica.rs, checksum.rs, collect.rs"
+    },
+    {
+      "path": "src/upload",
+      "claude_md": "new_directory",
+      "triggers": [],
+      "action": "create",
+      "changes": "New module: stream.rs (file -> lz4 compress -> tar -> S3 PutObject)"
+    },
+    {
+      "path": "src/download",
+      "claude_md": "new_directory",
+      "triggers": [],
+      "action": "create",
+      "changes": "New module: stream.rs (S3 GetObject -> lz4 decompress -> tar extract -> files)"
+    },
+    {
+      "path": "src/restore",
+      "claude_md": "new_directory",
+      "triggers": [],
+      "action": "create",
+      "changes": "New module: schema.rs, attach.rs, sort.rs"
+    }
+  ],
+  "top_level_files": [
+    {
+      "path": "src/lib.rs",
+      "action": "modify",
+      "changes": "Add pub mod declarations for new modules"
+    },
+    {
+      "path": "src/main.rs",
+      "action": "modify",
+      "changes": "Wire command implementations to new modules"
+    },
+    {
+      "path": "src/error.rs",
+      "action": "modify",
+      "changes": "Add new error variants for backup/restore operations"
+    },
+    {
+      "path": "src/manifest.rs",
+      "action": "create",
+      "changes": "New file: BackupManifest, TableManifest, PartInfo, DatabaseInfo structs"
+    },
+    {
+      "path": "src/list.rs",
+      "action": "create",
+      "changes": "New file: local and remote backup listing"
+    },
+    {
+      "path": "src/table_filter.rs",
+      "action": "create",
+      "changes": "New file: glob-based table filter for -t flag"
+    },
+    {
+      "path": "Cargo.toml",
+      "action": "modify",
+      "changes": "Add dependencies: async-compression, tar, nix, glob, CRC64 crate"
+    }
+  ],
+  "summary": {
+    "to_create": ["src/backup", "src/upload", "src/download", "src/restore"],
+    "to_update": ["src/clickhouse", "src/storage"],
+    "top_level_new": ["src/manifest.rs", "src/list.rs", "src/table_filter.rs"],
+    "top_level_modify": ["src/lib.rs", "src/main.rs", "src/error.rs", "Cargo.toml"],
+    "total_affected": 10
+  }
+}

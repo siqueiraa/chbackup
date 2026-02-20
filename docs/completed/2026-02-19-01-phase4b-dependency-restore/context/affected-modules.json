@@ -1,0 +1,45 @@
+{
+  "git_base": "ca7297a1",
+  "modules": [
+    {
+      "path": "src/backup",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "changes": "Populate dependencies field in create() by calling ch.query_table_dependencies()"
+    },
+    {
+      "path": "src/restore",
+      "claude_md": "exists",
+      "triggers": ["new_patterns", "tree_change"],
+      "action": "update",
+      "changes": "Add topo.rs module; restructure restore() for phased architecture; add create_ddl_objects() and create_functions() in schema.rs"
+    },
+    {
+      "path": "src/clickhouse",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "changes": "Add DependencyRow struct (private) and query_table_dependencies() method"
+    }
+  ],
+  "files_modified": [
+    "src/backup/mod.rs",
+    "src/clickhouse/client.rs",
+    "src/restore/mod.rs",
+    "src/restore/schema.rs",
+    "src/restore/topo.rs"
+  ],
+  "files_unchanged": [
+    "src/main.rs",
+    "src/lib.rs",
+    "src/manifest.rs",
+    "src/clickhouse/mod.rs",
+    "src/cli.rs"
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": ["src/backup", "src/restore", "src/clickhouse"],
+    "total_affected": 3
+  }
+}

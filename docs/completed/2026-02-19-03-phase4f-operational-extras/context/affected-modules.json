@@ -1,0 +1,60 @@
+{
+  "git_base": "HEAD",
+  "modules": [
+    {
+      "path": "src/upload",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "reason": "compress_part gets format param, s3_key_for_part gets dynamic extension"
+    },
+    {
+      "path": "src/download",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "reason": "decompress_part gets format param for multi-format decompression"
+    },
+    {
+      "path": "src/clickhouse",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "reason": "New check_json_columns() method added"
+    },
+    {
+      "path": "src/backup",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "reason": "JSON/Object column check added to pre-flight"
+    }
+  ],
+  "standalone_files": [
+    {
+      "path": "src/main.rs",
+      "reason": "Tables command implementation"
+    },
+    {
+      "path": "src/list.rs",
+      "reason": "Enhanced print_backup_table with compressed size column"
+    },
+    {
+      "path": "src/cli.rs",
+      "reason": "No changes needed - Tables command already defined"
+    },
+    {
+      "path": "src/config.rs",
+      "reason": "No changes needed - compression validation already exists"
+    },
+    {
+      "path": "Cargo.toml",
+      "reason": "Add zstd and flate2 crate dependencies"
+    }
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": ["src/upload", "src/download", "src/clickhouse", "src/backup"],
+    "total_affected": 4
+  }
+}
