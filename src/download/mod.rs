@@ -12,7 +12,7 @@
 
 pub mod stream;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,6 +22,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::backup::checksum::compute_crc64;
+use crate::backup::collect::per_disk_backup_dir;
 use crate::concurrency::effective_download_concurrency;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo};
@@ -47,6 +48,28 @@ fn url_encode(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Resolve the per-disk target backup directory for a download write path.
+///
+/// During download we are CREATING directories, not reading existing ones,
+/// so we check disk-path existence (not part-path existence). If the disk
+/// path from the manifest exists on the local host, parts are written to
+/// `{disk_path}/backup/{name}/`; otherwise falls back to the default
+/// `backup_dir` (for cross-host downloads where the original disk layout
+/// is not available).
+fn resolve_download_target_dir(
+    manifest_disks: &HashMap<String, String>,
+    disk_name: &str,
+    backup_name: &str,
+    backup_dir: &Path,
+) -> PathBuf {
+    match manifest_disks.get(disk_name) {
+        Some(dp) if Path::new(dp.trim_end_matches('/')).exists() => {
+            per_disk_backup_dir(dp.trim_end_matches('/'), backup_name)
+        }
+        _ => backup_dir.to_path_buf(), // Disk not on this host -- fall back to default
+    }
 }
 
 /// A work item for the parallel download queue.
@@ -332,6 +355,19 @@ pub async fn download(
         HashSet::new()
     };
 
+    // 2d. Persist disk map unconditionally so delete_local can find per-disk dirs
+    // even if the download fails before writing metadata.json. This is independent
+    // of resume mode -- it's for cleanup, not resume.
+    if !manifest.disks.is_empty() {
+        let disk_map_state = DownloadState {
+            completed_keys: HashSet::new(),
+            backup_name: backup_name.to_string(),
+            params_hash: current_params_hash.clone(),
+            disk_map: manifest.disks.clone(),
+        };
+        save_state_graceful(&state_path, &disk_map_state);
+    }
+
     // 3. Flatten all parts into work items
     let mut work_items: Vec<DownloadWorkItem> = Vec::new();
 
@@ -411,6 +447,7 @@ pub async fn download(
             completed_keys,
             backup_name: backup_name.to_string(),
             params_hash: current_params_hash,
+            disk_map: manifest.disks.clone(),
         };
         Some(Arc::new(tokio::sync::Mutex::new((
             state,

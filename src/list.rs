@@ -4,7 +4,7 @@
 //! produce a summary of available backups. The `delete` function removes
 //! backups from local disk or S3.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -12,9 +12,11 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
+use crate::backup::collect::per_disk_backup_dir;
 use crate::clickhouse::{sanitize_name, ChClient};
 use crate::config::Config;
 use crate::manifest::BackupManifest;
+use crate::resume::{load_state_file, DownloadState};
 use crate::storage::S3Client;
 
 /// Location specifier matching the CLI `Location` enum.
@@ -471,9 +473,16 @@ pub async fn delete(
     }
 }
 
-/// Delete a local backup directory.
+/// Delete a local backup directory and any per-disk backup directories.
 ///
-/// Removes `{data_path}/backup/{backup_name}/` entirely.
+/// Discovers per-disk backup dirs from the manifest (metadata.json) or falls
+/// back to the download state file (download.state.json) when the manifest is
+/// unavailable (e.g., broken or incomplete download). All paths are canonicalized
+/// and deduped via `HashSet` to prevent double-delete when symlinks or equivalent
+/// paths resolve to the same directory.
+///
+/// Per-disk dirs are deleted first (non-fatal), then the default backup_dir last
+/// (fatal on failure, preserving existing error propagation semantics).
 pub fn delete_local(data_path: &str, backup_name: &str) -> Result<()> {
     let backup_dir = PathBuf::from(data_path).join("backup").join(backup_name);
 
@@ -485,12 +494,58 @@ pub fn delete_local(data_path: &str, backup_name: &str) -> Result<()> {
         ));
     }
 
+    // Discover disk map: manifest first, download state file as fallback
+    let disk_map: HashMap<String, String> = {
+        let manifest_path = backup_dir.join("metadata.json");
+        match BackupManifest::load_from_file(&manifest_path) {
+            Ok(m) => m.disks,
+            Err(_) => {
+                // Fallback: try download state file (persisted unconditionally during download)
+                let state_path = backup_dir.join("download.state.json");
+                match load_state_file::<DownloadState>(&state_path) {
+                    Ok(Some(s)) => s.disk_map,
+                    _ => HashMap::new(), // No manifest, no state -- only default dir
+                }
+            }
+        }
+    };
+
     info!(
         backup = %backup_name,
         path = %backup_dir.display(),
         "Deleting local backup"
     );
 
+    // Collect all dirs to delete, deduped by canonical path
+    let mut dirs_to_delete: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    // Default backup_dir always included (deleted last, separately)
+    let canonical_default = std::fs::canonicalize(&backup_dir)
+        .unwrap_or_else(|_| backup_dir.clone());
+    seen.insert(canonical_default);
+
+    // Per-disk dirs (skip if same canonical path as default)
+    for disk_path in disk_map.values() {
+        let per_disk = per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
+        if per_disk.exists() {
+            let canonical = std::fs::canonicalize(&per_disk)
+                .unwrap_or_else(|_| per_disk.clone());
+            if seen.insert(canonical) {
+                dirs_to_delete.push(per_disk);
+            }
+        }
+    }
+
+    // Delete per-disk dirs first (non-fatal)
+    for dir in &dirs_to_delete {
+        info!(path = %dir.display(), "Deleting per-disk backup dir");
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            warn!(path = %dir.display(), error = %e, "Failed to remove per-disk backup dir");
+        }
+    }
+
+    // Delete default backup_dir last (fatal on failure)
     std::fs::remove_dir_all(&backup_dir).with_context(|| {
         format!(
             "Failed to delete local backup directory: {}",
@@ -2491,5 +2546,179 @@ mod tests {
         // (Instant::now().elapsed() >= Duration::ZERO is always true)
         std::thread::sleep(Duration::from_millis(1));
         assert!(cache.get().is_none());
+    }
+
+    // -- Per-disk delete_local tests --
+
+    #[test]
+    fn test_delete_local_cleans_per_disk_dirs() {
+        // Create a tempdir simulating a multi-disk setup with metadata.json
+        // containing a disks map and per-disk backup dirs.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().join("clickhouse");
+        let disk2_path = tmp.path().join("nvme1");
+
+        // Create default backup dir with metadata.json
+        let backup_dir = data_path.join("backup").join("test-del");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        // Create per-disk backup dir on disk2
+        let per_disk_dir = disk2_path.join("backup").join("test-del");
+        std::fs::create_dir_all(per_disk_dir.join("shadow")).unwrap();
+        std::fs::write(per_disk_dir.join("shadow").join("data.bin"), b"data").unwrap();
+
+        // Write a manifest with disks pointing to both paths
+        let manifest = BackupManifest {
+            manifest_version: 1,
+            name: "test-del".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: String::new(),
+            chbackup_version: String::new(),
+            data_format: "lz4".to_string(),
+            compressed_size: 0,
+            metadata_size: 0,
+            disks: HashMap::from([
+                ("default".to_string(), data_path.to_string_lossy().to_string()),
+                ("nvme1".to_string(), disk2_path.to_string_lossy().to_string()),
+            ]),
+            disk_types: HashMap::new(),
+            disk_remote_paths: HashMap::new(),
+            tables: HashMap::new(),
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+            rbac_size: 0,
+            config_size: 0,
+        };
+        manifest.save_to_file(&backup_dir.join("metadata.json")).unwrap();
+
+        assert!(per_disk_dir.exists());
+        assert!(backup_dir.exists());
+
+        delete_local(data_path.to_str().unwrap(), "test-del").unwrap();
+
+        assert!(!per_disk_dir.exists(), "Per-disk backup dir should be removed");
+        assert!(!backup_dir.exists(), "Default backup dir should be removed");
+    }
+
+    #[test]
+    fn test_delete_local_no_manifest_uses_download_state() {
+        // When metadata.json is missing but download.state.json has disk_map,
+        // per-disk dirs should still be cleaned.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().join("clickhouse");
+        let disk2_path = tmp.path().join("nvme1");
+
+        // Create default backup dir (no metadata.json)
+        let backup_dir = data_path.join("backup").join("test-state");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        // Create per-disk backup dir
+        let per_disk_dir = disk2_path.join("backup").join("test-state");
+        std::fs::create_dir_all(per_disk_dir.join("shadow")).unwrap();
+        std::fs::write(per_disk_dir.join("shadow").join("data.bin"), b"data").unwrap();
+
+        // Write a download state file with disk_map
+        let state = crate::resume::DownloadState {
+            completed_keys: std::collections::HashSet::new(),
+            backup_name: "test-state".to_string(),
+            params_hash: "abc".to_string(),
+            disk_map: HashMap::from([
+                ("nvme1".to_string(), disk2_path.to_string_lossy().to_string()),
+            ]),
+        };
+        crate::resume::save_state_file(
+            &backup_dir.join("download.state.json"),
+            &state,
+        ).unwrap();
+
+        assert!(per_disk_dir.exists());
+        assert!(backup_dir.exists());
+
+        delete_local(data_path.to_str().unwrap(), "test-state").unwrap();
+
+        assert!(!per_disk_dir.exists(), "Per-disk dir should be removed via state file fallback");
+        assert!(!backup_dir.exists(), "Default backup dir should be removed");
+    }
+
+    #[test]
+    fn test_delete_local_no_manifest_no_state_fallback() {
+        // When neither manifest nor state file exists (broken backup),
+        // only the default dir is removed.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().join("clickhouse");
+        let backup_dir = data_path.join("backup").join("test-broken");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("something.txt"), b"data").unwrap();
+
+        assert!(backup_dir.exists());
+
+        delete_local(data_path.to_str().unwrap(), "test-broken").unwrap();
+
+        assert!(!backup_dir.exists(), "Default backup dir should be removed");
+    }
+
+    #[test]
+    fn test_delete_local_symlink_dedup() {
+        // When two disk paths resolve to the same canonical path,
+        // the directory should only be deleted once.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().join("clickhouse");
+        let real_disk = tmp.path().join("real_disk");
+
+        // Create real disk directory
+        std::fs::create_dir_all(&real_disk).unwrap();
+
+        // Create a symlink from another name to the real disk
+        let symlink_disk = tmp.path().join("symlink_disk");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_disk, &symlink_disk).unwrap();
+        #[cfg(not(unix))]
+        {
+            // On non-Unix, just create a regular directory as fallback
+            std::fs::create_dir_all(&symlink_disk).unwrap();
+        }
+
+        // Create default backup dir with manifest
+        let backup_dir = data_path.join("backup").join("test-sym");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        // Create per-disk backup dir on the real disk
+        let per_disk_real = real_disk.join("backup").join("test-sym");
+        std::fs::create_dir_all(per_disk_real.join("shadow")).unwrap();
+
+        let manifest = BackupManifest {
+            manifest_version: 1,
+            name: "test-sym".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: String::new(),
+            chbackup_version: String::new(),
+            data_format: "lz4".to_string(),
+            compressed_size: 0,
+            metadata_size: 0,
+            disks: HashMap::from([
+                ("default".to_string(), data_path.to_string_lossy().to_string()),
+                // Both point to the same canonical path
+                ("disk_a".to_string(), real_disk.to_string_lossy().to_string()),
+                ("disk_b".to_string(), symlink_disk.to_string_lossy().to_string()),
+            ]),
+            disk_types: HashMap::new(),
+            disk_remote_paths: HashMap::new(),
+            tables: HashMap::new(),
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+            rbac_size: 0,
+            config_size: 0,
+        };
+        manifest.save_to_file(&backup_dir.join("metadata.json")).unwrap();
+
+        // Should succeed without double-delete errors
+        delete_local(data_path.to_str().unwrap(), "test-sym").unwrap();
+
+        assert!(!backup_dir.exists(), "Default backup dir should be removed");
+        assert!(!per_disk_real.exists(), "Per-disk real dir should be removed");
     }
 }

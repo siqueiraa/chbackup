@@ -41,6 +41,75 @@ pub fn url_encode_path(s: &str) -> String {
     result
 }
 
+/// Compute the per-disk backup directory for a given disk.
+///
+/// Returns `{disk_path}/backup/{backup_name}`. For the default disk where
+/// `disk_path == data_path`, this produces the same path as the existing
+/// `{data_path}/backup/{backup_name}` layout (zero behavior change).
+pub fn per_disk_backup_dir(disk_path: &str, backup_name: &str) -> PathBuf {
+    PathBuf::from(disk_path).join("backup").join(backup_name)
+}
+
+/// Resolve the shadow part path with strict fallback order:
+/// 1. Per-disk candidate (encoded):  {disk_path}/backup/{name}/shadow/{db}/{table}/{part}/
+/// 2. Legacy default (encoded):      {backup_dir}/shadow/{db}/{table}/{part}/
+/// 3. Legacy default (plain):        {backup_dir}/shadow/{plain_db}/{plain_table}/{part}/
+/// 4. None (part not found at any location)
+///
+/// `encoded_db` and `encoded_table` are URL-encoded (as created by backup::collect).
+/// `plain_db` and `plain_table` are the original unencoded names (for very old backups
+/// that stored shadow dirs without URL encoding).
+///
+/// This is the SINGLE source of truth for shadow path resolution across
+/// upload, download, and restore. Consumers must not implement their own
+/// fallback logic.
+pub fn resolve_shadow_part_path(
+    backup_dir: &Path,
+    manifest_disks: &HashMap<String, String>,
+    backup_name: &str,
+    disk_name: &str,
+    encoded_db: &str,
+    encoded_table: &str,
+    plain_db: &str,
+    plain_table: &str,
+    part_name: &str,
+) -> Option<PathBuf> {
+    let encoded_suffix = PathBuf::from("shadow")
+        .join(encoded_db)
+        .join(encoded_table)
+        .join(part_name);
+
+    // 1. Try per-disk candidate (encoded path)
+    if let Some(disk_path) = manifest_disks.get(disk_name) {
+        let per_disk = per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
+        let candidate = per_disk.join(&encoded_suffix);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // 2. Fallback to legacy encoded path (covers old backups and single-disk setups)
+    let legacy_encoded = backup_dir.join(&encoded_suffix);
+    if legacy_encoded.exists() {
+        return Some(legacy_encoded);
+    }
+
+    // 3. Fallback to legacy plain path (very old backups without URL encoding)
+    if plain_db != encoded_db || plain_table != encoded_table {
+        let plain_suffix = PathBuf::from("shadow")
+            .join(plain_db)
+            .join(plain_table)
+            .join(part_name);
+        let legacy_plain = backup_dir.join(&plain_suffix);
+        if legacy_plain.exists() {
+            return Some(legacy_plain);
+        }
+    }
+
+    // 4. Not found
+    None
+}
+
 /// Parse a part name like "202401_1_50_3" into (partition, min_block, max_block, level).
 ///
 /// The partition can contain underscores, so we split from the right.
@@ -864,5 +933,217 @@ mod tests {
         assert_eq!(part.disk_name, "s3disk");
         assert_eq!(part.database, "default");
         assert_eq!(part.table, "trades");
+    }
+
+    // -- per_disk_backup_dir tests --
+
+    #[test]
+    fn test_per_disk_backup_dir_default_disk() {
+        // When disk_path == data_path, result should equal {data_path}/backup/{name}
+        let data_path = "/var/lib/clickhouse";
+        let result = per_disk_backup_dir(data_path, "daily-2024");
+        assert_eq!(result, PathBuf::from("/var/lib/clickhouse/backup/daily-2024"));
+    }
+
+    #[test]
+    fn test_per_disk_backup_dir_non_default_disk() {
+        // When disk_path != data_path, result should be {disk_path}/backup/{name}
+        let disk_path = "/mnt/nvme1/clickhouse";
+        let result = per_disk_backup_dir(disk_path, "daily-2024");
+        assert_eq!(
+            result,
+            PathBuf::from("/mnt/nvme1/clickhouse/backup/daily-2024")
+        );
+    }
+
+    // -- resolve_shadow_part_path tests --
+
+    #[test]
+    fn test_resolve_shadow_part_path_per_disk_exists() {
+        // When per-disk candidate exists, it should be returned.
+        let tmp = tempfile::tempdir().unwrap();
+        let disk_path = tmp.path().join("nvme1");
+        let backup_dir = tmp.path().join("default_backup");
+
+        // Create per-disk candidate
+        let per_disk_part = disk_path
+            .join("backup")
+            .join("daily")
+            .join("shadow")
+            .join("default")
+            .join("trades")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&per_disk_part).unwrap();
+
+        let disks = HashMap::from([(
+            "nvme1".to_string(),
+            disk_path.to_string_lossy().to_string(),
+        )]);
+
+        let result = resolve_shadow_part_path(
+            &backup_dir,
+            &disks,
+            "daily",
+            "nvme1",
+            "default",
+            "trades",
+            "default",
+            "trades",
+            "202401_1_50_3",
+        );
+
+        assert_eq!(result, Some(per_disk_part));
+    }
+
+    #[test]
+    fn test_resolve_shadow_part_path_fallback_to_legacy_encoded() {
+        // When per-disk path doesn't exist, should fall back to legacy encoded
+        // path in backup_dir/shadow/.
+        let tmp = tempfile::tempdir().unwrap();
+        let disk_path = tmp.path().join("nvme1");
+        let backup_dir = tmp.path().join("default_backup");
+
+        // Create legacy encoded path (not per-disk)
+        let legacy_path = backup_dir
+            .join("shadow")
+            .join("default")
+            .join("trades")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&legacy_path).unwrap();
+
+        let disks = HashMap::from([(
+            "nvme1".to_string(),
+            disk_path.to_string_lossy().to_string(),
+        )]);
+
+        let result = resolve_shadow_part_path(
+            &backup_dir,
+            &disks,
+            "daily",
+            "nvme1",
+            "default",
+            "trades",
+            "default",
+            "trades",
+            "202401_1_50_3",
+        );
+
+        assert_eq!(result, Some(legacy_path));
+    }
+
+    #[test]
+    fn test_resolve_shadow_part_path_fallback_to_legacy_plain() {
+        // When per-disk and encoded legacy don't exist, should fall back to
+        // plain (unencoded) path for very old backups.
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("default_backup");
+
+        // Create legacy plain path with special chars (unencoded)
+        let legacy_plain = backup_dir
+            .join("shadow")
+            .join("my db")
+            .join("my+table")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&legacy_plain).unwrap();
+
+        let disks = HashMap::new();
+
+        let result = resolve_shadow_part_path(
+            &backup_dir,
+            &disks,
+            "daily",
+            "default",
+            "my%20db",
+            "my%2Btable",
+            "my db",
+            "my+table",
+            "202401_1_50_3",
+        );
+
+        assert_eq!(result, Some(legacy_plain));
+    }
+
+    #[test]
+    fn test_resolve_shadow_part_path_no_disk_in_manifest() {
+        // When disk_name is not in manifest.disks, should fall back to legacy path.
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("default_backup");
+
+        // Create legacy encoded path
+        let legacy_path = backup_dir
+            .join("shadow")
+            .join("default")
+            .join("trades")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&legacy_path).unwrap();
+
+        // Empty disks map -- disk_name "nvme1" not found
+        let disks = HashMap::new();
+
+        let result = resolve_shadow_part_path(
+            &backup_dir,
+            &disks,
+            "daily",
+            "nvme1",
+            "default",
+            "trades",
+            "default",
+            "trades",
+            "202401_1_50_3",
+        );
+
+        assert_eq!(result, Some(legacy_path));
+    }
+
+    #[test]
+    fn test_resolve_shadow_part_path_plain_skipped_when_same() {
+        // When plain == encoded (common case), step 3 is skipped (no redundant FS check).
+        // Verify None is returned when only step 3 would match but plain == encoded.
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("default_backup");
+
+        // Don't create any paths -- result should be None
+        let disks = HashMap::new();
+
+        let result = resolve_shadow_part_path(
+            &backup_dir,
+            &disks,
+            "daily",
+            "default",
+            "default",
+            "trades",
+            "default",  // plain == encoded
+            "trades",   // plain == encoded
+            "202401_1_50_3",
+        );
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_shadow_part_path_not_found() {
+        // When no path exists at any location, returns None.
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("default_backup");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let disks = HashMap::from([(
+            "default".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+        )]);
+
+        let result = resolve_shadow_part_path(
+            &backup_dir,
+            &disks,
+            "daily",
+            "default",
+            "db",
+            "table",
+            "db",
+            "table",
+            "nonexistent_part",
+        );
+
+        assert_eq!(result, None);
     }
 }

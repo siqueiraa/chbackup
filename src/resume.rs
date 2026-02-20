@@ -41,6 +41,11 @@ pub struct DownloadState {
     pub backup_name: String,
     /// Hash of operation parameters for invalidation.
     pub params_hash: String,
+    /// Disk name -> disk path mapping from manifest. Persisted so delete_local
+    /// can discover per-disk dirs even if download fails before writing metadata.json.
+    /// Written unconditionally (not gated by resume mode) for cleanup safety.
+    #[serde(default)]
+    pub disk_map: HashMap<String, String>,
 }
 
 /// Resume state for the restore pipeline.
@@ -175,6 +180,7 @@ mod tests {
             completed_keys: HashSet::from(["backup/data/db/table/part1.tar.lz4".to_string()]),
             backup_name: "daily-2024-01-15".to_string(),
             params_hash: "def456".to_string(),
+            disk_map: HashMap::new(),
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -186,6 +192,7 @@ mod tests {
         assert_eq!(loaded.completed_keys, state.completed_keys);
         assert_eq!(loaded.backup_name, state.backup_name);
         assert_eq!(loaded.params_hash, state.params_hash);
+        assert!(loaded.disk_map.is_empty());
     }
 
     #[test]
