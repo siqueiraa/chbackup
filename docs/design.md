@@ -1113,6 +1113,8 @@ Why per-table parallelism is safe: FREEZE is a ClickHouse server operation that 
 
 **Projection skipping** (`--skip-projections`): Projections are pre-computed materialized indexes stored as `.proj/` subdirectories inside parts. Skipping saves backup space when projections will be rebuilt. Pattern format: `db.table:proj_name` with glob support. During shadow walk, skip directories matching `*.proj` patterns.
 
+**Backup failure cleanup**: On `backup::create()` failure, the partial backup directory is removed and `clean_shadow()` runs for the backup name. This prevents broken backup accumulation and shadow directory leaks when a backup fails mid-process (e.g., ClickHouse goes down during FREEZE, disk runs out of space during hardlink). The cleanup is best-effort — if removal fails, the broken backup will be detected and cleaned by the `clean_broken` command.
+
 ### 3.5 Incremental Diff (--diff-from)
 
 Parts are immutable. Part name IS identity. Comparison is pure name matching (confirmed by Go tool source — `addRequiredPartIfNotExists` does exact string compare, no block range parsing). However, we add CRC64 checksum verification (#1307) to catch silent data corruption where part names match but content differs (can happen with mutations on different replicas):
@@ -1189,6 +1191,8 @@ Upload pipeline (all async, non-blocking):
 **S3 multipart uploads**: Since upload is a streaming pipeline (no temp file), we can't know compressed size in advance. Strategy: always use multipart upload for parts where `uncompressed_size > multipart_threshold` (default 32MB), since compression ratio is typically 2-4x and the result will likely exceed S3's single PUT limit. For small parts below the threshold, use a single PutObject. This avoids the waste of starting a PutObject, discovering it's too large, and re-uploading. The multipart upload itself counts as one semaphore permit — internal chunk parallelism doesn't consume additional permits.
 
 **Multipart cleanup on failure**: On upload cancellation or error, call `AbortMultipartUpload` for any in-progress multipart uploads. Without this, incomplete multipart uploads leak S3 storage (hidden, not visible in bucket listing, but billed). The scopeguard pattern ensures abort runs even on `fail-fast` cancellation.
+
+**Multipart CopyObject for large objects**: S3 imposes a 5GB hard limit on single CopyObject operations. For S3 disk objects exceeding 5GB (5,368,709,120 bytes), `copy_object()` automatically switches to multipart copy using the `UploadPartCopy` API. Chunk sizes are auto-calculated based on source object size with a maximum of 10,000 parts (S3 limit). On error, the multipart upload is aborted to prevent storage leaks. If `head_object()` fails to determine size, the operation falls through to a single CopyObject attempt (which will fail for >5GB objects, caught by the retry/fallback logic).
 
 **Rate limiting**: Applied at the byte stream level using a token bucket. The rate limit is global across all concurrent uploads, not per-upload. Implemented as an async wrapper around the S3 upload stream.
 
@@ -1766,6 +1770,8 @@ S3 objects in the backup bucket may be shared across incremental backups (via `s
 
 **Race condition window**: Between re-check (step 3c) and delete (step 3d), a new backup could still reference our keys. This window is milliseconds. Mitigation: retention runs under the global PID lock, so concurrent retention + create_remote is serialized. The only remaining race is between retention on one host and create_remote on a different host — an edge case that doesn't apply to single-sidecar deployments. Multi-host users should run retention from only one host.
 
+**Incremental chain protection**: In addition to key-level GC (which prevents deleting shared S3 objects), `retention_remote()` provides backup-level protection for incremental bases. A backup whose name appears in the `required_backups` field of any surviving manifest is protected from deletion regardless of age or count. This ensures that deleting an old backup never breaks the incremental chain — even though our manifests are self-contained (all part keys listed), the physical S3 objects still reside under the base backup's prefix. Protecting the base backup avoids the need to relocate objects during retention.
+
 ### 8.3 Auto-Retention
 
 ```yaml
@@ -1838,7 +1844,7 @@ Metrics: backup_duration_seconds, backup_size_bytes, backup_last_success_timesta
 
 **Auto-resume after restart** (`api.complete_resumable_after_restart: true`): On server startup, scan for `{backup_name}/(upload|download).state.json` files. If found, queue the interrupted operation for automatic resumption in the background. This handles pod rescheduling in K8s — the watch loop doesn't need to re-create the backup, just finish uploading it.
 
-**Parallel operations** (`api.allow_parallel: false`): When false (default), API operations are serialized — a second request while one is running returns 409 Conflict. When true, concurrent operations on different backup names are allowed (same backup name still serialized via PID lock). Enable only with sufficient memory, as each operation spawns concurrent upload/download tasks.
+**Parallel operations** (`api.allow_parallel: false`): When false (default), API operations are serialized — a second request while one is running returns 423 Locked. When true, concurrent operations on different backup names are allowed (same backup name still serialized via PID lock). Enable only with sufficient memory, as each operation spawns concurrent upload/download tasks.
 
 ### 9.1 ClickHouse Integration Tables
 
@@ -2478,7 +2484,7 @@ general:
 
 clickhouse:
   host: localhost
-  port: 9000
+  port: 8123
   username: default
   password: ""
   data_path: /var/lib/clickhouse
@@ -2511,6 +2517,7 @@ clickhouse:
     - "system.*"
     - "INFORMATION_SCHEMA.*"
     - "information_schema.*"
+    - "_temporary_and_external_tables.*"  # ClickHouse internal temporary tables
   skip_table_engines: []             # engine names to exclude (e.g. ["Kafka", "S3Queue"])
   skip_disks: []                     # disk names to exclude from backup
   skip_disk_types: []                # disk types to exclude (e.g. ["cache", "local"])
