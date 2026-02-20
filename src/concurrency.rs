@@ -97,12 +97,9 @@ mod tests {
         config.clickhouse.max_connections = 10;
         assert_eq!(effective_max_connections(&config), 10);
 
-        // Default value is NumCPU/2, minimum 1
+        // Default value is 1 (conservative sequential default per design doc §12)
         let config = Config::default();
-        let expected = std::thread::available_parallelism()
-            .map(|n| (n.get() as u32 / 2).max(1))
-            .unwrap_or(1);
-        assert_eq!(effective_max_connections(&config), expected);
+        assert_eq!(effective_max_connections(&config), 1);
     }
 
     #[test]

@@ -143,7 +143,7 @@ pub struct ClickHouseConfig {
     pub check_replicas_before_attach: bool,
 
     /// validate column type consistency before backup
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub check_parts_columns: bool,
 
     #[serde(default = "default_mutation_wait_timeout")]
@@ -522,7 +522,7 @@ impl Default for ClickHouseConfig {
             tls_ca: String::new(),
             sync_replicated_tables: true,
             check_replicas_before_attach: true,
-            check_parts_columns: true,
+            check_parts_columns: false,
             mutation_wait_timeout: default_mutation_wait_timeout(),
             restore_as_attach: false,
             restore_schema_on_cluster: String::new(),
@@ -709,9 +709,7 @@ fn default_mutation_wait_timeout() -> String {
 }
 
 fn default_max_connections() -> u32 {
-    std::thread::available_parallelism()
-        .map(|n| (n.get() as u32 / 2).max(1))
-        .unwrap_or(1)
+    1
 }
 
 fn default_restart_command() -> String {
@@ -732,7 +730,7 @@ fn default_skip_tables() -> Vec<String> {
 }
 
 fn default_replica_path() -> String {
-    "/clickhouse/tables/{cluster}/{shard}/{database}/{table}".to_string()
+    "/clickhouse/tables/{shard}/{database}/{table}".to_string()
 }
 
 fn default_replica_name() -> String {
@@ -740,7 +738,7 @@ fn default_replica_name() -> String {
 }
 
 fn default_ch_timeout() -> String {
-    "30m".to_string()
+    "5m".to_string()
 }
 
 fn default_s3_bucket() -> String {
@@ -756,7 +754,7 @@ fn default_s3_prefix() -> String {
 }
 
 fn default_s3_acl() -> String {
-    "private".to_string()
+    String::new()
 }
 
 fn default_storage_class() -> String {
@@ -1354,6 +1352,34 @@ mod tests {
         assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
         assert_eq!(parse_duration_secs("45m").unwrap(), 2700);
         assert_eq!(parse_duration_secs("120s").unwrap(), 120);
+    }
+
+    #[test]
+    fn test_config_defaults_match_design_doc() {
+        // Verify each default matches design doc §12 values
+        assert_eq!(default_ch_timeout(), "5m", "clickhouse.timeout should be 5m per §11.7/§12");
+        assert_eq!(
+            default_max_connections(),
+            1,
+            "clickhouse.max_connections should be 1 per §12 (conservative sequential default)"
+        );
+        assert_eq!(
+            default_replica_path(),
+            "/clickhouse/tables/{shard}/{database}/{table}",
+            "default_replica_path should not include {{cluster}} per §12"
+        );
+        assert_eq!(
+            default_s3_acl(),
+            "",
+            "s3.acl should be empty per §12 (don't send ACL header)"
+        );
+
+        // check_parts_columns defaults to false (opt-in per §12)
+        let config = Config::default();
+        assert!(
+            !config.clickhouse.check_parts_columns,
+            "check_parts_columns should default to false per §12 (opt-in)"
+        );
     }
 
     #[test]
