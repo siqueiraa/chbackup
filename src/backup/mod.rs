@@ -670,6 +670,25 @@ pub async fn create(
     )
     .await?;
 
+    // 13a.1. Compute rbac_size and config_size from backup directories
+    if manifest.rbac.is_some() {
+        let access_dir = backup_dir.join("access");
+        if access_dir.exists() {
+            manifest.rbac_size = collect::dir_size(&access_dir)?;
+        }
+    }
+    {
+        let configs_dir = backup_dir.join("configs");
+        if configs_dir.exists() {
+            manifest.config_size = collect::dir_size(&configs_dir)?;
+        }
+    }
+    info!(
+        rbac_size = manifest.rbac_size,
+        config_size = manifest.config_size,
+        "Computed RBAC and config sizes"
+    );
+
     // 13b. Apply incremental diff if --diff-from is specified
     if let Some(base_name) = diff_from {
         info!(base = %base_name, "Loading base manifest for diff-from");

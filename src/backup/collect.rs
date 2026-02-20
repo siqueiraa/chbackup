@@ -482,7 +482,7 @@ fn should_skip_projection(stem: &str, patterns: &[String]) -> bool {
 }
 
 /// Calculate the total size of all files in a directory.
-fn dir_size(path: &Path) -> Result<u64> {
+pub fn dir_size(path: &Path) -> Result<u64> {
     let mut total: u64 = 0;
     for entry in WalkDir::new(path) {
         let entry = entry?;
@@ -563,6 +563,24 @@ mod tests {
             std::fs::read_to_string(dst_path.join("subdir/file2.txt")).unwrap(),
             "world"
         );
+    }
+
+    #[test]
+    fn test_dir_size_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = dir_size(dir.path()).unwrap();
+        assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn test_dir_size_with_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create two files with known sizes
+        std::fs::write(dir.path().join("file1.txt"), b"hello").unwrap(); // 5 bytes
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        std::fs::write(dir.path().join("subdir/file2.txt"), b"world!").unwrap(); // 6 bytes
+        let size = dir_size(dir.path()).unwrap();
+        assert_eq!(size, 11);
     }
 
     #[test]
@@ -767,11 +785,7 @@ mod tests {
         std::fs::write(src_dir.path().join("data.bin"), b"data").unwrap();
         std::fs::write(src_dir.path().join("checksums.txt"), b"checksums").unwrap();
         std::fs::create_dir(src_dir.path().join("my_agg.proj")).unwrap();
-        std::fs::write(
-            src_dir.path().join("my_agg.proj/data.bin"),
-            b"proj data",
-        )
-        .unwrap();
+        std::fs::write(src_dir.path().join("my_agg.proj/data.bin"), b"proj data").unwrap();
 
         // Skip ALL projections
         hardlink_dir(src_dir.path(), &dst_path, &["*".to_string()]).unwrap();
@@ -792,11 +806,7 @@ mod tests {
 
         std::fs::write(src_dir.path().join("data.bin"), b"data").unwrap();
         std::fs::create_dir(src_dir.path().join("my_agg.proj")).unwrap();
-        std::fs::write(
-            src_dir.path().join("my_agg.proj/data.bin"),
-            b"proj data",
-        )
-        .unwrap();
+        std::fs::write(src_dir.path().join("my_agg.proj/data.bin"), b"proj data").unwrap();
 
         // Empty skip list -- keep all projections
         hardlink_dir(src_dir.path(), &dst_path, &[]).unwrap();
@@ -817,17 +827,9 @@ mod tests {
 
         std::fs::write(src_dir.path().join("data.bin"), b"data").unwrap();
         std::fs::create_dir(src_dir.path().join("my_agg.proj")).unwrap();
-        std::fs::write(
-            src_dir.path().join("my_agg.proj/data.bin"),
-            b"proj data",
-        )
-        .unwrap();
+        std::fs::write(src_dir.path().join("my_agg.proj/data.bin"), b"proj data").unwrap();
         std::fs::create_dir(src_dir.path().join("other.proj")).unwrap();
-        std::fs::write(
-            src_dir.path().join("other.proj/data.bin"),
-            b"other proj",
-        )
-        .unwrap();
+        std::fs::write(src_dir.path().join("other.proj/data.bin"), b"other proj").unwrap();
 
         // Skip only projections matching "my_*"
         hardlink_dir(src_dir.path(), &dst_path, &["my_*".to_string()]).unwrap();
