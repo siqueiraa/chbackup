@@ -18,6 +18,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
+use crate::backup::collect::resolve_shadow_part_path;
 use crate::clickhouse::client::ChClient;
 use crate::manifest::PartInfo;
 use crate::object_disk::{is_s3_disk, parse_metadata, rewrite_metadata};
@@ -50,6 +51,14 @@ pub struct AttachParams<'a> {
     pub already_attached: &'a HashSet<String>,
     /// Shared resume state for tracking (optional).
     pub resume_state: Option<&'a Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>>,
+    /// Disk name -> disk path mapping from manifest for per-disk path resolution.
+    pub manifest_disks: &'a HashMap<String, String>,
+    /// Original (pre-remap) database name for shadow path lookup.
+    pub source_db: &'a str,
+    /// Original (pre-remap) table name for shadow path lookup.
+    pub source_table: &'a str,
+    /// Parts grouped by disk name, for building part -> disk reverse map.
+    pub parts_by_disk: &'a HashMap<String, Vec<PartInfo>>,
 }
 
 /// Owned parameters for attaching parts to a table.
@@ -97,6 +106,15 @@ pub struct OwnedAttachParams {
     pub resume_state: Option<Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>>,
     /// Jitter factor for retry backoff (0.0 = no jitter).
     pub jitter_factor: f64,
+    /// Disk name -> disk path mapping from manifest. Used by
+    /// resolve_shadow_part_path() to find per-disk backup directories.
+    pub manifest_disks: HashMap<String, String>,
+    /// Original (pre-remap) database name for shadow path lookup.
+    /// Shadow directories are created during backup using the source names,
+    /// so lookups must always use source names even when remap is active.
+    pub source_db: String,
+    /// Original (pre-remap) table name for shadow path lookup.
+    pub source_table: String,
 }
 
 /// Derive the UUID-based S3 path prefix for restore.
@@ -132,6 +150,12 @@ struct S3RestoreParams<'a> {
     clickhouse_uid: Option<u32>,
     clickhouse_gid: Option<u32>,
     jitter_factor: f64,
+    /// Disk name -> disk path from manifest for per-disk resolution.
+    manifest_disks: &'a HashMap<String, String>,
+    /// Original source database name for shadow path lookup.
+    source_db: &'a str,
+    /// Original source table name for shadow path lookup.
+    source_table: &'a str,
 }
 
 /// Restore S3 disk parts for a single table.
@@ -288,14 +312,33 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
             })?;
 
             // Read metadata files from the backup shadow directory
-            let url_db = url_encode(db);
-            let url_table = url_encode(table);
-            let source_dir = p
+            // Use source names for shadow path lookup (source == pre-remap names)
+            let url_src_db = url_encode(p.source_db);
+            let url_src_table = url_encode(p.source_table);
+            let backup_name = p
                 .backup_dir
-                .join("shadow")
-                .join(&url_db)
-                .join(&url_table)
-                .join(&part.name);
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            let source_dir = resolve_shadow_part_path(
+                p.backup_dir,
+                p.manifest_disks,
+                backup_name,
+                disk_name,
+                &url_src_db,
+                &url_src_table,
+                p.source_db,
+                p.source_table,
+                &part.name,
+            )
+            .unwrap_or_else(|| {
+                // Fallback: legacy hardcoded path for backward compat
+                p.backup_dir
+                    .join("shadow")
+                    .join(&url_src_db)
+                    .join(&url_src_table)
+                    .join(&part.name)
+            });
 
             if source_dir.exists() {
                 // Walk all files in the source part directory
@@ -409,6 +452,9 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
             clickhouse_uid: params.clickhouse_uid,
             clickhouse_gid: params.clickhouse_gid,
             jitter_factor: params.jitter_factor,
+            manifest_disks: &params.manifest_disks,
+            source_db: &params.source_db,
+            source_table: &params.source_table,
         };
         restore_s3_disk_parts(&s3_params).await?;
     }
@@ -424,6 +470,10 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
         clickhouse_gid: params.clickhouse_gid,
         already_attached: &params.already_attached,
         resume_state: params.resume_state.as_ref(),
+        manifest_disks: &params.manifest_disks,
+        source_db: &params.source_db,
+        source_table: &params.source_table,
+        parts_by_disk: &params.parts_by_disk,
     };
 
     attach_parts_inner(&attach_params, &params.engine).await
@@ -511,39 +561,69 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                 "S3 disk part already prepared in detached/, skipping hardlink"
             );
         } else {
-            // URL-encode db and table names for the backup shadow path
-            let url_db = url_encode(db);
-            let url_table = url_encode(table);
+            // URL-encode source db and table names for the backup shadow path
+            // Use source_db/source_table (pre-remap names) since shadow dirs
+            // are created during backup using the original ClickHouse names.
+            let url_src_db = url_encode(params.source_db);
+            let url_src_table = url_encode(params.source_table);
 
-            // Source: {backup_dir}/shadow/{db}/{table}/{part_name}/
-            let source_dir = params
+            let backup_name = params
                 .backup_dir
-                .join("shadow")
-                .join(&url_db)
-                .join(&url_table)
-                .join(&part.name);
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
 
-            if !source_dir.exists() {
-                warn!(
-                    part = %part.name,
-                    source = %source_dir.display(),
-                    "Part source directory not found, skipping"
-                );
-                continue;
+            // Build reverse map: part_name -> disk_name
+            let disk_name = params
+                .parts_by_disk
+                .iter()
+                .find_map(|(dn, parts)| {
+                    if parts.iter().any(|p| p.name == part.name) {
+                        Some(dn.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or("default");
+
+            // Resolve source directory using per-disk fallback chain
+            let source_dir = resolve_shadow_part_path(
+                params.backup_dir,
+                params.manifest_disks,
+                backup_name,
+                disk_name,
+                &url_src_db,
+                &url_src_table,
+                params.source_db,
+                params.source_table,
+                &part.name,
+            );
+
+            match source_dir {
+                Some(dir) => {
+                    // Hardlink or copy all files from source to dest
+                    hardlink_or_copy_dir(&dir, &dest_dir).with_context(|| {
+                        format!(
+                            "Failed to hardlink/copy part {} from {} to {}",
+                            part.name,
+                            dir.display(),
+                            dest_dir.display()
+                        )
+                    })?;
+
+                    // Chown to ClickHouse uid/gid
+                    chown_recursive(&dest_dir, params.clickhouse_uid, params.clickhouse_gid)?;
+                }
+                None => {
+                    warn!(
+                        part = %part.name,
+                        source_db = %params.source_db,
+                        source_table = %params.source_table,
+                        "Part source directory not found, skipping"
+                    );
+                    continue;
+                }
             }
-
-            // Hardlink or copy all files from source to dest
-            hardlink_or_copy_dir(&source_dir, &dest_dir).with_context(|| {
-                format!(
-                    "Failed to hardlink/copy part {} from {} to {}",
-                    part.name,
-                    source_dir.display(),
-                    dest_dir.display()
-                )
-            })?;
-
-            // Chown to ClickHouse uid/gid
-            chown_recursive(&dest_dir, params.clickhouse_uid, params.clickhouse_gid)?;
         }
 
         // ATTACH PART
@@ -978,6 +1058,9 @@ mod tests {
             already_attached: HashSet::new(),
             resume_state: None,
             jitter_factor: 0.0,
+            manifest_disks: HashMap::new(),
+            source_db: "default".to_string(),
+            source_table: "trades".to_string(),
         };
 
         assert_eq!(params.object_disk_server_side_copy_concurrency, 32);
@@ -1017,6 +1100,9 @@ mod tests {
             already_attached: already.clone(),
             resume_state: None,
             jitter_factor: 0.0,
+            manifest_disks: HashMap::new(),
+            source_db: "default".to_string(),
+            source_table: "trades".to_string(),
         };
 
         assert_eq!(params.already_attached.len(), 2);
@@ -1054,5 +1140,133 @@ mod tests {
                 1
             );
         });
+    }
+
+    // ---- Task 7: Per-disk restore path resolution tests ----
+
+    /// Verify that when manifest_disks maps a part's disk to a non-default path,
+    /// the source resolves to the per-disk path.
+    #[test]
+    fn test_attach_source_dir_per_disk() {
+        use crate::backup::collect::resolve_shadow_part_path;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("clickhouse/backup/daily-2024");
+        let nvme1_path = tmp.path().join("nvme1");
+
+        // Create per-disk shadow path
+        let per_disk_part = nvme1_path
+            .join("backup/daily-2024/shadow/default/trades/202401_1_50_3");
+        std::fs::create_dir_all(&per_disk_part).unwrap();
+        std::fs::write(per_disk_part.join("checksums.txt"), b"data").unwrap();
+
+        let manifest_disks = HashMap::from([(
+            "nvme1".to_string(),
+            nvme1_path.to_string_lossy().to_string(),
+        )]);
+
+        let result = resolve_shadow_part_path(
+            &backup_dir,
+            &manifest_disks,
+            "daily-2024",
+            "nvme1",
+            "default",
+            "trades",
+            "default",
+            "trades",
+            "202401_1_50_3",
+        );
+
+        assert!(result.is_some(), "Should find part at per-disk path");
+        assert_eq!(result.unwrap(), per_disk_part);
+    }
+
+    /// Verify that when source_db != db (remap active), the shadow lookup
+    /// uses source_db/source_table, NOT destination names.
+    #[test]
+    fn test_attach_source_dir_remap_uses_source_names() {
+        use crate::backup::collect::resolve_shadow_part_path;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("clickhouse/backup/daily-2024");
+
+        // Shadow dirs use source names (prod.trades), NOT destination (staging.trades_copy)
+        let source_part = backup_dir.join("shadow/prod/trades/202401_1_50_3");
+        std::fs::create_dir_all(&source_part).unwrap();
+        std::fs::write(source_part.join("checksums.txt"), b"data").unwrap();
+
+        // Destination names -- these should NOT be found
+        let dest_part = backup_dir.join("shadow/staging/trades_copy/202401_1_50_3");
+        assert!(!dest_part.exists());
+
+        let manifest_disks = HashMap::new();
+
+        // Lookup with source names (prod.trades) should succeed
+        let result = resolve_shadow_part_path(
+            &backup_dir,
+            &manifest_disks,
+            "daily-2024",
+            "default",
+            "prod",
+            "trades",
+            "prod",
+            "trades",
+            "202401_1_50_3",
+        );
+        assert!(result.is_some(), "Should find part using source names");
+        assert_eq!(result.unwrap(), source_part);
+
+        // Lookup with destination names (staging.trades_copy) should fail
+        let result_dst = resolve_shadow_part_path(
+            &backup_dir,
+            &manifest_disks,
+            "daily-2024",
+            "default",
+            "staging",
+            "trades_copy",
+            "staging",
+            "trades_copy",
+            "202401_1_50_3",
+        );
+        assert!(
+            result_dst.is_none(),
+            "Should NOT find part using destination names"
+        );
+    }
+
+    /// Verify that old backups with manifest.disks populated but legacy layout
+    /// fall through to the legacy path.
+    #[test]
+    fn test_attach_source_dir_old_backup_fallback() {
+        use crate::backup::collect::resolve_shadow_part_path;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("clickhouse/backup/daily-2024");
+
+        // Create only the legacy (default backup_dir) path
+        let legacy_part = backup_dir.join("shadow/default/trades/202401_1_50_3");
+        std::fs::create_dir_all(&legacy_part).unwrap();
+        std::fs::write(legacy_part.join("checksums.txt"), b"data").unwrap();
+
+        // manifest.disks has a disk entry but per-disk path doesn't exist
+        let manifest_disks = HashMap::from([(
+            "nvme1".to_string(),
+            tmp.path().join("nvme1_does_not_exist").to_string_lossy().to_string(),
+        )]);
+
+        let result = resolve_shadow_part_path(
+            &backup_dir,
+            &manifest_disks,
+            "daily-2024",
+            "nvme1",
+            "default",
+            "trades",
+            "default",
+            "trades",
+            "202401_1_50_3",
+        );
+
+        assert!(result.is_some(), "Should fall back to legacy path");
+        assert_eq!(result.unwrap(), legacy_part);
     }
 }

@@ -554,6 +554,9 @@ pub async fn restore(
                 already_attached: table_already_attached,
                 resume_state: resume_state.clone(),
                 jitter_factor,
+                manifest_disks: manifest.disks.clone(),
+                source_db: src_db.to_string(),
+                source_table: src_table.to_string(),
             },
         ));
     }

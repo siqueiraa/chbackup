@@ -63,6 +63,7 @@ pub fn per_disk_backup_dir(disk_path: &str, backup_name: &str) -> PathBuf {
 /// This is the SINGLE source of truth for shadow path resolution across
 /// upload, download, and restore. Consumers must not implement their own
 /// fallback logic.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_shadow_part_path(
     backup_dir: &Path,
     manifest_disks: &HashMap<String, String>,
