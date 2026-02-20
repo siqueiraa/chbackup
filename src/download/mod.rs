@@ -459,6 +459,7 @@ pub async fn download(
 
     let mut handles = Vec::with_capacity(total_parts);
     let data_path_str = data_path.to_string();
+    let manifest_disks = Arc::new(manifest.disks.clone());
 
     for item in work_items {
         let sem = semaphore.clone();
@@ -470,6 +471,7 @@ pub async fn download(
         let data_path_clone = data_path_str.clone();
         let backup_name_clone = backup_name.to_string();
         let progress = progress.clone();
+        let manifest_disks = manifest_disks.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -502,7 +504,14 @@ pub async fn download(
                         )
                     })?;
 
-                let shadow_dir = backup_dir
+                // Resolve per-disk target dir for this part's disk
+                let target_backup_dir = resolve_download_target_dir(
+                    &manifest_disks,
+                    &item.disk_name,
+                    &backup_name_clone,
+                    &backup_dir,
+                );
+                let shadow_dir = target_backup_dir
                     .join("shadow")
                     .join(&url_db)
                     .join(&url_table)
@@ -582,7 +591,14 @@ pub async fn download(
                 Ok::<(String, u64), anyhow::Error>((item.table_key, total_metadata_bytes))
             } else {
                 // Local disk part: full download + decompress + CRC64 verify
-                let shadow_dir = backup_dir.join("shadow").join(&url_db).join(&url_table);
+                // Resolve per-disk target dir for this part's disk
+                let target_backup_dir = resolve_download_target_dir(
+                    &manifest_disks,
+                    &item.disk_name,
+                    &backup_name_clone,
+                    &backup_dir,
+                );
+                let shadow_dir = target_backup_dir.join("shadow").join(&url_db).join(&url_table);
                 let part_name = item.part.name.clone();
                 let expected_crc = item.part.checksum_crc64;
                 let backup_key = item.part.backup_key.clone();
@@ -1213,6 +1229,163 @@ mod tests {
             0,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_download_per_disk_dir_construction() {
+        // When manifest.disks maps a disk to a non-default path AND the disk path
+        // exists locally, the shadow_dir should use {disk_path}/backup/{name}/shadow/...
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create two "disks": data_path (default) and a separate nvme disk
+        let data_path = dir.path().join("data");
+        let nvme_path = dir.path().join("nvme1");
+        std::fs::create_dir_all(&data_path).unwrap();
+        std::fs::create_dir_all(&nvme_path).unwrap();
+
+        let backup_dir = data_path.join("backup").join("daily-2024");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let mut manifest_disks = HashMap::new();
+        manifest_disks.insert(
+            "default".to_string(),
+            data_path.to_str().unwrap().to_string(),
+        );
+        manifest_disks.insert(
+            "nvme1".to_string(),
+            nvme_path.to_str().unwrap().to_string(),
+        );
+
+        // For the default disk, target should resolve to the default backup_dir
+        let target_default = resolve_download_target_dir(
+            &manifest_disks,
+            "default",
+            "daily-2024",
+            &backup_dir,
+        );
+        assert_eq!(
+            target_default,
+            data_path.join("backup").join("daily-2024"),
+            "Default disk should resolve to data_path/backup/name"
+        );
+
+        // For the nvme1 disk, target should resolve to per-disk path
+        let target_nvme = resolve_download_target_dir(
+            &manifest_disks,
+            "nvme1",
+            "daily-2024",
+            &backup_dir,
+        );
+        assert_eq!(
+            target_nvme,
+            nvme_path.join("backup").join("daily-2024"),
+            "Non-default disk should resolve to disk_path/backup/name"
+        );
+
+        // The shadow dirs should be under per-disk paths
+        let shadow_nvme = target_nvme.join("shadow").join("default").join("trades").join("202401_1_50_3");
+        assert!(shadow_nvme.starts_with(&nvme_path));
+    }
+
+    #[test]
+    fn test_download_per_disk_fallback_disk_not_present() {
+        // When the disk path from the manifest does NOT exist on the local host,
+        // should fall back to the default backup_dir
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup").join("daily-2024");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let mut manifest_disks = HashMap::new();
+        manifest_disks.insert(
+            "nvme_remote".to_string(),
+            "/nonexistent/remote/nvme/path".to_string(),
+        );
+
+        // Disk path doesn't exist -> should fall back to backup_dir
+        let target = resolve_download_target_dir(
+            &manifest_disks,
+            "nvme_remote",
+            "daily-2024",
+            &backup_dir,
+        );
+        assert_eq!(
+            target, backup_dir,
+            "Non-existent disk path should fall back to default backup_dir"
+        );
+    }
+
+    #[test]
+    fn test_download_per_disk_fallback_unknown_disk() {
+        // When the disk_name is not in manifest.disks, should fall back to backup_dir
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup").join("daily-2024");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let manifest_disks = HashMap::new(); // empty
+
+        let target = resolve_download_target_dir(
+            &manifest_disks,
+            "unknown_disk",
+            "daily-2024",
+            &backup_dir,
+        );
+        assert_eq!(
+            target, backup_dir,
+            "Unknown disk should fall back to default backup_dir"
+        );
+    }
+
+    #[test]
+    fn test_download_disk_map_persisted_without_resume() {
+        // Verify that disk_map is written to the state file even when resume=false,
+        // by simulating the unconditional persistence logic from download()
+        use crate::resume::{load_state_file, save_state_graceful, DownloadState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("download.state.json");
+
+        let mut disk_map = HashMap::new();
+        disk_map.insert("default".to_string(), "/var/lib/clickhouse".to_string());
+        disk_map.insert("nvme1".to_string(), "/mnt/nvme1/clickhouse".to_string());
+
+        // Simulate the unconditional disk_map persistence (not gated by resume)
+        let disk_map_state = DownloadState {
+            completed_keys: HashSet::new(),
+            backup_name: "daily-2024".to_string(),
+            params_hash: "test_hash".to_string(),
+            disk_map: disk_map.clone(),
+        };
+        save_state_graceful(&state_path, &disk_map_state);
+
+        // Verify the state file was written and disk_map is present
+        let loaded: DownloadState = load_state_file(&state_path).unwrap().unwrap();
+        assert_eq!(loaded.disk_map.len(), 2);
+        assert_eq!(loaded.disk_map.get("default").unwrap(), "/var/lib/clickhouse");
+        assert_eq!(loaded.disk_map.get("nvme1").unwrap(), "/mnt/nvme1/clickhouse");
+        assert!(loaded.completed_keys.is_empty(), "completed_keys should be empty in initial state");
+    }
+
+    #[test]
+    fn test_download_disk_map_backward_compat() {
+        // Verify that a state file WITHOUT disk_map (old format) deserializes cleanly
+        use crate::resume::load_state_file;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("download.state.json");
+
+        // Write a state file without disk_map field (simulating old format)
+        let old_format_json = r#"{
+            "completed_keys": ["key1"],
+            "backup_name": "old-backup",
+            "params_hash": "old_hash"
+        }"#;
+        std::fs::write(&state_path, old_format_json).unwrap();
+
+        // Should deserialize cleanly with disk_map defaulting to empty HashMap
+        let loaded: DownloadState = load_state_file(&state_path).unwrap().unwrap();
+        assert_eq!(loaded.backup_name, "old-backup");
+        assert!(loaded.disk_map.is_empty(), "Missing disk_map should default to empty HashMap");
+        assert_eq!(loaded.completed_keys.len(), 1);
     }
 
     #[test]
