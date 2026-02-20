@@ -980,7 +980,7 @@ If `--skip-mutation-wait` was used, manifest stores the mutations:
     {
       "mutation_id": "0000000002",
       "command": "DELETE WHERE user_id = 5",
-      "parts_to_do": 3
+      "parts_to_do": ["all_0_0_0", "all_1_1_0", "all_2_2_0"]
     }
   ]
 }
@@ -1770,7 +1770,7 @@ S3 objects in the backup bucket may be shared across incremental backups (via `s
 
 **Race condition window**: Between re-check (step 3c) and delete (step 3d), a new backup could still reference our keys. This window is milliseconds. Mitigation: retention runs under the global PID lock, so concurrent retention + create_remote is serialized. The only remaining race is between retention on one host and create_remote on a different host — an edge case that doesn't apply to single-sidecar deployments. Multi-host users should run retention from only one host.
 
-**Incremental chain protection**: In addition to key-level GC (which prevents deleting shared S3 objects), `retention_remote()` provides backup-level protection for incremental bases. A backup whose name appears in the `required_backups` field of any surviving manifest is protected from deletion regardless of age or count. This ensures that deleting an old backup never breaks the incremental chain — even though our manifests are self-contained (all part keys listed), the physical S3 objects still reside under the base backup's prefix. Protecting the base backup avoids the need to relocate objects during retention.
+**Incremental chain protection**: In addition to key-level GC (which prevents deleting shared S3 objects), `retention_remote()` provides backup-level protection for incremental bases. For each surviving manifest, `collect_incremental_bases()` scans all `PartInfo.source` fields for `"carried:{base_name}"` prefixes and collects the referenced base backup names. A backup whose name appears in this set is protected from deletion regardless of age or count. This ensures that deleting an old backup never breaks the incremental chain — even though our manifests are self-contained (all part keys listed), the physical S3 objects still reside under the base backup's prefix. Protecting the base backup avoids the need to relocate objects during retention.
 
 ### 8.3 Auto-Retention
 
