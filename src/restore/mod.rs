@@ -35,7 +35,6 @@ use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
-use crate::backup::collect::resolve_shadow_part_path;
 use crate::clickhouse::client::ChClient;
 use crate::concurrency::{
     effective_max_connections, effective_object_disk_server_side_copy_concurrency,

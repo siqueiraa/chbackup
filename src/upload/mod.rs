@@ -358,7 +358,10 @@ pub async fn upload(
                         continue;
                     }
 
-                    let part_dir = find_part_dir(backup_dir, db, table, &part.name)?;
+                    let part_dir = find_part_dir(
+                        backup_dir, db, table, &part.name,
+                        &manifest.disks, backup_name, disk_name,
+                    )?;
 
                     s3_disk_work_items.push(S3DiskUploadWorkItem {
                         table_key: table_key.clone(),
@@ -376,7 +379,10 @@ pub async fn upload(
                     has_parts = true;
                 } else {
                     // Local disk part: compress + upload
-                    let part_dir = find_part_dir(backup_dir, db, table, &part.name)?;
+                    let part_dir = find_part_dir(
+                        backup_dir, db, table, &part.name,
+                        &manifest.disks, backup_name, disk_name,
+                    )?;
 
                     if !part_dir.exists() {
                         return Err(anyhow::anyhow!(
@@ -1060,36 +1066,40 @@ fn collect_files_recursive(
 
 /// Find the part directory within the backup staging area.
 ///
-/// Looks for the part at `{backup_dir}/shadow/{db}/{table}/{part_name}/`
-/// Uses URL-encoded paths to match what collect_parts creates.
-fn find_part_dir(backup_dir: &Path, db: &str, table: &str, part_name: &str) -> Result<PathBuf> {
-    // Try URL-encoded path first (as created by backup::collect)
+/// Delegates to `resolve_shadow_part_path()` which tries per-disk paths first,
+/// then falls back to legacy encoded and plain paths. This is the single source
+/// of truth for part directory resolution during upload.
+fn find_part_dir(
+    backup_dir: &Path,
+    db: &str,
+    table: &str,
+    part_name: &str,
+    manifest_disks: &HashMap<String, String>,
+    backup_name: &str,
+    disk_name: &str,
+) -> Result<PathBuf> {
+    use crate::backup::collect::resolve_shadow_part_path;
+
     let url_db = url_encode_component(db);
     let url_table = url_encode_component(table);
 
-    let path = backup_dir
-        .join("shadow")
-        .join(&url_db)
-        .join(&url_table)
-        .join(part_name);
-
-    if path.exists() {
-        return Ok(path);
-    }
-
-    // Try plain path as fallback
-    let plain_path = backup_dir
-        .join("shadow")
-        .join(db)
-        .join(table)
-        .join(part_name);
-
-    if plain_path.exists() {
-        return Ok(plain_path);
-    }
-
-    // Return the URL-encoded path (caller will check existence)
-    Ok(path)
+    resolve_shadow_part_path(
+        backup_dir,
+        manifest_disks,
+        backup_name,
+        disk_name,
+        &url_db,
+        &url_table,
+        db,
+        table,
+        part_name,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "Part directory not found for {}.{}/{} (checked per-disk, legacy encoded, and legacy plain paths)",
+            db, table, part_name
+        )
+    })
 }
 
 /// Upload all files from a local directory to S3 under `{backup_name}/{prefix}/`.
@@ -1241,6 +1251,7 @@ mod tests {
 
     #[test]
     fn test_find_part_dir_url_encoded() {
+        // Legacy layout: part under backup_dir/shadow/{db}/{table}/{part}
         let dir = tempfile::tempdir().unwrap();
         let part_path = dir
             .path()
@@ -1250,8 +1261,114 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&part_path).unwrap();
 
-        let found = find_part_dir(dir.path(), "default", "trades", "202401_1_50_3").unwrap();
+        // No disk in manifest_disks => falls back to legacy path under backup_dir
+        let manifest_disks: HashMap<String, String> = HashMap::new();
+        let found = find_part_dir(
+            dir.path(),
+            "default",
+            "trades",
+            "202401_1_50_3",
+            &manifest_disks,
+            "my-backup",
+            "disk1",
+        )
+        .unwrap();
         assert_eq!(found, part_path);
+    }
+
+    #[test]
+    fn test_find_part_dir_per_disk() {
+        // Per-disk layout: part under {disk_path}/backup/{name}/shadow/{db}/{table}/{part}
+        let dir = tempfile::tempdir().unwrap();
+        let disk_path = dir.path().join("store1");
+        let backup_name = "daily-2024-01-15";
+        let per_disk_part = disk_path
+            .join("backup")
+            .join(backup_name)
+            .join("shadow")
+            .join("mydb")
+            .join("mytable")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&per_disk_part).unwrap();
+
+        let manifest_disks: HashMap<String, String> =
+            HashMap::from([("nvme1".to_string(), disk_path.to_str().unwrap().to_string())]);
+
+        // backup_dir is a separate temp dir (the default data_path location)
+        let backup_dir = tempfile::tempdir().unwrap();
+        let found = find_part_dir(
+            backup_dir.path(),
+            "mydb",
+            "mytable",
+            "202401_1_50_3",
+            &manifest_disks,
+            backup_name,
+            "nvme1",
+        )
+        .unwrap();
+        assert_eq!(found, per_disk_part);
+    }
+
+    #[test]
+    fn test_find_part_dir_fallback_default() {
+        // Old single-dir layout: part under backup_dir/shadow/{db}/{table}/{part}
+        // Even though manifest_disks has an entry, the per-disk path doesn't exist,
+        // so it falls back to the legacy backup_dir path.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_part = dir
+            .path()
+            .join("shadow")
+            .join("mydb")
+            .join("mytable")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&legacy_part).unwrap();
+
+        let manifest_disks: HashMap<String, String> =
+            HashMap::from([("default".to_string(), dir.path().to_str().unwrap().to_string())]);
+
+        let found = find_part_dir(
+            dir.path(),
+            "mydb",
+            "mytable",
+            "202401_1_50_3",
+            &manifest_disks,
+            "daily-2024-01-15",
+            "default",
+        )
+        .unwrap();
+        assert_eq!(found, legacy_part);
+    }
+
+    #[test]
+    fn test_find_part_dir_old_backup_with_manifest_disks() {
+        // Simulate: manifest.disks has an entry for "nvme1" pointing to /store1,
+        // but the data was actually stored in the legacy backup_dir/shadow/ layout
+        // (e.g., backup was created before per-disk feature). Fallback should find it.
+        let backup_dir = tempfile::tempdir().unwrap();
+        let legacy_part = backup_dir
+            .path()
+            .join("shadow")
+            .join("mydb")
+            .join("mytable")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&legacy_part).unwrap();
+
+        // manifest_disks points to a different path that has no backup data
+        let disk_dir = tempfile::tempdir().unwrap();
+        let manifest_disks: HashMap<String, String> =
+            HashMap::from([("nvme1".to_string(), disk_dir.path().to_str().unwrap().to_string())]);
+
+        let found = find_part_dir(
+            backup_dir.path(),
+            "mydb",
+            "mytable",
+            "202401_1_50_3",
+            &manifest_disks,
+            "daily-2024-01-15",
+            "nvme1",
+        )
+        .unwrap();
+        assert_eq!(found, legacy_part);
     }
 
     #[test]
