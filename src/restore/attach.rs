@@ -1155,8 +1155,8 @@ mod tests {
         let nvme1_path = tmp.path().join("nvme1");
 
         // Create per-disk shadow path
-        let per_disk_part = nvme1_path
-            .join("backup/daily-2024/shadow/default/trades/202401_1_50_3");
+        let per_disk_part =
+            nvme1_path.join("backup/daily-2024/shadow/default/trades/202401_1_50_3");
         std::fs::create_dir_all(&per_disk_part).unwrap();
         std::fs::write(per_disk_part.join("checksums.txt"), b"data").unwrap();
 
@@ -1251,7 +1251,10 @@ mod tests {
         // manifest.disks has a disk entry but per-disk path doesn't exist
         let manifest_disks = HashMap::from([(
             "nvme1".to_string(),
-            tmp.path().join("nvme1_does_not_exist").to_string_lossy().to_string(),
+            tmp.path()
+                .join("nvme1_does_not_exist")
+                .to_string_lossy()
+                .to_string(),
         )]);
 
         let result = resolve_shadow_part_path(

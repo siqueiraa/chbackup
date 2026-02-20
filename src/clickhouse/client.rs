@@ -339,7 +339,10 @@ impl ChClient {
             .await
             .context("Failed to list all tables from system.tables")?;
 
-        info!(table_count = rows.len(), "Listed all tables (including system)");
+        info!(
+            table_count = rows.len(),
+            "Listed all tables (including system)"
+        );
         Ok(rows)
     }
 
@@ -680,12 +683,7 @@ impl ChClient {
             .query(&sql)
             .fetch_all::<PartitionRow>()
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to query distinct partitions for {}.{}",
-                    db, table
-                )
-            })?;
+            .with_context(|| format!("Failed to query distinct partitions for {}.{}", db, table))?;
 
         Ok(rows.into_iter().map(|r| r.partition_id).collect())
     }
@@ -729,12 +727,7 @@ impl ChClient {
             .query(&sql)
             .fetch_all::<ReplicaRow>()
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to query system.replicas for {}.{}",
-                    db, table
-                )
-            })?;
+            .with_context(|| format!("Failed to query system.replicas for {}.{}", db, table))?;
 
         if rows.is_empty() {
             // Table not found in system.replicas -- not a Replicated table

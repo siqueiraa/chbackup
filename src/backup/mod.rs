@@ -597,8 +597,8 @@ pub async fn create(
 
         // Default backup_dir
         if backup_dir.exists() {
-            let canonical = std::fs::canonicalize(&backup_dir)
-                .unwrap_or_else(|_| backup_dir.clone());
+            let canonical =
+                std::fs::canonicalize(&backup_dir).unwrap_or_else(|_| backup_dir.clone());
             seen.insert(canonical);
             dirs_to_delete.push(backup_dir.clone());
         }
@@ -608,8 +608,8 @@ pub async fn create(
             let per_disk =
                 collect::per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
             if per_disk.exists() {
-                let canonical = std::fs::canonicalize(&per_disk)
-                    .unwrap_or_else(|_| per_disk.clone());
+                let canonical =
+                    std::fs::canonicalize(&per_disk).unwrap_or_else(|_| per_disk.clone());
                 if seen.insert(canonical) {
                     dirs_to_delete.push(per_disk);
                 }
@@ -1142,8 +1142,8 @@ mod tests {
         let mut seen: HashSet<PathBuf> = HashSet::new();
 
         if backup_dir.exists() {
-            let canonical = std::fs::canonicalize(&backup_dir)
-                .unwrap_or_else(|_| backup_dir.clone());
+            let canonical =
+                std::fs::canonicalize(&backup_dir).unwrap_or_else(|_| backup_dir.clone());
             seen.insert(canonical);
             dirs_to_delete.push(backup_dir.clone());
         }
@@ -1152,8 +1152,8 @@ mod tests {
             let per_disk =
                 collect::per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
             if per_disk.exists() {
-                let canonical = std::fs::canonicalize(&per_disk)
-                    .unwrap_or_else(|_| per_disk.clone());
+                let canonical =
+                    std::fs::canonicalize(&per_disk).unwrap_or_else(|_| per_disk.clone());
                 if seen.insert(canonical) {
                     dirs_to_delete.push(per_disk);
                 }

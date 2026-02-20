@@ -182,8 +182,8 @@ fn find_existing_part(
 
     // Always search the default data_path/backup/ first
     let default_base = Path::new(data_path).join("backup");
-    let canonical_default = std::fs::canonicalize(&default_base)
-        .unwrap_or_else(|_| default_base.clone());
+    let canonical_default =
+        std::fs::canonicalize(&default_base).unwrap_or_else(|_| default_base.clone());
     seen.insert(canonical_default);
     search_bases.push(default_base);
 
@@ -192,8 +192,8 @@ fn find_existing_part(
         let dp = disk_path.trim_end_matches('/');
         let per_disk_base = Path::new(dp).join("backup");
         if per_disk_base.exists() {
-            let canonical = std::fs::canonicalize(&per_disk_base)
-                .unwrap_or_else(|_| per_disk_base.clone());
+            let canonical =
+                std::fs::canonicalize(&per_disk_base).unwrap_or_else(|_| per_disk_base.clone());
             if seen.insert(canonical) {
                 search_bases.push(per_disk_base);
             }
@@ -629,7 +629,10 @@ pub async fn download(
                     &backup_name_clone,
                     &backup_dir,
                 );
-                let shadow_dir = target_backup_dir.join("shadow").join(&url_db).join(&url_table);
+                let shadow_dir = target_backup_dir
+                    .join("shadow")
+                    .join(&url_db)
+                    .join(&url_table);
                 let part_name = item.part.name.clone();
                 let expected_crc = item.part.checksum_crc64;
                 let backup_key = item.part.backup_key.clone();
@@ -646,11 +649,10 @@ pub async fn download(
                     let dn = item.disk_name.clone();
 
                     let dedup_result = tokio::task::spawn_blocking(move || {
-                        find_existing_part(&dp, &bn, &tk, &pn, ec, &md, &dn)
-                            .map(|existing| {
-                                let target = sd.join(&pn);
-                                hardlink_existing_part(&existing, &target).map(|()| existing)
-                            })
+                        find_existing_part(&dp, &bn, &tk, &pn, ec, &md, &dn).map(|existing| {
+                            let target = sd.join(&pn);
+                            hardlink_existing_part(&existing, &target).map(|()| existing)
+                        })
                     })
                     .await
                     .context("Dedup task panicked")?;
@@ -674,9 +676,7 @@ pub async fn download(
 
                                 progress.inc();
 
-                                return Ok::<(String, u64), anyhow::Error>(
-                                    (item.table_key, 0),
-                                );
+                                return Ok::<(String, u64), anyhow::Error>((item.table_key, 0));
                             }
                             Err(e) => {
                                 warn!(
@@ -1184,8 +1184,14 @@ mod tests {
         let data_path = dir.path().to_str().unwrap();
 
         // Create an existing backup with a part
-        let existing_backup = dir.path().join("backup").join("old-backup").join("shadow")
-            .join("default").join("trades").join("202401_1_50_3");
+        let existing_backup = dir
+            .path()
+            .join("backup")
+            .join("old-backup")
+            .join("shadow")
+            .join("default")
+            .join("trades")
+            .join("202401_1_50_3");
         std::fs::create_dir_all(&existing_backup).unwrap();
         std::fs::write(existing_backup.join("checksums.txt"), b"checksum data").unwrap();
         std::fs::write(existing_backup.join("data.bin"), b"binary data").unwrap();
@@ -1214,8 +1220,14 @@ mod tests {
         let data_path = dir.path().to_str().unwrap();
 
         // Create a backup with same name as current
-        let same_backup = dir.path().join("backup").join("my-backup").join("shadow")
-            .join("default").join("trades").join("202401_1_50_3");
+        let same_backup = dir
+            .path()
+            .join("backup")
+            .join("my-backup")
+            .join("shadow")
+            .join("default")
+            .join("trades")
+            .join("202401_1_50_3");
         std::fs::create_dir_all(&same_backup).unwrap();
         std::fs::write(same_backup.join("checksums.txt"), b"checksum data").unwrap();
 
@@ -1292,18 +1304,11 @@ mod tests {
             "default".to_string(),
             data_path.to_str().unwrap().to_string(),
         );
-        manifest_disks.insert(
-            "nvme1".to_string(),
-            nvme_path.to_str().unwrap().to_string(),
-        );
+        manifest_disks.insert("nvme1".to_string(), nvme_path.to_str().unwrap().to_string());
 
         // For the default disk, target should resolve to the default backup_dir
-        let target_default = resolve_download_target_dir(
-            &manifest_disks,
-            "default",
-            "daily-2024",
-            &backup_dir,
-        );
+        let target_default =
+            resolve_download_target_dir(&manifest_disks, "default", "daily-2024", &backup_dir);
         assert_eq!(
             target_default,
             data_path.join("backup").join("daily-2024"),
@@ -1311,12 +1316,8 @@ mod tests {
         );
 
         // For the nvme1 disk, target should resolve to per-disk path
-        let target_nvme = resolve_download_target_dir(
-            &manifest_disks,
-            "nvme1",
-            "daily-2024",
-            &backup_dir,
-        );
+        let target_nvme =
+            resolve_download_target_dir(&manifest_disks, "nvme1", "daily-2024", &backup_dir);
         assert_eq!(
             target_nvme,
             nvme_path.join("backup").join("daily-2024"),
@@ -1324,7 +1325,11 @@ mod tests {
         );
 
         // The shadow dirs should be under per-disk paths
-        let shadow_nvme = target_nvme.join("shadow").join("default").join("trades").join("202401_1_50_3");
+        let shadow_nvme = target_nvme
+            .join("shadow")
+            .join("default")
+            .join("trades")
+            .join("202401_1_50_3");
         assert!(shadow_nvme.starts_with(&nvme_path));
     }
 
@@ -1343,12 +1348,8 @@ mod tests {
         );
 
         // Disk path doesn't exist -> should fall back to backup_dir
-        let target = resolve_download_target_dir(
-            &manifest_disks,
-            "nvme_remote",
-            "daily-2024",
-            &backup_dir,
-        );
+        let target =
+            resolve_download_target_dir(&manifest_disks, "nvme_remote", "daily-2024", &backup_dir);
         assert_eq!(
             target, backup_dir,
             "Non-existent disk path should fall back to default backup_dir"
@@ -1364,12 +1365,8 @@ mod tests {
 
         let manifest_disks = HashMap::new(); // empty
 
-        let target = resolve_download_target_dir(
-            &manifest_disks,
-            "unknown_disk",
-            "daily-2024",
-            &backup_dir,
-        );
+        let target =
+            resolve_download_target_dir(&manifest_disks, "unknown_disk", "daily-2024", &backup_dir);
         assert_eq!(
             target, backup_dir,
             "Unknown disk should fall back to default backup_dir"
@@ -1401,9 +1398,18 @@ mod tests {
         // Verify the state file was written and disk_map is present
         let loaded: DownloadState = load_state_file(&state_path).unwrap().unwrap();
         assert_eq!(loaded.disk_map.len(), 2);
-        assert_eq!(loaded.disk_map.get("default").unwrap(), "/var/lib/clickhouse");
-        assert_eq!(loaded.disk_map.get("nvme1").unwrap(), "/mnt/nvme1/clickhouse");
-        assert!(loaded.completed_keys.is_empty(), "completed_keys should be empty in initial state");
+        assert_eq!(
+            loaded.disk_map.get("default").unwrap(),
+            "/var/lib/clickhouse"
+        );
+        assert_eq!(
+            loaded.disk_map.get("nvme1").unwrap(),
+            "/mnt/nvme1/clickhouse"
+        );
+        assert!(
+            loaded.completed_keys.is_empty(),
+            "completed_keys should be empty in initial state"
+        );
     }
 
     #[test]
@@ -1425,7 +1431,10 @@ mod tests {
         // Should deserialize cleanly with disk_map defaulting to empty HashMap
         let loaded: DownloadState = load_state_file(&state_path).unwrap().unwrap();
         assert_eq!(loaded.backup_name, "old-backup");
-        assert!(loaded.disk_map.is_empty(), "Missing disk_map should default to empty HashMap");
+        assert!(
+            loaded.disk_map.is_empty(),
+            "Missing disk_map should default to empty HashMap"
+        );
         assert_eq!(loaded.completed_keys.len(), 1);
     }
 
@@ -1454,10 +1463,7 @@ mod tests {
         let expected_crc = compute_crc64(&per_disk_part.join("checksums.txt")).unwrap();
 
         let mut manifest_disks = HashMap::new();
-        manifest_disks.insert(
-            "nvme1".to_string(),
-            nvme_path.to_str().unwrap().to_string(),
-        );
+        manifest_disks.insert("nvme1".to_string(), nvme_path.to_str().unwrap().to_string());
 
         // Should find the part at the per-disk location
         let result = find_existing_part(
@@ -1540,10 +1546,7 @@ mod tests {
         let expected_crc = compute_crc64(&legacy_part.join("checksums.txt")).unwrap();
 
         let mut manifest_disks = HashMap::new();
-        manifest_disks.insert(
-            "nvme1".to_string(),
-            nvme_path.to_str().unwrap().to_string(),
-        );
+        manifest_disks.insert("nvme1".to_string(), nvme_path.to_str().unwrap().to_string());
 
         // Should find the part at the default data_path location
         let result = find_existing_part(

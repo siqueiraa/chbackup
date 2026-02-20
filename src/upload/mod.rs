@@ -360,8 +360,13 @@ pub async fn upload(
                     }
 
                     let part_dir = find_part_dir(
-                        backup_dir, db, table, &part.name,
-                        &manifest.disks, backup_name, disk_name,
+                        backup_dir,
+                        db,
+                        table,
+                        &part.name,
+                        &manifest.disks,
+                        backup_name,
+                        disk_name,
                     )?;
 
                     s3_disk_work_items.push(S3DiskUploadWorkItem {
@@ -381,8 +386,13 @@ pub async fn upload(
                 } else {
                     // Local disk part: compress + upload
                     let part_dir = find_part_dir(
-                        backup_dir, db, table, &part.name,
-                        &manifest.disks, backup_name, disk_name,
+                        backup_dir,
+                        db,
+                        table,
+                        &part.name,
+                        &manifest.disks,
+                        backup_name,
+                        disk_name,
                     )?;
 
                     if !part_dir.exists() {
@@ -509,77 +519,150 @@ pub async fn upload(
             );
 
             // Choose between streaming multipart (large parts) and buffered upload
-            let compressed_size =
-                if streaming_upload_threshold > 0 && item.part.size > streaming_upload_threshold {
-                    // --- Streaming multipart upload path for large parts ---
-                    info!(
+            let compressed_size = if streaming_upload_threshold > 0
+                && item.part.size > streaming_upload_threshold
+            {
+                // --- Streaming multipart upload path for large parts ---
+                info!(
+                    table = %item.table_key,
+                    part = %item.part.name,
+                    size = item.part.size,
+                    "Streaming multipart upload for large part"
+                );
+
+                let chunk_size =
+                    calculate_chunk_size(item.part.size, s3_chunk_size, s3_max_parts_count)
+                        as usize;
+                // Ensure chunk_size >= MIN_MULTIPART_CHUNK for S3 compliance
+                let chunk_size = chunk_size.max(stream::MIN_MULTIPART_CHUNK);
+
+                let part_dir = item.part_dir.clone();
+                let part_name_for_compress = item.part.name.clone();
+                let fmt = data_format_clone.clone();
+
+                // Start streaming compression in a background thread
+                let receiver = tokio::task::spawn_blocking(move || {
+                    stream::compress_part_streaming(
+                        &part_dir,
+                        &part_name_for_compress,
+                        &fmt,
+                        compression_level,
+                        chunk_size,
+                    )
+                })
+                .await
+                .context("Streaming compress setup panicked")?
+                .with_context(|| {
+                    format!(
+                        "Failed to start streaming compression for part {}",
+                        item.part.name
+                    )
+                })?;
+
+                // Create multipart upload
+                let upload_id = s3.create_multipart_upload(&item.s3_key).await?;
+
+                // Collect all chunks from the compression thread via spawn_blocking
+                // (bridges sync mpsc::Receiver to async context)
+                let part_name_for_err = item.part.name.clone();
+                let chunks: Vec<Vec<u8>> = tokio::task::spawn_blocking(move || {
+                    let mut chunks = Vec::new();
+                    for chunk_result in receiver.iter() {
+                        let chunk = chunk_result.with_context(|| {
+                            format!("Streaming compression error for part {}", part_name_for_err)
+                        })?;
+                        chunks.push(chunk);
+                    }
+                    Ok::<Vec<Vec<u8>>, anyhow::Error>(chunks)
+                })
+                .await
+                .context("Chunk collector task panicked")??;
+
+                // Upload each chunk as a multipart part
+                let upload_result = async {
+                    let mut completed_parts: Vec<(i32, String)> = Vec::new();
+                    let mut total_compressed: u64 = 0;
+
+                    for (idx, chunk_data) in chunks.into_iter().enumerate() {
+                        let part_number = (idx + 1) as i32;
+                        total_compressed += chunk_data.len() as u64;
+                        let e_tag = s3
+                            .upload_part_with_retry(
+                                &item.s3_key,
+                                &upload_id,
+                                part_number,
+                                chunk_data,
+                                retry_config,
+                            )
+                            .await?;
+                        completed_parts.push((part_number, e_tag));
+                    }
+
+                    s3.complete_multipart_upload(&item.s3_key, &upload_id, completed_parts)
+                        .await?;
+
+                    Ok::<u64, anyhow::Error>(total_compressed)
+                }
+                .await;
+
+                match upload_result {
+                    Ok(total) => total,
+                    Err(e) => {
+                        // Best-effort abort to clean up partial upload
+                        let _ = s3.abort_multipart_upload(&item.s3_key, &upload_id).await;
+                        return Err(e).with_context(|| {
+                            format!(
+                                "Streaming multipart upload failed for part {}",
+                                item.part.name
+                            )
+                        });
+                    }
+                }
+            } else {
+                // --- Buffered upload path (existing behavior) ---
+                // Compress part using spawn_blocking (sync tar + compression)
+                let part_dir = item.part_dir.clone();
+                let part_name_for_compress = item.part.name.clone();
+                let fmt = data_format_clone.clone();
+                let compressed = tokio::task::spawn_blocking(move || {
+                    stream::compress_part(
+                        &part_dir,
+                        &part_name_for_compress,
+                        &fmt,
+                        compression_level,
+                    )
+                })
+                .await
+                .context("Compress task panicked")?
+                .with_context(|| format!("Failed to compress part {}", item.part.name))?;
+
+                let compressed_size = compressed.len() as u64;
+
+                // Decide between single PutObject and multipart upload
+                if should_use_multipart(compressed_size) {
+                    debug!(
                         table = %item.table_key,
                         part = %item.part.name,
-                        size = item.part.size,
-                        "Streaming multipart upload for large part"
+                        compressed_size = compressed_size,
+                        "Part using multipart upload"
                     );
 
-                    let chunk_size = calculate_chunk_size(
-                        item.part.size,
-                        s3_chunk_size,
-                        s3_max_parts_count,
-                    ) as usize;
-                    // Ensure chunk_size >= MIN_MULTIPART_CHUNK for S3 compliance
-                    let chunk_size = chunk_size.max(stream::MIN_MULTIPART_CHUNK);
-
-                    let part_dir = item.part_dir.clone();
-                    let part_name_for_compress = item.part.name.clone();
-                    let fmt = data_format_clone.clone();
-
-                    // Start streaming compression in a background thread
-                    let receiver = tokio::task::spawn_blocking(move || {
-                        stream::compress_part_streaming(
-                            &part_dir,
-                            &part_name_for_compress,
-                            &fmt,
-                            compression_level,
-                            chunk_size,
-                        )
-                    })
-                    .await
-                    .context("Streaming compress setup panicked")?
-                    .with_context(|| {
-                        format!(
-                            "Failed to start streaming compression for part {}",
-                            item.part.name
-                        )
-                    })?;
+                    let chunk_size =
+                        calculate_chunk_size(compressed_size, s3_chunk_size, s3_max_parts_count)
+                            as usize;
 
                     // Create multipart upload
                     let upload_id = s3.create_multipart_upload(&item.s3_key).await?;
 
-                    // Collect all chunks from the compression thread via spawn_blocking
-                    // (bridges sync mpsc::Receiver to async context)
-                    let part_name_for_err = item.part.name.clone();
-                    let chunks: Vec<Vec<u8>> = tokio::task::spawn_blocking(move || {
-                        let mut chunks = Vec::new();
-                        for chunk_result in receiver.iter() {
-                            let chunk = chunk_result.with_context(|| {
-                                format!(
-                                    "Streaming compression error for part {}",
-                                    part_name_for_err
-                                )
-                            })?;
-                            chunks.push(chunk);
-                        }
-                        Ok::<Vec<Vec<u8>>, anyhow::Error>(chunks)
-                    })
-                    .await
-                    .context("Chunk collector task panicked")??;
-
-                    // Upload each chunk as a multipart part
+                    // Upload chunks, aborting on error
                     let upload_result = async {
                         let mut completed_parts: Vec<(i32, String)> = Vec::new();
-                        let mut total_compressed: u64 = 0;
+                        let mut part_number = 1i32;
 
-                        for (idx, chunk_data) in chunks.into_iter().enumerate() {
-                            let part_number = (idx + 1) as i32;
-                            total_compressed += chunk_data.len() as u64;
+                        for chunk_start in (0..compressed.len()).step_by(chunk_size) {
+                            let chunk_end = (chunk_start + chunk_size).min(compressed.len());
+                            let chunk_data = compressed[chunk_start..chunk_end].to_vec();
+
                             let e_tag = s3
                                 .upload_part_with_retry(
                                     &item.s3_key,
@@ -589,142 +672,36 @@ pub async fn upload(
                                     retry_config,
                                 )
                                 .await?;
+
                             completed_parts.push((part_number, e_tag));
+                            part_number += 1;
                         }
 
-                        s3.complete_multipart_upload(
-                            &item.s3_key,
-                            &upload_id,
-                            completed_parts,
-                        )
-                        .await?;
+                        s3.complete_multipart_upload(&item.s3_key, &upload_id, completed_parts)
+                            .await?;
 
-                        Ok::<u64, anyhow::Error>(total_compressed)
+                        Ok::<(), anyhow::Error>(())
                     }
                     .await;
 
-                    match upload_result {
-                        Ok(total) => total,
-                        Err(e) => {
-                            // Best-effort abort to clean up partial upload
-                            let _ =
-                                s3.abort_multipart_upload(&item.s3_key, &upload_id).await;
-                            return Err(e).with_context(|| {
-                                format!(
-                                    "Streaming multipart upload failed for part {}",
-                                    item.part.name
-                                )
-                            });
-                        }
+                    if let Err(e) = upload_result {
+                        // Best-effort abort to clean up partial upload
+                        let _ = s3.abort_multipart_upload(&item.s3_key, &upload_id).await;
+                        return Err(e).with_context(|| {
+                            format!("Multipart upload failed for part {}", item.part.name)
+                        });
                     }
                 } else {
-                    // --- Buffered upload path (existing behavior) ---
-                    // Compress part using spawn_blocking (sync tar + compression)
-                    let part_dir = item.part_dir.clone();
-                    let part_name_for_compress = item.part.name.clone();
-                    let fmt = data_format_clone.clone();
-                    let compressed =
-                        tokio::task::spawn_blocking(move || {
-                            stream::compress_part(
-                                &part_dir,
-                                &part_name_for_compress,
-                                &fmt,
-                                compression_level,
-                            )
-                        })
-                        .await
-                        .context("Compress task panicked")?
-                        .with_context(|| {
-                            format!("Failed to compress part {}", item.part.name)
-                        })?;
-
-                    let compressed_size = compressed.len() as u64;
-
-                    // Decide between single PutObject and multipart upload
-                    if should_use_multipart(compressed_size) {
-                        debug!(
-                            table = %item.table_key,
-                            part = %item.part.name,
-                            compressed_size = compressed_size,
-                            "Part using multipart upload"
-                        );
-
-                        let chunk_size = calculate_chunk_size(
-                            compressed_size,
-                            s3_chunk_size,
-                            s3_max_parts_count,
-                        ) as usize;
-
-                        // Create multipart upload
-                        let upload_id =
-                            s3.create_multipart_upload(&item.s3_key).await?;
-
-                        // Upload chunks, aborting on error
-                        let upload_result = async {
-                            let mut completed_parts: Vec<(i32, String)> =
-                                Vec::new();
-                            let mut part_number = 1i32;
-
-                            for chunk_start in
-                                (0..compressed.len()).step_by(chunk_size)
-                            {
-                                let chunk_end =
-                                    (chunk_start + chunk_size).min(compressed.len());
-                                let chunk_data =
-                                    compressed[chunk_start..chunk_end].to_vec();
-
-                                let e_tag = s3
-                                    .upload_part_with_retry(
-                                        &item.s3_key,
-                                        &upload_id,
-                                        part_number,
-                                        chunk_data,
-                                        retry_config,
-                                    )
-                                    .await?;
-
-                                completed_parts.push((part_number, e_tag));
-                                part_number += 1;
-                            }
-
-                            s3.complete_multipart_upload(
-                                &item.s3_key,
-                                &upload_id,
-                                completed_parts,
-                            )
-                            .await?;
-
-                            Ok::<(), anyhow::Error>(())
-                        }
-                        .await;
-
-                        if let Err(e) = upload_result {
-                            // Best-effort abort to clean up partial upload
-                            let _ = s3
-                                .abort_multipart_upload(&item.s3_key, &upload_id)
-                                .await;
-                            return Err(e).with_context(|| {
-                                format!(
-                                    "Multipart upload failed for part {}",
-                                    item.part.name
-                                )
-                            });
-                        }
-                    } else {
-                        // Single PutObject with retry
-                        s3.put_object_with_retry(
-                            &item.s3_key,
-                            compressed,
-                            retry_config,
-                        )
+                    // Single PutObject with retry
+                    s3.put_object_with_retry(&item.s3_key, compressed, retry_config)
                         .await
                         .with_context(|| {
                             format!("Failed to upload part {} to S3", item.part.name)
                         })?;
-                    }
+                }
 
-                    compressed_size
-                };
+                compressed_size
+            };
 
             // Rate limit after upload
             rate_limiter.consume(compressed_size).await;
@@ -991,17 +968,16 @@ pub async fn upload(
     if delete_local {
         // First: delete per-disk dirs (non-fatal, warn on failure)
         // These are "bonus" cleanup -- failing here is not critical.
-        let canonical_default = std::fs::canonicalize(backup_dir)
-            .unwrap_or_else(|_| backup_dir.to_path_buf());
+        let canonical_default =
+            std::fs::canonicalize(backup_dir).unwrap_or_else(|_| backup_dir.to_path_buf());
         let mut seen: HashSet<PathBuf> = HashSet::new();
         seen.insert(canonical_default);
 
         for disk_path in manifest.disks.values() {
-            let per_disk =
-                per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
+            let per_disk = per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
             if per_disk.exists() {
-                let canonical = std::fs::canonicalize(&per_disk)
-                    .unwrap_or_else(|_| per_disk.clone());
+                let canonical =
+                    std::fs::canonicalize(&per_disk).unwrap_or_else(|_| per_disk.clone());
                 if seen.insert(canonical) {
                     info!(path = %per_disk.display(), "Deleting per-disk backup dir");
                     if let Err(e) = std::fs::remove_dir_all(&per_disk) {
@@ -1348,8 +1324,10 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&legacy_part).unwrap();
 
-        let manifest_disks: HashMap<String, String> =
-            HashMap::from([("default".to_string(), dir.path().to_str().unwrap().to_string())]);
+        let manifest_disks: HashMap<String, String> = HashMap::from([(
+            "default".to_string(),
+            dir.path().to_str().unwrap().to_string(),
+        )]);
 
         let found = find_part_dir(
             dir.path(),
@@ -1380,8 +1358,10 @@ mod tests {
 
         // manifest_disks points to a different path that has no backup data
         let disk_dir = tempfile::tempdir().unwrap();
-        let manifest_disks: HashMap<String, String> =
-            HashMap::from([("nvme1".to_string(), disk_dir.path().to_str().unwrap().to_string())]);
+        let manifest_disks: HashMap<String, String> = HashMap::from([(
+            "nvme1".to_string(),
+            disk_dir.path().to_str().unwrap().to_string(),
+        )]);
 
         let found = find_part_dir(
             backup_dir.path(),
@@ -1719,10 +1699,7 @@ mod tests {
         std::fs::write(backup_dir.join("metadata.json"), b"{}").unwrap();
 
         // Create per-disk backup dir for nvme1
-        let per_disk_dir = per_disk_backup_dir(
-            nvme1_path.to_str().unwrap(),
-            backup_name,
-        );
+        let per_disk_dir = per_disk_backup_dir(nvme1_path.to_str().unwrap(), backup_name);
         std::fs::create_dir_all(per_disk_dir.join("shadow")).unwrap();
         std::fs::write(per_disk_dir.join("shadow").join("data.bin"), b"data").unwrap();
 
@@ -1731,21 +1708,27 @@ mod tests {
 
         // Simulate the manifest.disks map
         let manifest_disks: HashMap<String, String> = HashMap::from([
-            ("default".to_string(), data_path.to_string_lossy().to_string()),
-            ("nvme1".to_string(), nvme1_path.to_string_lossy().to_string()),
+            (
+                "default".to_string(),
+                data_path.to_string_lossy().to_string(),
+            ),
+            (
+                "nvme1".to_string(),
+                nvme1_path.to_string_lossy().to_string(),
+            ),
         ]);
 
         // Execute the same cleanup pattern as upload() delete_local
-        let canonical_default = std::fs::canonicalize(&backup_dir)
-            .unwrap_or_else(|_| backup_dir.clone());
+        let canonical_default =
+            std::fs::canonicalize(&backup_dir).unwrap_or_else(|_| backup_dir.clone());
         let mut seen: HashSet<PathBuf> = HashSet::new();
         seen.insert(canonical_default);
 
         for disk_path in manifest_disks.values() {
             let per_disk = per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
             if per_disk.exists() {
-                let canonical = std::fs::canonicalize(&per_disk)
-                    .unwrap_or_else(|_| per_disk.clone());
+                let canonical =
+                    std::fs::canonicalize(&per_disk).unwrap_or_else(|_| per_disk.clone());
                 if seen.insert(canonical) {
                     std::fs::remove_dir_all(&per_disk).unwrap();
                 }
@@ -1755,10 +1738,7 @@ mod tests {
         // Delete default backup_dir last
         std::fs::remove_dir_all(&backup_dir).unwrap();
 
-        assert!(
-            !backup_dir.exists(),
-            "Default backup dir should be removed"
-        );
+        assert!(!backup_dir.exists(), "Default backup dir should be removed");
         assert!(
             !per_disk_dir.exists(),
             "Per-disk backup dir should be removed"

@@ -111,9 +111,9 @@ impl S3Client {
                 .await
                 .with_context(|| format!("STS AssumeRole failed for ARN: {}", arn))?;
 
-            let sts_creds = sts_resp
-                .credentials()
-                .ok_or_else(|| anyhow::anyhow!("STS AssumeRole returned no credentials for ARN: {}", arn))?;
+            let sts_creds = sts_resp.credentials().ok_or_else(|| {
+                anyhow::anyhow!("STS AssumeRole returned no credentials for ARN: {}", arn)
+            })?;
 
             let access_key = sts_creds.access_key_id().to_string();
             let secret_key = sts_creds.secret_access_key().to_string();
@@ -1151,8 +1151,14 @@ impl S3Client {
         dest_key: &str,
         allow_streaming: bool,
     ) -> Result<()> {
-        self.copy_object_with_retry_jitter(source_bucket, source_key, dest_key, allow_streaming, 0.0)
-            .await
+        self.copy_object_with_retry_jitter(
+            source_bucket,
+            source_key,
+            dest_key,
+            allow_streaming,
+            0.0,
+        )
+        .await
     }
 
     /// Upload an object to S3 with retry logic.
@@ -1186,8 +1192,7 @@ impl S3Client {
                             error = %e,
                             "PutObject failed, retrying after backoff"
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(actual_delay))
-                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
                     } else {
                         return Err(e).with_context(|| {
                             format!(
@@ -1241,8 +1246,7 @@ impl S3Client {
                             error = %e,
                             "UploadPart failed, retrying after backoff"
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(actual_delay))
-                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
                     } else {
                         return Err(e).with_context(|| {
                             format!(

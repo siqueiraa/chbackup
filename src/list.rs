@@ -125,10 +125,7 @@ pub async fn list_remote_cached(
 
     // Cache miss: fetch from S3
     let summaries = list_remote(s3).await?;
-    info!(
-        "ManifestCache: populated, count={}",
-        summaries.len()
-    );
+    info!("ManifestCache: populated, count={}", summaries.len());
 
     // Store in cache
     {
@@ -521,16 +518,15 @@ pub fn delete_local(data_path: &str, backup_name: &str) -> Result<()> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
     // Default backup_dir always included (deleted last, separately)
-    let canonical_default = std::fs::canonicalize(&backup_dir)
-        .unwrap_or_else(|_| backup_dir.clone());
+    let canonical_default =
+        std::fs::canonicalize(&backup_dir).unwrap_or_else(|_| backup_dir.clone());
     seen.insert(canonical_default);
 
     // Per-disk dirs (skip if same canonical path as default)
     for disk_path in disk_map.values() {
         let per_disk = per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
         if per_disk.exists() {
-            let canonical = std::fs::canonicalize(&per_disk)
-                .unwrap_or_else(|_| per_disk.clone());
+            let canonical = std::fs::canonicalize(&per_disk).unwrap_or_else(|_| per_disk.clone());
             if seen.insert(canonical) {
                 dirs_to_delete.push(per_disk);
             }
@@ -2578,8 +2574,14 @@ mod tests {
             compressed_size: 0,
             metadata_size: 0,
             disks: HashMap::from([
-                ("default".to_string(), data_path.to_string_lossy().to_string()),
-                ("nvme1".to_string(), disk2_path.to_string_lossy().to_string()),
+                (
+                    "default".to_string(),
+                    data_path.to_string_lossy().to_string(),
+                ),
+                (
+                    "nvme1".to_string(),
+                    disk2_path.to_string_lossy().to_string(),
+                ),
             ]),
             disk_types: HashMap::new(),
             disk_remote_paths: HashMap::new(),
@@ -2591,14 +2593,19 @@ mod tests {
             rbac_size: 0,
             config_size: 0,
         };
-        manifest.save_to_file(&backup_dir.join("metadata.json")).unwrap();
+        manifest
+            .save_to_file(&backup_dir.join("metadata.json"))
+            .unwrap();
 
         assert!(per_disk_dir.exists());
         assert!(backup_dir.exists());
 
         delete_local(data_path.to_str().unwrap(), "test-del").unwrap();
 
-        assert!(!per_disk_dir.exists(), "Per-disk backup dir should be removed");
+        assert!(
+            !per_disk_dir.exists(),
+            "Per-disk backup dir should be removed"
+        );
         assert!(!backup_dir.exists(), "Default backup dir should be removed");
     }
 
@@ -2624,21 +2631,22 @@ mod tests {
             completed_keys: std::collections::HashSet::new(),
             backup_name: "test-state".to_string(),
             params_hash: "abc".to_string(),
-            disk_map: HashMap::from([
-                ("nvme1".to_string(), disk2_path.to_string_lossy().to_string()),
-            ]),
+            disk_map: HashMap::from([(
+                "nvme1".to_string(),
+                disk2_path.to_string_lossy().to_string(),
+            )]),
         };
-        crate::resume::save_state_file(
-            &backup_dir.join("download.state.json"),
-            &state,
-        ).unwrap();
+        crate::resume::save_state_file(&backup_dir.join("download.state.json"), &state).unwrap();
 
         assert!(per_disk_dir.exists());
         assert!(backup_dir.exists());
 
         delete_local(data_path.to_str().unwrap(), "test-state").unwrap();
 
-        assert!(!per_disk_dir.exists(), "Per-disk dir should be removed via state file fallback");
+        assert!(
+            !per_disk_dir.exists(),
+            "Per-disk dir should be removed via state file fallback"
+        );
         assert!(!backup_dir.exists(), "Default backup dir should be removed");
     }
 
@@ -2698,10 +2706,19 @@ mod tests {
             compressed_size: 0,
             metadata_size: 0,
             disks: HashMap::from([
-                ("default".to_string(), data_path.to_string_lossy().to_string()),
+                (
+                    "default".to_string(),
+                    data_path.to_string_lossy().to_string(),
+                ),
                 // Both point to the same canonical path
-                ("disk_a".to_string(), real_disk.to_string_lossy().to_string()),
-                ("disk_b".to_string(), symlink_disk.to_string_lossy().to_string()),
+                (
+                    "disk_a".to_string(),
+                    real_disk.to_string_lossy().to_string(),
+                ),
+                (
+                    "disk_b".to_string(),
+                    symlink_disk.to_string_lossy().to_string(),
+                ),
             ]),
             disk_types: HashMap::new(),
             disk_remote_paths: HashMap::new(),
@@ -2713,12 +2730,17 @@ mod tests {
             rbac_size: 0,
             config_size: 0,
         };
-        manifest.save_to_file(&backup_dir.join("metadata.json")).unwrap();
+        manifest
+            .save_to_file(&backup_dir.join("metadata.json"))
+            .unwrap();
 
         // Should succeed without double-delete errors
         delete_local(data_path.to_str().unwrap(), "test-sym").unwrap();
 
         assert!(!backup_dir.exists(), "Default backup dir should be removed");
-        assert!(!per_disk_real.exists(), "Per-disk real dir should be removed");
+        assert!(
+            !per_disk_real.exists(),
+            "Per-disk real dir should be removed"
+        );
     }
 }

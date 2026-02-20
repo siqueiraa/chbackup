@@ -37,8 +37,7 @@ pub fn decompress_part(data: &[u8], output_dir: &Path, data_format: &str) -> Res
             })?;
         }
         "zstd" => {
-            let decoder =
-                zstd::Decoder::new(data).context("Failed to create zstd decoder")?;
+            let decoder = zstd::Decoder::new(data).context("Failed to create zstd decoder")?;
             let mut archive = tar::Archive::new(decoder);
             archive.unpack(output_dir).with_context(|| {
                 format!(
@@ -68,10 +67,7 @@ pub fn decompress_part(data: &[u8], output_dir: &Path, data_format: &str) -> Res
             })?;
         }
         other => {
-            return Err(anyhow::anyhow!(
-                "Unknown compression format: {}",
-                other
-            ));
+            return Err(anyhow::anyhow!("Unknown compression format: {}", other));
         }
     }
 

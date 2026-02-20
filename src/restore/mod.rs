@@ -1427,7 +1427,10 @@ mod tests {
 
         // manifest_disks maps nvme1 to nvme_path
         let manifest_disks: HashMap<String, String> = HashMap::from([
-            ("default".to_string(), data_path.to_str().unwrap().to_string()),
+            (
+                "default".to_string(),
+                data_path.to_str().unwrap().to_string(),
+            ),
             ("nvme1".to_string(), nvme_path.to_str().unwrap().to_string()),
         ]);
 

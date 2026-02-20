@@ -764,10 +764,7 @@ mod tests {
         // When disk_path == data_path (default disk), per_disk_backup_dir(disk_path, name)
         // resolves to {data_path}/backup/{name} which is different from backup_dir
         // (the test uses a separate backup_dir, so we check the per-disk path).
-        let per_disk_staging = per_disk_backup_dir(
-            data_path.to_str().unwrap(),
-            "test-backup",
-        );
+        let per_disk_staging = per_disk_backup_dir(data_path.to_str().unwrap(), "test-backup");
         let staged = per_disk_staging
             .join("shadow")
             .join("default")
@@ -1067,7 +1064,10 @@ mod tests {
         // When disk_path == data_path, result should equal {data_path}/backup/{name}
         let data_path = "/var/lib/clickhouse";
         let result = per_disk_backup_dir(data_path, "daily-2024");
-        assert_eq!(result, PathBuf::from("/var/lib/clickhouse/backup/daily-2024"));
+        assert_eq!(
+            result,
+            PathBuf::from("/var/lib/clickhouse/backup/daily-2024")
+        );
     }
 
     #[test]
@@ -1100,10 +1100,7 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&per_disk_part).unwrap();
 
-        let disks = HashMap::from([(
-            "nvme1".to_string(),
-            disk_path.to_string_lossy().to_string(),
-        )]);
+        let disks = HashMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
 
         let result = resolve_shadow_part_path(
             &backup_dir,
@@ -1136,10 +1133,7 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&legacy_path).unwrap();
 
-        let disks = HashMap::from([(
-            "nvme1".to_string(),
-            disk_path.to_string_lossy().to_string(),
-        )]);
+        let disks = HashMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
 
         let result = resolve_shadow_part_path(
             &backup_dir,
@@ -1237,8 +1231,8 @@ mod tests {
             "default",
             "default",
             "trades",
-            "default",  // plain == encoded
-            "trades",   // plain == encoded
+            "default", // plain == encoded
+            "trades",  // plain == encoded
             "202401_1_50_3",
         );
 
