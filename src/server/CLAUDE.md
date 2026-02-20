@@ -70,6 +70,9 @@ async fn handler(State(state): State<AppState>, ...) -> Result<Json<OperationSta
 - Returns 423 Locked if another operation is running (when `allow_parallel=false`)
 - Request bodies use `Option<Json<T>>` to handle empty bodies gracefully
 
+### POST /api/v1/actions Command Dispatch (routes.rs)
+`post_actions()` accepts a `Vec<ActionRequest>` body, extracts the first element's `command` field, splits on whitespace, and dispatches based on the first word. Supported commands: `create`, `upload`, `download`, `restore`, `create_remote`, `restore_remote`, `delete`, `clean_broken`. Each branch loads config/ch/s3 via `state.config.load()` etc., calls the corresponding command function with default parameters, records duration, and calls `finish_op`/`fail_op`. The backup name defaults to the second word (or UTC timestamp if missing). Returns 400 for unknown commands or empty body, 423 if another operation is running.
+
 ### ActionLog Ring Buffer (actions.rs)
 Bounded `VecDeque<ActionEntry>` with configurable capacity (default 100). Tracks all server operations with monotonic IDs. When at capacity, oldest entry is popped on new start. Status lifecycle: `Running` -> `Completed` | `Failed(String)` | `Killed`.
 
@@ -105,11 +108,13 @@ On graceful shutdown, both tables are dropped. Creation failures are logged as w
 When `config.api.secure` is true, uses `axum_server::bind_rustls` with certificates from `config.api.certificate_file` and `config.api.private_key_file`. Otherwise uses plain `axum::serve` with `tokio::net::TcpListener`.
 
 ### Graceful Shutdown (mod.rs)
-Listens for Ctrl+C (SIGINT). On shutdown:
+A `shutdown_signal()` async helper uses `tokio::select!` to wait for either SIGINT (Ctrl+C) or SIGTERM (Unix only, via `SignalKind::terminate()`). On non-Unix platforms, only SIGINT is handled. This enables Kubernetes `kubectl delete pod` (which sends SIGTERM) to trigger the same graceful shutdown as Ctrl+C. On shutdown:
 1. Sends shutdown signal to watch loop (if active)
 2. Drops integration tables (if they were created)
 3. Stops accepting new connections
 4. Logs "Server stopped"
+
+The `shutdown_signal()` helper is used in both the TLS (`axum_server::bind_rustls`) and plain (`axum::serve`) server paths.
 
 ### Prometheus Metrics (metrics.rs)
 A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 metric families, all prefixed with `chbackup_`. Created conditionally in `AppState::new()` based on `config.api.enable_metrics`.
@@ -196,8 +201,11 @@ A SIGQUIT signal handler is spawned in `start_server()` (Unix only, gated by `#[
 ### Tables Pagination (Phase 8)
 `TablesParams` now includes `offset: Option<usize>` and `limit: Option<usize>` query parameters. The `tables()` handler applies `.skip(offset).take(limit)` after building the full result set. An `X-Total-Count` response header reports the total count before pagination for client use. When both parameters are omitted, all results are returned (backward compatible).
 
+### List Endpoint Pagination (routes.rs)
+`ListParams` includes `offset: Option<usize>`, `limit: Option<usize>`, and `format: Option<String>` query parameters (same pattern as `TablesParams`). The `list_backups()` handler builds the full result set, applies `desc` sort if requested, then applies `.skip(offset).take(limit)` pagination. An `X-Total-Count` response header reports the pre-pagination total count. The return type is `Result<([(HeaderName, HeaderValue); 1], Json<Vec<ListResponse>>), ...>` to include the header. The `format` field is stored for integration table DDL compatibility but the API always returns JSON (axum `Json` wrapper).
+
 ### Response Types for Integration Tables
-- `ListResponse` matches ALL columns of `system.backup_list` (name, created, location, size, data_size, object_disk_size, metadata_size, rbac_size, config_size, compressed_size, required). `metadata_size` is populated from `BackupSummary.metadata_size` (Phase 5); `rbac_size` and `config_size` are populated from `BackupSummary.rbac_size` and `BackupSummary.config_size` (Phase 8, computed during `backup::create()`)
+- `ListResponse` matches ALL columns of `system.backup_list` (name, created, location, size, data_size, object_disk_size, metadata_size, rbac_size, config_size, compressed_size, required). All fields are populated from `BackupSummary` via `summary_to_list_response()`: `object_disk_size` from `s.object_disk_size` (sum of S3 object sizes across all parts), `required` from `s.required` (extracted from first `carried:{base}` source in manifest parts), `metadata_size` from `s.metadata_size` (Phase 5), `rbac_size` and `config_size` from `s.rbac_size` and `s.config_size` (Phase 8, computed during `backup::create()`)
 - `ActionResponse` matches ALL columns of `system.backup_actions` (command, start, finish, status, error)
 - Both derive `Serialize` + `Deserialize` for bidirectional JSON compatibility with ClickHouse URL engine
 
