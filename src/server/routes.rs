@@ -90,6 +90,10 @@ pub struct TablesParams {
     pub table: Option<String>,
     pub all: Option<bool>,
     pub backup: Option<String>,
+    /// Starting offset for pagination (0-based).
+    pub offset: Option<usize>,
+    /// Maximum number of results to return.
+    pub limit: Option<usize>,
 }
 
 /// Response entry for GET /api/v1/tables
@@ -323,8 +327,8 @@ fn summary_to_list_response(s: list::BackupSummary, location: &str) -> ListRespo
         data_size: s.size,   // For now, same as size (total uncompressed)
         object_disk_size: 0, // Requires manifest disk_types analysis (future)
         metadata_size: s.metadata_size,
-        rbac_size: 0,        // TODO: requires scanning access/ directory sizes
-        config_size: 0,      // TODO: requires adding config_size to BackupManifest
+        rbac_size: 0,   // TODO: requires scanning access/ directory sizes
+        config_size: 0, // TODO: requires adding config_size to BackupManifest
         compressed_size: s.compressed_size,
         required: String::new(), // No dependency chain tracking yet
     }
@@ -532,14 +536,8 @@ pub async fn download_backup(
         let s3 = state_clone.s3.load();
         let effective_resume = config.general.use_resumable_state;
         let start_time = std::time::Instant::now();
-        let result = crate::download::download(
-            &config,
-            &s3,
-            &name,
-            effective_resume,
-            hardlink,
-        )
-        .await;
+        let result =
+            crate::download::download(&config, &s3, &name, effective_resume, hardlink).await;
         let duration = start_time.elapsed().as_secs_f64();
 
         match result {
@@ -858,14 +856,8 @@ pub async fn restore_remote(
 
         // Step 1: Download from S3
         let effective_resume = config.general.use_resumable_state;
-        let download_result = crate::download::download(
-            &config,
-            &s3,
-            &name,
-            effective_resume,
-            false,
-        )
-        .await;
+        let download_result =
+            crate::download::download(&config, &s3, &name, effective_resume, false).await;
 
         if let Err(e) = download_result {
             let duration = start_time.elapsed().as_secs_f64();
@@ -1272,16 +1264,15 @@ pub async fn restart(
     info!("Restart requested: reloading config and reconnecting clients");
 
     // Load config from disk
-    let config = crate::config::Config::load(&state.config_path, &[])
-        .map_err(|e| {
-            warn!(error = %e, "Restart failed: config load error");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("config load error: {}", e),
-                }),
-            )
-        })?;
+    let config = crate::config::Config::load(&state.config_path, &[]).map_err(|e| {
+        warn!(error = %e, "Restart failed: config load error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("config load error: {}", e),
+            }),
+        )
+    })?;
 
     config.validate().map_err(|e| {
         warn!(error = %e, "Restart failed: config validation error");
@@ -1304,15 +1295,17 @@ pub async fn restart(
         )
     })?;
 
-    let s3 = crate::storage::S3Client::new(&config.s3).await.map_err(|e| {
-        warn!(error = %e, "Restart failed: S3Client creation error");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("S3Client creation error: {}", e),
-            }),
-        )
-    })?;
+    let s3 = crate::storage::S3Client::new(&config.s3)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Restart failed: S3Client creation error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("S3Client creation error: {}", e),
+                }),
+            )
+        })?;
 
     // Verify ClickHouse connectivity
     ch.ping().await.map_err(|e| {
@@ -1350,8 +1343,17 @@ pub async fn restart(
 pub async fn tables(
     State(state): State<AppState>,
     Query(params): Query<TablesParams>,
-) -> Result<Json<Vec<TablesResponseEntry>>, (StatusCode, Json<ErrorResponse>)> {
-    if let Some(backup_name) = &params.backup {
+) -> Result<
+    (
+        [(
+            axum::http::header::HeaderName,
+            axum::http::header::HeaderValue,
+        ); 1],
+        Json<Vec<TablesResponseEntry>>,
+    ),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let results = if let Some(backup_name) = &params.backup {
         // Remote mode: download manifest and list tables from it
         let s3 = state.s3.load();
         let manifest_key = format!("{}/metadata.json", backup_name);
@@ -1427,7 +1429,7 @@ pub async fn tables(
             count = results.len(),
             "tables endpoint returning remote backup tables"
         );
-        Ok(Json(results))
+        results
     } else {
         // Live mode: query ClickHouse
         let ch = state.ch.load();
@@ -1477,8 +1479,39 @@ pub async fn tables(
             count = results.len(),
             "tables endpoint returning live tables"
         );
-        Ok(Json(results))
-    }
+        results
+    };
+
+    // Apply pagination (offset/limit)
+    let total_count = results.len();
+    let offset = params.offset.unwrap_or(0);
+    let results: Vec<TablesResponseEntry> = if let Some(limit) = params.limit {
+        info!(
+            offset = offset,
+            limit = limit,
+            total = total_count,
+            "tables: offset/limit applied"
+        );
+        results.into_iter().skip(offset).take(limit).collect()
+    } else {
+        if offset > 0 {
+            info!(
+                offset = offset,
+                total = total_count,
+                "tables: offset applied"
+            );
+        }
+        results.into_iter().skip(offset).collect()
+    };
+
+    Ok((
+        [(
+            axum::http::header::HeaderName::from_static("x-total-count"),
+            axum::http::header::HeaderValue::from_str(&total_count.to_string())
+                .unwrap_or_else(|_| axum::http::header::HeaderValue::from_static("0")),
+        )],
+        Json(results),
+    ))
 }
 
 /// POST /api/v1/watch/start -- start the watch loop
@@ -2050,5 +2083,31 @@ mod tests {
 
         assert_eq!(result.0, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(result.1, "metrics disabled");
+    }
+
+    #[test]
+    fn test_tables_pagination_params_deserialize() {
+        // Verify TablesParams can be deserialized from JSON with offset/limit
+        let json = r#"{"offset": 5, "limit": 10}"#;
+        let params: TablesParams = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(params.offset, Some(5));
+        assert_eq!(params.limit, Some(10));
+        assert_eq!(params.table, None);
+        assert_eq!(params.backup, None);
+
+        // Verify defaults when offset/limit are omitted
+        let json2 = r#"{"table": "default.*"}"#;
+        let params2: TablesParams = serde_json::from_str(json2).expect("should deserialize");
+        assert_eq!(params2.offset, None);
+        assert_eq!(params2.limit, None);
+        assert_eq!(params2.table.as_deref(), Some("default.*"));
+
+        // Verify all params together
+        let json3 = r#"{"table": "*.trades", "all": true, "offset": 0, "limit": 100}"#;
+        let params3: TablesParams = serde_json::from_str(json3).expect("should deserialize");
+        assert_eq!(params3.table.as_deref(), Some("*.trades"));
+        assert_eq!(params3.all, Some(true));
+        assert_eq!(params3.offset, Some(0));
+        assert_eq!(params3.limit, Some(100));
     }
 }
