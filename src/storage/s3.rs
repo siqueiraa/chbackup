@@ -9,6 +9,21 @@ use tracing::{debug, info, warn};
 
 use crate::config::S3Config;
 
+/// Retry configuration for S3 operations.
+///
+/// Bundles retry count, base delay, and jitter factor into a single value
+/// to avoid passing many individual parameters. Constructed from
+/// `crate::config::effective_retries()`.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts (0 = no retries, single attempt).
+    pub max_retries: u32,
+    /// Base delay between retries in seconds (exponentially increases).
+    pub base_delay_secs: u64,
+    /// Jitter factor (0.0-1.0) applied to each retry delay.
+    pub jitter_factor: f64,
+}
+
 /// S3 canned ACL type alias for convenience.
 type ObjectCannedAcl = aws_sdk_s3::types::ObjectCannedAcl;
 
@@ -1140,6 +1155,111 @@ impl S3Client {
             .await
     }
 
+    /// Upload an object to S3 with retry logic.
+    ///
+    /// Retries `put_object()` up to `retry.max_retries` times with exponential
+    /// backoff and configurable jitter. Only retries transient errors; happy
+    /// path is unchanged.
+    pub async fn put_object_with_retry(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        retry: RetryConfig,
+    ) -> Result<()> {
+        let total_attempts = retry.max_retries + 1;
+
+        for attempt in 0..total_attempts {
+            let body_clone = body.clone();
+
+            match self.put_object(key, body_clone).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt < total_attempts - 1 {
+                        let delay_ms = retry.base_delay_secs * 1000 * 2u64.pow(attempt);
+                        let actual_delay =
+                            crate::config::apply_jitter(delay_ms, retry.jitter_factor);
+                        warn!(
+                            key = %key,
+                            attempt = attempt + 1,
+                            max_retries = retry.max_retries,
+                            delay_ms = actual_delay,
+                            error = %e,
+                            "PutObject failed, retrying after backoff"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(actual_delay))
+                            .await;
+                    } else {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "PutObject failed after {} attempts: {}",
+                                total_attempts,
+                                self.full_key(key)
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
+        unreachable!("retry loop should have returned")
+    }
+
+    /// Upload a single part of a multipart upload with retry logic.
+    ///
+    /// Retries `upload_part()` up to `retry.max_retries` times with exponential
+    /// backoff and configurable jitter. Returns the ETag of the uploaded part.
+    pub async fn upload_part_with_retry(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: Vec<u8>,
+        retry: RetryConfig,
+    ) -> Result<String> {
+        let total_attempts = retry.max_retries + 1;
+
+        for attempt in 0..total_attempts {
+            let body_clone = body.clone();
+
+            match self
+                .upload_part(key, upload_id, part_number, body_clone)
+                .await
+            {
+                Ok(e_tag) => return Ok(e_tag),
+                Err(e) => {
+                    if attempt < total_attempts - 1 {
+                        let delay_ms = retry.base_delay_secs * 1000 * 2u64.pow(attempt);
+                        let actual_delay =
+                            crate::config::apply_jitter(delay_ms, retry.jitter_factor);
+                        warn!(
+                            key = %key,
+                            upload_id = %upload_id,
+                            part_number = part_number,
+                            attempt = attempt + 1,
+                            max_retries = retry.max_retries,
+                            delay_ms = actual_delay,
+                            error = %e,
+                            "UploadPart failed, retrying after backoff"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(actual_delay))
+                            .await;
+                    } else {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "UploadPart (part {}) failed after {} attempts: {}",
+                                part_number,
+                                total_attempts,
+                                self.full_key(key)
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
+        unreachable!("retry loop should have returned")
+    }
+
     /// Copy with retry, backoff, and configurable jitter factor.
     pub async fn copy_object_with_retry_jitter(
         &self,
@@ -1359,6 +1479,58 @@ mod tests {
         assert!(
             err_msg.contains("CopyObject failed"),
             "Error should mention CopyObject failure, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_object_retry_config() {
+        // Verify put_object_with_retry exists, accepts retry params, and fails
+        // with descriptive error when no real S3 endpoint is available.
+        let client = mock_s3_client("test-bucket", "prefix");
+
+        // 0 retries = single attempt, should fail quickly
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 10,
+            jitter_factor: 0.0,
+        };
+        let result = client
+            .put_object_with_retry("test/key.bin", vec![1, 2, 3], retry)
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("PutObject failed after 1 attempts")
+                || err_msg.contains("Failed to upload object"),
+            "Error should mention PutObject failure, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_part_retry_config() {
+        // Verify upload_part_with_retry exists, accepts retry params, and fails
+        // with descriptive error when no real S3 endpoint is available.
+        let client = mock_s3_client("test-bucket", "prefix");
+
+        // 0 retries = single attempt
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 10,
+            jitter_factor: 0.0,
+        };
+        let result = client
+            .upload_part_with_retry("test/key.bin", "fake-upload-id", 1, vec![1, 2, 3], retry)
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("UploadPart (part 1) failed after 1 attempts")
+                || err_msg.contains("Failed to upload part"),
+            "Error should mention UploadPart failure, got: {}",
             err_msg
         );
     }

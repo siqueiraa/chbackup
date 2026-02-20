@@ -33,7 +33,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, UploadState,
 };
-use crate::storage::s3::calculate_chunk_size;
+use crate::storage::s3::{calculate_chunk_size, RetryConfig};
 use crate::storage::S3Client;
 
 /// Multipart upload threshold: parts with compressed data larger than 32 MiB
@@ -451,7 +451,13 @@ pub async fn upload(
     let s3_chunk_size = config.s3.chunk_size;
     let s3_max_parts_count = config.s3.max_parts_count;
     let allow_object_disk_streaming = config.s3.allow_object_disk_streaming;
-    let (_, _, jitter_factor) = crate::config::effective_retries(config);
+    let (retries_on_failure, retry_delay_secs, jitter_factor) =
+        crate::config::effective_retries(config);
+    let retry_config = RetryConfig {
+        max_retries: retries_on_failure,
+        base_delay_secs: retry_delay_secs,
+        jitter_factor,
+    };
 
     // Shared resume state for tracking completed parts across parallel tasks
     let resume_state = if use_resume {
@@ -534,7 +540,13 @@ pub async fn upload(
                         let chunk_data = compressed[chunk_start..chunk_end].to_vec();
 
                         let e_tag = s3
-                            .upload_part(&item.s3_key, &upload_id, part_number, chunk_data)
+                            .upload_part_with_retry(
+                                &item.s3_key,
+                                &upload_id,
+                                part_number,
+                                chunk_data,
+                                retry_config,
+                            )
                             .await?;
 
                         completed_parts.push((part_number, e_tag));
@@ -556,8 +568,8 @@ pub async fn upload(
                     });
                 }
             } else {
-                // Single PutObject
-                s3.put_object(&item.s3_key, compressed)
+                // Single PutObject with retry
+                s3.put_object_with_retry(&item.s3_key, compressed, retry_config)
                     .await
                     .with_context(|| format!("Failed to upload part {} to S3", item.part.name))?;
             }
