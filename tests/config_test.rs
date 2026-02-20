@@ -48,7 +48,7 @@ fn test_default_config_serializes() {
     // Should be parseable back to Config
     let config: Config = serde_yaml::from_str(&yaml).expect("Should parse back from YAML");
     assert_eq!(config.general.log_level, "info");
-    assert_eq!(config.clickhouse.port, 9000);
+    assert_eq!(config.clickhouse.port, 8123);
     assert_eq!(config.s3.bucket, "my-backup-bucket");
 }
 

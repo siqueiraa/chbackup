@@ -689,7 +689,7 @@ fn default_localhost() -> String {
 }
 
 fn default_ch_port() -> u16 {
-    9000
+    8123
 }
 
 fn default_ch_username() -> String {
@@ -1352,6 +1352,20 @@ mod tests {
         assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
         assert_eq!(parse_duration_secs("45m").unwrap(), 2700);
         assert_eq!(parse_duration_secs("120s").unwrap(), 120);
+    }
+
+    #[test]
+    fn test_ch_port_default_http() {
+        // ClickHouse crate uses HTTP protocol (port 8123), not native TCP (port 9000)
+        assert_eq!(
+            default_ch_port(),
+            8123,
+            "default_ch_port should return 8123 for HTTP protocol"
+        );
+
+        // Verify it's wired into ClickHouseConfig default
+        let config = Config::default();
+        assert_eq!(config.clickhouse.port, 8123);
     }
 
     #[test]

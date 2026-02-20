@@ -1448,7 +1448,7 @@ mod tests {
         );
         let client = client.unwrap();
         assert_eq!(client.host, "localhost");
-        assert_eq!(client.port, 9000);
+        assert_eq!(client.port, 8123);
         assert!(client.log_sql_queries);
     }
 
