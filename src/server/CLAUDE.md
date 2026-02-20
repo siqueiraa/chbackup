@@ -177,8 +177,27 @@ All four operation request types (`CreateRequest`, `RestoreRequest`, `CreateRemo
 
 These fields are `Option<bool>` for backward compatibility -- existing API clients that omit these fields get `None`, which defaults to `false`. The `*_backup_always` config overrides still apply on the implementation side.
 
+### ManifestCache Integration (Phase 8)
+`ManifestCache` (defined in `list.rs`) is an in-memory TTL-based cache for remote backup summaries (design 8.4). It avoids redundant S3 manifest downloads during server operation.
+
+- **AppState field**: `manifest_cache: Arc<tokio::sync::Mutex<ManifestCache>>` -- shared across all handlers
+- **TTL**: Configured via `general.remote_cache_ttl_secs` (default 300 seconds / 5 minutes)
+- **Cache usage**: `list_backups()` and `refresh_backup_counts()` call `list::list_remote_cached(&s3, &state.manifest_cache)` instead of `list::list_remote(&s3)`. Cache hit returns stored summaries; miss falls through to S3 and populates cache.
+- **Invalidation**: Cache is explicitly invalidated (`manifest_cache.lock().await.invalidate()`) after mutating operations:
+  - `upload_backup` (after upload completes)
+  - `delete_backup` (remote deletion)
+  - `clean_remote_broken` (after cleanup)
+  - Watch loop retention_remote
+- **Logging**: `ManifestCache: populated, count=N` on cache fill, `ManifestCache: invalidated` on explicit invalidation
+
+### SIGQUIT Handler (Phase 8)
+A SIGQUIT signal handler is spawned in `start_server()` (Unix only, gated by `#[cfg(unix)]`). On `kill -QUIT <pid>`, it captures `std::backtrace::Backtrace::force_capture()` and prints the stack dump to stderr with delimiters (`=== SIGQUIT stack dump ===`). The handler runs in a loop and does not terminate the process. Follows the same pattern as the existing SIGHUP handler. The same handler is also registered in `main.rs` for standalone watch mode.
+
+### Tables Pagination (Phase 8)
+`TablesParams` now includes `offset: Option<usize>` and `limit: Option<usize>` query parameters. The `tables()` handler applies `.skip(offset).take(limit)` after building the full result set. An `X-Total-Count` response header reports the total count before pagination for client use. When both parameters are omitted, all results are returned (backward compatible).
+
 ### Response Types for Integration Tables
-- `ListResponse` matches ALL columns of `system.backup_list` (name, created, location, size, data_size, object_disk_size, metadata_size, rbac_size, config_size, compressed_size, required). `metadata_size` is populated from `BackupSummary.metadata_size` (Phase 5); `rbac_size` and `config_size` remain 0 (TODO: requires scanning directory sizes and adding manifest field respectively)
+- `ListResponse` matches ALL columns of `system.backup_list` (name, created, location, size, data_size, object_disk_size, metadata_size, rbac_size, config_size, compressed_size, required). `metadata_size` is populated from `BackupSummary.metadata_size` (Phase 5); `rbac_size` and `config_size` are populated from `BackupSummary.rbac_size` and `BackupSummary.config_size` (Phase 8, computed during `backup::create()`)
 - `ActionResponse` matches ALL columns of `system.backup_actions` (command, start, finish, status, error)
 - Both derive `Serialize` + `Deserialize` for bidirectional JSON compatibility with ClickHouse URL engine
 

@@ -11,7 +11,7 @@ This module implements the `upload` command -- compresses local backup parts wit
 ```
 src/upload/
   mod.rs      -- Entry point: upload() reads manifest, compresses parts, uploads to S3
-  stream.rs   -- compress_part(): tar directory + LZ4 frame compress to Vec<u8>
+  stream.rs   -- compress_part() (buffered) + compress_part_streaming() (chunked channel) for tar+compress
 ```
 
 ## Key Patterns
@@ -106,9 +106,19 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 ### Simple Directory Upload (Phase 4e)
 - `upload_simple_directory(s3, backup_name, local_dir, prefix)` -- Uploads all files from a local directory to S3 under `{backup_name}/{prefix}/`. Uses `spawn_blocking` + `walkdir` for directory traversal, then sequential `put_object` for each file. No compression (RBAC/config files are small text files). Called after part upload completes but before atomic manifest upload for `access/` and `configs/` directories.
 
+### Streaming Multipart Upload (Phase 8)
+For parts exceeding `config.backup.streaming_upload_threshold` (default 256 MiB uncompressed), the upload pipeline uses a streaming path instead of buffering the entire compressed part in memory.
+
+- **Threshold check**: Before calling `compress_part()`, the pipeline compares `part.size` against `streaming_upload_threshold`. Parts below the threshold use the existing buffered path unchanged.
+- **`compress_part_streaming()`** (stream.rs): Spawns a background `std::thread` that tars+compresses the part directory and sends fixed-size `Vec<u8>` chunks (at least `MIN_MULTIPART_CHUNK` = 5 MiB for S3 multipart compatibility) through a `std::sync::mpsc` channel. A `ChunkedWriter` adapter buffers bytes and flushes chunks when the buffer reaches the target size. The final partial chunk is sent on writer drop.
+- **Streaming upload flow**: Receives chunks from the channel, creates an S3 multipart upload, uploads each chunk as a part via `upload_part_with_retry()`, then completes the multipart. On error, `abort_multipart_upload` is called for cleanup.
+- **Coexistence**: Both `compress_part()` (buffered, returns `Vec<u8>`) and `compress_part_streaming()` (streaming, returns `mpsc::Receiver`) coexist. The buffered path remains the default for most parts. The streaming path is only used for large parts to avoid excessive memory consumption.
+- **Config**: `backup.streaming_upload_threshold` (u64, default 268435456 / 256 MiB). Set to 0 to force all parts through the streaming path; set very high to disable.
+
 ### Public API
 - `upload(config, s3, backup_name, backup_dir, delete_local, diff_from_remote: Option<&str>, resume: bool) -> Result<()>` -- Main entry point with resume and atomic manifest (Phase 2d)
-- `compress_part(part_dir, archive_name, data_format, compression_level) -> Result<Vec<u8>>` -- Sync multi-format compression (lz4, zstd, gzip, none) (Phase 4f)
+- `compress_part(part_dir, archive_name, data_format, compression_level) -> Result<Vec<u8>>` -- Sync multi-format buffered compression (lz4, zstd, gzip, none) (Phase 4f)
+- `compress_part_streaming(part_dir, archive_name, data_format, compression_level, chunk_size) -> Result<mpsc::Receiver<Result<Vec<u8>>>>` -- Sync multi-format streaming compression producing fixed-size chunks via channel (Phase 8)
 - `archive_extension(data_format) -> &str` -- Maps format name to file extension (e.g., "lz4" -> ".tar.lz4") (Phase 4f)
 
 ### Parallel Upload Pattern (Phase 2a)

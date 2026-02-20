@@ -52,6 +52,12 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - `merge_skip_projections()` in `main.rs` merges CLI flag with config list (CLI takes precedence)
 - Empty pattern list means all projections are preserved (default behavior)
 
+### Directory Size Computation (collect.rs, Phase 8)
+- `pub fn dir_size(path: &Path) -> Result<u64>` -- Recursively computes the total size of all files in a directory using `walkdir`. Made public in Phase 8 (was private prior).
+- Used by `backup::create()` after `backup_rbac_and_configs()` to compute `manifest.rbac_size` (from `{backup_dir}/access/`) and `manifest.config_size` (from `{backup_dir}/configs/`).
+- Both sizes are logged at info level: `info!(rbac_size = ..., config_size = ..., "Computed RBAC and config sizes")`.
+- Values flow into `BackupManifest.rbac_size` and `BackupManifest.config_size` (both `u64`, `#[serde(default)]` for backward compatibility), then propagate through `BackupSummary` to `ListResponse` in the server API.
+
 ### CRC64 Checksum (checksum.rs)
 - Uses `crc::Crc::<u64>::new(&crc::CRC_64_XZ)` for ClickHouse-compatible checksums
 - Computes CRC64 of the `checksums.txt` file content for each part

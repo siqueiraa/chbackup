@@ -70,6 +70,7 @@ Things that are easy to get wrong when reading the design doc:
 **Phase 5** (polish gaps): Complete -- API tables/restart endpoints (replacing 501 stubs), --skip-projections flag, --hardlink-exists-files download dedup, progress bar (indicatif), structured exit codes (0/1/2/3/4/130/143), metadata_size in list API response.
 **Phase 6** (Go parity): Complete -- STS AssumeRole for cross-account S3, S3 concurrency + object_disk_path fields, retry jitter wiring (backup.retries_* overrides general.*), multipart CopyObject for >5GB objects, freeze-by-part with error 218 handling, backup failure cleanup, restore --partitions/--skip-empty-tables, check_replicas_before_attach, incremental chain protection in remote retention, API parity (HTTP 423, JSON health, POST actions dispatch, list sizes), watch_is_main_process exit, list --format flag (json/yaml/csv/tsv) + latest/previous shortcuts.
 **Phase 7** (Go parity gaps): Complete -- Reverted config defaults to design doc values (timeout 5m, max_connections 1, acl empty, check_parts_columns false, replica_path without {cluster}), fixed ch_port to 8123 (HTTP protocol), expanded env var overlay to 54+ fields (design doc §2), added PutObject/UploadPart retry with exponential backoff and jitter, updated design doc for genuine Phase 6 improvements (skip_tables _temporary, API 423, backup cleanup, incremental chain protection, multipart CopyObject >5GB).
+**Phase 8** (polish & performance): Complete -- Populated rbac_size/config_size in BackupManifest via dir_size() computation (no longer hardcoded to 0), tables API pagination (offset/limit query params with X-Total-Count header), in-memory ManifestCache with TTL-based expiry for remote backup summaries (design 8.4, default 5min, invalidated on mutations), SIGQUIT stack dump handler (server + standalone watch), streaming multipart upload for large parts via compress_part_streaming() channel-based pipeline (configurable threshold, default 256 MiB).
 
 ## Source Module Map
 
@@ -89,7 +90,7 @@ src/
   resume.rs          -- Resume state types (UploadState, DownloadState, RestoreState), atomic save/load, graceful degradation
   table_filter.rs    -- Glob pattern matching for -t flag, disk exclusion checks
   progress.rs        -- ProgressTracker (indicatif wrapper, TTY-aware, Clone for spawned tasks)
-  list.rs            -- list + delete + clean_broken + retention + GC + clean_shadow (local dir scan + S3), --format output (json/yaml/csv/tsv), latest/previous shortcuts
+  list.rs            -- list + delete + clean_broken + retention + GC + clean_shadow (local dir scan + S3), --format output (json/yaml/csv/tsv), latest/previous shortcuts, ManifestCache (TTL-based remote summary cache)
   backup/            -- create command: parallel FREEZE, disk-aware shadow walk, hardlink/S3 metadata, CRC64, UNFREEZE
   upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart, CopyObject for S3 disk parts
   download/          -- download command: parallel S3 GetObject, LZ4+untar decompress, metadata-only for S3 disk parts
@@ -176,13 +177,15 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **S3 concurrency + object_disk_path** (Phase 6): `S3Client` stores `concurrency` (u32) and `object_disk_path` (String) from config with public getters. `concurrency` controls within-file multipart parallelism; `object_disk_path` provides alternate key prefix for S3 disk objects.
 - **PutObject/UploadPart retry** (Phase 7): `put_object_with_retry()` and `upload_part_with_retry()` wrap S3 upload operations with exponential backoff and jitter using `RetryConfig` struct (max_retries, base_delay_secs, jitter_factor). Clones body for each retry attempt. Wired into upload pipeline replacing direct `put_object()`/`upload_part()` calls.
 - **Expanded env var overlay** (Phase 7): `apply_env_overlay()` covers 54+ config fields (up from 18), fulfilling design doc §2 "every config parameter can be overridden via environment variable." Grouped by section: general (6), clickhouse (10), s3 (8), backup (6), api (4), watch (2). Each follows the existing pattern of `std::env::var()` with type-specific parsing.
+- **rbac_size/config_size computation** (Phase 8): `backup::create()` calls `collect::dir_size()` (made `pub`) after RBAC/config backup to compute `manifest.rbac_size` and `manifest.config_size`. Both fields are `u64` with `#[serde(default)]` for backward compatibility. Propagated through `BackupSummary` to `ListResponse` (replacing hardcoded 0 values).
+- **ManifestCache** (Phase 8): `ManifestCache` in `list.rs` caches remote backup summaries in memory with TTL-based expiry (default 5 min, configurable via `general.remote_cache_ttl_secs`). `list_remote_cached()` checks cache before falling back to S3. Stored in `AppState` as `Arc<tokio::sync::Mutex<ManifestCache>>`. Invalidated explicitly after upload, delete, clean_broken_remote, and watch retention operations.
+- **Tables pagination** (Phase 8): `TablesParams` includes `offset: Option<usize>` and `limit: Option<usize>`. Applied as `.skip(offset).take(limit)` after building the full result set. `X-Total-Count` response header reports pre-pagination count.
+- **SIGQUIT stack dump** (Phase 8): Unix-only signal handler (`SignalKind::quit()`) spawned in both `server/mod.rs` and `main.rs` (standalone watch). Captures `std::backtrace::Backtrace::force_capture()` and prints to stderr. Follows existing SIGHUP handler pattern. Non-terminating (runs in a loop).
+- **Streaming multipart upload** (Phase 8): `compress_part_streaming()` in `upload/stream.rs` spawns a background thread that tars+compresses a part directory and sends fixed-size chunks (>= 5 MiB) via `std::sync::mpsc` channel. Used by the upload pipeline for parts exceeding `backup.streaming_upload_threshold` (default 256 MiB). Coexists with the buffered `compress_part()` path for smaller parts. Each chunk is uploaded as an S3 multipart part via `upload_part_with_retry()`.
 
 ## Remaining Limitations
 
 - No parallel ATTACH within a single table (deferred -- tables parallel is sufficient)
-- No streaming multipart upload (Phase 2a buffers compressed data, then decides single vs multipart)
-- API tables endpoint has no pagination (returns all tables in a single response)
-- rbac_size and config_size in list API response are hardcoded to 0 (would require scanning directory sizes at backup creation time)
 
 ## Build & Test
 
