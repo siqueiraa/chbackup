@@ -410,6 +410,8 @@ pub async fn auto_resume(state: &AppState) {
                         false, // rbac (auto-resume does not include RBAC restore)
                         false, // configs (auto-resume does not include config restore)
                         false, // named_collections (auto-resume does not include named collections restore)
+                        None,  // partitions (auto-resume restores all partitions)
+                        false, // skip_empty_tables
                     )
                     .await;
 

@@ -143,7 +143,7 @@ pub struct ClickHouseConfig {
     pub check_replicas_before_attach: bool,
 
     /// validate column type consistency before backup
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub check_parts_columns: bool,
 
     #[serde(default = "default_mutation_wait_timeout")]
@@ -279,7 +279,7 @@ pub struct S3Config {
     pub disable_cert_verification: bool,
 
     /// S3 ACL ("private", "bucket-owner-full-control", or "" for disabled)
-    #[serde(default)]
+    #[serde(default = "default_s3_acl")]
     pub acl: String,
 
     #[serde(default = "default_storage_class")]
@@ -522,7 +522,7 @@ impl Default for ClickHouseConfig {
             tls_ca: String::new(),
             sync_replicated_tables: true,
             check_replicas_before_attach: true,
-            check_parts_columns: false,
+            check_parts_columns: true,
             mutation_wait_timeout: default_mutation_wait_timeout(),
             restore_as_attach: false,
             restore_schema_on_cluster: String::new(),
@@ -563,7 +563,7 @@ impl Default for S3Config {
             force_path_style: false,
             disable_ssl: false,
             disable_cert_verification: false,
-            acl: String::new(),
+            acl: default_s3_acl(),
             storage_class: default_storage_class(),
             sse: String::new(),
             sse_kms_key_id: String::new(),
@@ -709,7 +709,9 @@ fn default_mutation_wait_timeout() -> String {
 }
 
 fn default_max_connections() -> u32 {
-    1
+    std::thread::available_parallelism()
+        .map(|n| (n.get() as u32 / 2).max(1))
+        .unwrap_or(1)
 }
 
 fn default_restart_command() -> String {
@@ -725,11 +727,12 @@ fn default_skip_tables() -> Vec<String> {
         "system.*".to_string(),
         "INFORMATION_SCHEMA.*".to_string(),
         "information_schema.*".to_string(),
+        "_temporary_and_external_tables.*".to_string(),
     ]
 }
 
 fn default_replica_path() -> String {
-    "/clickhouse/tables/{shard}/{database}/{table}".to_string()
+    "/clickhouse/tables/{cluster}/{shard}/{database}/{table}".to_string()
 }
 
 fn default_replica_name() -> String {
@@ -737,7 +740,7 @@ fn default_replica_name() -> String {
 }
 
 fn default_ch_timeout() -> String {
-    "5m".to_string()
+    "30m".to_string()
 }
 
 fn default_s3_bucket() -> String {
@@ -750,6 +753,10 @@ fn default_s3_region() -> String {
 
 fn default_s3_prefix() -> String {
     "chbackup".to_string()
+}
+
+fn default_s3_acl() -> String {
+    "private".to_string()
 }
 
 fn default_storage_class() -> String {
@@ -1281,6 +1288,49 @@ pub fn parse_duration_secs(s: &str) -> Result<u64> {
         .with_context(|| format!("Invalid duration number: '{}'", num_str))?;
 
     Ok(num * multiplier)
+}
+
+/// Resolve effective retry configuration.
+///
+/// Returns `(retries_count, base_delay_secs, jitter_factor)`.
+/// `backup.*` overrides `general.*` when non-zero.
+pub fn effective_retries(config: &Config) -> (u32, u64, f64) {
+    let retries = if config.backup.retries_on_failure > 0 {
+        config.backup.retries_on_failure
+    } else {
+        config.general.retries_on_failure
+    };
+
+    let base_delay_secs = parse_duration_secs(&config.backup.retries_duration).unwrap_or(10);
+
+    // backup.retries_jitter is 0.0-1.0 (fraction), general.retries_jitter is 0-100 (percent)
+    let jitter = if config.backup.retries_jitter > 0.0 {
+        config.backup.retries_jitter
+    } else {
+        config.general.retries_jitter as f64 / 100.0
+    };
+
+    (retries, base_delay_secs, jitter)
+}
+
+/// Apply jitter to a delay duration.
+///
+/// Returns `base_delay * (1.0 + random_fraction * jitter_factor)`.
+/// Uses a simple XorShift-based PRNG seeded from the current time to avoid
+/// adding a `rand` dependency.
+pub fn apply_jitter(base_delay_ms: u64, jitter_factor: f64) -> u64 {
+    if jitter_factor <= 0.0 || base_delay_ms == 0 {
+        return base_delay_ms;
+    }
+    // Simple pseudo-random: use current nanoseconds as entropy source
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    // Map to 0.0..1.0 range
+    let random_fraction = (nanos as f64) / (u32::MAX as f64);
+    let jittered = base_delay_ms as f64 * (1.0 + random_fraction * jitter_factor);
+    jittered as u64
 }
 
 #[cfg(test)]

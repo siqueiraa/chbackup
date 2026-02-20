@@ -23,8 +23,23 @@ pub enum Location {
     Remote,
 }
 
+/// Output format for list commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListFormat {
+    /// Default human-readable table format.
+    Default,
+    /// JSON array output.
+    Json,
+    /// YAML output.
+    Yaml,
+    /// CSV with header row.
+    Csv,
+    /// Tab-separated values with header row.
+    Tsv,
+}
+
 /// Summary of a single backup for display in list output.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackupSummary {
     /// Backup name.
     pub name: String,
@@ -45,38 +60,188 @@ pub struct BackupSummary {
     pub broken_reason: Option<String>,
 }
 
-/// List backups based on the requested location.
+/// List backups based on the requested location and output format.
 ///
 /// If `location` is `None`, shows both local and remote backups.
 /// If `Some(Local)`, shows only local backups.
 /// If `Some(Remote)`, shows only remote backups.
-pub async fn list(data_path: &str, s3: &S3Client, location: Option<&Location>) -> Result<()> {
+///
+/// The `format` parameter controls output format (default table, JSON, YAML, CSV, TSV).
+pub async fn list(
+    data_path: &str,
+    s3: &S3Client,
+    location: Option<&Location>,
+    format: &ListFormat,
+) -> Result<()> {
     let show_local = location.is_none() || location == Some(&Location::Local);
     let show_remote = location.is_none() || location == Some(&Location::Remote);
 
-    if show_local {
-        let local_backups = list_local(data_path)?;
-        println!("Local backups:");
-        if local_backups.is_empty() {
-            println!("  (none)");
-        } else {
-            print_backup_table(&local_backups);
-        }
-        println!();
-    }
+    match format {
+        ListFormat::Default => {
+            // Original human-readable table format
+            if show_local {
+                let local_backups = list_local(data_path)?;
+                println!("Local backups:");
+                if local_backups.is_empty() {
+                    println!("  (none)");
+                } else {
+                    print_backup_table(&local_backups);
+                }
+                println!();
+            }
 
-    if show_remote {
-        let remote_backups = list_remote(s3).await?;
-        println!("Remote backups:");
-        if remote_backups.is_empty() {
-            println!("  (none)");
-        } else {
-            print_backup_table(&remote_backups);
+            if show_remote {
+                let remote_backups = list_remote(s3).await?;
+                println!("Remote backups:");
+                if remote_backups.is_empty() {
+                    println!("  (none)");
+                } else {
+                    print_backup_table(&remote_backups);
+                }
+                println!();
+            }
         }
-        println!();
+        _ => {
+            // Structured formats: collect all requested backups then format
+            let mut all_backups = Vec::new();
+
+            if show_local {
+                let local_backups = list_local(data_path)?;
+                all_backups.extend(local_backups);
+            }
+
+            if show_remote {
+                let remote_backups = list_remote(s3).await?;
+                all_backups.extend(remote_backups);
+            }
+
+            let output = format_list_output(&all_backups, format)?;
+            println!("{output}");
+        }
     }
 
     Ok(())
+}
+
+/// Format a list of backup summaries according to the specified format.
+///
+/// Returns the formatted string. Supports JSON, YAML, CSV, TSV, and default table format.
+pub fn format_list_output(summaries: &[BackupSummary], format: &ListFormat) -> Result<String> {
+    match format {
+        ListFormat::Default => {
+            // Build the default table format as a string
+            let mut output = String::new();
+            for s in summaries {
+                let status = if s.is_broken {
+                    match &s.broken_reason {
+                        Some(reason) => format!(" [BROKEN: {}]", reason),
+                        None => " [BROKEN]".to_string(),
+                    }
+                } else {
+                    String::new()
+                };
+                let ts = match &s.timestamp {
+                    Some(t) => t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                    None => "unknown".to_string(),
+                };
+                let size_str = format_size(s.size);
+                let compressed_str = format_size(s.compressed_size);
+                output.push_str(&format!(
+                    "  {}{}\t{}\t{}\t{}\t{} tables\n",
+                    s.name, status, ts, size_str, compressed_str, s.table_count
+                ));
+            }
+            Ok(output.trim_end().to_string())
+        }
+        ListFormat::Json => {
+            let json = serde_json::to_string_pretty(summaries)
+                .context("Failed to serialize backup list to JSON")?;
+            Ok(json)
+        }
+        ListFormat::Yaml => {
+            let yaml = serde_yaml::to_string(summaries)
+                .context("Failed to serialize backup list to YAML")?;
+            Ok(yaml.trim_end().to_string())
+        }
+        ListFormat::Csv => Ok(format_delimited(summaries, ',')),
+        ListFormat::Tsv => Ok(format_delimited(summaries, '\t')),
+    }
+}
+
+/// Format backup summaries as delimited text (CSV or TSV).
+fn format_delimited(summaries: &[BackupSummary], delimiter: char) -> String {
+    let mut output = String::new();
+    let d = &delimiter.to_string();
+
+    // Header row
+    let headers = [
+        "name",
+        "timestamp",
+        "size",
+        "compressed_size",
+        "table_count",
+        "metadata_size",
+        "is_broken",
+        "broken_reason",
+    ];
+    output.push_str(&headers.join(d));
+    output.push('\n');
+
+    // Data rows
+    for s in summaries {
+        let ts = match &s.timestamp {
+            Some(t) => t.to_rfc3339(),
+            None => String::new(),
+        };
+        let broken_reason = s.broken_reason.as_deref().unwrap_or("");
+
+        let fields = [
+            s.name.as_str(),
+            &ts,
+            &s.size.to_string(),
+            &s.compressed_size.to_string(),
+            &s.table_count.to_string(),
+            &s.metadata_size.to_string(),
+            &s.is_broken.to_string(),
+            broken_reason,
+        ];
+        output.push_str(&fields.join(d));
+        output.push('\n');
+    }
+
+    output.trim_end().to_string()
+}
+
+/// Resolve the "latest" or "previous" backup name shortcut from a sorted backup list.
+///
+/// - `"latest"` resolves to the most recent (last) backup by timestamp.
+/// - `"previous"` resolves to the second-most-recent backup.
+/// - Any other value is returned as-is.
+///
+/// The provided backups should be sorted by name/timestamp ascending (as returned
+/// by [`list_local`] and [`list_remote`]). Only non-broken backups are considered
+/// for shortcut resolution.
+pub fn resolve_backup_shortcut(name: &str, backups: &[BackupSummary]) -> Result<String> {
+    match name {
+        "latest" => {
+            let valid: Vec<&BackupSummary> = backups.iter().filter(|b| !b.is_broken).collect();
+            valid
+                .last()
+                .map(|b| b.name.clone())
+                .ok_or_else(|| anyhow::anyhow!("No backups found to resolve 'latest'"))
+        }
+        "previous" => {
+            let valid: Vec<&BackupSummary> = backups.iter().filter(|b| !b.is_broken).collect();
+            if valid.len() < 2 {
+                anyhow::bail!(
+                    "Not enough backups for 'previous' (found {} valid backups)",
+                    valid.len()
+                );
+            }
+            Ok(valid[valid.len() - 2].name.clone())
+        }
+        _ => Ok(name.to_string()),
+    }
 }
 
 /// Scan local backup directories and parse their manifests.
@@ -618,11 +783,61 @@ pub async fn gc_delete_backup(
     Ok(())
 }
 
+/// Collect the set of backup names referenced as incremental bases by a list of backups.
+///
+/// Scans the `source` field of every `PartInfo` in the given manifests. Parts with
+/// `source = "carried:{base_name}"` indicate that the backup depends on `{base_name}`
+/// for its data. Returns the set of all such base names.
+async fn collect_incremental_bases(s3: &S3Client, surviving_names: &[&str]) -> HashSet<String> {
+    let mut bases = HashSet::new();
+
+    for name in surviving_names {
+        let manifest_key = format!("{}/metadata.json", name);
+        let manifest = match s3.get_object(&manifest_key).await {
+            Ok(data) => match BackupManifest::from_json_bytes(&data) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        backup = %name,
+                        error = %e,
+                        "retention_remote: failed to parse surviving manifest for incremental check"
+                    );
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!(
+                    backup = %name,
+                    error = %e,
+                    "retention_remote: failed to download surviving manifest for incremental check"
+                );
+                continue;
+            }
+        };
+
+        for table in manifest.tables.values() {
+            for parts in table.parts.values() {
+                for part in parts {
+                    if let Some(base_name) = part.source.strip_prefix("carried:") {
+                        bases.insert(base_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    bases
+}
+
 /// Delete oldest remote backups exceeding the `keep` count with GC-safe deletion.
 ///
 /// For each backup to delete, collects referenced keys from all surviving
 /// manifests fresh (per design 8.2 race protection), then uses `gc_delete_backup`
 /// to only delete unreferenced keys.
+///
+/// Before deleting a backup, checks whether any SURVIVING backup references it as
+/// an incremental base (via `carried:{name}` in `PartInfo.source`). If so, the
+/// deletion is skipped to prevent orphaned incremental backups.
 ///
 /// Broken backups are excluded from retention counting (not deleted by retention).
 /// Errors on individual backup deletions are logged as warnings, not fatal.
@@ -651,9 +866,38 @@ pub async fn retention_remote(s3: &S3Client, keep: i32) -> Result<usize> {
 
     let to_delete = valid.len() - keep;
     let total = backups.len();
+
+    // Determine surviving backups (those that will be kept)
+    let surviving_names: Vec<&str> = valid
+        .iter()
+        .skip(to_delete)
+        .map(|b| b.name.as_str())
+        .collect();
+
+    // Collect all backup names referenced as incremental bases by surviving backups
+    let incremental_bases = collect_incremental_bases(s3, &surviving_names).await;
+
+    // DEBUG_MARKER:F001 - verify incremental base protection
+    debug!(
+        target: "debug",
+        "DEBUG_VERIFY:F001 incremental_bases={:?}, to_delete_count={}, surviving_count={}",
+        incremental_bases, to_delete, surviving_names.len()
+    );
+    // END_DEBUG_MARKER:F001
+
     let mut deleted = 0;
 
     for b in valid.iter().take(to_delete) {
+        // Check if this backup is referenced as an incremental base by any surviving backup
+        if incremental_bases.contains(&b.name) {
+            warn!(
+                backup = %b.name,
+                "Skipping deletion of {}: referenced as incremental base by surviving backup(s)",
+                b.name
+            );
+            continue;
+        }
+
         // Collect referenced keys fresh for each deletion (design 8.2 race protection)
         let referenced_keys = match gc_collect_referenced_keys(s3, &b.name).await {
             Ok(keys) => keys,
@@ -1754,5 +1998,305 @@ mod tests {
         let summary = parse_backup_summary("test-backup", &metadata_path);
         assert!(!summary.is_broken);
         assert_eq!(summary.metadata_size, 1024);
+    }
+
+    // -- Format output tests --
+
+    #[test]
+    fn test_format_list_output_json() {
+        let summaries = vec![BackupSummary {
+            name: "test-backup".to_string(),
+            timestamp: None,
+            size: 1000,
+            compressed_size: 500,
+            table_count: 2,
+            metadata_size: 256,
+            is_broken: false,
+            broken_reason: None,
+        }];
+
+        let output = format_list_output(&summaries, &ListFormat::Json).unwrap();
+        assert!(output.contains("\"name\": \"test-backup\""));
+        assert!(output.contains("\"size\": 1000"));
+
+        // Should be valid JSON
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["name"], "test-backup");
+    }
+
+    #[test]
+    fn test_format_list_output_yaml() {
+        let summaries = vec![BackupSummary {
+            name: "test-backup".to_string(),
+            timestamp: None,
+            size: 1000,
+            compressed_size: 500,
+            table_count: 2,
+            metadata_size: 256,
+            is_broken: false,
+            broken_reason: None,
+        }];
+
+        let output = format_list_output(&summaries, &ListFormat::Yaml).unwrap();
+        assert!(output.contains("name: test-backup"));
+        assert!(output.contains("size: 1000"));
+    }
+
+    #[test]
+    fn test_format_list_output_csv() {
+        let summaries = vec![BackupSummary {
+            name: "backup-1".to_string(),
+            timestamp: None,
+            size: 2000,
+            compressed_size: 1000,
+            table_count: 5,
+            metadata_size: 128,
+            is_broken: false,
+            broken_reason: None,
+        }];
+
+        let output = format_list_output(&summaries, &ListFormat::Csv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 data row
+        assert!(lines[0].contains("name,timestamp,size"));
+        assert!(lines[1].starts_with("backup-1,"));
+        assert!(lines[1].contains("2000"));
+    }
+
+    #[test]
+    fn test_format_list_output_tsv() {
+        let summaries = vec![BackupSummary {
+            name: "backup-1".to_string(),
+            timestamp: None,
+            size: 2000,
+            compressed_size: 1000,
+            table_count: 5,
+            metadata_size: 128,
+            is_broken: false,
+            broken_reason: None,
+        }];
+
+        let output = format_list_output(&summaries, &ListFormat::Tsv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("name\ttimestamp\tsize"));
+        assert!(lines[1].starts_with("backup-1\t"));
+    }
+
+    #[test]
+    fn test_format_list_output_default() {
+        let summaries = vec![BackupSummary {
+            name: "my-backup".to_string(),
+            timestamp: None,
+            size: 1_048_576,
+            compressed_size: 524_288,
+            table_count: 3,
+            metadata_size: 0,
+            is_broken: false,
+            broken_reason: None,
+        }];
+
+        let output = format_list_output(&summaries, &ListFormat::Default).unwrap();
+        assert!(output.contains("my-backup"));
+        assert!(output.contains("1.00 MB"));
+        assert!(output.contains("3 tables"));
+    }
+
+    #[test]
+    fn test_format_list_output_empty() {
+        let summaries: Vec<BackupSummary> = vec![];
+
+        let json = format_list_output(&summaries, &ListFormat::Json).unwrap();
+        assert_eq!(json, "[]");
+
+        let csv = format_list_output(&summaries, &ListFormat::Csv).unwrap();
+        // CSV with empty data should just have header
+        assert!(csv.contains("name"));
+        assert_eq!(csv.lines().count(), 1);
+    }
+
+    // -- Backup shortcut tests --
+
+    #[test]
+    fn test_resolve_backup_shortcut_latest() {
+        let backups = vec![
+            BackupSummary {
+                name: "backup-a".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "backup-b".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "backup-c".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                is_broken: false,
+                broken_reason: None,
+            },
+        ];
+
+        let resolved = resolve_backup_shortcut("latest", &backups).unwrap();
+        assert_eq!(resolved, "backup-c");
+    }
+
+    #[test]
+    fn test_resolve_backup_shortcut_previous() {
+        let backups = vec![
+            BackupSummary {
+                name: "backup-a".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "backup-b".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "backup-c".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                is_broken: false,
+                broken_reason: None,
+            },
+        ];
+
+        let resolved = resolve_backup_shortcut("previous", &backups).unwrap();
+        assert_eq!(resolved, "backup-b");
+    }
+
+    #[test]
+    fn test_resolve_backup_shortcut_passthrough() {
+        let backups = vec![];
+        let resolved = resolve_backup_shortcut("my-specific-backup", &backups).unwrap();
+        assert_eq!(resolved, "my-specific-backup");
+    }
+
+    #[test]
+    fn test_resolve_backup_shortcut_latest_no_backups() {
+        let backups: Vec<BackupSummary> = vec![];
+        let result = resolve_backup_shortcut("latest", &backups);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No backups found"));
+    }
+
+    #[test]
+    fn test_resolve_backup_shortcut_previous_not_enough() {
+        let backups = vec![BackupSummary {
+            name: "only-one".to_string(),
+            timestamp: None,
+            size: 0,
+            compressed_size: 0,
+            table_count: 0,
+            metadata_size: 0,
+            is_broken: false,
+            broken_reason: None,
+        }];
+
+        let result = resolve_backup_shortcut("previous", &backups);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Not enough backups"));
+    }
+
+    #[test]
+    fn test_resolve_backup_shortcut_skips_broken() {
+        let backups = vec![
+            BackupSummary {
+                name: "backup-a".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "backup-b-broken".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                is_broken: true,
+                broken_reason: Some("corrupt".to_string()),
+            },
+            BackupSummary {
+                name: "backup-c".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                is_broken: false,
+                broken_reason: None,
+            },
+        ];
+
+        // latest should skip broken and return backup-c
+        let resolved = resolve_backup_shortcut("latest", &backups).unwrap();
+        assert_eq!(resolved, "backup-c");
+
+        // previous should skip broken and return backup-a
+        let resolved = resolve_backup_shortcut("previous", &backups).unwrap();
+        assert_eq!(resolved, "backup-a");
+    }
+
+    #[test]
+    fn test_backup_summary_deserialize_roundtrip() {
+        let summary = BackupSummary {
+            name: "roundtrip-test".to_string(),
+            timestamp: Some(chrono::Utc::now()),
+            size: 12345,
+            compressed_size: 6789,
+            table_count: 4,
+            metadata_size: 512,
+            is_broken: false,
+            broken_reason: None,
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let deserialized: BackupSummary = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.name, summary.name);
+        assert_eq!(deserialized.size, summary.size);
+        assert_eq!(deserialized.compressed_size, summary.compressed_size);
+        assert_eq!(deserialized.table_count, summary.table_count);
+        assert_eq!(deserialized.metadata_size, summary.metadata_size);
+        assert_eq!(deserialized.is_broken, summary.is_broken);
     }
 }

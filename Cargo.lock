@@ -745,6 +745,7 @@ dependencies = [
  "arc-swap",
  "aws-config",
  "aws-sdk-s3",
+ "aws-sdk-sts",
  "axum",
  "axum-server",
  "base64",

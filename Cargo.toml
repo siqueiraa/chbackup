@@ -36,6 +36,7 @@ clickhouse = { version = "0.13", features = ["inserter", "native-tls"] }
 
 # S3
 aws-sdk-s3 = "1"
+aws-sdk-sts = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 
 # Compression

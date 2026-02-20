@@ -18,6 +18,10 @@ pub struct ChClient {
     port: u16,
     /// Whether to log SQL queries at info level (vs debug).
     log_sql_queries: bool,
+    /// Verbose debug logging of all queries and responses.
+    /// Stored for future use; currently wired via log_sql_queries override.
+    #[allow(dead_code)]
+    debug: bool,
 }
 
 /// Row from `system.tables` query.
@@ -204,11 +208,16 @@ impl ChClient {
             client = client.with_password(&config.password);
         }
 
+        if config.debug {
+            info!("ClickHouse debug mode enabled: all queries will be logged at info level");
+        }
+
         Ok(Self {
             inner: client,
             host: config.host.clone(),
             port: config.port,
-            log_sql_queries: config.log_sql_queries,
+            log_sql_queries: config.log_sql_queries || config.debug,
+            debug: config.debug,
         })
     }
 
@@ -630,6 +639,118 @@ impl ChClient {
             .with_context(|| format!("Failed to query system.parts for {}.{}", db, table))?;
 
         Ok(rows)
+    }
+
+    /// Query distinct partition IDs from `system.parts` for a specific table.
+    ///
+    /// Returns the list of distinct partition_id values for active parts.
+    /// Optionally applies an additional WHERE clause for filtering (from
+    /// `clickhouse.freeze_by_part_where` config).
+    pub async fn query_distinct_partitions(
+        &self,
+        db: &str,
+        table: &str,
+        extra_where: &str,
+    ) -> Result<Vec<String>> {
+        let mut sql = format!(
+            "SELECT DISTINCT partition_id FROM system.parts \
+             WHERE database = '{}' AND table = '{}' AND active = 1",
+            db, table
+        );
+
+        if !extra_where.is_empty() {
+            sql.push_str(&format!(" AND ({})", extra_where));
+        }
+
+        sql.push_str(" ORDER BY partition_id");
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing query_distinct_partitions");
+        } else {
+            debug!(sql = %sql, "Executing query_distinct_partitions");
+        }
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct PartitionRow {
+            partition_id: String,
+        }
+
+        let rows = self
+            .inner
+            .query(&sql)
+            .fetch_all::<PartitionRow>()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to query distinct partitions for {}.{}",
+                    db, table
+                )
+            })?;
+
+        Ok(rows.into_iter().map(|r| r.partition_id).collect())
+    }
+
+    /// Check if a Replicated table is in sync by querying `system.replicas`.
+    ///
+    /// Returns `Ok(true)` if the table is fully synced (queue is empty and
+    /// all parts have been fetched). Returns `Ok(false)` if the table has
+    /// pending operations. Returns an error if the query fails.
+    ///
+    /// Used by `check_replicas_before_attach` config option to warn about
+    /// out-of-sync replicas before ATTACH PART.
+    pub async fn check_replica_sync(&self, db: &str, table: &str) -> Result<bool> {
+        let sql = format!(
+            "SELECT is_readonly, is_session_expired, future_parts, \
+             parts_to_check, queue_size, inserts_in_queue, merges_in_queue \
+             FROM system.replicas \
+             WHERE database = '{}' AND table = '{}'",
+            db, table
+        );
+
+        if self.log_sql_queries {
+            info!(sql = %sql, "Executing check_replica_sync");
+        } else {
+            debug!(sql = %sql, "Executing check_replica_sync");
+        }
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct ReplicaRow {
+            is_readonly: u8,
+            is_session_expired: u8,
+            future_parts: u32,
+            parts_to_check: u32,
+            queue_size: u32,
+            inserts_in_queue: u32,
+            merges_in_queue: u32,
+        }
+
+        let rows = self
+            .inner
+            .query(&sql)
+            .fetch_all::<ReplicaRow>()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to query system.replicas for {}.{}",
+                    db, table
+                )
+            })?;
+
+        if rows.is_empty() {
+            // Table not found in system.replicas -- not a Replicated table
+            return Ok(true);
+        }
+
+        let row = &rows[0];
+        let is_synced = row.is_readonly == 0
+            && row.is_session_expired == 0
+            && row.future_parts == 0
+            && row.parts_to_check == 0
+            && row.queue_size == 0
+            && row.inserts_in_queue == 0
+            && row.merges_in_queue == 0;
+
+        Ok(is_synced)
     }
 
     // -- Parts column consistency check --

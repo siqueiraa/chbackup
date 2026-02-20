@@ -17,7 +17,7 @@ use chbackup::{backup, download, list, restore, upload};
 use chrono::Utc;
 use clap::Parser;
 use cli::{Cli, Command};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Extract the command name (as used by [`lock_for_command`]) from a [`Command`].
 fn command_name(cmd: &Command) -> &'static str {
@@ -189,7 +189,8 @@ async fn run() -> Result<()> {
             resume,
             backup_name,
         } => {
-            let name = backup_name_required(backup_name, "upload")?;
+            let raw_name = backup_name_required(backup_name, "upload")?;
+            let name = resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?;
             let s3 = S3Client::new(&config.s3).await?;
 
             let backup_dir = PathBuf::from(&config.clickhouse.data_path)
@@ -216,8 +217,9 @@ async fn run() -> Result<()> {
             resume,
             backup_name,
         } => {
-            let name = backup_name_required(backup_name, "download")?;
+            let raw_name = backup_name_required(backup_name, "download")?;
             let s3 = S3Client::new(&config.s3).await?;
+            let name = resolve_remote_shortcut(&raw_name, &s3).await?;
 
             let effective_resume = resume && config.general.use_resumable_state;
             let backup_dir = download::download(
@@ -251,15 +253,8 @@ async fn run() -> Result<()> {
             skip_empty_tables,
             backup_name,
         } => {
-            // Warn about flags not yet implemented
-            if partitions.is_some() {
-                warn!("--partitions flag is not yet implemented for restore, ignoring");
-            }
-            if skip_empty_tables {
-                warn!("--skip-empty-tables flag is not yet implemented, ignoring");
-            }
-
-            let name = backup_name_required(backup_name, "restore")?;
+            let raw_name = backup_name_required(backup_name, "restore")?;
+            let name = resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?;
             let ch = ChClient::new(&config.clickhouse)?;
 
             let db_mapping = match &database_mapping {
@@ -282,6 +277,8 @@ async fn run() -> Result<()> {
                 rbac,
                 configs,
                 named_collections,
+                partitions.as_deref(),
+                skip_empty_tables,
             )
             .await?;
 
@@ -359,14 +356,10 @@ async fn run() -> Result<()> {
             resume,
             backup_name,
         } => {
-            // Warn about unimplemented flags
-            if skip_empty_tables {
-                warn!("--skip-empty-tables flag is not yet implemented, ignoring");
-            }
-
-            let name = backup_name_required(backup_name, "restore_remote")?;
+            let raw_name = backup_name_required(backup_name, "restore_remote")?;
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
+            let name = resolve_remote_shortcut(&raw_name, &s3).await?;
 
             let db_mapping = match &database_mapping {
                 Some(s) => Some(remap::parse_database_mapping(s)?),
@@ -393,17 +386,20 @@ async fn run() -> Result<()> {
                 rbac,
                 configs,
                 named_collections,
+                None, // partitions (not a flag on restore_remote per design)
+                skip_empty_tables,
             )
             .await?;
 
             info!(backup_name = %name, "RestoreRemote command complete");
         }
 
-        Command::List { location } => {
+        Command::List { location, format } => {
             let s3 = S3Client::new(&config.s3).await?;
             let loc = location.map(map_cli_location);
+            let fmt = map_cli_list_format(format);
 
-            list::list(&config.clickhouse.data_path, &s3, loc.as_ref()).await?;
+            list::list(&config.clickhouse.data_path, &s3, loc.as_ref(), &fmt).await?;
 
             info!("List command complete");
         }
@@ -511,9 +507,16 @@ async fn run() -> Result<()> {
             location,
             backup_name,
         } => {
-            let name = backup_name_required(backup_name, "delete")?;
+            let raw_name = backup_name_required(backup_name, "delete")?;
             let s3 = S3Client::new(&config.s3).await?;
             let loc = map_cli_location(location);
+
+            let name = match &loc {
+                list::Location::Local => {
+                    resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?
+                }
+                list::Location::Remote => resolve_remote_shortcut(&raw_name, &s3).await?,
+            };
 
             list::delete(&config.clickhouse.data_path, &s3, &loc, &name).await?;
 
@@ -666,6 +669,47 @@ fn map_cli_location(loc: cli::Location) -> list::Location {
     match loc {
         cli::Location::Local => list::Location::Local,
         cli::Location::Remote => list::Location::Remote,
+    }
+}
+
+/// Map the CLI `ListFormat` enum to the list module's `ListFormat` enum.
+fn map_cli_list_format(fmt: cli::ListFormat) -> list::ListFormat {
+    match fmt {
+        cli::ListFormat::Default => list::ListFormat::Default,
+        cli::ListFormat::Json => list::ListFormat::Json,
+        cli::ListFormat::Yaml => list::ListFormat::Yaml,
+        cli::ListFormat::Csv => list::ListFormat::Csv,
+        cli::ListFormat::Tsv => list::ListFormat::Tsv,
+    }
+}
+
+/// Resolve "latest" or "previous" backup name shortcuts against local backups.
+///
+/// If the name is "latest" or "previous", scans local backup directories and
+/// resolves to the actual backup name. Otherwise returns the name unchanged.
+fn resolve_local_shortcut(name: &str, data_path: &str) -> Result<String> {
+    if name == "latest" || name == "previous" {
+        let backups = list::list_local(data_path)?;
+        let resolved = list::resolve_backup_shortcut(name, &backups)?;
+        info!(original = name, resolved = %resolved, "Resolved local backup name shortcut");
+        Ok(resolved)
+    } else {
+        Ok(name.to_string())
+    }
+}
+
+/// Resolve "latest" or "previous" backup name shortcuts against remote backups.
+///
+/// If the name is "latest" or "previous", queries S3 for remote backups and
+/// resolves to the actual backup name. Otherwise returns the name unchanged.
+async fn resolve_remote_shortcut(name: &str, s3: &S3Client) -> Result<String> {
+    if name == "latest" || name == "previous" {
+        let backups = list::list_remote(s3).await?;
+        let resolved = list::resolve_backup_shortcut(name, &backups)?;
+        info!(original = name, resolved = %resolved, "Resolved remote backup name shortcut");
+        Ok(resolved)
+    } else {
+        Ok(name.to_string())
     }
 }
 

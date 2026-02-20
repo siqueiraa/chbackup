@@ -401,7 +401,9 @@ pub async fn download(
     // 4. Download parts in parallel with semaphore and rate limiter
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let rate_limiter = RateLimiter::new(config.backup.download_max_bytes_per_second);
-    let retries_on_failure = config.general.retries_on_failure;
+    let (effective_retries_count, effective_retry_delay_secs, effective_jitter) =
+        crate::config::effective_retries(config);
+    let retries_on_failure = effective_retries_count;
 
     // Shared resume state for tracking completed parts across parallel tasks
     let resume_state = if use_resume {
@@ -611,12 +613,16 @@ pub async fn download(
 
                 for attempt in 0..max_attempts {
                     if attempt > 0 {
+                        let delay_ms = effective_retry_delay_secs * 1000;
+                        let jittered_ms = crate::config::apply_jitter(delay_ms, effective_jitter);
                         info!(
                             table = %item.table_key,
                             part = %part_name,
                             attempt = attempt + 1,
+                            delay_ms = jittered_ms,
                             "Retrying download after CRC64 mismatch"
                         );
+                        tokio::time::sleep(std::time::Duration::from_millis(jittered_ms)).await;
                     }
 
                     let compressed_data = s3.get_object(&backup_key).await.with_context(|| {

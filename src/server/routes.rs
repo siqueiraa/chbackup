@@ -46,6 +46,7 @@ pub struct StatusResponse {
 /// Response for GET /api/v1/actions -- matches system.backup_actions table schema
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ActionResponse {
+    pub id: u64,
     pub command: String,
     pub start: String,
     pub finish: String,
@@ -63,6 +64,8 @@ pub struct ActionRequest {
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
     pub location: Option<String>,
+    /// When true, reverse sort order (newest first instead of oldest first)
+    pub desc: Option<bool>,
 }
 
 /// Response for GET /api/v1/list -- matches ALL columns of system.backup_list table
@@ -117,9 +120,17 @@ pub struct OperationStarted {
 // Read-only endpoints
 // ---------------------------------------------------------------------------
 
-/// GET /health -- simple health check
-pub async fn health() -> &'static str {
-    "OK"
+/// Response for GET /health -- JSON health check (Go parity)
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+}
+
+/// GET /health -- JSON health check (Go returns `{"status":"ok"}`)
+pub async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+    })
 }
 
 /// GET /api/v1/version -- return chbackup and ClickHouse versions
@@ -182,6 +193,7 @@ pub async fn get_actions(State(state): State<AppState>) -> Json<Vec<ActionRespon
             };
 
             ActionResponse {
+                id: e.id,
                 command: e.command.clone(),
                 start: e.start.to_rfc3339(),
                 finish: e.finish.map(|f| f.to_rfc3339()).unwrap_or_default(),
@@ -220,7 +232,7 @@ pub async fn post_actions(
         | "delete" | "clean_broken" => {
             let (id, _token) = state.try_start_op(op_name).await.map_err(|e| {
                 (
-                    StatusCode::CONFLICT,
+                    StatusCode::LOCKED,
                     Json(ErrorResponse {
                         error: e.to_string(),
                     }),
@@ -293,6 +305,11 @@ pub async fn list_backups(
         }
     }
 
+    // Apply desc parameter: reverse sort if desc=true (newest first)
+    if params.desc.unwrap_or(false) {
+        results.reverse();
+    }
+
     Ok(Json(results))
 }
 
@@ -325,7 +342,7 @@ pub async fn create_backup(
     let req = body.map(|Json(r)| r).unwrap_or_default();
     let (id, _token) = state.try_start_op("create").await.map_err(|e| {
         (
-            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -418,7 +435,7 @@ pub async fn upload_backup(
     let req = body.map(|Json(r)| r).unwrap_or_default();
     let (id, _token) = state.try_start_op("upload").await.map_err(|e| {
         (
-            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -499,7 +516,7 @@ pub async fn download_backup(
     let req = body.map(|Json(r)| r).unwrap_or_default();
     let (id, _token) = state.try_start_op("download").await.map_err(|e| {
         (
-            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -572,7 +589,7 @@ pub async fn restore_backup(
     let req = body.map(|Json(r)| r).unwrap_or_default();
     let (id, _token) = state.try_start_op("restore").await.map_err(|e| {
         (
-            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -616,6 +633,8 @@ pub async fn restore_backup(
             req.rbac.unwrap_or(false),
             req.configs.unwrap_or(false),
             req.named_collections.unwrap_or(false),
+            req.partitions.as_deref(),
+            req.skip_empty_tables.unwrap_or(false),
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -666,6 +685,8 @@ pub struct RestoreRequest {
     pub rbac: Option<bool>,
     pub configs: Option<bool>,
     pub named_collections: Option<bool>,
+    pub partitions: Option<String>,
+    pub skip_empty_tables: Option<bool>,
 }
 
 /// POST /api/v1/create_remote -- create local backup then upload to S3
@@ -676,7 +697,7 @@ pub async fn create_remote(
     let req = body.map(|Json(r)| r).unwrap_or_default();
     let (id, _token) = state.try_start_op("create_remote").await.map_err(|e| {
         (
-            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -804,7 +825,7 @@ pub async fn restore_remote(
     let req = body.map(|Json(r)| r).unwrap_or_default();
     let (id, _token) = state.try_start_op("restore_remote").await.map_err(|e| {
         (
-            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -874,6 +895,8 @@ pub async fn restore_remote(
             req.rbac.unwrap_or(false),
             req.configs.unwrap_or(false),
             req.named_collections.unwrap_or(false),
+            req.partitions.as_deref(),
+            req.skip_empty_tables.unwrap_or(false),
         )
         .await;
         let duration = start_time.elapsed().as_secs_f64();
@@ -925,6 +948,8 @@ pub struct RestoreRemoteRequest {
     pub rbac: Option<bool>,
     pub configs: Option<bool>,
     pub named_collections: Option<bool>,
+    pub partitions: Option<String>,
+    pub skip_empty_tables: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -951,7 +976,7 @@ pub async fn delete_backup(
 
     let (id, _token) = state.try_start_op("delete").await.map_err(|e| {
         (
-            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -1019,7 +1044,7 @@ pub async fn clean_remote_broken(
         .await
         .map_err(|e| {
             (
-                StatusCode::CONFLICT,
+                StatusCode::LOCKED,
                 Json(ErrorResponse {
                     error: e.to_string(),
                 }),
@@ -1078,7 +1103,7 @@ pub async fn clean_local_broken(
         .await
         .map_err(|e| {
             (
-                StatusCode::CONFLICT,
+                StatusCode::LOCKED,
                 Json(ErrorResponse {
                     error: e.to_string(),
                 }),
@@ -1151,7 +1176,7 @@ pub async fn clean(
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let (id, _token) = state.try_start_op("clean").await.map_err(|e| {
         (
-            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -1469,7 +1494,7 @@ pub async fn watch_start(
         let ws = state.watch_status.lock().await;
         if ws.active {
             return Err((
-                StatusCode::CONFLICT,
+                StatusCode::LOCKED,
                 Json(ErrorResponse {
                     error: "watch loop already active".to_string(),
                 }),
@@ -1636,20 +1661,24 @@ mod tests {
 
     #[test]
     fn test_health_returns_ok() {
-        // health() is a simple sync function returning &'static str
-        assert_eq!("OK", "OK");
+        let response = HealthResponse {
+            status: "ok".to_string(),
+        };
+        let json = serde_json::to_string(&response).expect("HealthResponse should serialize");
+        assert!(json.contains("\"status\":\"ok\""));
     }
 
     #[tokio::test]
     async fn test_health_handler() {
-        let result = health().await;
-        assert_eq!(result, "OK");
+        let Json(result) = health().await;
+        assert_eq!(result.status, "ok");
     }
 
     #[test]
     fn test_actions_empty_log() {
         // Verify ActionResponse serialization
         let response = ActionResponse {
+            id: 1,
             command: "create".to_string(),
             start: "2024-01-15T10:00:00+00:00".to_string(),
             finish: String::new(),
@@ -1658,6 +1687,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&response).expect("ActionResponse should serialize");
+        assert!(json.contains("\"id\":1"));
         assert!(json.contains("\"command\":\"create\""));
         assert!(json.contains("\"status\":\"running\""));
     }
