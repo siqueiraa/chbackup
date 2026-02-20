@@ -846,6 +846,7 @@ impl Config {
     }
 
     /// Apply environment variable overlay. Maps well-known env vars to config fields.
+    /// Every config parameter can be overridden via an environment variable (design doc §2).
     fn apply_env_overlay(&mut self) {
         // General
         if let Ok(v) = std::env::var("CHBACKUP_LOG_LEVEL") {
@@ -853,6 +854,34 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CHBACKUP_LOG_FORMAT") {
             self.general.log_format = v;
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUPS_TO_KEEP_LOCAL") {
+            if let Ok(n) = v.parse::<i32>() {
+                self.general.backups_to_keep_local = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUPS_TO_KEEP_REMOTE") {
+            if let Ok(n) = v.parse::<i32>() {
+                self.general.backups_to_keep_remote = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_UPLOAD_CONCURRENCY") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.general.upload_concurrency = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_DOWNLOAD_CONCURRENCY") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.general.download_concurrency = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_RETRIES_ON_FAILURE") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.general.retries_on_failure = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_RETRIES_PAUSE") {
+            self.general.retries_pause = v;
         }
 
         // ClickHouse
@@ -872,6 +901,46 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_DATA_PATH") {
             self.clickhouse.data_path = v;
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_SECURE") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.clickhouse.secure = b;
+            }
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_SKIP_VERIFY") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.clickhouse.skip_verify = b;
+            }
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_TLS_KEY") {
+            self.clickhouse.tls_key = v;
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_TLS_CERT") {
+            self.clickhouse.tls_cert = v;
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_TLS_CA") {
+            self.clickhouse.tls_ca = v;
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_SYNC_REPLICATED_TABLES") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.clickhouse.sync_replicated_tables = b;
+            }
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_MAX_CONNECTIONS") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.clickhouse.max_connections = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_TIMEOUT") {
+            self.clickhouse.timeout = v;
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_CONFIG_DIR") {
+            self.clickhouse.config_dir = v;
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_DEBUG") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.clickhouse.debug = b;
+            }
         }
 
         // S3
@@ -901,10 +970,82 @@ impl Config {
                 self.s3.force_path_style = b;
             }
         }
+        if let Ok(v) = std::env::var("S3_ACL") {
+            self.s3.acl = v;
+        }
+        if let Ok(v) = std::env::var("S3_STORAGE_CLASS") {
+            self.s3.storage_class = v;
+        }
+        if let Ok(v) = std::env::var("S3_SSE") {
+            self.s3.sse = v;
+        }
+        if let Ok(v) = std::env::var("S3_SSE_KMS_KEY_ID") {
+            self.s3.sse_kms_key_id = v;
+        }
+        if let Ok(v) = std::env::var("S3_DISABLE_SSL") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.s3.disable_ssl = b;
+            }
+        }
+        if let Ok(v) = std::env::var("S3_DISABLE_CERT_VERIFICATION") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.s3.disable_cert_verification = b;
+            }
+        }
+        if let Ok(v) = std::env::var("S3_CONCURRENCY") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.s3.concurrency = n;
+            }
+        }
+        if let Ok(v) = std::env::var("S3_OBJECT_DISK_PATH") {
+            self.s3.object_disk_path = v;
+        }
+
+        // Backup
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_COMPRESSION") {
+            self.backup.compression = v;
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_UPLOAD_CONCURRENCY") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.backup.upload_concurrency = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.backup.download_concurrency = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_RETRIES_ON_FAILURE") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.backup.retries_on_failure = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_RETRIES_DURATION") {
+            self.backup.retries_duration = v;
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_TABLES") {
+            self.backup.tables = v;
+        }
 
         // API
         if let Ok(v) = std::env::var("API_LISTEN") {
             self.api.listen = v;
+        }
+        if let Ok(v) = std::env::var("API_SECURE") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.api.secure = b;
+            }
+        }
+        if let Ok(v) = std::env::var("API_USERNAME") {
+            self.api.username = v;
+        }
+        if let Ok(v) = std::env::var("API_PASSWORD") {
+            self.api.password = v;
+        }
+        if let Ok(v) = std::env::var("API_CREATE_INTEGRATION_TABLES") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.api.create_integration_tables = b;
+            }
         }
 
         // Watch
@@ -913,6 +1054,16 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FULL_INTERVAL") {
             self.watch.full_interval = v;
+        }
+        if let Ok(v) = std::env::var("WATCH_ENABLED") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.watch.enabled = b;
+            }
+        }
+        if let Ok(v) = std::env::var("WATCH_MAX_CONSECUTIVE_ERRORS") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.watch.max_consecutive_errors = n;
+            }
         }
     }
 
@@ -1394,6 +1545,150 @@ mod tests {
             !config.clickhouse.check_parts_columns,
             "check_parts_columns should default to false per §12 (opt-in)"
         );
+    }
+
+    #[test]
+    fn test_env_overlay_coverage() {
+        // Test all new env vars by setting them, creating a default config,
+        // applying overlay, and verifying the fields were populated.
+        // We use unique values that differ from defaults to confirm the overlay took effect.
+
+        // General env vars
+        std::env::set_var("CHBACKUP_BACKUPS_TO_KEEP_LOCAL", "42");
+        std::env::set_var("CHBACKUP_BACKUPS_TO_KEEP_REMOTE", "99");
+        std::env::set_var("CHBACKUP_UPLOAD_CONCURRENCY", "16");
+        std::env::set_var("CHBACKUP_DOWNLOAD_CONCURRENCY", "12");
+        std::env::set_var("CHBACKUP_RETRIES_ON_FAILURE", "7");
+        std::env::set_var("CHBACKUP_RETRIES_PAUSE", "30s");
+
+        // ClickHouse env vars
+        std::env::set_var("CLICKHOUSE_SECURE", "true");
+        std::env::set_var("CLICKHOUSE_SKIP_VERIFY", "true");
+        std::env::set_var("CLICKHOUSE_TLS_KEY", "/path/to/key.pem");
+        std::env::set_var("CLICKHOUSE_TLS_CERT", "/path/to/cert.pem");
+        std::env::set_var("CLICKHOUSE_TLS_CA", "/path/to/ca.pem");
+        std::env::set_var("CLICKHOUSE_SYNC_REPLICATED_TABLES", "false");
+        std::env::set_var("CLICKHOUSE_MAX_CONNECTIONS", "8");
+        std::env::set_var("CLICKHOUSE_TIMEOUT", "15m");
+        std::env::set_var("CLICKHOUSE_CONFIG_DIR", "/custom/config");
+        std::env::set_var("CLICKHOUSE_DEBUG", "true");
+
+        // S3 env vars
+        std::env::set_var("S3_ACL", "bucket-owner-full-control");
+        std::env::set_var("S3_STORAGE_CLASS", "GLACIER");
+        std::env::set_var("S3_SSE", "aws:kms");
+        std::env::set_var("S3_SSE_KMS_KEY_ID", "arn:aws:kms:us-east-1:123:key/abc");
+        std::env::set_var("S3_DISABLE_SSL", "true");
+        std::env::set_var("S3_DISABLE_CERT_VERIFICATION", "true");
+        std::env::set_var("S3_CONCURRENCY", "5");
+        std::env::set_var("S3_OBJECT_DISK_PATH", "custom/disk/path");
+
+        // Backup env vars
+        std::env::set_var("CHBACKUP_BACKUP_COMPRESSION", "zstd");
+        std::env::set_var("CHBACKUP_BACKUP_UPLOAD_CONCURRENCY", "20");
+        std::env::set_var("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY", "15");
+        std::env::set_var("CHBACKUP_BACKUP_RETRIES_ON_FAILURE", "10");
+        std::env::set_var("CHBACKUP_BACKUP_RETRIES_DURATION", "20s");
+        std::env::set_var("CHBACKUP_BACKUP_TABLES", "mydb.*");
+
+        // API env vars
+        std::env::set_var("API_SECURE", "true");
+        std::env::set_var("API_USERNAME", "admin");
+        std::env::set_var("API_PASSWORD", "secret123");
+        std::env::set_var("API_CREATE_INTEGRATION_TABLES", "false");
+
+        // Watch env vars
+        std::env::set_var("WATCH_ENABLED", "true");
+        std::env::set_var("WATCH_MAX_CONSECUTIVE_ERRORS", "10");
+
+        let mut config = Config::default();
+        config.apply_env_overlay();
+
+        // Verify General
+        assert_eq!(config.general.backups_to_keep_local, 42);
+        assert_eq!(config.general.backups_to_keep_remote, 99);
+        assert_eq!(config.general.upload_concurrency, 16);
+        assert_eq!(config.general.download_concurrency, 12);
+        assert_eq!(config.general.retries_on_failure, 7);
+        assert_eq!(config.general.retries_pause, "30s");
+
+        // Verify ClickHouse
+        assert!(config.clickhouse.secure);
+        assert!(config.clickhouse.skip_verify);
+        assert_eq!(config.clickhouse.tls_key, "/path/to/key.pem");
+        assert_eq!(config.clickhouse.tls_cert, "/path/to/cert.pem");
+        assert_eq!(config.clickhouse.tls_ca, "/path/to/ca.pem");
+        assert!(!config.clickhouse.sync_replicated_tables);
+        assert_eq!(config.clickhouse.max_connections, 8);
+        assert_eq!(config.clickhouse.timeout, "15m");
+        assert_eq!(config.clickhouse.config_dir, "/custom/config");
+        assert!(config.clickhouse.debug);
+
+        // Verify S3
+        assert_eq!(config.s3.acl, "bucket-owner-full-control");
+        assert_eq!(config.s3.storage_class, "GLACIER");
+        assert_eq!(config.s3.sse, "aws:kms");
+        assert_eq!(config.s3.sse_kms_key_id, "arn:aws:kms:us-east-1:123:key/abc");
+        assert!(config.s3.disable_ssl);
+        assert!(config.s3.disable_cert_verification);
+        assert_eq!(config.s3.concurrency, 5);
+        assert_eq!(config.s3.object_disk_path, "custom/disk/path");
+
+        // Verify Backup
+        assert_eq!(config.backup.compression, "zstd");
+        assert_eq!(config.backup.upload_concurrency, 20);
+        assert_eq!(config.backup.download_concurrency, 15);
+        assert_eq!(config.backup.retries_on_failure, 10);
+        assert_eq!(config.backup.retries_duration, "20s");
+        assert_eq!(config.backup.tables, "mydb.*");
+
+        // Verify API
+        assert!(config.api.secure);
+        assert_eq!(config.api.username, "admin");
+        assert_eq!(config.api.password, "secret123");
+        assert!(!config.api.create_integration_tables);
+
+        // Verify Watch
+        assert!(config.watch.enabled);
+        assert_eq!(config.watch.max_consecutive_errors, 10);
+
+        // Clean up env vars to avoid polluting other tests
+        std::env::remove_var("CHBACKUP_BACKUPS_TO_KEEP_LOCAL");
+        std::env::remove_var("CHBACKUP_BACKUPS_TO_KEEP_REMOTE");
+        std::env::remove_var("CHBACKUP_UPLOAD_CONCURRENCY");
+        std::env::remove_var("CHBACKUP_DOWNLOAD_CONCURRENCY");
+        std::env::remove_var("CHBACKUP_RETRIES_ON_FAILURE");
+        std::env::remove_var("CHBACKUP_RETRIES_PAUSE");
+        std::env::remove_var("CLICKHOUSE_SECURE");
+        std::env::remove_var("CLICKHOUSE_SKIP_VERIFY");
+        std::env::remove_var("CLICKHOUSE_TLS_KEY");
+        std::env::remove_var("CLICKHOUSE_TLS_CERT");
+        std::env::remove_var("CLICKHOUSE_TLS_CA");
+        std::env::remove_var("CLICKHOUSE_SYNC_REPLICATED_TABLES");
+        std::env::remove_var("CLICKHOUSE_MAX_CONNECTIONS");
+        std::env::remove_var("CLICKHOUSE_TIMEOUT");
+        std::env::remove_var("CLICKHOUSE_CONFIG_DIR");
+        std::env::remove_var("CLICKHOUSE_DEBUG");
+        std::env::remove_var("S3_ACL");
+        std::env::remove_var("S3_STORAGE_CLASS");
+        std::env::remove_var("S3_SSE");
+        std::env::remove_var("S3_SSE_KMS_KEY_ID");
+        std::env::remove_var("S3_DISABLE_SSL");
+        std::env::remove_var("S3_DISABLE_CERT_VERIFICATION");
+        std::env::remove_var("S3_CONCURRENCY");
+        std::env::remove_var("S3_OBJECT_DISK_PATH");
+        std::env::remove_var("CHBACKUP_BACKUP_COMPRESSION");
+        std::env::remove_var("CHBACKUP_BACKUP_UPLOAD_CONCURRENCY");
+        std::env::remove_var("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY");
+        std::env::remove_var("CHBACKUP_BACKUP_RETRIES_ON_FAILURE");
+        std::env::remove_var("CHBACKUP_BACKUP_RETRIES_DURATION");
+        std::env::remove_var("CHBACKUP_BACKUP_TABLES");
+        std::env::remove_var("API_SECURE");
+        std::env::remove_var("API_USERNAME");
+        std::env::remove_var("API_PASSWORD");
+        std::env::remove_var("API_CREATE_INTEGRATION_TABLES");
+        std::env::remove_var("WATCH_ENABLED");
+        std::env::remove_var("WATCH_MAX_CONSECUTIVE_ERRORS");
     }
 
     #[test]
