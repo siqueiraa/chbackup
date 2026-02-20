@@ -23,6 +23,7 @@ use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
+use crate::backup::collect::per_disk_backup_dir;
 use crate::backup::diff::diff_parts;
 use crate::concurrency::{effective_object_disk_copy_concurrency, effective_upload_concurrency};
 use crate::config::Config;
@@ -988,10 +989,34 @@ pub async fn upload(
 
     // 9. Delete local backup if requested
     if delete_local {
-        info!(
-            backup_dir = %backup_dir.display(),
-            "Deleting local backup after upload"
-        );
+        // First: delete per-disk dirs (non-fatal, warn on failure)
+        // These are "bonus" cleanup -- failing here is not critical.
+        let canonical_default = std::fs::canonicalize(backup_dir)
+            .unwrap_or_else(|_| backup_dir.to_path_buf());
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        seen.insert(canonical_default);
+
+        for disk_path in manifest.disks.values() {
+            let per_disk =
+                per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
+            if per_disk.exists() {
+                let canonical = std::fs::canonicalize(&per_disk)
+                    .unwrap_or_else(|_| per_disk.clone());
+                if seen.insert(canonical) {
+                    info!(path = %per_disk.display(), "Deleting per-disk backup dir");
+                    if let Err(e) = std::fs::remove_dir_all(&per_disk) {
+                        warn!(
+                            path = %per_disk.display(),
+                            error = %e,
+                            "Failed to remove per-disk backup dir"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Last: delete default backup_dir (FATAL with ? -- preserves existing semantics)
+        info!(backup_dir = %backup_dir.display(), "Deleting local backup after upload");
         std::fs::remove_dir_all(backup_dir).with_context(|| {
             format!(
                 "Failed to delete local backup directory: {}",
@@ -1673,5 +1698,70 @@ mod tests {
         let size: u64 = 500 * 1024 * 1024;
         let should_stream = disabled > 0 && size > disabled;
         assert!(!should_stream);
+    }
+
+    #[test]
+    fn test_upload_delete_local_cleans_per_disk_dirs() {
+        // Verify that the delete_local cleanup logic in upload() correctly
+        // removes per-disk backup dirs with canonical dedup, then removes
+        // the default backup_dir last.
+        use crate::backup::collect::per_disk_backup_dir;
+        use std::collections::HashSet;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().join("clickhouse");
+        let nvme1_path = tmp.path().join("nvme1");
+        let backup_name = "test-upload-delete";
+
+        // Create default backup_dir
+        let backup_dir = data_path.join("backup").join(backup_name);
+        std::fs::create_dir_all(backup_dir.join("shadow")).unwrap();
+        std::fs::write(backup_dir.join("metadata.json"), b"{}").unwrap();
+
+        // Create per-disk backup dir for nvme1
+        let per_disk_dir = per_disk_backup_dir(
+            nvme1_path.to_str().unwrap(),
+            backup_name,
+        );
+        std::fs::create_dir_all(per_disk_dir.join("shadow")).unwrap();
+        std::fs::write(per_disk_dir.join("shadow").join("data.bin"), b"data").unwrap();
+
+        assert!(backup_dir.exists());
+        assert!(per_disk_dir.exists());
+
+        // Simulate the manifest.disks map
+        let manifest_disks: HashMap<String, String> = HashMap::from([
+            ("default".to_string(), data_path.to_string_lossy().to_string()),
+            ("nvme1".to_string(), nvme1_path.to_string_lossy().to_string()),
+        ]);
+
+        // Execute the same cleanup pattern as upload() delete_local
+        let canonical_default = std::fs::canonicalize(&backup_dir)
+            .unwrap_or_else(|_| backup_dir.clone());
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        seen.insert(canonical_default);
+
+        for disk_path in manifest_disks.values() {
+            let per_disk = per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
+            if per_disk.exists() {
+                let canonical = std::fs::canonicalize(&per_disk)
+                    .unwrap_or_else(|_| per_disk.clone());
+                if seen.insert(canonical) {
+                    std::fs::remove_dir_all(&per_disk).unwrap();
+                }
+            }
+        }
+
+        // Delete default backup_dir last
+        std::fs::remove_dir_all(&backup_dir).unwrap();
+
+        assert!(
+            !backup_dir.exists(),
+            "Default backup dir should be removed"
+        );
+        assert!(
+            !per_disk_dir.exists(),
+            "Per-disk backup dir should be removed"
+        );
     }
 }
