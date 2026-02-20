@@ -2,11 +2,20 @@
 //!
 //! Provides tar + compression for part directories before S3 upload.
 //! Supports LZ4, zstd, gzip, and uncompressed (none) formats.
+//!
+//! Two modes are available:
+//! - **Buffered** (`compress_part`): compresses entire part to `Vec<u8>` in memory
+//! - **Streaming** (`compress_part_streaming`): produces fixed-size chunks via channel,
+//!   suitable for streaming multipart upload of large parts (>256 MiB)
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use anyhow::{Context, Result};
+
+/// Minimum S3 multipart chunk size (5 MiB).
+pub const MIN_MULTIPART_CHUNK: usize = 5 * 1024 * 1024;
 
 /// Return the archive file extension for the given compression format.
 ///
@@ -75,11 +84,7 @@ fn compress_lz4(part_dir: &Path, archive_name: &str) -> Result<Vec<u8>> {
 }
 
 /// Compress with Zstandard format.
-fn compress_zstd(
-    part_dir: &Path,
-    archive_name: &str,
-    compression_level: u32,
-) -> Result<Vec<u8>> {
+fn compress_zstd(part_dir: &Path, archive_name: &str, compression_level: u32) -> Result<Vec<u8>> {
     let mut encoder = zstd::Encoder::new(Vec::new(), compression_level as i32)
         .context("Failed to create zstd encoder")?;
 
@@ -100,15 +105,9 @@ fn compress_zstd(
 }
 
 /// Compress with gzip format.
-fn compress_gzip(
-    part_dir: &Path,
-    archive_name: &str,
-    compression_level: u32,
-) -> Result<Vec<u8>> {
-    let mut encoder = flate2::write::GzEncoder::new(
-        Vec::new(),
-        flate2::Compression::new(compression_level),
-    );
+fn compress_gzip(part_dir: &Path, archive_name: &str, compression_level: u32) -> Result<Vec<u8>> {
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(compression_level));
 
     {
         let mut tar_builder = tar::Builder::new(&mut encoder);
@@ -143,6 +142,222 @@ fn compress_none(part_dir: &Path, archive_name: &str) -> Result<Vec<u8>> {
     }
 
     Ok(buffer)
+}
+
+/// A writer that buffers bytes and sends fixed-size chunks through a channel.
+///
+/// When the internal buffer reaches `chunk_size` bytes, the full chunk is sent
+/// through the `mpsc::Sender`. On `flush()` or `Drop`, any remaining bytes in the
+/// buffer are sent as the final (possibly smaller) chunk.
+struct ChunkedWriter {
+    buffer: Vec<u8>,
+    chunk_size: usize,
+    sender: mpsc::Sender<Result<Vec<u8>>>,
+}
+
+impl ChunkedWriter {
+    fn new(chunk_size: usize, sender: mpsc::Sender<Result<Vec<u8>>>) -> Self {
+        Self {
+            buffer: Vec::with_capacity(chunk_size),
+            chunk_size,
+            sender,
+        }
+    }
+
+    /// Send the current buffer as a chunk and reset.
+    fn send_buffer(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(self.chunk_size));
+        self.sender
+            .send(Ok(chunk))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped"))
+    }
+}
+
+impl Write for ChunkedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while written < buf.len() {
+            let remaining_capacity = self.chunk_size - self.buffer.len();
+            let to_copy = std::cmp::min(remaining_capacity, buf.len() - written);
+            self.buffer
+                .extend_from_slice(&buf[written..written + to_copy]);
+            written += to_copy;
+
+            if self.buffer.len() >= self.chunk_size {
+                self.send_buffer()?;
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send_buffer()
+    }
+}
+
+impl Drop for ChunkedWriter {
+    fn drop(&mut self) {
+        // Best-effort send of remaining data
+        let _ = self.send_buffer();
+    }
+}
+
+/// Streaming compression: produces chunks suitable for multipart upload.
+///
+/// Spawns a background thread that tars+compresses `part_dir` and sends
+/// fixed-size chunks (at least 5MB each for S3 multipart) via a channel.
+/// Returns a receiver that yields `Vec<u8>` chunks.
+///
+/// The `chunk_size` parameter controls how large each chunk is. It must be
+/// at least `MIN_MULTIPART_CHUNK` (5 MiB) for S3 multipart compatibility.
+///
+/// This function spawns a `std::thread` internally. The receiver is consumed
+/// by async code via `spawn_blocking` or by iterating in a blocking context.
+///
+/// # Errors
+///
+/// Returns an error if `chunk_size` is less than `MIN_MULTIPART_CHUNK`.
+/// Compression/tar errors are sent through the channel as `Err` values.
+pub fn compress_part_streaming(
+    part_dir: &Path,
+    archive_name: &str,
+    data_format: &str,
+    compression_level: u32,
+    chunk_size: usize,
+) -> Result<mpsc::Receiver<Result<Vec<u8>>>> {
+    if chunk_size < MIN_MULTIPART_CHUNK {
+        anyhow::bail!(
+            "chunk_size ({}) must be at least MIN_MULTIPART_CHUNK ({} bytes)",
+            chunk_size,
+            MIN_MULTIPART_CHUNK
+        );
+    }
+
+    let (sender, receiver) = mpsc::channel();
+
+    // Clone owned data for the spawned thread
+    let part_dir_owned: PathBuf = part_dir.to_path_buf();
+    let archive_name_owned: String = archive_name.to_string();
+    let data_format_owned: String = data_format.to_string();
+
+    std::thread::spawn(move || {
+        let result = streaming_compress_inner(
+            &part_dir_owned,
+            &archive_name_owned,
+            &data_format_owned,
+            compression_level,
+            chunk_size,
+            &sender,
+        );
+
+        if let Err(e) = result {
+            // Send the error through the channel so the receiver can observe it
+            let _ = sender.send(Err(e));
+        }
+        // sender is dropped here, closing the channel
+    });
+
+    Ok(receiver)
+}
+
+/// Inner function that performs the actual tar+compress into a `ChunkedWriter`.
+///
+/// Creates the appropriate compressor wrapping a `ChunkedWriter`, builds a tar
+/// archive, and finalizes both the tar and compressor. Chunks are sent through
+/// the channel as the compressor flushes its output.
+fn streaming_compress_inner(
+    part_dir: &Path,
+    archive_name: &str,
+    data_format: &str,
+    compression_level: u32,
+    chunk_size: usize,
+    sender: &mpsc::Sender<Result<Vec<u8>>>,
+) -> Result<()> {
+    match data_format {
+        "lz4" => {
+            let chunked = ChunkedWriter::new(chunk_size, sender.clone());
+            let mut encoder = lz4_flex::frame::FrameEncoder::new(chunked);
+            {
+                let mut tar_builder = tar::Builder::new(&mut encoder);
+                tar_builder
+                    .append_dir_all(archive_name, part_dir)
+                    .with_context(|| {
+                        format!("Failed to add directory to tar: {}", part_dir.display())
+                    })?;
+                tar_builder
+                    .finish()
+                    .context("Failed to finish tar archive")?;
+            }
+            let mut chunked = encoder
+                .finish()
+                .context("Failed to finish LZ4 compression")?;
+            chunked.flush().context("Failed to flush final chunk")?;
+            Ok(())
+        }
+        "zstd" => {
+            let chunked = ChunkedWriter::new(chunk_size, sender.clone());
+            let mut encoder = zstd::Encoder::new(chunked, compression_level as i32)
+                .context("Failed to create zstd encoder")?;
+            {
+                let mut tar_builder = tar::Builder::new(&mut encoder);
+                tar_builder
+                    .append_dir_all(archive_name, part_dir)
+                    .with_context(|| {
+                        format!("Failed to add directory to tar: {}", part_dir.display())
+                    })?;
+                tar_builder
+                    .finish()
+                    .context("Failed to finish tar archive")?;
+            }
+            let mut chunked = encoder
+                .finish()
+                .context("Failed to finish zstd compression")?;
+            chunked.flush().context("Failed to flush final chunk")?;
+            Ok(())
+        }
+        "gzip" => {
+            let chunked = ChunkedWriter::new(chunk_size, sender.clone());
+            let mut encoder =
+                flate2::write::GzEncoder::new(chunked, flate2::Compression::new(compression_level));
+            {
+                let mut tar_builder = tar::Builder::new(&mut encoder);
+                tar_builder
+                    .append_dir_all(archive_name, part_dir)
+                    .with_context(|| {
+                        format!("Failed to add directory to tar: {}", part_dir.display())
+                    })?;
+                tar_builder
+                    .finish()
+                    .context("Failed to finish tar archive")?;
+            }
+            encoder.flush().context("Failed to flush gzip encoder")?;
+            let mut chunked = encoder
+                .finish()
+                .context("Failed to finish gzip compression")?;
+            chunked.flush().context("Failed to flush final chunk")?;
+            Ok(())
+        }
+        "none" => {
+            let mut chunked = ChunkedWriter::new(chunk_size, sender.clone());
+            {
+                let mut tar_builder = tar::Builder::new(&mut chunked);
+                tar_builder
+                    .append_dir_all(archive_name, part_dir)
+                    .with_context(|| {
+                        format!("Failed to add directory to tar: {}", part_dir.display())
+                    })?;
+                tar_builder
+                    .finish()
+                    .context("Failed to finish tar archive")?;
+            }
+            chunked.flush().context("Failed to flush final chunk")?;
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!("Unknown compression format: {}", other)),
+    }
 }
 
 #[cfg(test)]
@@ -334,5 +549,166 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("Unknown compression format: brotli"));
+    }
+
+    #[test]
+    fn test_compress_part_streaming_roundtrip() {
+        // Create a temp directory with test data
+        let dir = tempfile::tempdir().unwrap();
+        let part_dir = dir.path().join("stream_part");
+        fs::create_dir_all(part_dir.join("subdir")).unwrap();
+
+        fs::write(part_dir.join("file1.txt"), b"streaming content one").unwrap();
+        fs::write(part_dir.join("subdir/file2.txt"), b"streaming content two").unwrap();
+        // Write a larger file to ensure multi-chunk behavior
+        let large_data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        fs::write(part_dir.join("large.bin"), &large_data).unwrap();
+
+        // Use the streaming path with the minimum chunk size
+        let rx = compress_part_streaming(&part_dir, "stream_part", "lz4", 1, MIN_MULTIPART_CHUNK)
+            .unwrap();
+
+        // Collect all chunks
+        let mut all_compressed = Vec::new();
+        for chunk_result in rx {
+            let chunk = chunk_result.unwrap();
+            all_compressed.extend_from_slice(&chunk);
+        }
+        assert!(!all_compressed.is_empty());
+
+        // Decompress and verify data integrity
+        let decoder = lz4_flex::frame::FrameDecoder::new(all_compressed.as_slice());
+        let mut archive = tar::Archive::new(decoder);
+        let output_dir = dir.path().join("streaming_output");
+        archive.unpack(&output_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(output_dir.join("stream_part/file1.txt")).unwrap(),
+            "streaming content one"
+        );
+        assert_eq!(
+            fs::read_to_string(output_dir.join("stream_part/subdir/file2.txt")).unwrap(),
+            "streaming content two"
+        );
+        assert_eq!(
+            fs::read(output_dir.join("stream_part/large.bin")).unwrap(),
+            large_data
+        );
+    }
+
+    #[test]
+    fn test_compress_part_streaming_chunk_sizes() {
+        // Create temp data large enough to produce multiple chunks at MIN_MULTIPART_CHUNK size
+        let dir = tempfile::tempdir().unwrap();
+        let part_dir = dir.path().join("chunk_test_part");
+        fs::create_dir_all(&part_dir).unwrap();
+
+        // Write ~15 MiB of data (should produce multiple 5 MiB chunks)
+        let data: Vec<u8> = (0..15_000_000).map(|i| (i % 256) as u8).collect();
+        fs::write(part_dir.join("big_file.bin"), &data).unwrap();
+
+        let rx = compress_part_streaming(
+            &part_dir,
+            "chunk_test_part",
+            "none", // no compression so output is larger than input (tar overhead)
+            0,
+            MIN_MULTIPART_CHUNK,
+        )
+        .unwrap();
+
+        let chunks: Vec<Vec<u8>> = rx.into_iter().map(|r| r.unwrap()).collect();
+
+        // Should have multiple chunks
+        assert!(
+            chunks.len() > 1,
+            "Expected multiple chunks, got {}",
+            chunks.len()
+        );
+
+        // All chunks except the last must be at least MIN_MULTIPART_CHUNK bytes
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i < chunks.len() - 1 {
+                assert!(
+                    chunk.len() >= MIN_MULTIPART_CHUNK,
+                    "Chunk {} has {} bytes, expected at least {} bytes",
+                    i,
+                    chunk.len(),
+                    MIN_MULTIPART_CHUNK
+                );
+            }
+        }
+
+        // Verify all chunks except last are exactly chunk_size
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i < chunks.len() - 1 {
+                assert_eq!(
+                    chunk.len(),
+                    MIN_MULTIPART_CHUNK,
+                    "Non-final chunk {} should be exactly {} bytes, got {}",
+                    i,
+                    MIN_MULTIPART_CHUNK,
+                    chunk.len()
+                );
+            }
+        }
+
+        // Last chunk can be smaller
+        let last = chunks.last().unwrap();
+        assert!(!last.is_empty(), "Last chunk should not be empty");
+    }
+
+    #[test]
+    fn test_compress_part_streaming_chunk_size_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_dir = dir.path().join("test_part");
+        fs::create_dir_all(&part_dir).unwrap();
+        fs::write(part_dir.join("data.bin"), b"test").unwrap();
+
+        // Should fail with chunk_size below minimum
+        let result = compress_part_streaming(&part_dir, "test_part", "lz4", 1, 1024);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("chunk_size"));
+        assert!(err.contains("MIN_MULTIPART_CHUNK"));
+    }
+
+    #[test]
+    fn test_compress_part_streaming_zstd_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_dir = dir.path().join("zstd_stream_part");
+        fs::create_dir_all(&part_dir).unwrap();
+
+        fs::write(part_dir.join("data.bin"), b"zstd streaming test data").unwrap();
+        fs::write(part_dir.join("checksums.txt"), b"checksum for zstd stream").unwrap();
+
+        let rx = compress_part_streaming(
+            &part_dir,
+            "zstd_stream_part",
+            "zstd",
+            3,
+            MIN_MULTIPART_CHUNK,
+        )
+        .unwrap();
+
+        let mut all_compressed = Vec::new();
+        for chunk_result in rx {
+            let chunk = chunk_result.unwrap();
+            all_compressed.extend_from_slice(&chunk);
+        }
+
+        // Decompress and verify
+        let decoder = zstd::Decoder::new(all_compressed.as_slice()).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let output_dir = dir.path().join("zstd_streaming_output");
+        archive.unpack(&output_dir).unwrap();
+
+        assert_eq!(
+            fs::read(output_dir.join("zstd_stream_part/data.bin")).unwrap(),
+            b"zstd streaming test data"
+        );
+        assert_eq!(
+            fs::read(output_dir.join("zstd_stream_part/checksums.txt")).unwrap(),
+            b"checksum for zstd stream"
+        );
     }
 }
