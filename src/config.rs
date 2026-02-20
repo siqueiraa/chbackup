@@ -88,6 +88,11 @@ pub struct GeneralConfig {
     /// track progress in state files for --resume
     #[serde(default = "default_true")]
     pub use_resumable_state: bool,
+
+    /// TTL in seconds for the in-memory remote manifest cache (design 8.4).
+    /// Used in server mode to avoid redundant S3 list calls. 0 = disabled.
+    #[serde(default = "default_remote_cache_ttl_secs")]
+    pub remote_cache_ttl_secs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +513,7 @@ impl Default for GeneralConfig {
             retries_pause: default_retries_pause(),
             retries_jitter: default_retries_jitter_30(),
             use_resumable_state: true,
+            remote_cache_ttl_secs: default_remote_cache_ttl_secs(),
         }
     }
 }
@@ -682,6 +688,11 @@ fn default_retries_on_failure_5() -> u32 {
 /// 256 MiB default for streaming upload threshold.
 fn default_streaming_upload_threshold() -> u64 {
     256 * 1024 * 1024
+}
+
+/// Default TTL for remote manifest cache: 300 seconds (5 minutes) per design 8.4.
+fn default_remote_cache_ttl_secs() -> u64 {
+    300
 }
 
 fn default_retries_pause() -> String {
@@ -894,6 +905,11 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CHBACKUP_RETRIES_PAUSE") {
             self.general.retries_pause = v;
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_REMOTE_CACHE_TTL_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.general.remote_cache_ttl_secs = n;
+            }
         }
 
         // ClickHouse
@@ -1142,6 +1158,9 @@ impl Config {
             }
             "general.use_resumable_state" => {
                 self.general.use_resumable_state = value.parse().context("Invalid bool")?
+            }
+            "general.remote_cache_ttl_secs" => {
+                self.general.remote_cache_ttl_secs = value.parse().context("Invalid u64")?
             }
 
             // ClickHouse

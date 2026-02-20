@@ -11,9 +11,11 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
+use tokio::sync::Mutex;
+
 use crate::clickhouse::ChClient;
 use crate::config::{parse_duration_secs, Config};
-use crate::list::BackupSummary;
+use crate::list::{BackupSummary, ManifestCache};
 use crate::server::metrics::Metrics;
 use crate::storage::S3Client;
 
@@ -248,6 +250,8 @@ pub struct WatchContext {
     pub reload_rx: tokio::sync::watch::Receiver<bool>,
     pub config_path: PathBuf,
     pub macros: HashMap<String, String>,
+    /// Shared manifest cache for invalidation after retention_remote.
+    pub manifest_cache: Option<Arc<Mutex<ManifestCache>>>,
 }
 
 impl WatchContext {
@@ -509,6 +513,11 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
                 Ok(deleted) => {
                     if deleted > 0 {
                         info!(deleted = deleted, "watch: remote retention applied");
+                        // Invalidate manifest cache after remote retention changes backup set
+                        if let Some(cache) = &ctx.manifest_cache {
+                            cache.lock().await.invalidate();
+                            info!("ManifestCache: invalidated");
+                        }
                     }
                 }
                 Err(e) => {

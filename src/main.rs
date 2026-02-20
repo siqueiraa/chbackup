@@ -618,6 +618,7 @@ async fn run() -> Result<()> {
                 reload_rx,
                 config_path,
                 macros,
+                manifest_cache: None, // No cache in standalone watch mode
             };
 
             let exit = chbackup::watch::run_watch_loop(ctx).await;

@@ -297,7 +297,7 @@ pub async fn list_backups(
 
     if show_remote {
         let s3 = state.s3.load();
-        match list::list_remote(&s3).await {
+        match list::list_remote_cached(&s3, &state.manifest_cache).await {
             Ok(summaries) => {
                 for s in summaries {
                     results.push(summary_to_list_response(s, "remote"));
@@ -483,6 +483,8 @@ pub async fn upload_backup(
                         .set(Utc::now().timestamp() as f64);
                 }
                 info!(backup_name = %name, "Upload operation completed");
+                state_clone.manifest_cache.lock().await.invalidate();
+                info!("ManifestCache: invalidated");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
@@ -780,6 +782,8 @@ pub async fn create_remote(
                     m.backup_size_bytes.set(manifest.compressed_size as f64);
                 }
                 info!(backup_name = %backup_name, "create_remote operation completed");
+                state_clone.manifest_cache.lock().await.invalidate();
+                info!("ManifestCache: invalidated");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
@@ -1006,6 +1010,10 @@ pub async fn delete_backup(
                         .inc();
                 }
                 info!(backup_name = %name, "Delete operation completed");
+                if loc == list::Location::Remote {
+                    state_clone.manifest_cache.lock().await.invalidate();
+                    info!("ManifestCache: invalidated");
+                }
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
@@ -1063,6 +1071,8 @@ pub async fn clean_remote_broken(
                         .inc();
                 }
                 info!(count = count, "clean_broken_remote operation completed");
+                state_clone.manifest_cache.lock().await.invalidate();
+                info!("ManifestCache: invalidated");
                 state_clone.finish_op(id).await;
             }
             Err(e) => {
@@ -1672,9 +1682,9 @@ async fn refresh_backup_counts(state: &AppState, metrics: &Metrics) {
         Err(e) => warn!(error = %e, "spawn_blocking failed for list_local in metrics"),
     }
 
-    // Refresh remote backup count (async)
+    // Refresh remote backup count (async, using cache to avoid redundant S3 calls)
     let s3 = state.s3.load();
-    match crate::list::list_remote(&s3).await {
+    match crate::list::list_remote_cached(&s3, &state.manifest_cache).await {
         Ok(summaries) => metrics.number_backups_remote.set(summaries.len() as i64),
         Err(e) => warn!(error = %e, "Failed to refresh remote backup count for metrics"),
     }

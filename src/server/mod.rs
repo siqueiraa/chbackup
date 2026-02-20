@@ -166,6 +166,7 @@ pub async fn start_server(
             reload_rx,
             config_path: config_path.clone(),
             macros,
+            manifest_cache: Some(state.manifest_cache.clone()),
         };
 
         let watch_status_clone = watch_status.clone();
@@ -387,6 +388,7 @@ pub async fn spawn_watch_from_state(
         reload_rx,
         config_path,
         macros,
+        manifest_cache: Some(state.manifest_cache.clone()),
     };
 
     let watch_status_clone = watch_status;

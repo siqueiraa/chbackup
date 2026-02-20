@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::clickhouse::ChClient;
 use crate::config::Config;
+use crate::list::ManifestCache;
 use crate::storage::S3Client;
 
 use tracing::{info, warn};
@@ -78,6 +79,9 @@ pub struct AppState {
     pub watch_status: Arc<Mutex<WatchStatus>>,
     /// Path to the config file, used for config reload.
     pub config_path: PathBuf,
+    /// In-memory cache for remote backup summaries (design 8.4).
+    /// TTL-based expiry, invalidated on mutating operations.
+    pub manifest_cache: Arc<Mutex<ManifestCache>>,
 }
 
 /// Tracks a currently running operation for cancellation support.
@@ -120,6 +124,9 @@ impl AppState {
             None
         };
 
+        let cache_ttl = Duration::from_secs(config.general.remote_cache_ttl_secs);
+        let manifest_cache = Arc::new(Mutex::new(ManifestCache::new(cache_ttl)));
+
         Self {
             config: Arc::new(ArcSwap::from_pointee((*config).clone())),
             ch: Arc::new(ArcSwap::from_pointee(ch)),
@@ -132,6 +139,7 @@ impl AppState {
             watch_reload_tx: None,
             watch_status: Arc::new(Mutex::new(WatchStatus::default())),
             config_path,
+            manifest_cache,
         }
     }
 
@@ -311,10 +319,9 @@ pub async fn auto_resume(state: &AppState) {
 
                     let config = state_clone.config.load();
                     let s3 = state_clone.s3.load();
-                    let backup_dir =
-                        std::path::PathBuf::from(&config.clickhouse.data_path)
-                            .join("backup")
-                            .join(&backup_name);
+                    let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
+                        .join("backup")
+                        .join(&backup_name);
 
                     let result = crate::upload::upload(
                         &config,
