@@ -407,10 +407,7 @@ pub async fn post_actions(
                     "delete" => {
                         // delete <location> <name> OR delete <name> (defaults to remote)
                         let (loc, name) = if parts_owned.len() >= 3 {
-                            (
-                                parts_owned[1].as_str().to_string(),
-                                parts_owned[2].clone(),
-                            )
+                            (parts_owned[1].as_str().to_string(), parts_owned[2].clone())
                         } else {
                             ("remote".to_string(), backup_name.clone())
                         };
@@ -432,14 +429,11 @@ pub async fn post_actions(
                     "clean_broken" => {
                         let s3_result = list::clean_broken_remote(&s3).await;
                         let data_path = config.clickhouse.data_path.clone();
-                        let local_result =
-                            tokio::task::spawn_blocking(move || {
-                                list::clean_broken_local(&data_path)
-                            })
-                            .await
-                            .unwrap_or_else(|e| {
-                                Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
-                            });
+                        let local_result = tokio::task::spawn_blocking(move || {
+                            list::clean_broken_local(&data_path)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)));
                         // Combine results -- fail if either failed
                         match (s3_result, local_result) {
                             (Ok(_), Ok(_)) => Ok(()),
@@ -457,19 +451,11 @@ pub async fn post_actions(
                             m.backup_duration_seconds
                                 .with_label_values(&[op])
                                 .observe(duration);
-                            m.successful_operations_total
-                                .with_label_values(&[op])
-                                .inc();
+                            m.successful_operations_total.with_label_values(&[op]).inc();
                         }
                         info!(command = %command, "Action completed from POST /api/v1/actions");
                         // Invalidate manifest cache for operations that mutate remote state
-                        if matches!(
-                            op,
-                            "upload"
-                                | "create_remote"
-                                | "delete"
-                                | "clean_broken"
-                        ) {
+                        if matches!(op, "upload" | "create_remote" | "delete" | "clean_broken") {
                             state_clone.manifest_cache.lock().await.invalidate();
                         }
                         state_clone.finish_op(id).await;
@@ -570,11 +556,7 @@ pub async fn list_backups(
         results.into_iter().skip(offset).take(limit).collect()
     } else {
         if offset > 0 {
-            info!(
-                offset = offset,
-                total = total_count,
-                "list: offset applied"
-            );
+            info!(offset = offset, total = total_count, "list: offset applied");
         }
         results.into_iter().skip(offset).collect()
     };
@@ -596,13 +578,13 @@ fn summary_to_list_response(s: list::BackupSummary, location: &str) -> ListRespo
         created: s.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
         location: location.to_string(),
         size: s.size,
-        data_size: s.size,   // For now, same as size (total uncompressed)
-        object_disk_size: 0, // Requires manifest disk_types analysis (future)
+        data_size: s.size, // For now, same as size (total uncompressed)
+        object_disk_size: s.object_disk_size,
         metadata_size: s.metadata_size,
         rbac_size: s.rbac_size,
         config_size: s.config_size,
         compressed_size: s.compressed_size,
-        required: String::new(), // No dependency chain tracking yet
+        required: s.required,
     }
 }
 
@@ -2435,8 +2417,8 @@ mod tests {
             metadata_size: 128,
             rbac_size: 1024,
             config_size: 512,
-            object_disk_size: 0,
-            required: String::new(),
+            object_disk_size: 768,
+            required: "base-backup".to_string(),
             is_broken: false,
             broken_reason: None,
         };
@@ -2446,5 +2428,7 @@ mod tests {
         assert_eq!(response.config_size, 512);
         assert_eq!(response.metadata_size, 128);
         assert_eq!(response.size, 4096);
+        assert_eq!(response.object_disk_size, 768);
+        assert_eq!(response.required, "base-backup");
     }
 }
