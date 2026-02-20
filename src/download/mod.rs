@@ -151,6 +151,10 @@ fn check_disk_space(backup_dir: &Path, required_bytes: u64) -> Result<()> {
 /// Searches `{data_path}/backup/*/shadow/{table_key}/{part_name}/` (excluding
 /// `current_backup`) for parts whose `checksums.txt` CRC64 matches `expected_crc`.
 ///
+/// Also searches per-disk backup directories: for each disk in `manifest_disks`
+/// where `disk_path != data_path` and the disk path exists locally, searches
+/// `{disk_path}/backup/*/shadow/{table_key}/{part_name}/`.
+///
 /// Returns the path to the first matching part directory, or `None`.
 fn find_existing_part(
     data_path: &str,
@@ -158,6 +162,8 @@ fn find_existing_part(
     table_key: &str,
     part_name: &str,
     expected_crc: u64,
+    manifest_disks: &HashMap<String, String>,
+    disk_name: &str,
 ) -> Option<PathBuf> {
     use crate::backup::checksum::compute_crc64;
 
@@ -165,49 +171,74 @@ fn find_existing_part(
         return None;
     }
 
-    let backup_base = Path::new(data_path).join("backup");
-    let entries = match std::fs::read_dir(&backup_base) {
-        Ok(e) => e,
-        Err(_) => return None,
-    };
-
     // URL-encode the table_key components for filesystem path
     let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
     let url_db = url_encode(db);
     let url_table = url_encode(table);
 
-    for entry in entries.flatten() {
-        let name = match entry.file_name().into_string() {
-            Ok(n) => n,
+    // Collect all backup base directories to search, deduped
+    let mut search_bases: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    // Always search the default data_path/backup/ first
+    let default_base = Path::new(data_path).join("backup");
+    let canonical_default = std::fs::canonicalize(&default_base)
+        .unwrap_or_else(|_| default_base.clone());
+    seen.insert(canonical_default);
+    search_bases.push(default_base);
+
+    // Also search per-disk backup directories for the part's disk
+    if let Some(disk_path) = manifest_disks.get(disk_name) {
+        let dp = disk_path.trim_end_matches('/');
+        let per_disk_base = Path::new(dp).join("backup");
+        if per_disk_base.exists() {
+            let canonical = std::fs::canonicalize(&per_disk_base)
+                .unwrap_or_else(|_| per_disk_base.clone());
+            if seen.insert(canonical) {
+                search_bases.push(per_disk_base);
+            }
+        }
+    }
+
+    for backup_base in &search_bases {
+        let entries = match std::fs::read_dir(backup_base) {
+            Ok(e) => e,
             Err(_) => continue,
         };
 
-        // Skip the current backup being downloaded
-        if name == current_backup {
-            continue;
-        }
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
 
-        let candidate = backup_base
-            .join(&name)
-            .join("shadow")
-            .join(&url_db)
-            .join(&url_table)
-            .join(part_name);
-
-        if !candidate.is_dir() {
-            continue;
-        }
-
-        let checksums_path = candidate.join("checksums.txt");
-        if !checksums_path.exists() {
-            continue;
-        }
-
-        match compute_crc64(&checksums_path) {
-            Ok(crc) if crc == expected_crc => {
-                return Some(candidate);
+            // Skip the current backup being downloaded
+            if name == current_backup {
+                continue;
             }
-            _ => continue,
+
+            let candidate = backup_base
+                .join(&name)
+                .join("shadow")
+                .join(&url_db)
+                .join(&url_table)
+                .join(part_name);
+
+            if !candidate.is_dir() {
+                continue;
+            }
+
+            let checksums_path = candidate.join("checksums.txt");
+            if !checksums_path.exists() {
+                continue;
+            }
+
+            match compute_crc64(&checksums_path) {
+                Ok(crc) if crc == expected_crc => {
+                    return Some(candidate);
+                }
+                _ => continue,
+            }
         }
     }
 
@@ -611,9 +642,11 @@ pub async fn download(
                     let pn = part_name.clone();
                     let sd = shadow_dir.clone();
                     let ec = expected_crc;
+                    let md = (*manifest_disks).clone();
+                    let dn = item.disk_name.clone();
 
                     let dedup_result = tokio::task::spawn_blocking(move || {
-                        find_existing_part(&dp, &bn, &tk, &pn, ec)
+                        find_existing_part(&dp, &bn, &tk, &pn, ec, &md, &dn)
                             .map(|existing| {
                                 let target = sd.join(&pn);
                                 hardlink_existing_part(&existing, &target).map(|()| existing)
@@ -1166,6 +1199,8 @@ mod tests {
             "default.trades",
             "202401_1_50_3",
             expected_crc,
+            &HashMap::new(),
+            "default",
         );
         assert!(result.is_some());
         assert!(result.unwrap().ends_with("202401_1_50_3"));
@@ -1193,6 +1228,8 @@ mod tests {
             "default.trades",
             "202401_1_50_3",
             crc,
+            &HashMap::new(),
+            "default",
         );
         assert!(result.is_none());
     }
@@ -1211,6 +1248,8 @@ mod tests {
             "default.trades",
             "202401_1_50_3",
             12345,
+            &HashMap::new(),
+            "default",
         );
         assert!(result.is_none());
     }
@@ -1227,6 +1266,8 @@ mod tests {
             "default.trades",
             "202401_1_50_3",
             0,
+            &HashMap::new(),
+            "default",
         );
         assert!(result.is_none());
     }
@@ -1386,6 +1427,136 @@ mod tests {
         assert_eq!(loaded.backup_name, "old-backup");
         assert!(loaded.disk_map.is_empty(), "Missing disk_map should default to empty HashMap");
         assert_eq!(loaded.completed_keys.len(), 1);
+    }
+
+    #[test]
+    fn test_find_existing_part_per_disk() {
+        // Verify that find_existing_part searches per-disk backup directories
+        // when manifest_disks maps a disk to a non-default path
+        use crate::backup::checksum::compute_crc64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().join("data");
+        let nvme_path = tmp.path().join("nvme1");
+        std::fs::create_dir_all(data_path.join("backup")).unwrap();
+
+        // Create a part in a per-disk backup directory (not under data_path)
+        let per_disk_part = nvme_path
+            .join("backup")
+            .join("old-backup")
+            .join("shadow")
+            .join("default")
+            .join("trades")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&per_disk_part).unwrap();
+        std::fs::write(per_disk_part.join("checksums.txt"), b"data").unwrap();
+
+        let expected_crc = compute_crc64(&per_disk_part.join("checksums.txt")).unwrap();
+
+        let mut manifest_disks = HashMap::new();
+        manifest_disks.insert(
+            "nvme1".to_string(),
+            nvme_path.to_str().unwrap().to_string(),
+        );
+
+        // Should find the part at the per-disk location
+        let result = find_existing_part(
+            data_path.to_str().unwrap(),
+            "new-backup",
+            "default.trades",
+            "202401_1_50_3",
+            expected_crc,
+            &manifest_disks,
+            "nvme1",
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), per_disk_part);
+    }
+
+    #[test]
+    fn test_find_existing_part_per_disk_also_searches_default() {
+        // Verify that find_existing_part still finds parts in the default
+        // data_path even when manifest_disks is populated
+        use crate::backup::checksum::compute_crc64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().join("data");
+
+        // Create a part in the default backup directory
+        let source_part = data_path
+            .join("backup")
+            .join("old-backup")
+            .join("shadow")
+            .join("default")
+            .join("trades")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&source_part).unwrap();
+        std::fs::write(source_part.join("checksums.txt"), b"data").unwrap();
+
+        let expected_crc = compute_crc64(&source_part.join("checksums.txt")).unwrap();
+
+        let mut manifest_disks = HashMap::new();
+        manifest_disks.insert(
+            "default".to_string(),
+            data_path.to_str().unwrap().to_string(),
+        );
+
+        // Should find the part at the default location
+        let result = find_existing_part(
+            data_path.to_str().unwrap(),
+            "new-backup",
+            "default.trades",
+            "202401_1_50_3",
+            expected_crc,
+            &manifest_disks,
+            "default",
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), source_part);
+    }
+
+    #[test]
+    fn test_find_existing_part_per_disk_fallback_to_default() {
+        // When per-disk path does not have the part but default does,
+        // should still find it at the default location
+        use crate::backup::checksum::compute_crc64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().join("data");
+        let nvme_path = tmp.path().join("nvme1");
+        std::fs::create_dir_all(nvme_path.join("backup")).unwrap();
+
+        // Part only exists in default backup dir, not in per-disk dir
+        let legacy_part = data_path
+            .join("backup")
+            .join("old-backup")
+            .join("shadow")
+            .join("default")
+            .join("trades")
+            .join("202401_1_50_3");
+        std::fs::create_dir_all(&legacy_part).unwrap();
+        std::fs::write(legacy_part.join("checksums.txt"), b"data").unwrap();
+
+        let expected_crc = compute_crc64(&legacy_part.join("checksums.txt")).unwrap();
+
+        let mut manifest_disks = HashMap::new();
+        manifest_disks.insert(
+            "nvme1".to_string(),
+            nvme_path.to_str().unwrap().to_string(),
+        );
+
+        // Should find the part at the default data_path location
+        let result = find_existing_part(
+            data_path.to_str().unwrap(),
+            "new-backup",
+            "default.trades",
+            "202401_1_50_3",
+            expected_crc,
+            &manifest_disks,
+            "nvme1",
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), legacy_part);
     }
 
     #[test]
