@@ -106,6 +106,28 @@ pub fn build_router(state: AppState) -> Router {
     router.with_state(state)
 }
 
+/// Wait for either SIGINT (Ctrl+C) or SIGTERM to trigger graceful shutdown.
+///
+/// On Unix, both signals are handled; on non-Unix only SIGINT (Ctrl+C) is available.
+/// This enables Kubernetes `kubectl delete pod` (which sends SIGTERM) to trigger
+/// the same graceful shutdown as Ctrl+C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+    }
+}
+
 /// Start the API server.
 ///
 /// Creates `AppState`, builds the router, optionally creates integration tables,
@@ -114,8 +136,9 @@ pub fn build_router(state: AppState) -> Router {
 /// When `watch` is true, spawns the watch loop as a background task alongside
 /// the HTTP server. The watch loop is also started if `config.watch.enabled` is set.
 ///
-/// Graceful shutdown is triggered by Ctrl+C (SIGINT). On shutdown, integration
-/// tables are dropped if they were created, and the watch loop is signaled to stop.
+/// Graceful shutdown is triggered by Ctrl+C (SIGINT) or SIGTERM (Unix). On shutdown,
+/// integration tables are dropped if they were created, and the watch loop is signaled
+/// to stop.
 pub async fn start_server(
     config: Arc<Config>,
     ch: ChClient,
@@ -300,7 +323,7 @@ pub async fn start_server(
         let created_tables_shutdown = created_tables;
         let watch_shutdown_tx_clone = watch_shutdown_tx.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
+            shutdown_signal().await;
             info!("Shutdown signal received");
             if let Some(tx) = watch_shutdown_tx_clone {
                 tx.send(true).ok();
@@ -331,7 +354,7 @@ pub async fn start_server(
 
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
-                tokio::signal::ctrl_c().await.ok();
+                shutdown_signal().await;
                 info!("Shutdown signal received");
                 if let Some(tx) = watch_shutdown_tx_clone {
                     tx.send(true).ok();
