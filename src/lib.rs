@@ -199,6 +199,8 @@ mod tests {
             metadata_size: 256,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         };

@@ -728,6 +728,8 @@ mod tests {
             metadata_size: 0,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: broken,
             broken_reason: if broken {
                 Some("test".to_string())

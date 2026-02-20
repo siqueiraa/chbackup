@@ -60,6 +60,14 @@ pub struct BackupSummary {
     pub rbac_size: u64,
     /// Size of ClickHouse config backup files in bytes.
     pub config_size: u64,
+    /// Total size of S3 object disk parts in bytes.
+    /// Computed by summing s3_objects[].size across all manifest parts.
+    #[serde(default)]
+    pub object_disk_size: u64,
+    /// Name of the base backup this backup depends on (for incremental backups).
+    /// Empty string for full backups. Extracted from the first `carried:{base}` source.
+    #[serde(default)]
+    pub required: String,
     /// Whether the backup manifest is missing or corrupt.
     pub is_broken: bool,
     /// Reason why the backup is broken (e.g., "metadata.json not found").
@@ -391,6 +399,8 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
         match s3.get_object(&manifest_key).await {
             Ok(data) => match BackupManifest::from_json_bytes(&data) {
                 Ok(manifest) => {
+                    let object_disk_size = compute_object_disk_size(&manifest);
+                    let required = extract_required_backup(&manifest);
                     summaries.push(BackupSummary {
                         name: manifest.name.clone(),
                         timestamp: Some(manifest.timestamp),
@@ -400,6 +410,8 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                         metadata_size: manifest.metadata_size,
                         rbac_size: manifest.rbac_size,
                         config_size: manifest.config_size,
+                        object_disk_size,
+                        required,
                         is_broken: false,
                         broken_reason: None,
                     });
@@ -420,6 +432,8 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                         metadata_size: 0,
                         rbac_size: 0,
                         config_size: 0,
+                        object_disk_size: 0,
+                        required: String::new(),
                         is_broken: true,
                         broken_reason: Some(reason),
                     });
@@ -441,6 +455,8 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                     metadata_size: 0,
                     rbac_size: 0,
                     config_size: 0,
+                    object_disk_size: 0,
+                    required: String::new(),
                     is_broken: true,
                     broken_reason: Some(reason),
                 });
@@ -1183,6 +1199,43 @@ pub async fn clean_shadow(ch: &ChClient, data_path: &str, name: Option<&str>) ->
 
 // -- Internal helpers --
 
+/// Compute the total size of S3 object disk parts in a manifest.
+///
+/// Sums `s3_objects[].size` across all parts in all tables. The `s3_objects`
+/// field is only populated for S3 disk parts, so no disk type check is needed.
+fn compute_object_disk_size(manifest: &BackupManifest) -> u64 {
+    let mut total: u64 = 0;
+    for table in manifest.tables.values() {
+        for parts in table.parts.values() {
+            for part in parts {
+                if let Some(ref s3_objects) = part.s3_objects {
+                    for obj in s3_objects {
+                        total = total.saturating_add(obj.size);
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Extract the base backup name from incremental parts in a manifest.
+///
+/// Scans all parts for the first `source = "carried:{base_name}"` entry and
+/// returns the base name. Returns an empty string for full backups (no carried parts).
+fn extract_required_backup(manifest: &BackupManifest) -> String {
+    for table in manifest.tables.values() {
+        for parts in table.parts.values() {
+            for part in parts {
+                if let Some(base_name) = part.source.strip_prefix("carried:") {
+                    return base_name.to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 /// Parse a backup summary from a metadata.json file path.
 fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
     if !metadata_path.exists() {
@@ -1195,24 +1248,32 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
             metadata_size: 0,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: true,
             broken_reason: Some("metadata.json not found".to_string()),
         };
     }
 
     match BackupManifest::load_from_file(metadata_path) {
-        Ok(manifest) => BackupSummary {
-            name: manifest.name.clone(),
-            timestamp: Some(manifest.timestamp),
-            size: total_uncompressed_size(&manifest),
-            compressed_size: manifest.compressed_size,
-            table_count: manifest.tables.len(),
-            metadata_size: manifest.metadata_size,
-            rbac_size: manifest.rbac_size,
-            config_size: manifest.config_size,
-            is_broken: false,
-            broken_reason: None,
-        },
+        Ok(manifest) => {
+            let object_disk_size = compute_object_disk_size(&manifest);
+            let required = extract_required_backup(&manifest);
+            BackupSummary {
+                name: manifest.name.clone(),
+                timestamp: Some(manifest.timestamp),
+                size: total_uncompressed_size(&manifest),
+                compressed_size: manifest.compressed_size,
+                table_count: manifest.tables.len(),
+                metadata_size: manifest.metadata_size,
+                rbac_size: manifest.rbac_size,
+                config_size: manifest.config_size,
+                object_disk_size,
+                required,
+                is_broken: false,
+                broken_reason: None,
+            }
+        }
         Err(e) => {
             let reason = format!("manifest parse error: {e}");
             warn!(
@@ -1230,6 +1291,8 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: true,
                 broken_reason: Some(reason),
             }
@@ -1488,6 +1551,8 @@ mod tests {
             metadata_size: 0,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         }];
@@ -2112,10 +2177,199 @@ mod tests {
             metadata_size: 256,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         };
         assert_eq!(summary.metadata_size, 256);
+    }
+
+    #[test]
+    fn test_backup_summary_object_disk_size() {
+        let summary = BackupSummary {
+            name: "test-s3".to_string(),
+            timestamp: None,
+            size: 2000,
+            compressed_size: 1000,
+            table_count: 1,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 512,
+            required: String::new(),
+            is_broken: false,
+            broken_reason: None,
+        };
+        assert_eq!(summary.object_disk_size, 512);
+    }
+
+    #[test]
+    fn test_compute_object_disk_size_sums_s3_objects() {
+        use crate::manifest::{PartInfo, S3ObjectInfo, TableManifest};
+
+        let mut tables = std::collections::HashMap::new();
+        let mut parts = std::collections::HashMap::new();
+        parts.insert(
+            "default".to_string(),
+            vec![PartInfo {
+                name: "all_0_0_0".to_string(),
+                size: 1000,
+                backup_key: String::new(),
+                source: "uploaded".to_string(),
+                checksum_crc64: 0,
+                s3_objects: Some(vec![
+                    S3ObjectInfo {
+                        path: "obj1".to_string(),
+                        size: 200,
+                        backup_key: String::new(),
+                    },
+                    S3ObjectInfo {
+                        path: "obj2".to_string(),
+                        size: 300,
+                        backup_key: String::new(),
+                    },
+                ]),
+            }],
+        );
+        parts.insert(
+            "s3disk".to_string(),
+            vec![PartInfo {
+                name: "all_1_1_0".to_string(),
+                size: 500,
+                backup_key: String::new(),
+                source: "uploaded".to_string(),
+                checksum_crc64: 0,
+                s3_objects: None, // local disk part, no s3_objects
+            }],
+        );
+        tables.insert(
+            "db.table".to_string(),
+            TableManifest {
+                ddl: String::new(),
+                uuid: None,
+                engine: String::new(),
+                total_bytes: 1500,
+                parts,
+                pending_mutations: Vec::new(),
+                metadata_only: false,
+                dependencies: Vec::new(),
+            },
+        );
+
+        let manifest = crate::manifest::BackupManifest {
+            manifest_version: 1,
+            name: "test".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: String::new(),
+            chbackup_version: String::new(),
+            data_format: "lz4".to_string(),
+            compressed_size: 0,
+            metadata_size: 0,
+            disks: std::collections::HashMap::new(),
+            disk_types: std::collections::HashMap::new(),
+            disk_remote_paths: std::collections::HashMap::new(),
+            tables,
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+            rbac_size: 0,
+            config_size: 0,
+        };
+
+        assert_eq!(compute_object_disk_size(&manifest), 500); // 200 + 300
+    }
+
+    #[test]
+    fn test_extract_required_from_manifest() {
+        use crate::manifest::{PartInfo, TableManifest};
+
+        let mut tables = std::collections::HashMap::new();
+        let mut parts = std::collections::HashMap::new();
+        parts.insert(
+            "default".to_string(),
+            vec![
+                PartInfo {
+                    name: "all_0_0_0".to_string(),
+                    size: 100,
+                    backup_key: String::new(),
+                    source: "uploaded".to_string(),
+                    checksum_crc64: 0,
+                    s3_objects: None,
+                },
+                PartInfo {
+                    name: "all_1_1_0".to_string(),
+                    size: 100,
+                    backup_key: String::new(),
+                    source: "carried:base-backup".to_string(),
+                    checksum_crc64: 0,
+                    s3_objects: None,
+                },
+            ],
+        );
+        tables.insert(
+            "db.table".to_string(),
+            TableManifest {
+                ddl: String::new(),
+                uuid: None,
+                engine: String::new(),
+                total_bytes: 200,
+                parts,
+                pending_mutations: Vec::new(),
+                metadata_only: false,
+                dependencies: Vec::new(),
+            },
+        );
+
+        let manifest = crate::manifest::BackupManifest {
+            manifest_version: 1,
+            name: "incr-backup".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: String::new(),
+            chbackup_version: String::new(),
+            data_format: "lz4".to_string(),
+            compressed_size: 0,
+            metadata_size: 0,
+            disks: std::collections::HashMap::new(),
+            disk_types: std::collections::HashMap::new(),
+            disk_remote_paths: std::collections::HashMap::new(),
+            tables,
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+            rbac_size: 0,
+            config_size: 0,
+        };
+
+        assert_eq!(extract_required_backup(&manifest), "base-backup");
+    }
+
+    #[test]
+    fn test_extract_required_empty_for_full_backup() {
+        let manifest = crate::manifest::BackupManifest {
+            manifest_version: 1,
+            name: "full-backup".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: String::new(),
+            chbackup_version: String::new(),
+            data_format: "lz4".to_string(),
+            compressed_size: 0,
+            metadata_size: 0,
+            disks: std::collections::HashMap::new(),
+            disk_types: std::collections::HashMap::new(),
+            disk_remote_paths: std::collections::HashMap::new(),
+            tables: std::collections::HashMap::new(),
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+            rbac_size: 0,
+            config_size: 0,
+        };
+
+        assert_eq!(extract_required_backup(&manifest), "");
     }
 
     #[test]
@@ -2167,6 +2421,8 @@ mod tests {
             metadata_size: 256,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         }];
@@ -2192,6 +2448,8 @@ mod tests {
             metadata_size: 256,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         }];
@@ -2212,6 +2470,8 @@ mod tests {
             metadata_size: 128,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         }];
@@ -2235,6 +2495,8 @@ mod tests {
             metadata_size: 128,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         }];
@@ -2257,6 +2519,8 @@ mod tests {
             metadata_size: 0,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         }];
@@ -2294,6 +2558,8 @@ mod tests {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2306,6 +2572,8 @@ mod tests {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2318,6 +2586,8 @@ mod tests {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2339,6 +2609,8 @@ mod tests {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2351,6 +2623,8 @@ mod tests {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2363,6 +2637,8 @@ mod tests {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2398,6 +2674,8 @@ mod tests {
             metadata_size: 0,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         }];
@@ -2422,6 +2700,8 @@ mod tests {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2434,6 +2714,8 @@ mod tests {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: true,
                 broken_reason: Some("corrupt".to_string()),
             },
@@ -2446,6 +2728,8 @@ mod tests {
                 metadata_size: 0,
                 rbac_size: 0,
                 config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2471,6 +2755,8 @@ mod tests {
             metadata_size: 512,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         };
@@ -2503,6 +2789,8 @@ mod tests {
             metadata_size: 128,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         }];
@@ -2533,6 +2821,8 @@ mod tests {
             metadata_size: 0,
             rbac_size: 0,
             config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
             is_broken: false,
             broken_reason: None,
         }];
