@@ -327,8 +327,8 @@ fn summary_to_list_response(s: list::BackupSummary, location: &str) -> ListRespo
         data_size: s.size,   // For now, same as size (total uncompressed)
         object_disk_size: 0, // Requires manifest disk_types analysis (future)
         metadata_size: s.metadata_size,
-        rbac_size: 0,   // TODO: requires scanning access/ directory sizes
-        config_size: 0, // TODO: requires adding config_size to BackupManifest
+        rbac_size: s.rbac_size,
+        config_size: s.config_size,
         compressed_size: s.compressed_size,
         required: String::new(), // No dependency chain tracking yet
     }
@@ -2109,5 +2109,27 @@ mod tests {
         assert_eq!(params3.all, Some(true));
         assert_eq!(params3.offset, Some(0));
         assert_eq!(params3.limit, Some(100));
+    }
+
+    #[test]
+    fn test_summary_to_list_response_sizes() {
+        let summary = list::BackupSummary {
+            name: "test-backup".to_string(),
+            timestamp: None,
+            size: 4096,
+            compressed_size: 2048,
+            table_count: 3,
+            metadata_size: 128,
+            rbac_size: 1024,
+            config_size: 512,
+            is_broken: false,
+            broken_reason: None,
+        };
+
+        let response = summary_to_list_response(summary, "local");
+        assert_eq!(response.rbac_size, 1024);
+        assert_eq!(response.config_size, 512);
+        assert_eq!(response.metadata_size, 128);
+        assert_eq!(response.size, 4096);
     }
 }
