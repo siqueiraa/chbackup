@@ -52,7 +52,7 @@
 
 Things that are easy to get wrong when reading the design doc:
 
-- **Config param count**: Design says "~40 params" but actual count from §12 YAML block is **~106 params** across 7 sections (general:14, clickhouse:37, s3:20, backup:13, retention:2, watch:7, api:13)
+- **Config param count**: Design says "~40 params" but actual count from §12 YAML block is **~106 params** across 7 sections (general:15, clickhouse:37, s3:20, backup:13, retention:2, watch:8, api:13)
 - **CreateRemote != Create**: `create_remote` has a DIFFERENT flag set than `create` — no `--diff-from`, `--partitions`, `--schema`. Uses `--diff-from-remote` instead. Always check the §2 flag reference table.
 - **RestoreRemote != Restore**: `restore_remote` has no `--partitions`, `--schema`, `--data-only`. But DOES have `--as` (per flag table).
 - **Logging mode**: JSON mode is triggered by `server` command OR `general.log_format: json` config. Not just server mode.
@@ -171,7 +171,7 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **Restore partitions** (Phase 6): `--partitions` on restore filters parts by `partition_id` during ATTACH. `partition_id = "all"` matches unpartitioned tables (tuple()). `--skip-empty-tables` skips CREATE DDL for tables with no matching parts.
 - **Check replicas before attach** (Phase 6): When `clickhouse.check_replicas_before_attach` is true, queries `system.replicas` to verify all replicas are synced (zero queue/inserts_in_queue) before attaching parts. Logs warning and continues on sync failure (non-fatal).
 - **Incremental chain protection** (Phase 6): `retention_remote()` checks `required_backups` field in manifests; backups referenced as diff-from bases by surviving backups are protected from deletion regardless of age.
-- **API parity** (Phase 6): HTTP 423 (not 409) for concurrent op rejection. Health endpoint returns JSON `{"status":"ok"}`. `POST /api/v1/actions` dispatches commands. List API includes `named_collection_size`, `desc` (reverse sort) query params.
+- **API parity** (Phase 6): HTTP 423 (not 409) for concurrent op rejection. Health endpoint returns JSON `{"status":"ok"}`. `POST /api/v1/actions` dispatches commands (create, upload, download, restore, delete, clean, create_remote, restore_remote). List API includes `desc` (reverse sort) query param.
 - **Watch exit behavior** (Phase 6): When `api.watch_is_main_process` is true and the watch loop ends (max errors or channel close), the server process calls `std::process::exit(1)` to terminate.
 - **List format flag** (Phase 6): `--format` flag supports `text` (default), `json`, `yaml`, `csv`, `tsv` output. `latest` and `previous` are shortcut aliases for the most recent and second-most-recent backup names.
 - **S3 concurrency + object_disk_path** (Phase 6): `S3Client` stores `concurrency` (u32) and `object_disk_path` (String) from config with public getters. `concurrency` controls within-file multipart parallelism; `object_disk_path` provides alternate key prefix for S3 disk objects.
