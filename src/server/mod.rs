@@ -179,7 +179,10 @@ pub async fn start_server(
             drop(ws);
 
             let should_shutdown = watch_is_main
-                && !matches!(exit, watch::WatchLoopExit::Shutdown | watch::WatchLoopExit::Stopped);
+                && !matches!(
+                    exit,
+                    watch::WatchLoopExit::Shutdown | watch::WatchLoopExit::Stopped
+                );
 
             info!(
                 watch_is_main_process = watch_is_main,
@@ -230,6 +233,24 @@ pub async fn start_server(
     } else {
         None
     };
+
+    // Spawn SIGQUIT handler for stack dump (Unix only)
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigquit =
+                signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
+            loop {
+                sigquit.recv().await;
+                info!("SIGQUIT received, dumping stack trace to stderr");
+                let bt = std::backtrace::Backtrace::force_capture();
+                eprintln!("=== SIGQUIT stack dump ===");
+                eprintln!("{bt}");
+                eprintln!("=== end stack dump ===");
+            }
+        });
+    }
 
     let router = build_router(state.clone());
 
@@ -378,7 +399,10 @@ pub async fn spawn_watch_from_state(
         drop(ws);
 
         let should_shutdown = watch_is_main
-            && !matches!(exit, watch::WatchLoopExit::Shutdown | watch::WatchLoopExit::Stopped);
+            && !matches!(
+                exit,
+                watch::WatchLoopExit::Shutdown | watch::WatchLoopExit::Stopped
+            );
 
         info!(
             watch_is_main_process = watch_is_main,

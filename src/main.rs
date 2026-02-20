@@ -222,14 +222,9 @@ async fn run() -> Result<()> {
             let name = resolve_remote_shortcut(&raw_name, &s3).await?;
 
             let effective_resume = resume && config.general.use_resumable_state;
-            let backup_dir = download::download(
-                &config,
-                &s3,
-                &name,
-                effective_resume,
-                hardlink_exists_files,
-            )
-            .await?;
+            let backup_dir =
+                download::download(&config, &s3, &name, effective_resume, hardlink_exists_files)
+                    .await?;
 
             info!(
                 backup_name = %name,
@@ -413,12 +408,9 @@ async fn run() -> Result<()> {
                 // Remote mode: download manifest and list tables
                 let s3 = S3Client::new(&config.s3).await?;
                 let manifest_key = format!("{}/metadata.json", backup_name);
-                let manifest_data = s3
-                    .get_object(&manifest_key)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to download manifest for backup '{}'", backup_name)
-                    })?;
+                let manifest_data = s3.get_object(&manifest_key).await.with_context(|| {
+                    format!("Failed to download manifest for backup '{}'", backup_name)
+                })?;
                 let manifest = BackupManifest::from_json_bytes(&manifest_data)
                     .context("Failed to parse backup manifest")?;
 
@@ -496,10 +488,7 @@ async fn run() -> Result<()> {
                     );
                 }
 
-                info!(
-                    tables_count = filtered.len(),
-                    "Tables command complete"
-                );
+                info!(tables_count = filtered.len(), "Tables command complete");
             }
         }
 
@@ -593,6 +582,24 @@ async fn run() -> Result<()> {
                         sighup.recv().await;
                         info!("SIGHUP received, triggering config reload");
                         reload_tx_clone.send(true).ok();
+                    }
+                });
+            }
+
+            // Spawn SIGQUIT handler for stack dump (Unix only)
+            #[cfg(unix)]
+            {
+                tokio::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigquit =
+                        signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
+                    loop {
+                        sigquit.recv().await;
+                        info!("SIGQUIT received, dumping stack trace to stderr");
+                        let bt = std::backtrace::Backtrace::force_capture();
+                        eprintln!("=== SIGQUIT stack dump ===");
+                        eprintln!("{bt}");
+                        eprintln!("=== end stack dump ===");
                     }
                 });
             }
