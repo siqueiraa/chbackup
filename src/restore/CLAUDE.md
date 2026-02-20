@@ -118,7 +118,12 @@ Key behaviors:
 
 ### Part Attachment (attach.rs)
 - Uses `AttachParams` struct to bundle all parameters for a table's attachment
-- Hardlinks files from `{backup_dir}/shadow/{db}/{table}/{part_name}/` to `{table_data_path}/detached/{part_name}/`
+- `OwnedAttachParams` extended with per-disk fields:
+  - `manifest_disks: HashMap<String, String>` -- disk name -> disk path from manifest for per-disk shadow path resolution
+  - `source_db: String` -- original (pre-remap) database name for shadow path lookup
+  - `source_table: String` -- original (pre-remap) table name for shadow path lookup
+- `attach_parts_inner()` uses `resolve_shadow_part_path()` with `source_db`/`source_table` to resolve per-disk shadow paths. Builds `part_to_disk` reverse map from `parts_by_disk` to look up each part's disk name.
+- This fixes a pre-existing inconsistency: previously `attach_parts_inner()` used destination db/table names for shadow lookup, which broke under remap (`--as`). Now both `attach_parts_inner()` and `try_attach_table_mode()` consistently use source names.
 - Falls back to file copy on EXDEV (cross-device error code 18)
 - Chowns to ClickHouse uid/gid detected from `stat()` on data_path; skips chown if not root
 - `ALTER TABLE ATTACH PART` errors 232/233 (overlapping range, already exists) are logged as warnings and skipped
@@ -170,6 +175,7 @@ Key behaviors:
 - `try_attach_table_mode()` returns `Ok(true)` on success, `Ok(false)` if not eligible, `Err` on failure
 - Results from ATTACH TABLE mode are merged with per-part ATTACH results for the final tally
 - The `is_replicated_engine()` helper (in schema.rs) checks `engine.starts_with("Replicated")`
+- Per-disk path resolution: accepts `manifest_disks` and `parts_by_disk` parameters, builds `part_to_disk` reverse map, and uses `resolve_shadow_part_path()` per-part instead of a single `shadow_base` directory. Uses `src_db`/`src_table` (source names) for shadow lookup, consistent with `attach_parts_inner()`.
 
 ### Mutation Re-Apply (Phase 4d, mod.rs)
 After all data parts are attached (Phase 2) and before Phase 2b, `reapply_pending_mutations()` iterates restored tables and checks each `TableManifest.pending_mutations`. For each non-empty list:
@@ -236,7 +242,7 @@ Queries `system.tables` for `data_paths` column to find the table's data directo
 - `execute_restart_commands(ch, restart_command) -> Result<()>` -- Execute semicolon-separated restart commands with exec:/sql: prefix routing (Phase 4e)
 - `attach_parts(params) -> Result<u64>` -- Hardlink + ATTACH PART (borrowed params), returns count
 - `attach_parts_owned(params) -> Result<u64>` -- Hardlink + ATTACH PART (owned params for tokio::spawn); handles both local and S3 disk parts; skips already-attached parts when resume is active (Phase 2d)
-- `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries; includes `s3_client`, `disk_type_map`, `disk_remote_paths`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming` for Phase 2c; `already_attached`, `restore_state_path` for Phase 2d
+- `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries; includes `s3_client`, `disk_type_map`, `disk_remote_paths`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming` for Phase 2c; `already_attached`, `restore_state_path` for Phase 2d; `manifest_disks`, `source_db`, `source_table` for per-disk path resolution
 - `uuid_s3_prefix(uuid) -> String` -- Generate `store/{3char}/{uuid_with_dashes}/` prefix for S3 restore paths
 - `detect_clickhouse_ownership(data_path) -> Result<(Option<u32>, Option<u32>)>` -- UID/GID detection
 - `get_table_data_path(ch, db, table) -> Result<PathBuf>` -- Query data_paths

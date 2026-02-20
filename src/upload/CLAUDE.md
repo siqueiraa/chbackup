@@ -50,6 +50,18 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 {backup_name}/metadata.json  (uploaded LAST)
 ```
 
+### Per-Disk Part Lookup (mod.rs)
+- `find_part_dir()` delegates to `backup::collect::resolve_shadow_part_path()` for per-disk + legacy fallback path resolution
+- Accepts `manifest_disks: &HashMap<String, String>`, `backup_name: &str`, and `disk_name: &str` in addition to existing parameters
+- Callers in `upload()` pass `&manifest.disks`, the backup name, and each part's disk name (all already in scope)
+- Error on `None` return (part not found at any location) includes details about which paths were checked
+
+### Per-Disk Delete Local Cleanup (mod.rs)
+- When `delete_local` is true after upload, per-disk backup directories are cleaned BEFORE the default backup_dir
+- Iterates `manifest.disks` to discover per-disk dirs via `per_disk_backup_dir()`
+- Uses `std::fs::canonicalize()` + `HashSet` dedup to prevent double-delete (e.g., when symlinks resolve to the same path)
+- Per-disk dir deletion is non-fatal (warn on failure); default backup_dir deletion remains fatal (preserves existing `?` propagation semantics)
+
 ### URL Encoding
 - `url_encode_component()` percent-encodes non-alphanumeric chars except `-`, `_`, `.`
 - Does NOT preserve `/` (encodes individual path components)

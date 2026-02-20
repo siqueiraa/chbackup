@@ -25,6 +25,19 @@ src/backup/
 ### FreezeGuard (freeze.rs)
 The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. Since `Drop` is synchronous and cannot run async code, callers MUST call `unfreeze_all()` in a finally-like block. The guard accumulates `FreezeInfo` entries as tables are frozen, and iterates over them to UNFREEZE on cleanup.
 
+### Per-Disk Backup Directory (collect.rs)
+- `per_disk_backup_dir(disk_path, backup_name) -> PathBuf` computes `{disk_path}/backup/{backup_name}` for any disk
+- For single-disk setups where `disk_path == data_path`, this produces the same path as the legacy `{data_path}/backup/{name}` layout (zero behavior change)
+- `resolve_shadow_part_path()` is the SINGLE source of truth for shadow path resolution with a 4-step fallback chain:
+  1. Per-disk candidate (encoded): `{disk_path}/backup/{name}/shadow/{encoded_db}/{encoded_table}/{part}/`
+  2. Legacy default (encoded): `{backup_dir}/shadow/{encoded_db}/{encoded_table}/{part}/`
+  3. Legacy default (plain): `{backup_dir}/shadow/{plain_db}/{plain_table}/{part}/` (very old backups without URL encoding, skipped when plain == encoded)
+  4. None (part not found at any location)
+- Fallback checks **part-path existence** (not disk-path existence), correctly handling old backups with `manifest.disks` populated but legacy single-dir layout
+- Used by upload (`find_part_dir`), restore (`attach_parts_inner`, `try_attach_table_mode`), and indirectly by download (write-path uses `per_disk_backup_dir` directly)
+- `collect_parts()` accepts `backup_name` parameter and stages parts to `per_disk_backup_dir(disk_path, backup_name).join("shadow/...")` instead of the single `backup_dir/shadow/...`
+- Logs `"staging per-disk backup dir"` per disk during collection (satisfies runtime log pattern requirement)
+
 ### Shadow Walk and Hardlink (collect.rs)
 - Uses `walkdir` via `tokio::task::spawn_blocking` to iterate shadow directories
 - Shadow path structure: `{data_path}/shadow/{freeze_name}/store/{shard_hex}/{table_uuid}/{part_name}/`
@@ -74,15 +87,19 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 ### Backup Directory Layout
 ```
 {data_path}/backup/{backup_name}/
-  metadata.json                         -- BackupManifest
+  metadata.json                         -- BackupManifest (always on default disk)
   metadata/{db}/{table}.json            -- Per-table metadata
-  shadow/{db}/{table}/{part_name}/...   -- Hardlinked data files
   access/users.jsonl                    -- RBAC users (Phase 4e, when --rbac)
   access/roles.jsonl                    -- RBAC roles (Phase 4e, when --rbac)
   access/row_policies.jsonl             -- RBAC row policies (Phase 4e, when --rbac)
   access/settings_profiles.jsonl        -- RBAC settings profiles (Phase 4e, when --rbac)
   access/quotas.jsonl                   -- RBAC quotas (Phase 4e, when --rbac)
   configs/...                           -- ClickHouse config files (Phase 4e, when --configs)
+
+# Per-disk shadow directories (hardlinked data files):
+{disk_path}/backup/{backup_name}/shadow/{db}/{table}/{part_name}/...
+# When disk_path == data_path (single-disk), this is inside the default backup dir.
+# When disk_path != data_path (multi-disk), this is on the same filesystem as the source.
 ```
 
 ### Partition-Level Freeze (Phase 2d)
@@ -126,7 +143,9 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - `diff_parts(current, base) -> DiffResult` -- Incremental comparison of current vs base manifest parts
 - `compute_crc64(path) -> Result<u64>` -- File-level CRC64
 - `compute_crc64_bytes(data) -> u64` -- In-memory CRC64
-- `collect_parts(data_path, freeze_name, backup_dir, tables, disk_type_map, disk_paths, skip_projections: &[String]) -> Result<HashMap<String, Vec<CollectedPart>>>` -- Walk all disk shadow directories, detect S3 disk parts, hardlink local parts, filter projections (Phase 2c + Phase 5 updated signature)
+- `per_disk_backup_dir(disk_path, backup_name) -> PathBuf` -- Compute per-disk backup directory `{disk_path}/backup/{backup_name}`
+- `resolve_shadow_part_path(backup_dir, manifest_disks, backup_name, disk_name, encoded_db, encoded_table, plain_db, plain_table, part_name) -> Option<PathBuf>` -- 4-step fallback chain for shadow path resolution (per-disk -> legacy encoded -> legacy plain -> None)
+- `collect_parts(data_path, freeze_name, backup_dir, backup_name, tables, disk_type_map, disk_paths, skip_projections: &[String]) -> Result<HashMap<String, Vec<CollectedPart>>>` -- Walk all disk shadow directories, stage to per-disk backup dirs, detect S3 disk parts, hardlink local parts, filter projections (Phase 2c + Phase 5 + per-disk updated signature)
 - `CollectedPart` -- Struct with `database`, `table`, `part_info: PartInfo`, `disk_name: String`
 - `freeze_table(ch, db, table, freeze_name) -> Result<()>` -- Issue FREEZE
 - `check_mutations(ch, targets, timeout) -> Result<()>` -- Mutation pre-flight
@@ -149,6 +168,12 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - After all tasks join: aggregate `FreezeInfo` entries into a `FreezeGuard`, aggregate `TableManifest` entries into the manifest `HashMap`
 - Error cleanup: on any task error, all successfully frozen tables are still unfrozen via the assembled `FreezeGuard`
 - `ChClient` and `Arc<Vec<TableRow>>` are cloned into each spawn (both are `Clone`)
+
+### Per-Disk Error Cleanup (mod.rs)
+- On `backup::create()` failure, `cleanup_failed_backup()` removes both the default backup directory AND all per-disk backup directories
+- Uses `std::fs::canonicalize()` + `HashSet` dedup to prevent double-delete when paths resolve to the same directory (e.g., symlinks)
+- Per-disk dir cleanup is non-fatal (warn on failure); default backup_dir cleanup follows existing error handling
+- Disk map (`HashMap<String, String>`) from `ch.get_disks()` is already in scope at the error cleanup site
 
 ### Error Handling
 - Uses `anyhow::Result` throughout with `.context()` for error chain

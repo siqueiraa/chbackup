@@ -75,14 +75,27 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
   - On insufficient space: returns an error with details (required vs available)
   - On `statvfs` failure (e.g., NFS): logs warning and continues (best-effort)
 
+### Per-Disk Download Target Directories (mod.rs)
+- During download, parts are written to per-disk directories when the disk path from `manifest.disks` exists on the local host
+- For each part: if `manifest.disks[disk_name]` exists as a local directory, writes to `{disk_path}/backup/{name}/shadow/...` (per-disk); otherwise falls back to `{data_path}/backup/{name}/shadow/...` (cross-host download)
+- Note: download WRITES (creates dirs), so it checks **disk existence** (not part-path existence). This differs from `resolve_shadow_part_path()` which checks part-path existence for READ paths.
+- Uses `per_disk_backup_dir()` from `backup::collect` for consistent path computation
+
+### Per-Disk Disk Map Persistence (mod.rs, resume.rs)
+- `DownloadState.disk_map: HashMap<String, String>` field (`#[serde(default)]` for backward compat) stores the manifest's disk name -> disk path mapping
+- Persisted **unconditionally** (NOT gated by resume mode) to the state file BEFORE downloading any parts
+- This ensures `delete_local()` in `list.rs` can discover per-disk dirs even if the download fails before writing `metadata.json`, whether or not resume mode is active
+- Separate `save_state_graceful()` call inserted after `backup_dir` creation and before the download work queue
+
 ### Hardlink Dedup (Phase 5)
 - `--hardlink-exists-files` flag enables post-download deduplication via hardlinks to existing local backups
-- Before downloading each local disk part, `find_existing_part()` scans `{data_path}/backup/*/shadow/{table_key}/{part_name}/` (excluding the current backup)
+- Before downloading each local disk part, `find_existing_part()` scans `{data_path}/backup/*/shadow/{table_key}/{part_name}/` (excluding the current backup) AND per-disk paths `{disk_path}/backup/*/shadow/{table_key}/{part_name}/` for each disk in `manifest_disks`
+- Accepts `manifest_disks: &HashMap<String, String>` and `disk_name: &str` parameters for per-disk search
 - For each candidate: computes CRC64 of `checksums.txt`, compares against the manifest's expected CRC64
 - If a match is found: `hardlink_existing_part()` creates hardlinks from the existing part to the target directory (with EXDEV copy fallback), skipping the S3 download entirely
 - Parts with `checksum_crc64 == 0` are skipped (no valid CRC to compare)
 - The check runs inside the parallel task via `spawn_blocking`, before the S3 `get_object` call
-- Performance note: scans all local backups for each part (O(backups * parts)), acceptable because directory listing is fast and typically few backups exist locally
+- Performance note: scans all local backups for each part (O(backups * parts * disks)), acceptable because directory listing is fast and typically few backups exist locally
 
 ### Progress Bar Integration (Phase 5)
 - `ProgressTracker` from `progress.rs` is created before the parallel download loop
