@@ -79,6 +79,14 @@ pub struct BackupManifest {
     /// RBAC metadata (path to access/ directory in S3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rbac: Option<RbacInfo>,
+
+    /// Total size of RBAC (access/) files in bytes.
+    #[serde(default)]
+    pub rbac_size: u64,
+
+    /// Total size of ClickHouse config backup files in bytes.
+    #[serde(default)]
+    pub config_size: u64,
 }
 
 /// Per-table metadata within a backup.
@@ -310,6 +318,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         }
     }
 
@@ -468,6 +478,32 @@ mod tests {
         assert_eq!(part.source, "uploaded");
         assert_eq!(part.checksum_crc64, 0);
         assert!(part.s3_objects.is_none());
+    }
+
+    #[test]
+    fn test_manifest_rbac_config_size_fields() {
+        let mut manifest = sample_manifest();
+        manifest.rbac_size = 1024;
+        manifest.config_size = 2048;
+
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        let deserialized: BackupManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.rbac_size, 1024);
+        assert_eq!(deserialized.config_size, 2048);
+    }
+
+    #[test]
+    fn test_manifest_backward_compat_no_rbac_config_size() {
+        // Deserialize a JSON string WITHOUT rbac_size/config_size
+        // and verify both default to 0.
+        let json = r#"{
+            "name": "old-backup",
+            "timestamp": "2024-01-15T02:00:00Z"
+        }"#;
+        let manifest: BackupManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.rbac_size, 0);
+        assert_eq!(manifest.config_size, 0);
     }
 
     #[test]

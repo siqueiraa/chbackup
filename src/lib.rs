@@ -197,6 +197,8 @@ mod tests {
             compressed_size: 512,
             table_count: 3,
             metadata_size: 256,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         };

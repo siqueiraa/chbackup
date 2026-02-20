@@ -53,6 +53,10 @@ pub struct BackupSummary {
     pub table_count: usize,
     /// Size of the manifest metadata in bytes.
     pub metadata_size: u64,
+    /// Size of RBAC (access/) files in bytes.
+    pub rbac_size: u64,
+    /// Size of ClickHouse config backup files in bytes.
+    pub config_size: u64,
     /// Whether the backup manifest is missing or corrupt.
     pub is_broken: bool,
     /// Reason why the backup is broken (e.g., "metadata.json not found").
@@ -181,6 +185,8 @@ fn format_delimited(summaries: &[BackupSummary], delimiter: char) -> String {
         "compressed_size",
         "table_count",
         "metadata_size",
+        "rbac_size",
+        "config_size",
         "is_broken",
         "broken_reason",
     ];
@@ -202,6 +208,8 @@ fn format_delimited(summaries: &[BackupSummary], delimiter: char) -> String {
             &s.compressed_size.to_string(),
             &s.table_count.to_string(),
             &s.metadata_size.to_string(),
+            &s.rbac_size.to_string(),
+            &s.config_size.to_string(),
             &s.is_broken.to_string(),
             broken_reason,
         ];
@@ -318,6 +326,8 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                         compressed_size: manifest.compressed_size,
                         table_count: manifest.tables.len(),
                         metadata_size: manifest.metadata_size,
+                        rbac_size: manifest.rbac_size,
+                        config_size: manifest.config_size,
                         is_broken: false,
                         broken_reason: None,
                     });
@@ -336,6 +346,8 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                         compressed_size: 0,
                         table_count: 0,
                         metadata_size: 0,
+                        rbac_size: 0,
+                        config_size: 0,
                         is_broken: true,
                         broken_reason: Some(reason),
                     });
@@ -355,6 +367,8 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                     compressed_size: 0,
                     table_count: 0,
                     metadata_size: 0,
+                    rbac_size: 0,
+                    config_size: 0,
                     is_broken: true,
                     broken_reason: Some(reason),
                 });
@@ -1055,6 +1069,8 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
             compressed_size: 0,
             table_count: 0,
             metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: true,
             broken_reason: Some("metadata.json not found".to_string()),
         };
@@ -1068,6 +1084,8 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
             compressed_size: manifest.compressed_size,
             table_count: manifest.tables.len(),
             metadata_size: manifest.metadata_size,
+            rbac_size: manifest.rbac_size,
+            config_size: manifest.config_size,
             is_broken: false,
             broken_reason: None,
         },
@@ -1086,6 +1104,8 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: true,
                 broken_reason: Some(reason),
             }
@@ -1202,6 +1222,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
         manifest
             .save_to_file(&backup1.join("metadata.json"))
@@ -1273,6 +1295,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
         manifest
             .save_to_file(&backup1.join("metadata.json"))
@@ -1334,10 +1358,12 @@ mod tests {
         let summaries = [BackupSummary {
             name: "test-backup".to_string(),
             timestamp: Some(chrono::Utc::now()),
-            size: 1_048_576,           // 1 MB
-            compressed_size: 524_288,  // 512 KB
+            size: 1_048_576,          // 1 MB
+            compressed_size: 524_288, // 512 KB
             table_count: 3,
             metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         }];
@@ -1514,6 +1540,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
         manifest
             .save_to_file(&valid_dir.join("metadata.json"))
@@ -1629,6 +1657,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
         manifest
             .save_to_file(&backup_dir.join("metadata.json"))
@@ -1847,6 +1877,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
 
         let keys = collect_keys_from_manifest(&manifest);
@@ -1885,6 +1917,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
 
         let keys = collect_keys_from_manifest(&manifest);
@@ -1952,6 +1986,8 @@ mod tests {
             compressed_size: 500,
             table_count: 2,
             metadata_size: 256,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         };
@@ -1982,6 +2018,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
 
         let metadata_path = backup_dir.join("metadata.json");
@@ -2003,6 +2041,8 @@ mod tests {
             compressed_size: 500,
             table_count: 2,
             metadata_size: 256,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         }];
@@ -2026,6 +2066,8 @@ mod tests {
             compressed_size: 500,
             table_count: 2,
             metadata_size: 256,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         }];
@@ -2044,6 +2086,8 @@ mod tests {
             compressed_size: 1000,
             table_count: 5,
             metadata_size: 128,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         }];
@@ -2065,6 +2109,8 @@ mod tests {
             compressed_size: 1000,
             table_count: 5,
             metadata_size: 128,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         }];
@@ -2085,6 +2131,8 @@ mod tests {
             compressed_size: 524_288,
             table_count: 3,
             metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         }];
@@ -2120,6 +2168,8 @@ mod tests {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2130,6 +2180,8 @@ mod tests {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2140,6 +2192,8 @@ mod tests {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2159,6 +2213,8 @@ mod tests {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2169,6 +2225,8 @@ mod tests {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2179,6 +2237,8 @@ mod tests {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2212,6 +2272,8 @@ mod tests {
             compressed_size: 0,
             table_count: 0,
             metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         }];
@@ -2234,6 +2296,8 @@ mod tests {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2244,6 +2308,8 @@ mod tests {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: true,
                 broken_reason: Some("corrupt".to_string()),
             },
@@ -2254,6 +2320,8 @@ mod tests {
                 compressed_size: 0,
                 table_count: 0,
                 metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
                 is_broken: false,
                 broken_reason: None,
             },
@@ -2277,6 +2345,8 @@ mod tests {
             compressed_size: 6789,
             table_count: 4,
             metadata_size: 512,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: false,
             broken_reason: None,
         };

@@ -717,6 +717,8 @@ mod tests {
             compressed_size: 0,
             table_count: 0,
             metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
             is_broken: broken,
             broken_reason: if broken {
                 Some("test".to_string())

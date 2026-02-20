@@ -314,6 +314,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         }
     }
 

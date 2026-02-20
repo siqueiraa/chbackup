@@ -654,6 +654,8 @@ pub async fn create(
         functions: Vec::new(),
         named_collections: Vec::new(),
         rbac: None,
+        rbac_size: 0,
+        config_size: 0,
     };
 
     // 13a. Backup RBAC, configs, named collections (populates manifest fields)
@@ -822,6 +824,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
 
         let json = serde_json::to_string(&manifest).unwrap();
@@ -885,11 +889,17 @@ mod tests {
     fn test_partition_list_all_triggers_whole_table_freeze() {
         // "all" partition ID should result in empty vec (whole-table freeze)
         let result = parse_partition_list(Some("all"));
-        assert!(result.is_empty(), "partition 'all' should result in empty vec for whole-table freeze");
+        assert!(
+            result.is_empty(),
+            "partition 'all' should result in empty vec for whole-table freeze"
+        );
 
         // "all" mixed with other partitions should still trigger whole-table
         let mixed = parse_partition_list(Some("202401,all,202403"));
-        assert!(mixed.is_empty(), "partition 'all' in a list should result in empty vec");
+        assert!(
+            mixed.is_empty(),
+            "partition 'all' in a list should result in empty vec"
+        );
 
         // Normal partitions should not be affected
         let normal = parse_partition_list(Some("202401,202402"));
@@ -899,15 +909,21 @@ mod tests {
     #[test]
     fn test_is_ignorable_freeze_error() {
         // Code 60: UNKNOWN_TABLE
-        assert!(is_ignorable_freeze_error("Code: 60. DB::Exception: Table default.trades does not exist. (UNKNOWN_TABLE)"));
+        assert!(is_ignorable_freeze_error(
+            "Code: 60. DB::Exception: Table default.trades does not exist. (UNKNOWN_TABLE)"
+        ));
         assert!(is_ignorable_freeze_error("Code: 60"));
 
         // Code 81: UNKNOWN_DATABASE
-        assert!(is_ignorable_freeze_error("Code: 81. DB::Exception: Database mydb does not exist. (UNKNOWN_DATABASE)"));
+        assert!(is_ignorable_freeze_error(
+            "Code: 81. DB::Exception: Database mydb does not exist. (UNKNOWN_DATABASE)"
+        ));
         assert!(is_ignorable_freeze_error("UNKNOWN_DATABASE"));
 
         // Code 218: CANNOT_FREEZE_PARTITION
-        assert!(is_ignorable_freeze_error("Code: 218. DB::Exception: CANNOT_FREEZE_PARTITION"));
+        assert!(is_ignorable_freeze_error(
+            "Code: 218. DB::Exception: CANNOT_FREEZE_PARTITION"
+        ));
         assert!(is_ignorable_freeze_error("Code: 218"));
         assert!(is_ignorable_freeze_error("CANNOT_FREEZE_PARTITION"));
 

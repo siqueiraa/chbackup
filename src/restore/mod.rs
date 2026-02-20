@@ -1279,6 +1279,8 @@ mod tests {
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
 
         // Verify table has no mutations -- reapply_pending_mutations would skip it

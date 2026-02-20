@@ -856,6 +856,8 @@ mod tests {
             functions: Vec::new(), // Empty -- should return immediately
             named_collections: Vec::new(),
             rbac: None,
+            rbac_size: 0,
+            config_size: 0,
         };
 
         assert!(manifest.functions.is_empty());
