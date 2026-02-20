@@ -245,12 +245,240 @@ pub async fn post_actions(
 
             let state_clone = state.clone();
             let command = request.command.clone();
+            let parts_owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
             tokio::spawn(async move {
                 tracing::info!(command = %command, "Action dispatched from POST /api/v1/actions");
-                // For now, we mark the operation as completed immediately.
-                // Full dispatch to actual command functions is wired via the dedicated
-                // POST endpoints (create, upload, etc.) which parse proper request bodies.
-                state_clone.finish_op(id).await;
+                let backup_name = parts_owned
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
+
+                let config = state_clone.config.load();
+                let ch = state_clone.ch.load();
+                let s3 = state_clone.s3.load();
+                let start_time = std::time::Instant::now();
+                let op = parts_owned[0].as_str();
+
+                let result: Result<(), anyhow::Error> = match op {
+                    "create" => {
+                        crate::backup::create(
+                            &config,
+                            &ch,
+                            &backup_name,
+                            None,  // table_pattern
+                            false, // schema_only
+                            None,  // diff_from
+                            None,  // partitions
+                            false, // skip_check_parts_columns
+                            false, // rbac
+                            false, // configs
+                            false, // named_collections
+                            &config.backup.skip_projections,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                    "upload" => {
+                        let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
+                            .join("backup")
+                            .join(&backup_name);
+                        let effective_resume = config.general.use_resumable_state;
+                        crate::upload::upload(
+                            &config,
+                            &s3,
+                            &backup_name,
+                            &backup_dir,
+                            false, // delete_local
+                            None,  // diff_from_remote
+                            effective_resume,
+                        )
+                        .await
+                    }
+                    "download" => {
+                        let effective_resume = config.general.use_resumable_state;
+                        crate::download::download(
+                            &config,
+                            &s3,
+                            &backup_name,
+                            effective_resume,
+                            false, // hardlink_exists_files
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                    "restore" => {
+                        let effective_resume = config.general.use_resumable_state;
+                        crate::restore::restore(
+                            &config,
+                            &ch,
+                            &backup_name,
+                            None,  // table_pattern
+                            false, // schema_only
+                            false, // data_only
+                            false, // rm
+                            effective_resume,
+                            None,  // rename_as
+                            None,  // database_mapping
+                            false, // rbac
+                            false, // configs
+                            false, // named_collections
+                            None,  // partitions
+                            false, // skip_empty_tables
+                        )
+                        .await
+                    }
+                    "create_remote" => {
+                        let create_result = crate::backup::create(
+                            &config,
+                            &ch,
+                            &backup_name,
+                            None,  // table_pattern
+                            false, // schema_only
+                            None,  // diff_from
+                            None,  // partitions
+                            false, // skip_check_parts_columns
+                            false, // rbac
+                            false, // configs
+                            false, // named_collections
+                            &config.backup.skip_projections,
+                        )
+                        .await;
+                        match create_result {
+                            Ok(_) => {
+                                let backup_dir =
+                                    std::path::PathBuf::from(&config.clickhouse.data_path)
+                                        .join("backup")
+                                        .join(&backup_name);
+                                let effective_resume = config.general.use_resumable_state;
+                                crate::upload::upload(
+                                    &config,
+                                    &s3,
+                                    &backup_name,
+                                    &backup_dir,
+                                    false, // delete_local
+                                    None,  // diff_from_remote
+                                    effective_resume,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    "restore_remote" => {
+                        let effective_resume = config.general.use_resumable_state;
+                        let dl = crate::download::download(
+                            &config,
+                            &s3,
+                            &backup_name,
+                            effective_resume,
+                            false, // hardlink_exists_files
+                        )
+                        .await;
+                        match dl {
+                            Ok(_) => {
+                                crate::restore::restore(
+                                    &config,
+                                    &ch,
+                                    &backup_name,
+                                    None,  // table_pattern
+                                    false, // schema_only
+                                    false, // data_only
+                                    false, // rm
+                                    effective_resume,
+                                    None,  // rename_as
+                                    None,  // database_mapping
+                                    false, // rbac
+                                    false, // configs
+                                    false, // named_collections
+                                    None,  // partitions
+                                    false, // skip_empty_tables
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    "delete" => {
+                        // delete <location> <name> OR delete <name> (defaults to remote)
+                        let (loc, name) = if parts_owned.len() >= 3 {
+                            (
+                                parts_owned[1].as_str().to_string(),
+                                parts_owned[2].clone(),
+                            )
+                        } else {
+                            ("remote".to_string(), backup_name.clone())
+                        };
+                        let data_path = config.clickhouse.data_path.clone();
+                        match loc.as_str() {
+                            "local" => {
+                                let n = name.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    list::delete_local(&data_path, &n)
+                                })
+                                .await
+                                .unwrap_or_else(|e| {
+                                    Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
+                                })
+                            }
+                            _ => list::delete_remote(&s3, &name).await,
+                        }
+                    }
+                    "clean_broken" => {
+                        let s3_result = list::clean_broken_remote(&s3).await;
+                        let data_path = config.clickhouse.data_path.clone();
+                        let local_result =
+                            tokio::task::spawn_blocking(move || {
+                                list::clean_broken_local(&data_path)
+                            })
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
+                            });
+                        // Combine results -- fail if either failed
+                        match (s3_result, local_result) {
+                            (Ok(_), Ok(_)) => Ok(()),
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        }
+                    }
+                    _ => Err(anyhow::anyhow!("unknown command: {}", op)),
+                };
+
+                let duration = start_time.elapsed().as_secs_f64();
+
+                match result {
+                    Ok(()) => {
+                        if let Some(m) = &state_clone.metrics {
+                            m.backup_duration_seconds
+                                .with_label_values(&[op])
+                                .observe(duration);
+                            m.successful_operations_total
+                                .with_label_values(&[op])
+                                .inc();
+                        }
+                        info!(command = %command, "Action completed from POST /api/v1/actions");
+                        // Invalidate manifest cache for operations that mutate remote state
+                        if matches!(
+                            op,
+                            "upload"
+                                | "create_remote"
+                                | "delete"
+                                | "clean_broken"
+                        ) {
+                            state_clone.manifest_cache.lock().await.invalidate();
+                        }
+                        state_clone.finish_op(id).await;
+                    }
+                    Err(e) => {
+                        if let Some(m) = &state_clone.metrics {
+                            m.backup_duration_seconds
+                                .with_label_values(&[op])
+                                .observe(duration);
+                            m.errors_total.with_label_values(&[op]).inc();
+                        }
+                        warn!(command = %command, error = %e, "Action failed from POST /api/v1/actions");
+                        state_clone.fail_op(id, e.to_string()).await;
+                    }
+                }
             });
 
             Ok((
