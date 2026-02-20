@@ -33,7 +33,7 @@
 | CLI | `clap` (derive API) |
 | Config | `serde_yaml` + env overlay |
 | ClickHouse | `clickhouse` v0.13 (HTTP protocol, async) |
-| S3 | `aws-sdk-s3` + `aws-config` |
+| S3 | `aws-sdk-s3` + `aws-config` + `aws-sdk-sts` (AssumeRole) |
 | Async | `tokio` |
 | Async streams | `tokio-util` (codec feature) |
 | Directory walks | `walkdir` (via `spawn_blocking`) |
@@ -68,6 +68,7 @@ Things that are easy to get wrong when reading the design doc:
 **Phase 3d** (watch mode): Complete -- Watch state machine loop with full+incremental backup chains, name template resolution ({type}/{time:FORMAT}/{shard} macros), resume-on-restart from remote backup listing, SIGHUP config hot-reload, API endpoints (watch/start, watch/stop, watch/status, reload), server --watch flag, Prometheus watch metrics.
 **Phase 3e** (docker/deploy): Complete -- Production Dockerfile, GitHub Actions CI with ClickHouse version matrix, K8s sidecar example, integration test seed data and round-trip smoke tests, WATCH_INTERVAL/FULL_INTERVAL env var overlay.
 **Phase 5** (polish gaps): Complete -- API tables/restart endpoints (replacing 501 stubs), --skip-projections flag, --hardlink-exists-files download dedup, progress bar (indicatif), structured exit codes (0/1/2/3/4/130/143), metadata_size in list API response.
+**Phase 6** (Go parity): Complete -- Config defaults aligned with Go (timeout 30m, max_connections NumCPU/2, skip_tables includes _temporary), S3 ACL applied to all write operations, STS AssumeRole for cross-account S3, S3 concurrency + object_disk_path fields, retry jitter wiring (backup.retries_* overrides general.*), multipart CopyObject for >5GB objects, freeze-by-part with error 218 handling, backup failure cleanup, restore --partitions/--skip-empty-tables, check_replicas_before_attach, incremental chain protection in remote retention, API parity (HTTP 423, JSON health, POST actions dispatch, list sizes), watch_is_main_process exit, list --format flag (json/yaml/csv/tsv) + latest/previous shortcuts.
 
 ## Source Module Map
 
@@ -87,13 +88,13 @@ src/
   resume.rs          -- Resume state types (UploadState, DownloadState, RestoreState), atomic save/load, graceful degradation
   table_filter.rs    -- Glob pattern matching for -t flag, disk exclusion checks
   progress.rs        -- ProgressTracker (indicatif wrapper, TTY-aware, Clone for spawned tasks)
-  list.rs            -- list + delete + clean_broken + retention + GC + clean_shadow (local dir scan + S3)
+  list.rs            -- list + delete + clean_broken + retention + GC + clean_shadow (local dir scan + S3), --format output (json/yaml/csv/tsv), latest/previous shortcuts
   backup/            -- create command: parallel FREEZE, disk-aware shadow walk, hardlink/S3 metadata, CRC64, UNFREEZE
   upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart, CopyObject for S3 disk parts
   download/          -- download command: parallel S3 GetObject, LZ4+untar decompress, metadata-only for S3 disk parts
   restore/           -- restore command: Mode A (--rm DROP) + Mode B (non-destructive), ON CLUSTER, ZK conflict resolution, ATTACH TABLE mode, mutation re-apply, parallel hardlink+ATTACH PART, UUID-isolated S3 CopyObject restore
   clickhouse/        -- ChClient wrapper (FREEZE/UNFREEZE, DDL, DROP, DETACH/ATTACH TABLE, ZK queries, mutation exec, get_macros)
-  storage/           -- S3Client wrapper (put, get, list, delete, head, multipart, copy_object)
+  storage/           -- S3Client wrapper (put, get, list, delete, head, multipart, copy_object, multipart_copy >5GB, STS AssumeRole)
   watch/             -- Watch mode scheduler: state machine loop, name template resolution, resume state, config hot-reload
   server/            -- HTTP API server: axum routes, AppState, metrics, auth, watch lifecycle endpoints
 ```
@@ -160,13 +161,25 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **Structured exit codes** (Phase 5): `main()` wraps `run()` and maps errors to exit codes via `exit_code_from_error()` in `error.rs`. Downcasts `anyhow::Error` to `ChBackupError` for variant-specific codes: `LockError` -> 4, `BackupError`/`ManifestError` containing "not found" -> 3, all others -> 1. Clap handles code 2 (usage). SIGINT/SIGTERM handled by tokio signal handlers for codes 130/143.
 - **Hardlink dedup** (Phase 5): `--hardlink-exists-files` flag enables post-download deduplication. `find_existing_part()` scans `{data_path}/backup/*/shadow/{table_key}/{part_name}/` (excluding current backup), computes CRC64 of `checksums.txt`, returns first match. `hardlink_existing_part()` creates hardlinks (with EXDEV fallback). Checked before each part download in the parallel pipeline.
 - **Skip projections** (Phase 5): `--skip-projections` flag (CLI comma-separated or `config.backup.skip_projections` list) filters `.proj` subdirectories during `hardlink_dir()` shadow walk. `should_skip_projection()` uses `glob::Pattern` matching on the stem (name without `.proj`). Special value `*` skips all projections. `WalkDir::skip_current_dir()` prevents descending into skipped directories.
+- **STS AssumeRole** (Phase 6): When `s3.assume_role_arn` is non-empty, `S3Client::new()` creates an STS client, calls `assume_role()` with session name "chbackup", extracts temporary credentials, and rebuilds the SDK config with them. Enables cross-account S3 access.
+- **Multipart CopyObject** (Phase 6): `copy_object()` checks source object size via `head_object()`; objects >5GB (5,368,709,120 bytes) use `copy_object_multipart()` with `UploadPartCopy` API (auto-calculated chunk sizes, max 10000 parts). On error, the multipart upload is aborted. Falls through to single CopyObject on `head_object` failure.
+- **Retry jitter** (Phase 6): `effective_retries()` resolves `backup.retries_*` vs `general.retries_*` config (backup overrides when non-zero). `apply_jitter()` uses `SystemTime` nanos as PRNG to avoid `rand` dependency. `copy_object_with_retry_jitter()` extends retry with configurable jitter factor. Wired into upload CopyObject, restore CopyObject, and download CRC64 retry paths.
+- **Freeze-by-part** (Phase 6): When `clickhouse.freeze_by_part` is true, calls `ALTER TABLE FREEZE PARTITION` per partition instead of whole-table FREEZE. `freeze_by_part_where` adds a WHERE filter on `system.parts` to select partitions. Error code 218 (CANNOT_FREEZE_PARTITION) is caught and logged as a non-fatal warning.
+- **Backup failure cleanup** (Phase 6): On `backup::create()` failure, `cleanup_failed_backup()` removes the local backup directory and calls `clean_shadow()` for the backup name, matching Go behavior.
+- **Restore partitions** (Phase 6): `--partitions` on restore filters parts by `partition_id` during ATTACH. `partition_id = "all"` matches unpartitioned tables (tuple()). `--skip-empty-tables` skips CREATE DDL for tables with no matching parts.
+- **Check replicas before attach** (Phase 6): When `clickhouse.check_replicas_before_attach` is true, queries `system.replicas` to verify all replicas are synced (zero queue/inserts_in_queue) before attaching parts. Logs warning and continues on sync failure (non-fatal).
+- **Incremental chain protection** (Phase 6): `retention_remote()` checks `required_backups` field in manifests; backups referenced as diff-from bases by surviving backups are protected from deletion regardless of age.
+- **API parity** (Phase 6): HTTP 423 (not 409) for concurrent op rejection. Health endpoint returns JSON `{"status":"ok"}`. `POST /api/v1/actions` dispatches commands. List API includes `named_collection_size`, `desc` (reverse sort) query params.
+- **Watch exit behavior** (Phase 6): When `api.watch_is_main_process` is true and the watch loop ends (max errors or channel close), the server process calls `std::process::exit(1)` to terminate.
+- **List format flag** (Phase 6): `--format` flag supports `text` (default), `json`, `yaml`, `csv`, `tsv` output. `latest` and `previous` are shortcut aliases for the most recent and second-most-recent backup names.
+- **S3 concurrency + object_disk_path** (Phase 6): `S3Client` stores `concurrency` (u32) and `object_disk_path` (String) from config with public getters. `concurrency` controls within-file multipart parallelism; `object_disk_path` provides alternate key prefix for S3 disk objects.
 
 ## Remaining Limitations
 
 - No parallel ATTACH within a single table (deferred -- tables parallel is sufficient)
 - No streaming multipart upload (Phase 2a buffers compressed data, then decides single vs multipart)
 - API tables endpoint has no pagination (returns all tables in a single response)
-- rbac_size and config_size in list API response are hardcoded to 0 (requires scanning directory sizes)
+- rbac_size and config_size in list API response are hardcoded to 0 (would require scanning directory sizes at backup creation time)
 
 ## Build & Test
 
