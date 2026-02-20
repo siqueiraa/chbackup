@@ -877,14 +877,6 @@ pub async fn retention_remote(s3: &S3Client, keep: i32) -> Result<usize> {
     // Collect all backup names referenced as incremental bases by surviving backups
     let incremental_bases = collect_incremental_bases(s3, &surviving_names).await;
 
-    // DEBUG_MARKER:F001 - verify incremental base protection
-    debug!(
-        target: "debug",
-        "DEBUG_VERIFY:F001 incremental_bases={:?}, to_delete_count={}, surviving_count={}",
-        incremental_bases, to_delete, surviving_names.len()
-    );
-    // END_DEBUG_MARKER:F001
-
     let mut deleted = 0;
 
     for b in valid.iter().take(to_delete) {
