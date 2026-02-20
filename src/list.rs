@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -62,6 +63,78 @@ pub struct BackupSummary {
     /// Reason why the backup is broken (e.g., "metadata.json not found").
     /// None for valid backups.
     pub broken_reason: Option<String>,
+}
+
+/// In-memory cache for remote backup summaries (design 8.4).
+/// TTL-based expiry, invalidated on mutating operations.
+pub struct ManifestCache {
+    summaries: Option<Vec<BackupSummary>>,
+    populated_at: Option<Instant>,
+    ttl: Duration,
+}
+
+impl ManifestCache {
+    /// Create a new empty cache with the given TTL.
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            summaries: None,
+            populated_at: None,
+            ttl,
+        }
+    }
+
+    /// Get cached summaries if they exist and have not expired.
+    pub fn get(&self) -> Option<&Vec<BackupSummary>> {
+        let populated_at = self.populated_at?;
+        if populated_at.elapsed() >= self.ttl {
+            return None;
+        }
+        self.summaries.as_ref()
+    }
+
+    /// Store summaries in the cache, resetting the TTL timer.
+    pub fn set(&mut self, summaries: Vec<BackupSummary>) {
+        self.populated_at = Some(Instant::now());
+        self.summaries = Some(summaries);
+    }
+
+    /// Clear cached data, forcing the next get() to return None.
+    pub fn invalidate(&mut self) {
+        self.summaries = None;
+        self.populated_at = None;
+    }
+}
+
+/// List remote backups using the cache if available, otherwise fetching from S3.
+///
+/// On cache miss, calls `list_remote(s3)` and populates the cache.
+pub async fn list_remote_cached(
+    s3: &S3Client,
+    cache: &tokio::sync::Mutex<ManifestCache>,
+) -> Result<Vec<BackupSummary>> {
+    // Check cache first
+    {
+        let guard = cache.lock().await;
+        if let Some(cached) = guard.get() {
+            debug!("ManifestCache: hit, returning {} summaries", cached.len());
+            return Ok(cached.clone());
+        }
+    }
+
+    // Cache miss: fetch from S3
+    let summaries = list_remote(s3).await?;
+    info!(
+        "ManifestCache: populated, count={}",
+        summaries.len()
+    );
+
+    // Store in cache
+    {
+        let mut guard = cache.lock().await;
+        guard.set(summaries.clone());
+    }
+
+    Ok(summaries)
 }
 
 /// List backups based on the requested location and output format.
@@ -2360,5 +2433,63 @@ mod tests {
         assert_eq!(deserialized.table_count, summary.table_count);
         assert_eq!(deserialized.metadata_size, summary.metadata_size);
         assert_eq!(deserialized.is_broken, summary.is_broken);
+    }
+
+    #[test]
+    fn test_manifest_cache_basic() {
+        let mut cache = ManifestCache::new(Duration::from_secs(300));
+
+        // Initially empty
+        assert!(cache.get().is_none());
+
+        // Set some summaries
+        let summaries = vec![BackupSummary {
+            name: "test-backup".to_string(),
+            timestamp: None,
+            size: 1024,
+            compressed_size: 512,
+            table_count: 1,
+            metadata_size: 128,
+            rbac_size: 0,
+            config_size: 0,
+            is_broken: false,
+            broken_reason: None,
+        }];
+        cache.set(summaries.clone());
+
+        // Should return cached data
+        let cached = cache.get();
+        assert!(cached.is_some());
+        assert_eq!(cached.unwrap().len(), 1);
+        assert_eq!(cached.unwrap()[0].name, "test-backup");
+
+        // Invalidate
+        cache.invalidate();
+        assert!(cache.get().is_none());
+    }
+
+    #[test]
+    fn test_manifest_cache_ttl_expiry() {
+        // TTL of 0 means immediate expiry
+        let mut cache = ManifestCache::new(Duration::from_millis(0));
+
+        let summaries = vec![BackupSummary {
+            name: "expired-backup".to_string(),
+            timestamp: None,
+            size: 0,
+            compressed_size: 0,
+            table_count: 0,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            is_broken: false,
+            broken_reason: None,
+        }];
+        cache.set(summaries);
+
+        // Even after set, TTL=0 means it should be expired immediately
+        // (Instant::now().elapsed() >= Duration::ZERO is always true)
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(cache.get().is_none());
     }
 }
