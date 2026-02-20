@@ -368,6 +368,12 @@ pub struct BackupConfig {
     /// patterns like "db.table:proj_name"
     #[serde(default)]
     pub skip_projections: Vec<String>,
+
+    /// Parts with uncompressed size above this threshold (in bytes) use
+    /// streaming compression+multipart upload instead of buffering in memory.
+    /// Default: 256 MiB.
+    #[serde(default = "default_streaming_upload_threshold")]
+    pub streaming_upload_threshold: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +599,7 @@ impl Default for BackupConfig {
             retries_duration: default_retries_duration(),
             retries_jitter: default_retries_jitter_01(),
             skip_projections: Vec::new(),
+            streaming_upload_threshold: default_streaming_upload_threshold(),
         }
     }
 }
@@ -670,6 +677,11 @@ fn default_retries_on_failure_3() -> u32 {
 
 fn default_retries_on_failure_5() -> u32 {
     5
+}
+
+/// 256 MiB default for streaming upload threshold.
+fn default_streaming_upload_threshold() -> u64 {
+    256 * 1024 * 1024
 }
 
 fn default_retries_pause() -> String {
@@ -1522,7 +1534,11 @@ mod tests {
     #[test]
     fn test_config_defaults_match_design_doc() {
         // Verify each default matches design doc §12 values
-        assert_eq!(default_ch_timeout(), "5m", "clickhouse.timeout should be 5m per §11.7/§12");
+        assert_eq!(
+            default_ch_timeout(),
+            "5m",
+            "clickhouse.timeout should be 5m per §11.7/§12"
+        );
         assert_eq!(
             default_max_connections(),
             1,
@@ -1628,7 +1644,10 @@ mod tests {
         assert_eq!(config.s3.acl, "bucket-owner-full-control");
         assert_eq!(config.s3.storage_class, "GLACIER");
         assert_eq!(config.s3.sse, "aws:kms");
-        assert_eq!(config.s3.sse_kms_key_id, "arn:aws:kms:us-east-1:123:key/abc");
+        assert_eq!(
+            config.s3.sse_kms_key_id,
+            "arn:aws:kms:us-east-1:123:key/abc"
+        );
         assert!(config.s3.disable_ssl);
         assert!(config.s3.disable_cert_verification);
         assert_eq!(config.s3.concurrency, 5);

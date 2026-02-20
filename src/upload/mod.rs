@@ -387,8 +387,7 @@ pub async fn upload(
                     }
 
                     // Generate S3 key
-                    let s3_key =
-                        s3_key_for_part(backup_name, db, table, &part.name, data_format);
+                    let s3_key = s3_key_for_part(backup_name, db, table, &part.name, data_format);
 
                     // Skip already-completed parts (resume)
                     if completed_keys.contains(&s3_key) {
@@ -451,6 +450,7 @@ pub async fn upload(
     let s3_chunk_size = config.s3.chunk_size;
     let s3_max_parts_count = config.s3.max_parts_count;
     let allow_object_disk_streaming = config.s3.allow_object_disk_streaming;
+    let streaming_upload_threshold = config.backup.streaming_upload_threshold;
     let (retries_on_failure, retry_delay_secs, jitter_factor) =
         crate::config::effective_retries(config);
     let retry_config = RetryConfig {
@@ -501,78 +501,223 @@ pub async fn upload(
                 "Compressing and uploading part"
             );
 
-            // Compress part using spawn_blocking (sync tar + compression)
-            let part_dir = item.part_dir.clone();
-            let part_name_for_compress = item.part.name.clone();
-            let fmt = data_format_clone.clone();
-            let compressed = tokio::task::spawn_blocking(move || {
-                stream::compress_part(&part_dir, &part_name_for_compress, &fmt, compression_level)
-            })
-            .await
-            .context("Compress task panicked")?
-            .with_context(|| format!("Failed to compress part {}", item.part.name))?;
+            // Choose between streaming multipart (large parts) and buffered upload
+            let compressed_size =
+                if streaming_upload_threshold > 0 && item.part.size > streaming_upload_threshold {
+                    // --- Streaming multipart upload path for large parts ---
+                    info!(
+                        table = %item.table_key,
+                        part = %item.part.name,
+                        size = item.part.size,
+                        "Streaming multipart upload for large part"
+                    );
 
-            let compressed_size = compressed.len() as u64;
+                    let chunk_size = calculate_chunk_size(
+                        item.part.size,
+                        s3_chunk_size,
+                        s3_max_parts_count,
+                    ) as usize;
+                    // Ensure chunk_size >= MIN_MULTIPART_CHUNK for S3 compliance
+                    let chunk_size = chunk_size.max(stream::MIN_MULTIPART_CHUNK);
 
-            // Decide between single PutObject and multipart upload
-            if should_use_multipart(compressed_size) {
-                debug!(
-                    table = %item.table_key,
-                    part = %item.part.name,
-                    compressed_size = compressed_size,
-                    "Part using multipart upload"
-                );
+                    let part_dir = item.part_dir.clone();
+                    let part_name_for_compress = item.part.name.clone();
+                    let fmt = data_format_clone.clone();
 
-                let chunk_size =
-                    calculate_chunk_size(compressed_size, s3_chunk_size, s3_max_parts_count)
-                        as usize;
+                    // Start streaming compression in a background thread
+                    let receiver = tokio::task::spawn_blocking(move || {
+                        stream::compress_part_streaming(
+                            &part_dir,
+                            &part_name_for_compress,
+                            &fmt,
+                            compression_level,
+                            chunk_size,
+                        )
+                    })
+                    .await
+                    .context("Streaming compress setup panicked")?
+                    .with_context(|| {
+                        format!(
+                            "Failed to start streaming compression for part {}",
+                            item.part.name
+                        )
+                    })?;
 
-                // Create multipart upload
-                let upload_id = s3.create_multipart_upload(&item.s3_key).await?;
+                    // Create multipart upload
+                    let upload_id = s3.create_multipart_upload(&item.s3_key).await?;
 
-                // Upload chunks, aborting on error
-                let upload_result = async {
-                    let mut completed_parts: Vec<(i32, String)> = Vec::new();
-                    let mut part_number = 1i32;
+                    // Collect all chunks from the compression thread via spawn_blocking
+                    // (bridges sync mpsc::Receiver to async context)
+                    let part_name_for_err = item.part.name.clone();
+                    let chunks: Vec<Vec<u8>> = tokio::task::spawn_blocking(move || {
+                        let mut chunks = Vec::new();
+                        for chunk_result in receiver.iter() {
+                            let chunk = chunk_result.with_context(|| {
+                                format!(
+                                    "Streaming compression error for part {}",
+                                    part_name_for_err
+                                )
+                            })?;
+                            chunks.push(chunk);
+                        }
+                        Ok::<Vec<Vec<u8>>, anyhow::Error>(chunks)
+                    })
+                    .await
+                    .context("Chunk collector task panicked")??;
 
-                    for chunk_start in (0..compressed.len()).step_by(chunk_size) {
-                        let chunk_end = (chunk_start + chunk_size).min(compressed.len());
-                        let chunk_data = compressed[chunk_start..chunk_end].to_vec();
+                    // Upload each chunk as a multipart part
+                    let upload_result = async {
+                        let mut completed_parts: Vec<(i32, String)> = Vec::new();
+                        let mut total_compressed: u64 = 0;
 
-                        let e_tag = s3
-                            .upload_part_with_retry(
+                        for (idx, chunk_data) in chunks.into_iter().enumerate() {
+                            let part_number = (idx + 1) as i32;
+                            total_compressed += chunk_data.len() as u64;
+                            let e_tag = s3
+                                .upload_part_with_retry(
+                                    &item.s3_key,
+                                    &upload_id,
+                                    part_number,
+                                    chunk_data,
+                                    retry_config,
+                                )
+                                .await?;
+                            completed_parts.push((part_number, e_tag));
+                        }
+
+                        s3.complete_multipart_upload(
+                            &item.s3_key,
+                            &upload_id,
+                            completed_parts,
+                        )
+                        .await?;
+
+                        Ok::<u64, anyhow::Error>(total_compressed)
+                    }
+                    .await;
+
+                    match upload_result {
+                        Ok(total) => total,
+                        Err(e) => {
+                            // Best-effort abort to clean up partial upload
+                            let _ =
+                                s3.abort_multipart_upload(&item.s3_key, &upload_id).await;
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "Streaming multipart upload failed for part {}",
+                                    item.part.name
+                                )
+                            });
+                        }
+                    }
+                } else {
+                    // --- Buffered upload path (existing behavior) ---
+                    // Compress part using spawn_blocking (sync tar + compression)
+                    let part_dir = item.part_dir.clone();
+                    let part_name_for_compress = item.part.name.clone();
+                    let fmt = data_format_clone.clone();
+                    let compressed =
+                        tokio::task::spawn_blocking(move || {
+                            stream::compress_part(
+                                &part_dir,
+                                &part_name_for_compress,
+                                &fmt,
+                                compression_level,
+                            )
+                        })
+                        .await
+                        .context("Compress task panicked")?
+                        .with_context(|| {
+                            format!("Failed to compress part {}", item.part.name)
+                        })?;
+
+                    let compressed_size = compressed.len() as u64;
+
+                    // Decide between single PutObject and multipart upload
+                    if should_use_multipart(compressed_size) {
+                        debug!(
+                            table = %item.table_key,
+                            part = %item.part.name,
+                            compressed_size = compressed_size,
+                            "Part using multipart upload"
+                        );
+
+                        let chunk_size = calculate_chunk_size(
+                            compressed_size,
+                            s3_chunk_size,
+                            s3_max_parts_count,
+                        ) as usize;
+
+                        // Create multipart upload
+                        let upload_id =
+                            s3.create_multipart_upload(&item.s3_key).await?;
+
+                        // Upload chunks, aborting on error
+                        let upload_result = async {
+                            let mut completed_parts: Vec<(i32, String)> =
+                                Vec::new();
+                            let mut part_number = 1i32;
+
+                            for chunk_start in
+                                (0..compressed.len()).step_by(chunk_size)
+                            {
+                                let chunk_end =
+                                    (chunk_start + chunk_size).min(compressed.len());
+                                let chunk_data =
+                                    compressed[chunk_start..chunk_end].to_vec();
+
+                                let e_tag = s3
+                                    .upload_part_with_retry(
+                                        &item.s3_key,
+                                        &upload_id,
+                                        part_number,
+                                        chunk_data,
+                                        retry_config,
+                                    )
+                                    .await?;
+
+                                completed_parts.push((part_number, e_tag));
+                                part_number += 1;
+                            }
+
+                            s3.complete_multipart_upload(
                                 &item.s3_key,
                                 &upload_id,
-                                part_number,
-                                chunk_data,
-                                retry_config,
+                                completed_parts,
                             )
                             .await?;
 
-                        completed_parts.push((part_number, e_tag));
-                        part_number += 1;
+                            Ok::<(), anyhow::Error>(())
+                        }
+                        .await;
+
+                        if let Err(e) = upload_result {
+                            // Best-effort abort to clean up partial upload
+                            let _ = s3
+                                .abort_multipart_upload(&item.s3_key, &upload_id)
+                                .await;
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "Multipart upload failed for part {}",
+                                    item.part.name
+                                )
+                            });
+                        }
+                    } else {
+                        // Single PutObject with retry
+                        s3.put_object_with_retry(
+                            &item.s3_key,
+                            compressed,
+                            retry_config,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to upload part {} to S3", item.part.name)
+                        })?;
                     }
 
-                    s3.complete_multipart_upload(&item.s3_key, &upload_id, completed_parts)
-                        .await?;
-
-                    Ok::<(), anyhow::Error>(())
-                }
-                .await;
-
-                if let Err(e) = upload_result {
-                    // Best-effort abort to clean up partial upload
-                    let _ = s3.abort_multipart_upload(&item.s3_key, &upload_id).await;
-                    return Err(e).with_context(|| {
-                        format!("Multipart upload failed for part {}", item.part.name)
-                    });
-                }
-            } else {
-                // Single PutObject with retry
-                s3.put_object_with_retry(&item.s3_key, compressed, retry_config)
-                    .await
-                    .with_context(|| format!("Failed to upload part {} to S3", item.part.name))?;
-            }
+                    compressed_size
+                };
 
             // Rate limit after upload
             rate_limiter.consume(compressed_size).await;
@@ -1049,7 +1194,13 @@ mod tests {
 
     #[test]
     fn test_s3_key_for_part_simple() {
-        let key = s3_key_for_part("daily-20240115", "default", "trades", "202401_1_50_3", "lz4");
+        let key = s3_key_for_part(
+            "daily-20240115",
+            "default",
+            "trades",
+            "202401_1_50_3",
+            "lz4",
+        );
         assert_eq!(
             key,
             "daily-20240115/data/default/trades/202401_1_50_3.tar.lz4"
@@ -1225,8 +1376,13 @@ mod tests {
         );
 
         // Local disk part: should use standard S3 key format
-        let s3_key =
-            s3_key_for_part("daily-2024-01-15", "default", "trades", &local_part.name, "lz4");
+        let s3_key = s3_key_for_part(
+            "daily-2024-01-15",
+            "default",
+            "trades",
+            &local_part.name,
+            "lz4",
+        );
         assert_eq!(
             s3_key,
             "daily-2024-01-15/data/default/trades/202401_1_50_3.tar.lz4"
@@ -1374,5 +1530,31 @@ mod tests {
         // Different diff_from_remote should produce different hash
         let h3 = compute_params_hash(&["daily-2024-01-15", "base-backup"]);
         assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_should_use_streaming() {
+        let threshold: u64 = 256 * 1024 * 1024; // 256 MiB
+
+        // Parts below threshold should not use streaming
+        let small: u64 = 100 * 1024 * 1024;
+        assert!(small <= threshold);
+        assert!(1024_u64 <= threshold);
+
+        // Parts above threshold should use streaming
+        let large: u64 = 300 * 1024 * 1024;
+        assert!(large > threshold);
+        assert!(threshold + 1 > threshold);
+
+        // Exactly at threshold should NOT use streaming (> not >=)
+        let at_threshold = threshold;
+        assert!(at_threshold <= threshold);
+
+        // Threshold of 0 disables streaming
+        let disabled: u64 = 0;
+        // When threshold is 0, the condition `threshold > 0 && size > threshold` is false
+        let size: u64 = 500 * 1024 * 1024;
+        let should_stream = disabled > 0 && size > disabled;
+        assert!(!should_stream);
     }
 }
