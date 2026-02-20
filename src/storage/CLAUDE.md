@@ -56,6 +56,8 @@ pub struct S3Object {
 - `delete_object(key) -> Result<()>` -- Delete single object
 - `delete_objects(keys) -> Result<()>` -- Batch delete (groups of 1000 per S3 API limit)
 - `head_object(key) -> Result<Option<u64>>` -- Check existence and get size
+- `put_object_with_retry(key, body, retry) -> Result<()>` -- PutObject with retry/backoff/jitter (Phase 7)
+- `upload_part_with_retry(key, upload_id, part_number, body, retry) -> Result<String>` -- UploadPart with retry (Phase 7)
 - `copy_object(source_bucket, source_key, dest_key) -> Result<()>` -- Server-side copy with SSE/storage_class (Phase 2c)
 - `copy_object_streaming(source_bucket, source_key, dest_key) -> Result<()>` -- Download+upload fallback for cross-region (Phase 2c)
 - `copy_object_with_retry(source_bucket, source_key, dest_key, allow_streaming) -> Result<()>` -- Retry wrapper with exponential backoff and conditional streaming fallback (Phase 2c)
@@ -71,6 +73,22 @@ pub struct S3Object {
 - `complete_multipart_upload(key, upload_id, parts) -> Result<()>` -- Finalize with list of `(part_number, e_tag)` tuples.
 - `abort_multipart_upload(key, upload_id) -> Result<()>` -- Cancel and clean up partial uploads.
 - `calculate_chunk_size(data_len, config_chunk_size, max_parts_count) -> u64` -- Standalone pure function. When `config_chunk_size` is 0, auto-computes from `data_len / max_parts_count`. Enforces 5 MiB minimum (S3 requirement).
+
+### RetryConfig Type
+```rust
+pub struct RetryConfig {
+    pub max_retries: u32,        // 0 = no retries, single attempt
+    pub base_delay_secs: u64,    // exponentially increases per attempt
+    pub jitter_factor: f64,      // 0.0-1.0, applied via config::apply_jitter()
+}
+```
+Constructed from `crate::config::effective_retries()`. Shared across `put_object_with_retry()`, `upload_part_with_retry()`, and `copy_object_with_retry_jitter()`.
+
+### PutObject/UploadPart Retry (Phase 7)
+- `put_object_with_retry(key, body, retry) -> Result<()>` -- Retries `put_object()` up to `retry.max_retries` times with exponential backoff and configurable jitter. Clones the body for each retry attempt. On final failure, returns error with attempt count and full key in context.
+- `upload_part_with_retry(key, upload_id, part_number, body, retry) -> Result<String>` -- Retries `upload_part()` with the same exponential backoff pattern. Returns the ETag on success.
+- Both methods use `config::apply_jitter()` for delay randomization and `tokio::time::sleep` for async-safe waiting.
+- Wired into the upload pipeline (`src/upload/mod.rs`) where `put_object()` and `upload_part()` were previously called directly.
 
 ### CopyObject API (Phase 2c)
 - `copy_object(source_bucket, source_key, dest_key) -> Result<()>` -- Server-side copy using AWS SDK `CopyObject`. CopySource format: `"{source_bucket}/{source_key}"`. Applies SSE and storage_class settings. Destination key is relative to self's prefix.

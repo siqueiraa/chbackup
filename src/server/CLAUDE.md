@@ -67,7 +67,7 @@ async fn handler(State(state): State<AppState>, ...) -> Result<Json<OperationSta
 }
 ```
 - Returns 200 immediately with action ID (async operation)
-- Returns 409 Conflict if another operation is running (when `allow_parallel=false`)
+- Returns 423 Locked if another operation is running (when `allow_parallel=false`)
 - Request bodies use `Option<Json<T>>` to handle empty bodies gracefully
 
 ### ActionLog Ring Buffer (actions.rs)
@@ -152,7 +152,7 @@ A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 met
 **spawn_watch_from_state()** (mod.rs): Creates new channels and a `WatchContext` from the current `AppState`, spawns the watch loop. Used by the `watch_start` API endpoint to start watch dynamically.
 
 **Watch API endpoints** (routes.rs -- replaced stubs):
-- `POST /api/v1/watch/start` -- Start watch loop; returns 409 if already active
+- `POST /api/v1/watch/start` -- Start watch loop; returns 423 if already active
 - `POST /api/v1/watch/stop` -- Stop watch loop via shutdown signal; returns 404 if not active
 - `GET /api/v1/watch/status` -- Returns JSON with state, last_full, last_incr, consecutive_errors, next_in
 - `POST /api/v1/reload` -- Sends reload signal to watch loop (or re-reads config if watch inactive)
@@ -199,7 +199,7 @@ The download handler (`download_backup`) passes the `hardlink_exists_files` flag
 
 ### Error Handling
 - Handler errors return `(StatusCode, Json<ErrorResponse>)` tuples
-- 409 Conflict for concurrent operation rejection
+- 423 Locked for concurrent operation rejection
 - 400 Bad Request for invalid inputs (unknown location, empty command)
 - 401 Unauthorized for auth failures
 - 404 Not Found for kill with no running operation
