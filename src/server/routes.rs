@@ -165,20 +165,28 @@ pub async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
 /// For backward compatibility, returns the first running operation or "idle"
 /// when no operations are running. Use GET /api/v1/actions for all operations.
 pub async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let ops = state.running_ops.lock().await;
+    // Extract what we need from running_ops, then drop that lock before touching
+    // action_log. Holding running_ops while waiting for action_log would invert the
+    // lock order used by try_start_op/finish_op/fail_op (action_log first) and
+    // create a deadlock under concurrent status + operation-start/finish traffic.
+    let running_op: Option<(u64, String)> = {
+        let ops = state.running_ops.lock().await;
+        ops.values().next().map(|op| (op.id, op.command.clone()))
+    }; // running_ops lock dropped here
 
-    // Return the first running op for backward compatibility
-    if let Some(op) = ops.values().next() {
-        let action_log = state.action_log.lock().await;
-        let start_time = action_log
-            .entries()
-            .iter()
-            .find(|e| e.id == op.id)
-            .map(|e| e.start.to_rfc3339());
+    if let Some((id, command)) = running_op {
+        let start_time = {
+            let action_log = state.action_log.lock().await;
+            action_log
+                .entries()
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.start.to_rfc3339())
+        };
 
         Json(StatusResponse {
             status: "running".to_string(),
-            command: Some(op.command.clone()),
+            command: Some(command),
             start: start_time,
         })
     } else {
