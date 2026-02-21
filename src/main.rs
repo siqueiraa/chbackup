@@ -8,6 +8,7 @@ use chbackup::clickhouse::{ChClient, TableRow};
 use chbackup::config::Config;
 use chbackup::error::exit_code_from_error;
 use chbackup::lock::{lock_for_command, lock_path_for_scope, PidLock};
+use chbackup::server::state::validate_backup_name;
 use chbackup::logging;
 use chbackup::manifest::BackupManifest;
 use chbackup::restore::remap;
@@ -149,7 +150,7 @@ async fn run() -> Result<()> {
             resume,
             backup_name,
         } => {
-            let name = resolve_backup_name(backup_name);
+            let name = resolve_backup_name(backup_name)?;
             let ch = ChClient::new(&config.clickhouse)?;
 
             // Note: --resume is not applicable to `create` (backup is local-only,
@@ -292,7 +293,7 @@ async fn run() -> Result<()> {
             resume,
             backup_name,
         } => {
-            let name = resolve_backup_name(backup_name);
+            let name = resolve_backup_name(backup_name)?;
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
 
@@ -660,14 +661,27 @@ async fn run() -> Result<()> {
 /// Generate a backup name from the current UTC timestamp if none is provided.
 ///
 /// Format: `YYYY-MM-DDTHHMMSS` (e.g. `2024-01-15T143052`).
-fn resolve_backup_name(name: Option<String>) -> String {
-    name.unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string())
+/// When a name is provided, it is validated for path traversal safety.
+fn resolve_backup_name(name: Option<String>) -> Result<String> {
+    match name {
+        Some(n) => {
+            validate_backup_name(&n)
+                .map_err(|e| anyhow::anyhow!("invalid backup name '{}': {}", n, e))?;
+            Ok(n)
+        }
+        None => Ok(Utc::now().format("%Y-%m-%dT%H%M%S").to_string()),
+    }
 }
 
 /// Require a backup name, returning an error if not provided.
+/// Also validates the name for path traversal safety.
 fn backup_name_required(name: Option<String>, command: &str) -> Result<String> {
     match name {
-        Some(n) => Ok(n),
+        Some(n) => {
+            validate_backup_name(&n)
+                .map_err(|e| anyhow::anyhow!("invalid backup name '{}': {}", n, e))?;
+            Ok(n)
+        }
         None => bail!("backup_name is required for the '{}' command", command),
     }
 }

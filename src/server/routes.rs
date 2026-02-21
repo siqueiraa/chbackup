@@ -22,7 +22,7 @@ use crate::table_filter::TableFilter;
 
 use super::actions::ActionStatus;
 use super::metrics::Metrics;
-use super::state::AppState;
+use super::state::{validate_backup_name, AppState};
 
 // ---------------------------------------------------------------------------
 // Response / Request types
@@ -240,6 +240,19 @@ pub async fn post_actions(
     match op_name {
         "create" | "upload" | "download" | "restore" | "create_remote" | "restore_remote"
         | "delete" | "clean_broken" => {
+            // Validate backup name if explicitly provided in the command
+            if let Some(name) = parts.get(1) {
+                validate_backup_name(name).map_err(|e| {
+                    warn!(backup_name = %name, "backup name rejected: {}", e);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("invalid backup name: {e}"),
+                        }),
+                    )
+                })?;
+            }
+
             let (id, _token) = state.try_start_op(op_name).await.map_err(|e| {
                 (
                     StatusCode::LOCKED,
@@ -598,6 +611,20 @@ pub async fn create_backup(
     body: Option<Json<CreateRequest>>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
+
+    // Validate backup name if provided (auto-generated names are always safe)
+    if let Some(ref name) = req.backup_name {
+        validate_backup_name(name).map_err(|e| {
+            warn!(backup_name = %name, "backup name rejected: {}", e);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid backup name: {e}"),
+                }),
+            )
+        })?;
+    }
+
     let (id, _token) = state.try_start_op("create").await.map_err(|e| {
         (
             StatusCode::LOCKED,
@@ -691,6 +718,17 @@ pub async fn upload_backup(
     body: Option<Json<UploadRequest>>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
+
+    validate_backup_name(&name).map_err(|e| {
+        warn!(backup_name = %name, "backup name rejected: {}", e);
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid backup name: {e}"),
+            }),
+        )
+    })?;
+
     let (id, _token) = state.try_start_op("upload").await.map_err(|e| {
         (
             StatusCode::LOCKED,
@@ -774,6 +812,17 @@ pub async fn download_backup(
     body: Option<Json<DownloadRequest>>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
+
+    validate_backup_name(&name).map_err(|e| {
+        warn!(backup_name = %name, "backup name rejected: {}", e);
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid backup name: {e}"),
+            }),
+        )
+    })?;
+
     let (id, _token) = state.try_start_op("download").await.map_err(|e| {
         (
             StatusCode::LOCKED,
@@ -841,6 +890,17 @@ pub async fn restore_backup(
     body: Option<Json<RestoreRequest>>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
+
+    validate_backup_name(&name).map_err(|e| {
+        warn!(backup_name = %name, "backup name rejected: {}", e);
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid backup name: {e}"),
+            }),
+        )
+    })?;
+
     let (id, _token) = state.try_start_op("restore").await.map_err(|e| {
         (
             StatusCode::LOCKED,
@@ -949,6 +1009,20 @@ pub async fn create_remote(
     body: Option<Json<CreateRemoteRequest>>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
+
+    // Validate backup name if provided (auto-generated names are always safe)
+    if let Some(ref name) = req.backup_name {
+        validate_backup_name(name).map_err(|e| {
+            warn!(backup_name = %name, "backup name rejected: {}", e);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid backup name: {e}"),
+                }),
+            )
+        })?;
+    }
+
     let (id, _token) = state.try_start_op("create_remote").await.map_err(|e| {
         (
             StatusCode::LOCKED,
@@ -1079,6 +1153,17 @@ pub async fn restore_remote(
     body: Option<Json<RestoreRemoteRequest>>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
+
+    validate_backup_name(&name).map_err(|e| {
+        warn!(backup_name = %name, "backup name rejected: {}", e);
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid backup name: {e}"),
+            }),
+        )
+    })?;
+
     let (id, _token) = state.try_start_op("restore_remote").await.map_err(|e| {
         (
             StatusCode::LOCKED,
@@ -1211,6 +1296,16 @@ pub async fn delete_backup(
     State(state): State<AppState>,
     Path((location, name)): Path<(String, String)>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
+    validate_backup_name(&name).map_err(|e| {
+        warn!(backup_name = %name, "backup name rejected: {}", e);
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid backup name: {e}"),
+            }),
+        )
+    })?;
+
     let loc = match location.as_str() {
         "local" => list::Location::Local,
         "remote" => list::Location::Remote,

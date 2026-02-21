@@ -220,6 +220,29 @@ impl AppState {
     }
 }
 
+/// Validate a backup name to prevent path traversal attacks.
+///
+/// Rejects names that are empty, contain `..`, `/`, `\`, or NUL bytes.
+/// Returns `Ok(())` for valid names, or `Err` with a human-readable reason.
+pub fn validate_backup_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("backup name must not be empty");
+    }
+    if name.contains("..") {
+        return Err("backup name must not contain '..'");
+    }
+    if name.contains('/') {
+        return Err("backup name must not contain '/'");
+    }
+    if name.contains('\\') {
+        return Err("backup name must not contain '\\'");
+    }
+    if name.contains('\0') {
+        return Err("backup name must not contain NUL byte");
+    }
+    Ok(())
+}
+
 /// A resumable operation found by scanning the backup directory for state files.
 #[derive(Debug, Clone)]
 pub struct ResumableOp {
@@ -666,6 +689,43 @@ mod tests {
             metrics.is_none(),
             "Metrics should be None when enable_metrics=false"
         );
+    }
+
+    #[test]
+    fn test_validate_backup_name_valid() {
+        assert!(validate_backup_name("daily-2024-01-15").is_ok());
+        assert!(validate_backup_name("my_backup").is_ok());
+        assert!(validate_backup_name("backup.v2").is_ok());
+        assert!(validate_backup_name("2024-01-15T143052").is_ok());
+        assert!(validate_backup_name("a").is_ok());
+    }
+
+    #[test]
+    fn test_validate_backup_name_rejects_dotdot() {
+        assert!(validate_backup_name("../etc/passwd").is_err());
+        assert!(validate_backup_name("foo/../bar").is_err());
+        assert!(validate_backup_name("..").is_err());
+    }
+
+    #[test]
+    fn test_validate_backup_name_rejects_slash() {
+        assert!(validate_backup_name("foo/bar").is_err());
+        assert!(validate_backup_name("/abs").is_err());
+    }
+
+    #[test]
+    fn test_validate_backup_name_rejects_backslash() {
+        assert!(validate_backup_name("foo\\bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_backup_name_rejects_empty() {
+        assert!(validate_backup_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_backup_name_rejects_nul() {
+        assert!(validate_backup_name("foo\0bar").is_err());
     }
 
     #[test]
