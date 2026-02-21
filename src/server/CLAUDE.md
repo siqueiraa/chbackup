@@ -15,7 +15,7 @@ src/server/
   actions.rs      -- ActionLog ring buffer + ActionEntry/ActionStatus types
   auth.rs         -- Basic auth middleware (HTTP Basic, optional based on config)
   metrics.rs      -- Metrics struct (custom prometheus::Registry), 14 metric families, encode()
-  state.rs        -- AppState, RunningOp, operation management, auto-resume on restart
+  state.rs        -- AppState, RunningOp, run_operation helper, validate_backup_name, operation management, auto-resume on restart
 ```
 
 ## Key Patterns
@@ -26,52 +26,74 @@ src/server/
 - `ch: Arc<ArcSwap<ChClient>>` -- hot-swappable ClickHouse client (Phase 5)
 - `s3: Arc<ArcSwap<S3Client>>` -- hot-swappable S3 client (Phase 5)
 - `action_log: Arc<Mutex<ActionLog>>` -- operation history ring buffer
-- `current_op: Arc<Mutex<Option<RunningOp>>>` -- currently running operation for kill support
+- `running_ops: Arc<Mutex<HashMap<u64, RunningOp>>>` -- all currently running operations, keyed by action ID, for kill support and parallel tracking
 - `op_semaphore: Arc<Semaphore>` -- concurrency control (1 permit when `allow_parallel=false`)
 - `metrics: Option<Arc<Metrics>>` -- Prometheus metrics registry (`None` when `config.api.enable_metrics` is false)
 - `watch_shutdown_tx: Option<watch::Sender<bool>>` -- watch loop shutdown signal (`None` when watch inactive)
 - `watch_reload_tx: Option<watch::Sender<bool>>` -- watch loop config reload signal (`None` when watch inactive)
 - `watch_status: Arc<Mutex<WatchStatus>>` -- shared watch loop status for API queries
 - `config_path: PathBuf` -- path to config file, used for config reload
+- `manifest_cache: Arc<Mutex<ManifestCache>>` -- in-memory TTL-based cache for remote backup summaries
 
 Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) since locks are held across `.await` points.
 
-**ArcSwap access pattern** (Phase 5): Handlers read config/clients via `.load()` which returns a `Guard<Arc<T>>` that derefs to `T`. The `/api/v1/restart` endpoint atomically swaps new values via `.store(Arc::new(new_value))`. All handler call sites use `state.config.load()`, `state.ch.load()`, `state.s3.load()` instead of direct field access. `load_full()` is used in `spawn_watch_from_state()` where an owned `Arc<T>` is needed (for cloning into background tasks).
+**ArcSwap access pattern** (Phase 5): Handlers read config/clients via `.load()` which returns a `Guard<Arc<T>>` that derefs to `T`. The `/api/v1/restart` and `/api/v1/reload` endpoints atomically swap new values via `.store(Arc::new(new_value))`. All handler call sites use `state.config.load()`, `state.ch.load()`, `state.s3.load()` instead of direct field access. `load_full()` is used in `run_operation()` and `spawn_watch_from_state()` where an owned `Arc<T>` is needed (for cloning into background tasks).
 
 ### Operation Lifecycle (state.rs)
 Every mutating operation follows a three-phase lifecycle:
-1. **Start**: `try_start_op(command)` acquires a semaphore permit (non-blocking via `try_acquire_owned`), creates a `CancellationToken`, logs the start in `ActionLog`, stores `RunningOp`
-2. **Execute**: Background `tokio::spawn` task runs the actual command function
+1. **Start**: `try_start_op(command)` acquires a semaphore permit (non-blocking via `try_acquire_owned`), creates a `CancellationToken`, logs the start in `ActionLog`, inserts `RunningOp` into `running_ops` HashMap keyed by action ID
+2. **Execute**: Background `tokio::spawn` task runs the actual command function, wrapped in `tokio::select!` with a cancellation branch
 3. **Complete**: One of three exit paths:
-   - `finish_op(id)` -- success: marks `ActionStatus::Completed`, clears `RunningOp`
-   - `fail_op(id, error)` -- failure: marks `ActionStatus::Failed`, clears `RunningOp`
-   - `kill_current()` -- cancellation: cancels token, marks `ActionStatus::Killed`, clears `RunningOp`
+   - `finish_op(id)` -- success: marks `ActionStatus::Completed`, removes `RunningOp` from HashMap
+   - `fail_op(id, error)` -- failure: marks `ActionStatus::Failed`, removes `RunningOp` from HashMap
+   - `kill_op(id: Option<u64>)` -- cancellation: cancels token(s), marks `ActionStatus::Killed`, removes `RunningOp`(s) from HashMap. If `id` is `Some(N)`, cancels only that operation; if `None`, cancels ALL running operations (backward-compatible kill-all)
 
-The `OwnedSemaphorePermit` is stored inside `RunningOp` and dropped when the operation completes, releasing the permit for the next operation.
+The `OwnedSemaphorePermit` is stored inside `RunningOp` and dropped when the operation completes, releasing the permit for the next operation. Multiple operations can be tracked simultaneously when `allow_parallel=true`.
 
 ### Route Handler Delegation Pattern (routes.rs)
-All operation endpoints follow the same pattern:
+All 10 standalone operation endpoints use the `run_operation()` DRY helper (defined in `state.rs`):
 ```rust
 async fn handler(State(state): State<AppState>, ...) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
-    let (id, _token) = state.try_start_op("command")
-        .map_err(|e| (StatusCode::CONFLICT, Json(ErrorResponse { error: e.to_string() })))?;
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        let result = do_operation(&state_clone).await;
-        match result {
-            Ok(_) => state_clone.finish_op(id).await,
-            Err(e) => state_clone.fail_op(id, e.to_string()).await,
-        }
-    });
-    Ok(Json(OperationStarted { id, status: "started".into() }))
+    validate_backup_name(&name).map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })))?;
+    run_operation(&state, "command", "op_label", invalidate_cache, |config, ch, s3| async move {
+        // operation-specific logic
+        Ok(())
+    }).await
 }
 ```
-- Returns 200 immediately with action ID (async operation)
-- Returns 423 Locked if another operation is running (when `allow_parallel=false`)
-- Request bodies use `Option<Json<T>>` to handle empty bodies gracefully
+
+The `run_operation()` helper encapsulates:
+- `try_start_op()` with 423 error mapping
+- `tokio::spawn` with `tokio::select!` (cancellation branch via `CancellationToken`)
+- Duration, success, and error metrics recording
+- `finish_op()`/`fail_op()` lifecycle calls
+- Optional `ManifestCache` invalidation (when `invalidate_cache=true`)
+- Returns 200 immediately with action ID
+
+**Exclusion**: `post_actions` is intentionally excluded from the `run_operation()` helper because it returns `(StatusCode, Json<OperationStarted>)` (201 CREATED), which is incompatible with the helper's return type. `post_actions` retains its inline `try_start_op` + `tokio::spawn` + `tokio::select!` pattern.
+
+### Kill Endpoint (routes.rs)
+`POST /api/v1/kill` -- Cancel running operation(s). Accepts optional `?id=N` query parameter via `KillParams { id: Option<u64> }`.
+
+- If `?id=N` is provided: cancels only the operation with that action ID
+- If no `id` is provided: cancels ALL running operations (backward-compatible kill-all)
+- Returns 200 `"killed"` on success, 404 if no matching operation found
+
+**CancellationToken wiring**: All 11 route handlers (10 via `run_operation()` + `post_actions`) wire `CancellationToken` into spawned tasks via `tokio::select!`. When the token is cancelled, the operation's future is DROPPED -- this aborts the task but does not run cleanup inside the function. Known limitation: in-progress FREEZE operations will leave shadow directories that can be cleaned via `chbackup clean`.
+
+**Auto-resume exclusion**: The 3 `_token` bindings in `auto_resume()` (state.rs) are intentionally discarded. Auto-resume operations are fire-and-forget restart recovery and must NOT be cancellable via kill.
+
+### Backup Name Validation (state.rs)
+`validate_backup_name(name: &str) -> Result<(), &'static str>` prevents path traversal attacks via malicious backup names. Rejects names that are:
+- Empty
+- Contain `..` (parent directory traversal)
+- Contain `/` or `\` (path separators)
+- Contain NUL bytes
+
+Wired into all API entry points that accept backup names (called BEFORE `try_start_op` to avoid consuming a semaphore permit for invalid requests) and CLI entry points (`resolve_backup_name()` and `backup_name_required()` in `main.rs`). Returns 400 Bad Request with descriptive error message on validation failure.
 
 ### POST /api/v1/actions Command Dispatch (routes.rs)
-`post_actions()` accepts a `Vec<ActionRequest>` body, extracts the first element's `command` field, splits on whitespace, and dispatches based on the first word. Supported commands: `create`, `upload`, `download`, `restore`, `create_remote`, `restore_remote`, `delete`, `clean_broken`. Each branch loads config/ch/s3 via `state.config.load()` etc., calls the corresponding command function with default parameters, records duration, and calls `finish_op`/`fail_op`. The backup name defaults to the second word (or UTC timestamp if missing). Returns 400 for unknown commands or empty body, 423 if another operation is running.
+`post_actions()` accepts a `Vec<ActionRequest>` body, extracts the first element's `command` field, splits on whitespace, and dispatches based on the first word. Supported commands: `create`, `upload`, `download`, `restore`, `create_remote`, `restore_remote`, `delete`, `clean_broken`. Each branch validates backup names, loads config/ch/s3 via `state.config.load()` etc., calls the corresponding command function with default parameters, records duration, and calls `finish_op`/`fail_op`. The backup name defaults to the second word (or UTC timestamp if missing). Returns 400 for unknown commands or empty body, 423 if another operation is running. Uses inline `tokio::select!` for cancellation (not `run_operation()` helper due to incompatible return type).
 
 ### ActionLog Ring Buffer (actions.rs)
 Bounded `VecDeque<ActionEntry>` with configurable capacity (default 100). Tracks all server operations with monotonic IDs. When at capacity, oldest entry is popped on new start. Status lifecycle: `Running` -> `Completed` | `Failed(String)` | `Killed`.
@@ -135,16 +157,12 @@ A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 met
 - `chbackup_watch_last_incremental_timestamp` -- Gauge (Phase 3d, defaults to 0)
 - `chbackup_watch_consecutive_errors` -- IntGauge (Phase 3d, defaults to 0)
 
-**Scrape-time refresh:** The `/metrics` handler calls `refresh_backup_counts()` which uses `spawn_blocking` for `list_local()` and async for `list_remote()` to update backup count gauges. The `in_progress` gauge is computed from `current_op` state.
+**Scrape-time refresh:** The `/metrics` handler calls `refresh_backup_counts()` which uses `spawn_blocking` for `list_local()` and async for `list_remote()` to update backup count gauges. The `in_progress` gauge is computed from `running_ops` HashMap state (`!running_ops.is_empty()`).
 
-**Operation instrumentation:** Each spawned task in `routes.rs` records:
-- Duration via `backup_duration_seconds.with_label_values(&[op]).observe(elapsed)`
-- Success via `successful_operations_total.with_label_values(&[op]).inc()`
-- Failure via `errors_total.with_label_values(&[op]).inc()`
-- For create: `backup_size_bytes.set(manifest.compressed_size)` and `backup_last_success_timestamp.set(now)`
+**Operation instrumentation:** The `run_operation()` helper records generic metrics (duration, success, error) for all operations. Operation-specific metrics (e.g. `backup_size_bytes`, `backup_last_success_timestamp` for create) are recorded inside the closure.
 
 ### Clean Endpoint (routes.rs)
-`POST /api/v1/clean` -- Shadow directory cleanup. Follows the standard operation lifecycle pattern (try_start_op -> spawn -> finish_op/fail_op). Calls `list::clean_shadow(&ch, &data_path, None)` to remove `chbackup_*` directories from all disk shadow paths. Records `clean` operation label for duration, success, and error metrics.
+`POST /api/v1/clean` -- Shadow directory cleanup. Uses `run_operation()` helper. Calls `list::clean_shadow(&ch, &data_path, None)` to remove `chbackup_*` directories from all disk shadow paths. Records `clean` operation label for duration, success, and error metrics.
 
 ### Watch Mode Integration (Phase 3d)
 
@@ -160,10 +178,22 @@ A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 met
 - `POST /api/v1/watch/start` -- Start watch loop; returns 423 if already active
 - `POST /api/v1/watch/stop` -- Stop watch loop via shutdown signal; returns 404 if not active
 - `GET /api/v1/watch/status` -- Returns JSON with state, last_full, last_incr, consecutive_errors, next_in
-- `POST /api/v1/reload` -- Sends reload signal to watch loop (or re-reads config if watch inactive)
+- `POST /api/v1/reload` -- Reloads config and creates new clients via `reload_config_and_clients()` helper; also sends reload signal to watch loop if active
 
-### Restart Endpoint (Phase 5)
-`POST /api/v1/restart` -- Reloads config from disk, creates new `ChClient` and `S3Client`, pings ClickHouse to verify connectivity, then atomically swaps all three via `ArcSwap::store()`. Returns `RestartResponse { status: "restarted" }` on success, 500 with error message on failure (old clients remain active -- no partial state). Uses `Config::load()` + `validate()` for config validation before swap.
+### Reload Endpoint (routes.rs)
+`POST /api/v1/reload` -- Reloads config from disk and creates new `ChClient` and `S3Client` via the shared `reload_config_and_clients()` helper, then atomically swaps all three in `AppState` via `ArcSwap::store()`. If the watch loop is active, also sends the reload signal. Returns `ReloadResponse { status: "reloaded" }`. Unlike restart, reload does NOT ping ClickHouse before swapping.
+
+**`reload_config_and_clients()` helper** (routes.rs): Shared between `reload()` and `restart()`. Loads `Config::load(&state.config_path, &[])`, calls `validate()`, creates new `ChClient::new(&config.clickhouse)` and `S3Client::new(&config.s3).await`. Returns `(Config, ChClient, S3Client)` tuple without performing the swap -- callers decide when/whether to swap (restart adds a ping gate).
+
+### Restart Endpoint (routes.rs)
+`POST /api/v1/restart` -- Calls `reload_config_and_clients()` to get new config and clients, then pings ClickHouse to verify connectivity. Only on ping success does it atomically swap all three via `ArcSwap::store()`. Returns `RestartResponse { status: "restarted" }` on success, 500 with error message on failure (old clients remain active -- no partial state).
+
+### Upload Auto-Retention (list.rs, wired in routes.rs + main.rs)
+After successful upload, `apply_retention_after_upload()` (defined in `list.rs`) applies local and remote retention per `effective_retention_local/remote()` config. Wired into:
+- CLI `main.rs`: upload and create_remote commands (with `manifest_cache: None`)
+- API `upload_backup`, `create_remote`, and `post_actions` upload branch (with `manifest_cache: Some(...)` for cache invalidation)
+
+NOT wired into the watch loop (it has its own retention logic) or auto-resume upload path (resume should not trigger retention). Errors are warnings (best-effort, matching watch loop pattern).
 
 ### Tables Endpoint (Phase 5)
 `GET /api/v1/tables` -- Supports two modes via `TablesParams` query parameters:
@@ -188,11 +218,7 @@ These fields are `Option<bool>` for backward compatibility -- existing API clien
 - **AppState field**: `manifest_cache: Arc<tokio::sync::Mutex<ManifestCache>>` -- shared across all handlers
 - **TTL**: Configured via `general.remote_cache_ttl_secs` (default 300 seconds / 5 minutes)
 - **Cache usage**: `list_backups()` and `refresh_backup_counts()` call `list::list_remote_cached(&s3, &state.manifest_cache)` instead of `list::list_remote(&s3)`. Cache hit returns stored summaries; miss falls through to S3 and populates cache.
-- **Invalidation**: Cache is explicitly invalidated (`manifest_cache.lock().await.invalidate()`) after mutating operations:
-  - `upload_backup` (after upload completes)
-  - `delete_backup` (remote deletion)
-  - `clean_remote_broken` (after cleanup)
-  - Watch loop retention_remote
+- **Invalidation**: Cache is explicitly invalidated (`manifest_cache.lock().await.invalidate()`) after mutating operations. The `run_operation()` helper handles invalidation automatically when `invalidate_cache=true`. Manual invalidation in `post_actions` for upload/delete/clean paths.
 - **Logging**: `ManifestCache: populated, count=N` on cache fill, `ManifestCache: invalidated` on explicit invalidation
 
 ### SIGQUIT Handler (Phase 8)
@@ -218,7 +244,9 @@ The download handler (`download_backup`) passes the `hardlink_exists_files` flag
 - `spawn_watch_from_state(state: &mut AppState, config_path: PathBuf, macros: HashMap<String, String>)` -- Spawn watch loop from API context (used by watch_start endpoint)
 - `AppState::new(config, ch, s3, config_path) -> Self` -- Create shared state with semaphore, optional metrics, and watch fields initialized to None/default
 - `AppState::try_start_op(command) -> Result<(u64, CancellationToken), &str>` -- Start tracked operation
-- `AppState::finish_op(id)` / `fail_op(id, error)` / `kill_current() -> bool` -- Operation exit paths
+- `AppState::finish_op(id)` / `fail_op(id, error)` / `kill_op(id: Option<u64>) -> bool` -- Operation exit paths
+- `run_operation(state, command, op_label, invalidate_cache, closure) -> Result<Json<OperationStarted>, ...>` -- DRY orchestration helper for all route handlers except `post_actions`
+- `validate_backup_name(name) -> Result<(), &str>` -- Path traversal validation for backup names
 - `scan_resumable_state_files(data_path) -> Vec<ResumableOp>` -- Find interrupted operations
 - `auto_resume(state)` -- Spawn resume tasks for found state files
 - `Metrics::new() -> Result<Self, prometheus::Error>` -- Create metrics registry with all 14 families registered
@@ -226,10 +254,10 @@ The download handler (`download_backup`) passes the `hardlink_exists_files` flag
 
 ### Error Handling
 - Handler errors return `(StatusCode, Json<ErrorResponse>)` tuples
-- 423 Locked for concurrent operation rejection
-- 400 Bad Request for invalid inputs (unknown location, empty command)
+- 400 Bad Request for invalid inputs (unknown location, empty command, malicious backup names)
 - 401 Unauthorized for auth failures
 - 404 Not Found for kill with no running operation
+- 423 Locked for concurrent operation rejection
 - 500 Internal Server Error for restart failures (old clients remain active)
 - Integration table DDL failures are warnings, not fatal errors
 
