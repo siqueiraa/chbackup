@@ -22,7 +22,7 @@ use crate::table_filter::TableFilter;
 
 use super::actions::ActionStatus;
 use super::metrics::Metrics;
-use super::state::{validate_backup_name, AppState};
+use super::state::{run_operation, validate_backup_name, AppState};
 
 // ---------------------------------------------------------------------------
 // Response / Request types
@@ -222,6 +222,11 @@ pub async fn get_actions(State(state): State<AppState>) -> Json<Vec<ActionRespon
 ///
 /// Accepts JSONEachRow: `[{"command": "create_remote daily_backup"}]`
 /// Parses the first command string and dispatches to the appropriate handler.
+///
+/// NOTE: This handler is intentionally excluded from the `run_operation()` DRY helper
+/// because it returns `(StatusCode, Json<OperationStarted>)` (201 CREATED compatible)
+/// which is incompatible with the helper's `Result<Json<OperationStarted>, ...>` return type.
+/// The inline try_start_op + tokio::spawn + tokio::select! pattern is retained here.
 pub async fn post_actions(
     State(state): State<AppState>,
     Json(body): Json<Vec<ActionRequest>>,
@@ -635,87 +640,43 @@ pub async fn create_backup(
         })?;
     }
 
-    let (id, token) = state.try_start_op("create").await.map_err(|e| {
-        (
-            StatusCode::LOCKED,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
+    let metrics_clone = state.metrics.clone();
+    run_operation(
+        &state,
+        "create",
+        "create",
+        false, // no cache invalidation
+        move |config, ch, _s3| async move {
+            let backup_name = req
+                .backup_name
+                .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
 
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
+            info!(backup_name = %backup_name, "Starting create operation");
+            let manifest = crate::backup::create(
+                &config,
+                &ch,
+                &backup_name,
+                req.tables.as_deref(),
+                req.schema.unwrap_or(false),
+                req.diff_from.as_deref(),
+                req.partitions.as_deref(),
+                req.skip_check_parts_columns.unwrap_or(false),
+                req.rbac.unwrap_or(false),
+                req.configs.unwrap_or(false),
+                req.named_collections.unwrap_or(false),
+                &config.backup.skip_projections,
+            )
+            .await?;
+
+            if let Some(m) = &metrics_clone {
+                m.backup_last_success_timestamp
+                    .set(Utc::now().timestamp() as f64);
+                m.backup_size_bytes.set(manifest.compressed_size as f64);
             }
-            result = async {
-        let backup_name = req
-            .backup_name
-            .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
-
-        info!(backup_name = %backup_name, "Starting create operation");
-
-        let config = state_clone.config.load();
-        let ch = state_clone.ch.load();
-        let start_time = std::time::Instant::now();
-        let result = crate::backup::create(
-            &config,
-            &ch,
-            &backup_name,
-            req.tables.as_deref(),
-            req.schema.unwrap_or(false),
-            req.diff_from.as_deref(),
-            req.partitions.as_deref(),
-            req.skip_check_parts_columns.unwrap_or(false),
-            req.rbac.unwrap_or(false),
-            req.configs.unwrap_or(false),
-            req.named_collections.unwrap_or(false),
-            &config.backup.skip_projections,
-        )
-        .await;
-        let duration = start_time.elapsed().as_secs_f64();
-
-        (result, duration, backup_name)
-            } => {
-                let (result, duration, backup_name) = result;
-                match result {
-            Ok(manifest) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["create"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["create"])
-                        .inc();
-                    m.backup_last_success_timestamp
-                        .set(Utc::now().timestamp() as f64);
-                    m.backup_size_bytes.set(manifest.compressed_size as f64);
-                }
-                info!(backup_name = %backup_name, "Create operation completed");
-                state_clone.finish_op(id).await;
-            }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["create"])
-                        .observe(duration);
-                    m.errors_total.with_label_values(&["create"]).inc();
-                }
-                warn!(backup_name = %backup_name, error = %e, "Create operation failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
-                }
-            }
-        }
-    });
-
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// Request body for POST /api/v1/create
@@ -750,81 +711,30 @@ pub async fn upload_backup(
         )
     })?;
 
-    let (id, token) = state.try_start_op("upload").await.map_err(|e| {
-        (
-            StatusCode::LOCKED,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
-            }
-            _ = async {
-        info!(backup_name = %name, "Starting upload operation");
-
-        let config = state_clone.config.load();
-        let s3 = state_clone.s3.load();
-        let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
-            .join("backup")
-            .join(&name);
-
-        let effective_resume = config.general.use_resumable_state;
-        let start_time = std::time::Instant::now();
-        let result = crate::upload::upload(
-            &config,
-            &s3,
-            &name,
-            &backup_dir,
-            req.delete_local.unwrap_or(false),
-            req.diff_from_remote.as_deref(),
-            effective_resume,
-        )
-        .await;
-        let duration = start_time.elapsed().as_secs_f64();
-
-        match result {
-            Ok(_) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["upload"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["upload"])
-                        .inc();
-                    m.backup_last_success_timestamp
-                        .set(Utc::now().timestamp() as f64);
-                }
-                info!(backup_name = %name, "Upload operation completed");
-                state_clone.manifest_cache.lock().await.invalidate();
-                info!("ManifestCache: invalidated");
-                state_clone.finish_op(id).await;
-            }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["upload"])
-                        .observe(duration);
-                    m.errors_total.with_label_values(&["upload"]).inc();
-                }
-                warn!(backup_name = %name, error = %e, "Upload operation failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
-        }
-            } => {}
-        }
-    });
-
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+    run_operation(
+        &state,
+        "upload",
+        "upload",
+        true, // invalidate cache after upload
+        move |config, _ch, s3| async move {
+            info!(backup_name = %name, "Starting upload operation");
+            let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
+                .join("backup")
+                .join(&name);
+            let effective_resume = config.general.use_resumable_state;
+            crate::upload::upload(
+                &config,
+                &s3,
+                &name,
+                &backup_dir,
+                req.delete_local.unwrap_or(false),
+                req.diff_from_remote.as_deref(),
+                effective_resume,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 /// Request body for POST /api/v1/upload/{name}
@@ -852,66 +762,21 @@ pub async fn download_backup(
         )
     })?;
 
-    let (id, token) = state.try_start_op("download").await.map_err(|e| {
-        (
-            StatusCode::LOCKED,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    let state_clone = state.clone();
     let hardlink = req.hardlink_exists_files.unwrap_or(false);
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
-            }
-            _ = async {
-        info!(backup_name = %name, hardlink_exists_files = hardlink, "Starting download operation");
-
-        let config = state_clone.config.load();
-        let s3 = state_clone.s3.load();
-        let effective_resume = config.general.use_resumable_state;
-        let start_time = std::time::Instant::now();
-        let result =
-            crate::download::download(&config, &s3, &name, effective_resume, hardlink).await;
-        let duration = start_time.elapsed().as_secs_f64();
-
-        match result {
-            Ok(_backup_dir) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["download"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["download"])
-                        .inc();
-                }
-                info!(backup_name = %name, "Download operation completed");
-                state_clone.finish_op(id).await;
-            }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["download"])
-                        .observe(duration);
-                    m.errors_total.with_label_values(&["download"]).inc();
-                }
-                warn!(backup_name = %name, error = %e, "Download operation failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
-        }
-            } => {}
-        }
-    });
-
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+    run_operation(
+        &state,
+        "download",
+        "download",
+        false, // no cache invalidation
+        move |config, _ch, s3| async move {
+            info!(backup_name = %name, hardlink_exists_files = hardlink, "Starting download operation");
+            let effective_resume = config.general.use_resumable_state;
+            crate::download::download(&config, &s3, &name, effective_resume, hardlink)
+                .await
+                .map(|_| ())
+        },
+    )
+    .await
 }
 
 /// Request body for POST /api/v1/download/{name}
@@ -938,96 +803,52 @@ pub async fn restore_backup(
         )
     })?;
 
-    let (id, token) = state.try_start_op("restore").await.map_err(|e| {
-        (
-            StatusCode::LOCKED,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
-            }
-            _ = async {
-        info!(backup_name = %name, "Starting restore operation");
-
-        // Parse remap parameters
-        let db_mapping = match &req.database_mapping {
-            Some(s) if !s.is_empty() => match crate::restore::remap::parse_database_mapping(s) {
-                Ok(map) => Some(map),
-                Err(e) => {
-                    warn!(error = %e, "Invalid database_mapping parameter");
-                    state_clone
-                        .fail_op(id, format!("invalid database_mapping: {}", e))
-                        .await;
-                    return;
-                }
-            },
-            _ => None,
-        };
-
-        let config = state_clone.config.load();
-        let ch = state_clone.ch.load();
-        let effective_resume = config.general.use_resumable_state;
-        let start_time = std::time::Instant::now();
-        let result = crate::restore::restore(
-            &config,
-            &ch,
-            &name,
-            req.tables.as_deref(),
-            req.schema.unwrap_or(false),
-            req.data_only.unwrap_or(false),
-            req.rm.unwrap_or(false),
-            effective_resume,
-            req.rename_as.as_deref(),
-            db_mapping.as_ref(),
-            req.rbac.unwrap_or(false),
-            req.configs.unwrap_or(false),
-            req.named_collections.unwrap_or(false),
-            req.partitions.as_deref(),
-            req.skip_empty_tables.unwrap_or(false),
-        )
-        .await;
-        let duration = start_time.elapsed().as_secs_f64();
-
-        match result {
-            Ok(_) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["restore"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["restore"])
-                        .inc();
-                }
-                info!(backup_name = %name, "Restore operation completed");
-                state_clone.finish_op(id).await;
-            }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["restore"])
-                        .observe(duration);
-                    m.errors_total.with_label_values(&["restore"]).inc();
-                }
-                warn!(backup_name = %name, error = %e, "Restore operation failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
+    // Parse remap parameters before starting the operation
+    let db_mapping = match &req.database_mapping {
+        Some(s) if !s.is_empty() => {
+            let map = crate::restore::remap::parse_database_mapping(s).map_err(|e| {
+                warn!(error = %e, "Invalid database_mapping parameter");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid database_mapping: {}", e),
+                    }),
+                )
+            })?;
+            Some(map)
         }
-            } => {}
-        }
-    });
+        _ => None,
+    };
 
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+    run_operation(
+        &state,
+        "restore",
+        "restore",
+        false, // no cache invalidation
+        move |config, ch, _s3| async move {
+            info!(backup_name = %name, "Starting restore operation");
+            let effective_resume = config.general.use_resumable_state;
+            crate::restore::restore(
+                &config,
+                &ch,
+                &name,
+                req.tables.as_deref(),
+                req.schema.unwrap_or(false),
+                req.data_only.unwrap_or(false),
+                req.rm.unwrap_or(false),
+                effective_resume,
+                req.rename_as.as_deref(),
+                db_mapping.as_ref(),
+                req.rbac.unwrap_or(false),
+                req.configs.unwrap_or(false),
+                req.named_collections.unwrap_or(false),
+                req.partitions.as_deref(),
+                req.skip_empty_tables.unwrap_or(false),
+            )
+            .await
+        },
+    )
+    .await
 }
 
 /// Request body for POST /api/v1/restore/{name}
@@ -1068,122 +889,62 @@ pub async fn create_remote(
         })?;
     }
 
-    let (id, token) = state.try_start_op("create_remote").await.map_err(|e| {
-        (
-            StatusCode::LOCKED,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
+    let metrics_clone = state.metrics.clone();
+    run_operation(
+        &state,
+        "create_remote",
+        "create_remote",
+        true, // invalidate cache after upload
+        move |config, ch, s3| async move {
+            let backup_name = req
+                .backup_name
+                .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
 
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
+            info!(backup_name = %backup_name, "Starting create_remote operation");
+
+            // Step 1: Create local backup
+            let manifest = crate::backup::create(
+                &config,
+                &ch,
+                &backup_name,
+                req.tables.as_deref(),
+                false, // schema_only
+                None,  // diff_from (create_remote uses diff_from_remote on upload side)
+                None,  // partitions (create_remote doesn't support --partitions)
+                req.skip_check_parts_columns.unwrap_or(false),
+                req.rbac.unwrap_or(false),
+                req.configs.unwrap_or(false),
+                req.named_collections.unwrap_or(false),
+                &config.backup.skip_projections,
+            )
+            .await?;
+
+            // Step 2: Upload to S3
+            let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
+                .join("backup")
+                .join(&backup_name);
+
+            let effective_resume = config.general.use_resumable_state;
+            crate::upload::upload(
+                &config,
+                &s3,
+                &backup_name,
+                &backup_dir,
+                req.delete_source.unwrap_or(false),
+                req.diff_from_remote.as_deref(),
+                effective_resume,
+            )
+            .await?;
+
+            if let Some(m) = &metrics_clone {
+                m.backup_last_success_timestamp
+                    .set(Utc::now().timestamp() as f64);
+                m.backup_size_bytes.set(manifest.compressed_size as f64);
             }
-            _ = async {
-        let backup_name = req
-            .backup_name
-            .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
-
-        info!(backup_name = %backup_name, "Starting create_remote operation");
-
-        let config = state_clone.config.load();
-        let ch = state_clone.ch.load();
-        let s3 = state_clone.s3.load();
-        let start_time = std::time::Instant::now();
-
-        // Step 1: Create local backup
-        let create_result = crate::backup::create(
-            &config,
-            &ch,
-            &backup_name,
-            req.tables.as_deref(),
-            false, // schema_only
-            None,  // diff_from (create_remote uses diff_from_remote on upload side)
-            None,  // partitions (create_remote doesn't support --partitions)
-            req.skip_check_parts_columns.unwrap_or(false),
-            req.rbac.unwrap_or(false),
-            req.configs.unwrap_or(false),
-            req.named_collections.unwrap_or(false),
-            &config.backup.skip_projections,
-        )
-        .await;
-
-        let manifest = match create_result {
-            Ok(manifest) => manifest,
-            Err(e) => {
-                let duration = start_time.elapsed().as_secs_f64();
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["create_remote"])
-                        .observe(duration);
-                    m.errors_total.with_label_values(&["create_remote"]).inc();
-                }
-                warn!(backup_name = %backup_name, error = %e, "create_remote: create step failed");
-                state_clone.fail_op(id, e.to_string()).await;
-                return;
-            }
-        };
-
-        // Step 2: Upload to S3
-        let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
-            .join("backup")
-            .join(&backup_name);
-
-        let effective_resume = config.general.use_resumable_state;
-        let upload_result = crate::upload::upload(
-            &config,
-            &s3,
-            &backup_name,
-            &backup_dir,
-            req.delete_source.unwrap_or(false),
-            req.diff_from_remote.as_deref(),
-            effective_resume,
-        )
-        .await;
-        let duration = start_time.elapsed().as_secs_f64();
-
-        match upload_result {
-            Ok(_) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["create_remote"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["create_remote"])
-                        .inc();
-                    m.backup_last_success_timestamp
-                        .set(Utc::now().timestamp() as f64);
-                    m.backup_size_bytes.set(manifest.compressed_size as f64);
-                }
-                info!(backup_name = %backup_name, "create_remote operation completed");
-                state_clone.manifest_cache.lock().await.invalidate();
-                info!("ManifestCache: invalidated");
-                state_clone.finish_op(id).await;
-            }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["create_remote"])
-                        .observe(duration);
-                    m.errors_total.with_label_values(&["create_remote"]).inc();
-                }
-                warn!(backup_name = %backup_name, error = %e, "create_remote: upload step failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
-        }
-            } => {}
-        }
-    });
-
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// Request body for POST /api/v1/create_remote
@@ -1217,116 +978,60 @@ pub async fn restore_remote(
         )
     })?;
 
-    let (id, token) = state.try_start_op("restore_remote").await.map_err(|e| {
-        (
-            StatusCode::LOCKED,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
-            }
-            _ = async {
-        info!(backup_name = %name, "Starting restore_remote operation");
-
-        // Parse remap parameters
-        let db_mapping = match &req.database_mapping {
-            Some(s) if !s.is_empty() => match crate::restore::remap::parse_database_mapping(s) {
-                Ok(map) => Some(map),
-                Err(e) => {
-                    warn!(error = %e, "Invalid database_mapping parameter");
-                    state_clone
-                        .fail_op(id, format!("invalid database_mapping: {}", e))
-                        .await;
-                    return;
-                }
-            },
-            _ => None,
-        };
-
-        let config = state_clone.config.load();
-        let ch = state_clone.ch.load();
-        let s3 = state_clone.s3.load();
-        let start_time = std::time::Instant::now();
-
-        // Step 1: Download from S3
-        let effective_resume = config.general.use_resumable_state;
-        let download_result =
-            crate::download::download(&config, &s3, &name, effective_resume, false).await;
-
-        if let Err(e) = download_result {
-            let duration = start_time.elapsed().as_secs_f64();
-            if let Some(m) = &state_clone.metrics {
-                m.backup_duration_seconds
-                    .with_label_values(&["restore_remote"])
-                    .observe(duration);
-                m.errors_total.with_label_values(&["restore_remote"]).inc();
-            }
-            warn!(backup_name = %name, error = %e, "restore_remote: download step failed");
-            state_clone.fail_op(id, e.to_string()).await;
-            return;
+    // Parse remap parameters before starting the operation
+    let db_mapping = match &req.database_mapping {
+        Some(s) if !s.is_empty() => {
+            let map = crate::restore::remap::parse_database_mapping(s).map_err(|e| {
+                warn!(error = %e, "Invalid database_mapping parameter");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid database_mapping: {}", e),
+                    }),
+                )
+            })?;
+            Some(map)
         }
+        _ => None,
+    };
 
-        // Step 2: Restore with remap
-        let restore_result = crate::restore::restore(
-            &config,
-            &ch,
-            &name,
-            req.tables.as_deref(),
-            req.schema.unwrap_or(false),
-            req.data_only.unwrap_or(false),
-            req.rm.unwrap_or(false),
-            effective_resume,
-            req.rename_as.as_deref(),
-            db_mapping.as_ref(),
-            req.rbac.unwrap_or(false),
-            req.configs.unwrap_or(false),
-            req.named_collections.unwrap_or(false),
-            req.partitions.as_deref(),
-            req.skip_empty_tables.unwrap_or(false),
-        )
-        .await;
-        let duration = start_time.elapsed().as_secs_f64();
+    run_operation(
+        &state,
+        "restore_remote",
+        "restore_remote",
+        false, // no cache invalidation
+        move |config, ch, s3| async move {
+            info!(backup_name = %name, "Starting restore_remote operation");
 
-        match restore_result {
-            Ok(_) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["restore_remote"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["restore_remote"])
-                        .inc();
-                }
-                info!(backup_name = %name, "restore_remote operation completed");
-                state_clone.finish_op(id).await;
-            }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["restore_remote"])
-                        .observe(duration);
-                    m.errors_total.with_label_values(&["restore_remote"]).inc();
-                }
-                warn!(backup_name = %name, error = %e, "restore_remote: restore step failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
-        }
-            } => {}
-        }
-    });
+            let effective_resume = config.general.use_resumable_state;
 
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+            // Step 1: Download from S3
+            crate::download::download(&config, &s3, &name, effective_resume, false)
+                .await
+                .map(|_| ())?;
+
+            // Step 2: Restore with remap
+            crate::restore::restore(
+                &config,
+                &ch,
+                &name,
+                req.tables.as_deref(),
+                req.schema.unwrap_or(false),
+                req.data_only.unwrap_or(false),
+                req.rm.unwrap_or(false),
+                effective_resume,
+                req.rename_as.as_deref(),
+                db_mapping.as_ref(),
+                req.rbac.unwrap_or(false),
+                req.configs.unwrap_or(false),
+                req.named_collections.unwrap_or(false),
+                req.partitions.as_deref(),
+                req.skip_empty_tables.unwrap_or(false),
+            )
+            .await
+        },
+    )
+    .await
 }
 
 /// Request body for POST /api/v1/restore_remote/{name}
@@ -1380,216 +1085,68 @@ pub async fn delete_backup(
         }
     };
 
-    let (id, token) = state.try_start_op("delete").await.map_err(|e| {
-        (
-            StatusCode::LOCKED,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
-            }
-            _ = async {
-        info!(backup_name = %name, location = %location, "Starting delete operation");
-
-        let config = state_clone.config.load();
-        let s3 = state_clone.s3.load();
-        let data_path = config.clickhouse.data_path.clone();
-        let start_time = std::time::Instant::now();
-        let result = match loc {
-            list::Location::Local => {
-                let dp = data_path.clone();
-                let n = name.clone();
-                tokio::task::spawn_blocking(move || list::delete_local(&dp, &n))
-                    .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
-            }
-            list::Location::Remote => list::delete_remote(&s3, &name).await,
-        };
-        let duration = start_time.elapsed().as_secs_f64();
-
-        match result {
-            Ok(_) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["delete"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["delete"])
-                        .inc();
+    let invalidate = loc == list::Location::Remote;
+    run_operation(
+        &state,
+        "delete",
+        "delete",
+        invalidate,
+        move |config, _ch, s3| async move {
+            info!(backup_name = %name, location = %location, "Starting delete operation");
+            let data_path = config.clickhouse.data_path.clone();
+            match loc {
+                list::Location::Local => {
+                    let n = name.clone();
+                    tokio::task::spawn_blocking(move || list::delete_local(&data_path, &n))
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
                 }
-                info!(backup_name = %name, "Delete operation completed");
-                if loc == list::Location::Remote {
-                    state_clone.manifest_cache.lock().await.invalidate();
-                    info!("ManifestCache: invalidated");
-                }
-                state_clone.finish_op(id).await;
+                list::Location::Remote => list::delete_remote(&s3, &name).await,
             }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["delete"])
-                        .observe(duration);
-                    m.errors_total.with_label_values(&["delete"]).inc();
-                }
-                warn!(backup_name = %name, error = %e, "Delete operation failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
-        }
-            } => {}
-        }
-    });
-
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+        },
+    )
+    .await
 }
 
 /// POST /api/v1/clean/remote_broken -- delete broken remote backups
 pub async fn clean_remote_broken(
     State(state): State<AppState>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
-    let (id, token) = state
-        .try_start_op("clean_broken_remote")
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::LOCKED,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-        })?;
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
-            }
-            _ = async {
-        info!("Starting clean_broken_remote operation");
-
-        let s3 = state_clone.s3.load();
-        let start_time = std::time::Instant::now();
-        let result = list::clean_broken_remote(&s3).await;
-        let duration = start_time.elapsed().as_secs_f64();
-
-        match result {
-            Ok(count) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["clean_broken_remote"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["clean_broken_remote"])
-                        .inc();
-                }
-                info!(count = count, "clean_broken_remote operation completed");
-                state_clone.manifest_cache.lock().await.invalidate();
-                info!("ManifestCache: invalidated");
-                state_clone.finish_op(id).await;
-            }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["clean_broken_remote"])
-                        .observe(duration);
-                    m.errors_total
-                        .with_label_values(&["clean_broken_remote"])
-                        .inc();
-                }
-                warn!(error = %e, "clean_broken_remote operation failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
-        }
-            } => {}
-        }
-    });
-
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+    run_operation(
+        &state,
+        "clean_broken_remote",
+        "clean_broken_remote",
+        true, // invalidate cache
+        |_config, _ch, s3| async move {
+            info!("Starting clean_broken_remote operation");
+            let count = list::clean_broken_remote(&s3).await?;
+            info!(count = count, "clean_broken_remote operation completed");
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// POST /api/v1/clean/local_broken -- delete broken local backups
 pub async fn clean_local_broken(
     State(state): State<AppState>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
-    let (id, token) = state
-        .try_start_op("clean_broken_local")
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::LOCKED,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-        })?;
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
-            }
-            _ = async {
-        info!("Starting clean_broken_local operation");
-
-        let config = state_clone.config.load();
-        let data_path = config.clickhouse.data_path.clone();
-        let start_time = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)));
-        let duration = start_time.elapsed().as_secs_f64();
-
-        match result {
-            Ok(count) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["clean_broken_local"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["clean_broken_local"])
-                        .inc();
-                }
-                info!(count = count, "clean_broken_local operation completed");
-                state_clone.finish_op(id).await;
-            }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["clean_broken_local"])
-                        .observe(duration);
-                    m.errors_total
-                        .with_label_values(&["clean_broken_local"])
-                        .inc();
-                }
-                warn!(error = %e, "clean_broken_local operation failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
-        }
-            } => {}
-        }
-    });
-
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+    run_operation(
+        &state,
+        "clean_broken_local",
+        "clean_broken_local",
+        false, // no cache invalidation
+        |config, _ch, _s3| async move {
+            info!("Starting clean_broken_local operation");
+            let data_path = config.clickhouse.data_path.clone();
+            let count = tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))?;
+            info!(count = count, "clean_broken_local operation completed");
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// Query params for POST /api/v1/kill
@@ -1622,64 +1179,20 @@ pub async fn kill_op(
 pub async fn clean(
     State(state): State<AppState>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
-    let (id, token) = state.try_start_op("clean").await.map_err(|e| {
-        (
-            StatusCode::LOCKED,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = token.cancelled() => {
-                warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
-            }
-            _ = async {
-        info!("Starting clean operation");
-
-        let config = state_clone.config.load();
-        let ch = state_clone.ch.load();
-        let start_time = std::time::Instant::now();
-        let data_path = config.clickhouse.data_path.clone();
-        let result = list::clean_shadow(&ch, &data_path, None).await;
-        let duration = start_time.elapsed().as_secs_f64();
-
-        match result {
-            Ok(count) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["clean"])
-                        .observe(duration);
-                    m.successful_operations_total
-                        .with_label_values(&["clean"])
-                        .inc();
-                }
-                info!(count = count, "clean operation completed");
-                state_clone.finish_op(id).await;
-            }
-            Err(e) => {
-                if let Some(m) = &state_clone.metrics {
-                    m.backup_duration_seconds
-                        .with_label_values(&["clean"])
-                        .observe(duration);
-                    m.errors_total.with_label_values(&["clean"]).inc();
-                }
-                warn!(error = %e, "clean operation failed");
-                state_clone.fail_op(id, e.to_string()).await;
-            }
-        }
-            } => {}
-        }
-    });
-
-    Ok(Json(OperationStarted {
-        id,
-        status: "started".to_string(),
-    }))
+    run_operation(
+        &state,
+        "clean",
+        "clean",
+        false, // no cache invalidation
+        |config, ch, _s3| async move {
+            info!("Starting clean operation");
+            let data_path = config.clickhouse.data_path.clone();
+            let count = list::clean_shadow(&ch, &data_path, None).await?;
+            info!(count = count, "clean operation completed");
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// POST /api/v1/reload -- config hot-reload

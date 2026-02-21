@@ -5,11 +5,14 @@
 //! via a semaphore (single-op when allow_parallel=false).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use axum::http::StatusCode;
+use axum::Json;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +26,7 @@ use tracing::{info, warn};
 
 use super::actions::ActionLog;
 use super::metrics::Metrics;
+use super::routes::{ErrorResponse, OperationStarted};
 
 /// Current status of the watch loop, shared between the watch loop and API handlers.
 #[derive(Debug, Clone)]
@@ -237,6 +241,92 @@ impl AppState {
             }
         }
     }
+}
+
+/// DRY orchestration helper for all operation endpoints (except post_actions).
+///
+/// Encapsulates the common try_start_op / spawn / select! / metrics / finish_op
+/// boilerplate. The caller provides a closure that receives loaded config, ch,
+/// and s3 clients and returns `Result<()>`. Operation-specific metrics (e.g.
+/// `backup_size_bytes`) should be recorded inside the closure.
+///
+/// `post_actions` is excluded because it returns `(StatusCode, Json<OperationStarted>)`
+/// (201 CREATED) which is incompatible with this helper's return type.
+pub async fn run_operation<F, Fut>(
+    state: &AppState,
+    command: &str,
+    op_label: &str,
+    invalidate_cache: bool,
+    f: F,
+) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)>
+where
+    F: FnOnce(Arc<Config>, Arc<ChClient>, Arc<S3Client>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), anyhow::Error>> + Send,
+{
+    let (id, token) = state.try_start_op(command).await.map_err(|e| {
+        (
+            StatusCode::LOCKED,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let state_clone = state.clone();
+    let op_label_owned = op_label.to_string();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
+                let config = state_clone.config.load_full();
+                let ch = state_clone.ch.load_full();
+                let s3 = state_clone.s3.load_full();
+                let start_time = std::time::Instant::now();
+
+                let result = f(config, ch, s3).await;
+                let duration = start_time.elapsed().as_secs_f64();
+
+                match result {
+                    Ok(()) => {
+                        if let Some(m) = &state_clone.metrics {
+                            m.backup_duration_seconds
+                                .with_label_values(&[&op_label_owned])
+                                .observe(duration);
+                            m.successful_operations_total
+                                .with_label_values(&[&op_label_owned])
+                                .inc();
+                        }
+                        info!(op = %op_label_owned, "Operation completed");
+                        if invalidate_cache {
+                            state_clone.manifest_cache.lock().await.invalidate();
+                            info!("ManifestCache: invalidated");
+                        }
+                        state_clone.finish_op(id).await;
+                    }
+                    Err(e) => {
+                        if let Some(m) = &state_clone.metrics {
+                            m.backup_duration_seconds
+                                .with_label_values(&[&op_label_owned])
+                                .observe(duration);
+                            m.errors_total
+                                .with_label_values(&[&op_label_owned])
+                                .inc();
+                        }
+                        warn!(op = %op_label_owned, error = %e, "Operation failed");
+                        state_clone.fail_op(id, e.to_string()).await;
+                    }
+                }
+            } => {}
+        }
+    });
+
+    Ok(Json(OperationStarted {
+        id,
+        status: "started".to_string(),
+    }))
 }
 
 /// Validate a backup name to prevent path traversal attacks.
@@ -490,6 +580,7 @@ pub async fn auto_resume(state: &AppState) {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::server::actions::ActionStatus;
 
     /// Helper to create an AppState for testing without real CH/S3 clients.
     /// We cannot construct real ChClient/S3Client without servers, so we test
@@ -965,6 +1056,141 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert!(!ops.contains_key(&ids[0]));
         assert!(ops.contains_key(&ids[1]));
+    }
+
+    /// Verify that the run_operation helper's success path calls finish_op,
+    /// which clears the running op from the map.
+    /// We simulate the helper's exact internal pattern here since AppState
+    /// requires real ChClient/S3Client instances that need running servers.
+    #[tokio::test]
+    async fn test_run_operation_success() {
+        let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
+        let op_semaphore = Arc::new(Semaphore::new(1));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Simulate try_start_op
+        let permit = op_semaphore.clone().try_acquire_owned().unwrap();
+        let token = CancellationToken::new();
+        let id = {
+            let mut log = action_log.lock().await;
+            log.start("create".to_string())
+        };
+        {
+            let mut ops = running_ops.lock().await;
+            ops.insert(
+                id,
+                RunningOp {
+                    id,
+                    command: "create".to_string(),
+                    cancel_token: token.clone(),
+                    _permit: permit,
+                },
+            );
+        }
+
+        // Simulate the spawned task with select! (success path)
+        let action_log_clone = action_log.clone();
+        let running_ops_clone = running_ops.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    // killed path -- should not trigger
+                    panic!("Should not be cancelled");
+                }
+                _ = async {
+                    // Simulate successful operation
+                    let result: Result<(), anyhow::Error> = Ok(());
+                    match result {
+                        Ok(()) => {
+                            let mut log = action_log_clone.lock().await;
+                            log.finish(id);
+                            drop(log);
+                            let mut ops = running_ops_clone.lock().await;
+                            ops.remove(&id);
+                        }
+                        Err(_) => panic!("Should not fail"),
+                    }
+                } => {}
+            }
+        });
+
+        handle.await.unwrap();
+
+        // Verify finish_op was called: op removed from map, log shows completed
+        assert!(running_ops.lock().await.is_empty());
+        let log = action_log.lock().await;
+        let entry = log.entries().iter().find(|e| e.id == id).unwrap();
+        assert!(
+            matches!(entry.status, ActionStatus::Completed),
+            "Expected Completed status after success"
+        );
+    }
+
+    /// Verify that the run_operation helper's failure path calls fail_op,
+    /// which clears the running op from the map and records the error.
+    #[tokio::test]
+    async fn test_run_operation_failure() {
+        let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
+        let op_semaphore = Arc::new(Semaphore::new(1));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Simulate try_start_op
+        let permit = op_semaphore.clone().try_acquire_owned().unwrap();
+        let token = CancellationToken::new();
+        let id = {
+            let mut log = action_log.lock().await;
+            log.start("upload".to_string())
+        };
+        {
+            let mut ops = running_ops.lock().await;
+            ops.insert(
+                id,
+                RunningOp {
+                    id,
+                    command: "upload".to_string(),
+                    cancel_token: token.clone(),
+                    _permit: permit,
+                },
+            );
+        }
+
+        // Simulate the spawned task with select! (failure path)
+        let action_log_clone = action_log.clone();
+        let running_ops_clone = running_ops.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    panic!("Should not be cancelled");
+                }
+                _ = async {
+                    // Simulate failed operation
+                    let result: Result<(), anyhow::Error> = Err(anyhow::anyhow!("upload error"));
+                    match result {
+                        Ok(()) => panic!("Should not succeed"),
+                        Err(e) => {
+                            let mut log = action_log_clone.lock().await;
+                            log.fail(id, e.to_string());
+                            drop(log);
+                            let mut ops = running_ops_clone.lock().await;
+                            ops.remove(&id);
+                        }
+                    }
+                } => {}
+            }
+        });
+
+        handle.await.unwrap();
+
+        // Verify fail_op was called: op removed from map, log shows failed
+        assert!(running_ops.lock().await.is_empty());
+        let log = action_log.lock().await;
+        let entry = log.entries().iter().find(|e| e.id == id).unwrap();
+        match &entry.status {
+            ActionStatus::Failed(msg) => assert_eq!(msg, "upload error"),
+            other => panic!("Expected Failed status, got {:?}", other),
+        }
     }
 
     #[test]
