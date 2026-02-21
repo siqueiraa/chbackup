@@ -588,7 +588,7 @@ async fn interruptible_sleep(
                 if *ctx.reload_rx.borrow() {
                     // Config reload requested
                     info!("watch: config reload requested");
-                    apply_config_reload(ctx);
+                    apply_config_reload(ctx).await;
                     // Continue sleeping -- reload doesn't interrupt the current cycle
                 }
             }
@@ -598,10 +598,11 @@ async fn interruptible_sleep(
 
 /// Apply a config reload from the config file.
 ///
-/// Reads the config file, validates it, and if valid, applies the new watch params.
+/// Reads the config file, validates it, and if valid, recreates ChClient and
+/// S3Client with the new config, then applies all three (config, ch, s3).
 /// Logs old -> new values for key parameters (design 10.8 step 3d).
-/// On error, logs a warning and retains the current config.
-fn apply_config_reload(ctx: &mut WatchContext) {
+/// On error, logs a warning and retains the current config and clients.
+async fn apply_config_reload(ctx: &mut WatchContext) {
     let new_config = match Config::load(&ctx.config_path, &[]) {
         Ok(c) => c,
         Err(e) => {
@@ -638,6 +639,26 @@ fn apply_config_reload(ctx: &mut WatchContext) {
         info!("watch: config reloaded (no watch param changes)");
     }
 
+    // Recreate clients with new config -- failures are non-fatal
+    let new_ch = match crate::clickhouse::ChClient::new(&new_config.clickhouse) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "watch: reload failed to recreate ChClient (keeping old)");
+            return;
+        }
+    };
+
+    let new_s3 = match crate::storage::S3Client::new(&new_config.s3).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "watch: reload failed to recreate S3Client (keeping old)");
+            return;
+        }
+    };
+
+    // Update all three atomically -- config last, only after both clients succeed
+    ctx.ch = new_ch;
+    ctx.s3 = new_s3;
     ctx.config = Arc::new(new_config);
 }
 
