@@ -778,6 +778,72 @@ pub fn retention_local(data_path: &str, keep: i32) -> Result<usize> {
     Ok(deleted)
 }
 
+/// Apply local and remote retention after a successful upload.
+///
+/// Follows the same best-effort pattern as the watch loop (watch/mod.rs:490-527):
+/// errors are logged as warnings, never fatal.
+///
+/// - `retention_local` is sync -- called via `spawn_blocking`
+/// - `retention_remote` is async -- called directly
+/// - `manifest_cache` is `Option` because CLI mode has no cache
+///
+/// Design doc section 3.6 step 7: "Apply retention: delete oldest remote backups
+/// exceeding `backups_to_keep_remote`" after upload.
+pub async fn apply_retention_after_upload(
+    config: &Config,
+    s3: &S3Client,
+    manifest_cache: Option<&tokio::sync::Mutex<ManifestCache>>,
+) {
+    let keep_local = effective_retention_local(config);
+    if keep_local > 0 {
+        let data_path = config.clickhouse.data_path.clone();
+        match tokio::task::spawn_blocking(move || retention_local(&data_path, keep_local))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
+        {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    info!(
+                        deleted = deleted,
+                        "retention applied after upload: local retention"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "retention after upload: local retention failed (best-effort)"
+                );
+            }
+        }
+    }
+
+    let keep_remote = effective_retention_remote(config);
+    if keep_remote > 0 {
+        match retention_remote(s3, keep_remote).await {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    info!(
+                        deleted = deleted,
+                        "retention applied after upload: remote retention"
+                    );
+                    // Invalidate manifest cache after remote retention changes backup set
+                    if let Some(cache) = manifest_cache {
+                        cache.lock().await.invalidate();
+                        info!("ManifestCache: invalidated");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "retention after upload: remote retention failed (best-effort)"
+                );
+            }
+        }
+    }
+}
+
 // -- GC functions --
 
 /// Extract all referenced S3 keys from a backup manifest.

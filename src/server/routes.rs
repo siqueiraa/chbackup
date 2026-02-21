@@ -315,7 +315,7 @@ pub async fn post_actions(
                             .join("backup")
                             .join(&backup_name);
                         let effective_resume = config.general.use_resumable_state;
-                        crate::upload::upload(
+                        let upload_result = crate::upload::upload(
                             &config,
                             &s3,
                             &backup_name,
@@ -324,7 +324,18 @@ pub async fn post_actions(
                             None,  // diff_from_remote
                             effective_resume,
                         )
-                        .await
+                        .await;
+
+                        if upload_result.is_ok() {
+                            // Apply retention after successful upload (design doc 3.6 step 7)
+                            list::apply_retention_after_upload(
+                                &config,
+                                &s3,
+                                Some(&state_clone.manifest_cache),
+                            )
+                            .await;
+                        }
+                        upload_result
                     }
                     "download" => {
                         let effective_resume = config.general.use_resumable_state;
@@ -382,7 +393,7 @@ pub async fn post_actions(
                                         .join("backup")
                                         .join(&backup_name);
                                 let effective_resume = config.general.use_resumable_state;
-                                crate::upload::upload(
+                                let upload_result = crate::upload::upload(
                                     &config,
                                     &s3,
                                     &backup_name,
@@ -391,7 +402,18 @@ pub async fn post_actions(
                                     None,  // diff_from_remote
                                     effective_resume,
                                 )
-                                .await
+                                .await;
+
+                                if upload_result.is_ok() {
+                                    // Apply retention after successful upload (design doc 3.6 step 7)
+                                    list::apply_retention_after_upload(
+                                        &config,
+                                        &s3,
+                                        Some(&state_clone.manifest_cache),
+                                    )
+                                    .await;
+                                }
+                                upload_result
                             }
                             Err(e) => Err(e),
                         }
@@ -711,6 +733,7 @@ pub async fn upload_backup(
         )
     })?;
 
+    let cache_clone = state.manifest_cache.clone();
     run_operation(
         &state,
         "upload",
@@ -731,7 +754,11 @@ pub async fn upload_backup(
                 req.diff_from_remote.as_deref(),
                 effective_resume,
             )
-            .await
+            .await?;
+
+            // Apply retention after successful upload (design doc 3.6 step 7)
+            list::apply_retention_after_upload(&config, &s3, Some(&cache_clone)).await;
+            Ok(())
         },
     )
     .await
@@ -890,6 +917,7 @@ pub async fn create_remote(
     }
 
     let metrics_clone = state.metrics.clone();
+    let cache_clone = state.manifest_cache.clone();
     run_operation(
         &state,
         "create_remote",
@@ -935,6 +963,9 @@ pub async fn create_remote(
                 effective_resume,
             )
             .await?;
+
+            // Apply retention after successful upload (design doc 3.6 step 7)
+            list::apply_retention_after_upload(&config, &s3, Some(&cache_clone)).await;
 
             if let Some(m) = &metrics_clone {
                 m.backup_last_success_timestamp

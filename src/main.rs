@@ -210,6 +210,9 @@ async fn run() -> Result<()> {
             )
             .await?;
 
+            // Apply retention after successful upload (design doc 3.6 step 7)
+            list::apply_retention_after_upload(&config, &s3, None).await;
+
             info!(backup_name = %name, "Upload command complete");
         }
 
@@ -336,6 +339,9 @@ async fn run() -> Result<()> {
                 effective_resume,
             )
             .await?;
+
+            // Apply retention after successful upload (design doc 3.6 step 7)
+            list::apply_retention_after_upload(&config, &s3, None).await;
 
             info!(backup_name = %name, "CreateRemote command complete");
         }
