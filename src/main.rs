@@ -153,8 +153,10 @@ async fn run() -> Result<()> {
             let name = resolve_backup_name(backup_name)?;
             let ch = ChClient::new(&config.clickhouse)?;
 
-            // Note: --resume is not applicable to `create` (backup is local-only,
-            // no resume state tracking needed). The flag is accepted but ignored.
+            // Design doc: create --resume is planned but explicitly deferred. The create
+            // command operates on local filesystem only (FREEZE + hardlink) with no remote
+            // state to resume from. Resume is meaningful for upload/download/restore which
+            // interact with S3 and can be interrupted mid-transfer.
             if resume {
                 info!("--resume flag has no effect on the create command");
             }
