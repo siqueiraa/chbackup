@@ -573,6 +573,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancellation_token_aborts_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = completed.clone();
+
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = token_clone.cancelled() => {
+                    // Cancelled branch fires -- task aborted
+                }
+                _ = async {
+                    // Simulate a long-running operation
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    completed_clone.store(true, Ordering::SeqCst);
+                } => {
+                    // Operation completed normally (should not happen)
+                }
+            }
+        });
+
+        // Cancel the token
+        token.cancel();
+
+        // Wait for the task to finish
+        handle.await.unwrap();
+
+        // The operation should NOT have completed
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "Operation should have been aborted by cancellation"
+        );
+    }
+
+    #[tokio::test]
     async fn test_parallel_ops_allowed() {
         let op_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
 

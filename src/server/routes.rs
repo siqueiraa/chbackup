@@ -255,7 +255,7 @@ pub async fn post_actions(
                 })?;
             }
 
-            let (id, _token) = state.try_start_op(op_name).await.map_err(|e| {
+            let (id, token) = state.try_start_op(op_name).await.map_err(|e| {
                 (
                     StatusCode::LOCKED,
                     Json(ErrorResponse {
@@ -268,6 +268,12 @@ pub async fn post_actions(
             let command = request.command.clone();
             let parts_owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
             tokio::spawn(async move {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        warn!(id = id, "Operation {} killed by user", id);
+                        state_clone.fail_op(id, "killed by user".to_string()).await;
+                    }
+                    _ = async {
                 tracing::info!(command = %command, "Action dispatched from POST /api/v1/actions");
                 let backup_name = parts_owned
                     .get(1)
@@ -486,6 +492,8 @@ pub async fn post_actions(
                         state_clone.fail_op(id, e.to_string()).await;
                     }
                 }
+                    } => {}
+                }
             });
 
             Ok((
@@ -627,7 +635,7 @@ pub async fn create_backup(
         })?;
     }
 
-    let (id, _token) = state.try_start_op("create").await.map_err(|e| {
+    let (id, token) = state.try_start_op("create").await.map_err(|e| {
         (
             StatusCode::LOCKED,
             Json(ErrorResponse {
@@ -638,6 +646,12 @@ pub async fn create_backup(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            result = async {
         let backup_name = req
             .backup_name
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
@@ -664,7 +678,10 @@ pub async fn create_backup(
         .await;
         let duration = start_time.elapsed().as_secs_f64();
 
-        match result {
+        (result, duration, backup_name)
+            } => {
+                let (result, duration, backup_name) = result;
+                match result {
             Ok(manifest) => {
                 if let Some(m) = &state_clone.metrics {
                     m.backup_duration_seconds
@@ -689,6 +706,8 @@ pub async fn create_backup(
                 }
                 warn!(backup_name = %backup_name, error = %e, "Create operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
+            }
+                }
             }
         }
     });
@@ -731,7 +750,7 @@ pub async fn upload_backup(
         )
     })?;
 
-    let (id, _token) = state.try_start_op("upload").await.map_err(|e| {
+    let (id, token) = state.try_start_op("upload").await.map_err(|e| {
         (
             StatusCode::LOCKED,
             Json(ErrorResponse {
@@ -742,6 +761,12 @@ pub async fn upload_backup(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
         info!(backup_name = %name, "Starting upload operation");
 
         let config = state_clone.config.load();
@@ -792,6 +817,8 @@ pub async fn upload_backup(
                 state_clone.fail_op(id, e.to_string()).await;
             }
         }
+            } => {}
+        }
     });
 
     Ok(Json(OperationStarted {
@@ -825,7 +852,7 @@ pub async fn download_backup(
         )
     })?;
 
-    let (id, _token) = state.try_start_op("download").await.map_err(|e| {
+    let (id, token) = state.try_start_op("download").await.map_err(|e| {
         (
             StatusCode::LOCKED,
             Json(ErrorResponse {
@@ -837,6 +864,12 @@ pub async fn download_backup(
     let state_clone = state.clone();
     let hardlink = req.hardlink_exists_files.unwrap_or(false);
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
         info!(backup_name = %name, hardlink_exists_files = hardlink, "Starting download operation");
 
         let config = state_clone.config.load();
@@ -871,6 +904,8 @@ pub async fn download_backup(
                 state_clone.fail_op(id, e.to_string()).await;
             }
         }
+            } => {}
+        }
     });
 
     Ok(Json(OperationStarted {
@@ -903,7 +938,7 @@ pub async fn restore_backup(
         )
     })?;
 
-    let (id, _token) = state.try_start_op("restore").await.map_err(|e| {
+    let (id, token) = state.try_start_op("restore").await.map_err(|e| {
         (
             StatusCode::LOCKED,
             Json(ErrorResponse {
@@ -914,6 +949,12 @@ pub async fn restore_backup(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
         info!(backup_name = %name, "Starting restore operation");
 
         // Parse remap parameters
@@ -979,6 +1020,8 @@ pub async fn restore_backup(
                 state_clone.fail_op(id, e.to_string()).await;
             }
         }
+            } => {}
+        }
     });
 
     Ok(Json(OperationStarted {
@@ -1025,7 +1068,7 @@ pub async fn create_remote(
         })?;
     }
 
-    let (id, _token) = state.try_start_op("create_remote").await.map_err(|e| {
+    let (id, token) = state.try_start_op("create_remote").await.map_err(|e| {
         (
             StatusCode::LOCKED,
             Json(ErrorResponse {
@@ -1036,6 +1079,12 @@ pub async fn create_remote(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
         let backup_name = req
             .backup_name
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
@@ -1127,6 +1176,8 @@ pub async fn create_remote(
                 state_clone.fail_op(id, e.to_string()).await;
             }
         }
+            } => {}
+        }
     });
 
     Ok(Json(OperationStarted {
@@ -1166,7 +1217,7 @@ pub async fn restore_remote(
         )
     })?;
 
-    let (id, _token) = state.try_start_op("restore_remote").await.map_err(|e| {
+    let (id, token) = state.try_start_op("restore_remote").await.map_err(|e| {
         (
             StatusCode::LOCKED,
             Json(ErrorResponse {
@@ -1177,6 +1228,12 @@ pub async fn restore_remote(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
         info!(backup_name = %name, "Starting restore_remote operation");
 
         // Parse remap parameters
@@ -1262,6 +1319,8 @@ pub async fn restore_remote(
                 state_clone.fail_op(id, e.to_string()).await;
             }
         }
+            } => {}
+        }
     });
 
     Ok(Json(OperationStarted {
@@ -1321,7 +1380,7 @@ pub async fn delete_backup(
         }
     };
 
-    let (id, _token) = state.try_start_op("delete").await.map_err(|e| {
+    let (id, token) = state.try_start_op("delete").await.map_err(|e| {
         (
             StatusCode::LOCKED,
             Json(ErrorResponse {
@@ -1332,6 +1391,12 @@ pub async fn delete_backup(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
         info!(backup_name = %name, location = %location, "Starting delete operation");
 
         let config = state_clone.config.load();
@@ -1378,6 +1443,8 @@ pub async fn delete_backup(
                 state_clone.fail_op(id, e.to_string()).await;
             }
         }
+            } => {}
+        }
     });
 
     Ok(Json(OperationStarted {
@@ -1390,7 +1457,7 @@ pub async fn delete_backup(
 pub async fn clean_remote_broken(
     State(state): State<AppState>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
-    let (id, _token) = state
+    let (id, token) = state
         .try_start_op("clean_broken_remote")
         .await
         .map_err(|e| {
@@ -1404,6 +1471,12 @@ pub async fn clean_remote_broken(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
         info!("Starting clean_broken_remote operation");
 
         let s3 = state_clone.s3.load();
@@ -1439,6 +1512,8 @@ pub async fn clean_remote_broken(
                 state_clone.fail_op(id, e.to_string()).await;
             }
         }
+            } => {}
+        }
     });
 
     Ok(Json(OperationStarted {
@@ -1451,7 +1526,7 @@ pub async fn clean_remote_broken(
 pub async fn clean_local_broken(
     State(state): State<AppState>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
-    let (id, _token) = state
+    let (id, token) = state
         .try_start_op("clean_broken_local")
         .await
         .map_err(|e| {
@@ -1465,6 +1540,12 @@ pub async fn clean_local_broken(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
         info!("Starting clean_broken_local operation");
 
         let config = state_clone.config.load();
@@ -1500,6 +1581,8 @@ pub async fn clean_local_broken(
                 warn!(error = %e, "clean_broken_local operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
+        }
+            } => {}
         }
     });
 
@@ -1539,7 +1622,7 @@ pub async fn kill_op(
 pub async fn clean(
     State(state): State<AppState>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
-    let (id, _token) = state.try_start_op("clean").await.map_err(|e| {
+    let (id, token) = state.try_start_op("clean").await.map_err(|e| {
         (
             StatusCode::LOCKED,
             Json(ErrorResponse {
@@ -1550,6 +1633,12 @@ pub async fn clean(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(id = id, "Operation {} killed by user", id);
+                state_clone.fail_op(id, "killed by user".to_string()).await;
+            }
+            _ = async {
         info!("Starting clean operation");
 
         let config = state_clone.config.load();
@@ -1582,6 +1671,8 @@ pub async fn clean(
                 warn!(error = %e, "clean operation failed");
                 state_clone.fail_op(id, e.to_string()).await;
             }
+        }
+            } => {}
         }
     });
 
