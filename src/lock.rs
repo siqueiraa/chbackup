@@ -51,11 +51,7 @@ impl PidLock {
 
         // Attempt atomic file creation via O_CREAT|O_EXCL (create_new).
         // This eliminates the TOCTOU race between exists() and write().
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => {
                 file.write_all(json.as_bytes())?;
                 Ok(PidLock {

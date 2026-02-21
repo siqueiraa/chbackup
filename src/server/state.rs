@@ -880,8 +880,7 @@ mod tests {
         // With parallel ops enabled, we can start multiple operations
         let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
         let op_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
-        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Start 3 ops manually (simulating try_start_op)
         let mut tokens = Vec::new();
@@ -919,8 +918,7 @@ mod tests {
     async fn test_running_ops_finish_removes() {
         let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
         let op_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
-        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Start 2 ops
         let mut ids = Vec::new();
@@ -967,8 +965,7 @@ mod tests {
     async fn test_running_ops_fail_removes() {
         let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
         let op_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
-        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Start 1 op
         let permit = op_semaphore.clone().try_acquire_owned().unwrap();
@@ -1009,8 +1006,7 @@ mod tests {
     async fn test_running_ops_kill_by_id() {
         let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
         let op_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
-        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Start 2 ops
         let mut ids = Vec::new();
@@ -1066,8 +1062,7 @@ mod tests {
     async fn test_run_operation_success() {
         let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
         let op_semaphore = Arc::new(Semaphore::new(1));
-        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Simulate try_start_op
         let permit = op_semaphore.clone().try_acquire_owned().unwrap();
@@ -1133,8 +1128,7 @@ mod tests {
     async fn test_run_operation_failure() {
         let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
         let op_semaphore = Arc::new(Semaphore::new(1));
-        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Simulate try_start_op
         let permit = op_semaphore.clone().try_acquire_owned().unwrap();
