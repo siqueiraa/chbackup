@@ -4,6 +4,7 @@
 //! It provides operation lifecycle management with concurrency control
 //! via a semaphore (single-op when allow_parallel=false).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,7 +68,7 @@ pub struct AppState {
     pub ch: Arc<ArcSwap<ChClient>>,
     pub s3: Arc<ArcSwap<S3Client>>,
     pub action_log: Arc<Mutex<ActionLog>>,
-    pub current_op: Arc<Mutex<Option<RunningOp>>>,
+    pub running_ops: Arc<Mutex<HashMap<u64, RunningOp>>>,
     pub op_semaphore: Arc<Semaphore>,
     /// Prometheus metrics registry. `None` when `config.api.enable_metrics` is false.
     pub metrics: Option<Arc<Metrics>>,
@@ -132,7 +133,7 @@ impl AppState {
             ch: Arc::new(ArcSwap::from_pointee(ch)),
             s3: Arc::new(ArcSwap::from_pointee(s3)),
             action_log: Arc::new(Mutex::new(ActionLog::new(100))),
-            current_op: Arc::new(Mutex::new(None)),
+            running_ops: Arc::new(Mutex::new(HashMap::new())),
             op_semaphore: Arc::new(Semaphore::new(permits)),
             metrics,
             watch_shutdown_tx: None,
@@ -164,13 +165,16 @@ impl AppState {
         };
 
         {
-            let mut current = self.current_op.lock().await;
-            *current = Some(RunningOp {
+            let mut ops = self.running_ops.lock().await;
+            ops.insert(
                 id,
-                command: command.to_string(),
-                cancel_token: token.clone(),
-                _permit: permit,
-            });
+                RunningOp {
+                    id,
+                    command: command.to_string(),
+                    cancel_token: token.clone(),
+                    _permit: permit,
+                },
+            );
         }
 
         Ok((id, token))
@@ -183,10 +187,8 @@ impl AppState {
             log.finish(id);
         }
         {
-            let mut current = self.current_op.lock().await;
-            if current.as_ref().is_some_and(|op| op.id == id) {
-                *current = None;
-            }
+            let mut ops = self.running_ops.lock().await;
+            ops.remove(&id);
         }
     }
 
@@ -197,25 +199,42 @@ impl AppState {
             log.fail(id, error);
         }
         {
-            let mut current = self.current_op.lock().await;
-            if current.as_ref().is_some_and(|op| op.id == id) {
-                *current = None;
-            }
+            let mut ops = self.running_ops.lock().await;
+            ops.remove(&id);
         }
     }
 
-    /// Cancel the currently running operation.
+    /// Cancel one or all running operations.
     ///
-    /// Returns `true` if an operation was cancelled, `false` if no operation was running.
-    pub async fn kill_current(&self) -> bool {
-        let mut current = self.current_op.lock().await;
-        if let Some(op) = current.take() {
-            op.cancel_token.cancel();
-            let mut log = self.action_log.lock().await;
-            log.kill(op.id);
-            true
-        } else {
-            false
+    /// If `id` is `Some(id)`, cancels and removes only the specified operation.
+    /// If `id` is `None`, cancels ALL running operations (backward-compatible kill-all).
+    ///
+    /// Returns `true` if at least one operation was cancelled, `false` if none matched.
+    pub async fn kill_op(&self, id: Option<u64>) -> bool {
+        let mut ops = self.running_ops.lock().await;
+        let mut log = self.action_log.lock().await;
+
+        match id {
+            Some(target_id) => {
+                if let Some(op) = ops.remove(&target_id) {
+                    op.cancel_token.cancel();
+                    log.kill(op.id);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                if ops.is_empty() {
+                    return false;
+                }
+                let all_ops: Vec<(u64, RunningOp)> = ops.drain().collect();
+                for (_, op) in all_ops {
+                    op.cancel_token.cancel();
+                    log.kill(op.id);
+                }
+                true
+            }
         }
     }
 }
@@ -726,6 +745,189 @@ mod tests {
     #[test]
     fn test_validate_backup_name_rejects_nul() {
         assert!(validate_backup_name("foo\0bar").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_running_ops_tracks_multiple() {
+        // With parallel ops enabled, we can start multiple operations
+        let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
+        let op_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Start 3 ops manually (simulating try_start_op)
+        let mut tokens = Vec::new();
+        for i in 0..3 {
+            let permit = op_semaphore.clone().try_acquire_owned().unwrap();
+            let token = CancellationToken::new();
+            let id = {
+                let mut log = action_log.lock().await;
+                log.start(format!("op{}", i))
+            };
+            {
+                let mut ops = running_ops.lock().await;
+                ops.insert(
+                    id,
+                    RunningOp {
+                        id,
+                        command: format!("op{}", i),
+                        cancel_token: token.clone(),
+                        _permit: permit,
+                    },
+                );
+            }
+            tokens.push((id, token));
+        }
+
+        // All 3 should be in the map
+        let ops = running_ops.lock().await;
+        assert_eq!(ops.len(), 3);
+        assert!(ops.contains_key(&1));
+        assert!(ops.contains_key(&2));
+        assert!(ops.contains_key(&3));
+    }
+
+    #[tokio::test]
+    async fn test_running_ops_finish_removes() {
+        let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
+        let op_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Start 2 ops
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let permit = op_semaphore.clone().try_acquire_owned().unwrap();
+            let token = CancellationToken::new();
+            let id = {
+                let mut log = action_log.lock().await;
+                log.start(format!("op{}", i))
+            };
+            {
+                let mut ops = running_ops.lock().await;
+                ops.insert(
+                    id,
+                    RunningOp {
+                        id,
+                        command: format!("op{}", i),
+                        cancel_token: token.clone(),
+                        _permit: permit,
+                    },
+                );
+            }
+            ids.push(id);
+        }
+
+        // Finish op 1 (remove from map)
+        {
+            let mut log = action_log.lock().await;
+            log.finish(ids[0]);
+        }
+        {
+            let mut ops = running_ops.lock().await;
+            ops.remove(&ids[0]);
+        }
+
+        // Only op 2 remains
+        let ops = running_ops.lock().await;
+        assert_eq!(ops.len(), 1);
+        assert!(!ops.contains_key(&ids[0]));
+        assert!(ops.contains_key(&ids[1]));
+    }
+
+    #[tokio::test]
+    async fn test_running_ops_fail_removes() {
+        let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
+        let op_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Start 1 op
+        let permit = op_semaphore.clone().try_acquire_owned().unwrap();
+        let token = CancellationToken::new();
+        let id = {
+            let mut log = action_log.lock().await;
+            log.start("failing_op".to_string())
+        };
+        {
+            let mut ops = running_ops.lock().await;
+            ops.insert(
+                id,
+                RunningOp {
+                    id,
+                    command: "failing_op".to_string(),
+                    cancel_token: token,
+                    _permit: permit,
+                },
+            );
+        }
+
+        // Fail it (remove from map)
+        {
+            let mut log = action_log.lock().await;
+            log.fail(id, "error".to_string());
+        }
+        {
+            let mut ops = running_ops.lock().await;
+            ops.remove(&id);
+        }
+
+        // Map should be empty
+        let ops = running_ops.lock().await;
+        assert!(ops.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_running_ops_kill_by_id() {
+        let action_log = Arc::new(Mutex::new(ActionLog::new(100)));
+        let op_semaphore = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
+        let running_ops: Arc<Mutex<HashMap<u64, RunningOp>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Start 2 ops
+        let mut ids = Vec::new();
+        let mut tokens = Vec::new();
+        for i in 0..2 {
+            let permit = op_semaphore.clone().try_acquire_owned().unwrap();
+            let token = CancellationToken::new();
+            let id = {
+                let mut log = action_log.lock().await;
+                log.start(format!("op{}", i))
+            };
+            {
+                let mut ops = running_ops.lock().await;
+                ops.insert(
+                    id,
+                    RunningOp {
+                        id,
+                        command: format!("op{}", i),
+                        cancel_token: token.clone(),
+                        _permit: permit,
+                    },
+                );
+            }
+            ids.push(id);
+            tokens.push(token);
+        }
+
+        // Kill op 1 by ID
+        {
+            let mut ops = running_ops.lock().await;
+            let mut log = action_log.lock().await;
+            if let Some(op) = ops.remove(&ids[0]) {
+                op.cancel_token.cancel();
+                log.kill(op.id);
+            }
+        }
+
+        // Verify op 1 is cancelled, op 2 survives
+        assert!(tokens[0].is_cancelled());
+        assert!(!tokens[1].is_cancelled());
+
+        let ops = running_ops.lock().await;
+        assert_eq!(ops.len(), 1);
+        assert!(!ops.contains_key(&ids[0]));
+        assert!(ops.contains_key(&ids[1]));
     }
 
     #[test]

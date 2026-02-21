@@ -161,30 +161,32 @@ pub async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
 }
 
 /// GET /api/v1/status -- return current operation status
+///
+/// For backward compatibility, returns the first running operation or "idle"
+/// when no operations are running. Use GET /api/v1/actions for all operations.
 pub async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let current = state.current_op.lock().await;
+    let ops = state.running_ops.lock().await;
 
-    match current.as_ref() {
-        Some(op) => {
-            // Look up the action entry to get the start time
-            let action_log = state.action_log.lock().await;
-            let start_time = action_log
-                .entries()
-                .iter()
-                .find(|e| e.id == op.id)
-                .map(|e| e.start.to_rfc3339());
+    // Return the first running op for backward compatibility
+    if let Some(op) = ops.values().next() {
+        let action_log = state.action_log.lock().await;
+        let start_time = action_log
+            .entries()
+            .iter()
+            .find(|e| e.id == op.id)
+            .map(|e| e.start.to_rfc3339());
 
-            Json(StatusResponse {
-                status: "running".to_string(),
-                command: Some(op.command.clone()),
-                start: start_time,
-            })
-        }
-        None => Json(StatusResponse {
+        Json(StatusResponse {
+            status: "running".to_string(),
+            command: Some(op.command.clone()),
+            start: start_time,
+        })
+    } else {
+        Json(StatusResponse {
             status: "idle".to_string(),
             command: None,
             start: None,
-        }),
+        })
     }
 }
 
@@ -1507,10 +1509,22 @@ pub async fn clean_local_broken(
     }))
 }
 
-/// POST /api/v1/kill -- cancel the currently running operation
-pub async fn kill_op(State(state): State<AppState>) -> Result<&'static str, StatusCode> {
-    if state.kill_current().await {
-        info!("Operation killed");
+/// Query params for POST /api/v1/kill
+#[derive(Debug, Deserialize, Default)]
+pub struct KillParams {
+    pub id: Option<u64>,
+}
+
+/// POST /api/v1/kill -- cancel running operation(s)
+///
+/// If `?id=N` is provided, cancels only the operation with that ID.
+/// If no `id` is provided, cancels ALL running operations.
+pub async fn kill_op(
+    State(state): State<AppState>,
+    Query(params): Query<KillParams>,
+) -> Result<&'static str, StatusCode> {
+    if state.kill_op(params.id).await {
+        info!(target_id = ?params.id, "Operation killed");
         Ok("killed")
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -2020,7 +2034,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 ///
 /// Calls `list_local` (via `spawn_blocking`) and `list_remote` (async) to
 /// update the `number_backups_local` and `number_backups_remote` gauges.
-/// Also updates the `in_progress` gauge from `current_op`.
+/// Also updates the `in_progress` gauge from `running_ops`.
 async fn refresh_backup_counts(state: &AppState, metrics: &Metrics) {
     // Refresh local backup count (sync function -- use spawn_blocking)
     let config = state.config.load();
@@ -2038,8 +2052,8 @@ async fn refresh_backup_counts(state: &AppState, metrics: &Metrics) {
         Err(e) => warn!(error = %e, "Failed to refresh remote backup count for metrics"),
     }
 
-    // Refresh in_progress gauge from current_op
-    let is_running = state.current_op.lock().await.is_some();
+    // Refresh in_progress gauge from running_ops
+    let is_running = !state.running_ops.lock().await.is_empty();
     metrics.in_progress.set(if is_running { 1 } else { 0 });
 }
 
