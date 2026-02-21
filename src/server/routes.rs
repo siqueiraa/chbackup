@@ -247,7 +247,9 @@ pub async fn post_actions(
     match op_name {
         "create" | "upload" | "download" | "restore" | "create_remote" | "restore_remote"
         | "delete" | "clean_broken" => {
-            // Validate backup name if explicitly provided in the command
+            // Validate backup name if explicitly provided in the command.
+            // For most commands the name is parts[1]; for "delete <location> <name>"
+            // the location is parts[1] and the backup name is parts[2].
             if let Some(name) = parts.get(1) {
                 validate_backup_name(name).map_err(|e| {
                     warn!(backup_name = %name, "backup name rejected: {}", e);
@@ -258,6 +260,19 @@ pub async fn post_actions(
                         }),
                     )
                 })?;
+            }
+            if op_name == "delete" {
+                if let Some(name) = parts.get(2) {
+                    validate_backup_name(name).map_err(|e| {
+                        warn!(backup_name = %name, "backup name rejected: {}", e);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: format!("invalid backup name: {e}"),
+                            }),
+                        )
+                    })?;
+                }
             }
 
             let (id, token) = state.try_start_op(op_name).await.map_err(|e| {
@@ -276,7 +291,9 @@ pub async fn post_actions(
                 tokio::select! {
                     _ = token.cancelled() => {
                         warn!(id = id, "Operation {} killed by user", id);
-                        state_clone.fail_op(id, "killed by user".to_string()).await;
+                        // kill_op() already removed this op from running_ops and set its
+                        // ActionLog status to Killed before cancelling the token.
+                        // Calling fail_op() here would overwrite Killed with Failed — do nothing.
                     }
                     _ = async {
                 tracing::info!(command = %command, "Action dispatched from POST /api/v1/actions");

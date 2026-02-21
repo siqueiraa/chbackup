@@ -215,31 +215,42 @@ impl AppState {
     ///
     /// Returns `true` if at least one operation was cancelled, `false` if none matched.
     pub async fn kill_op(&self, id: Option<u64>) -> bool {
-        let mut ops = self.running_ops.lock().await;
-        let mut log = self.action_log.lock().await;
-
-        match id {
-            Some(target_id) => {
-                if let Some(op) = ops.remove(&target_id) {
-                    op.cancel_token.cancel();
-                    log.kill(op.id);
-                    true
-                } else {
-                    false
+        // Step 1: Remove target op(s) from running_ops under its own lock, then drop the lock.
+        // This avoids holding running_ops and action_log simultaneously, which would invert the
+        // lock order used by try_start_op / finish_op / fail_op (action_log first, then
+        // running_ops) and create a deadlock under concurrent calls.
+        let killed_ops: Vec<RunningOp> = {
+            let mut ops = self.running_ops.lock().await;
+            match id {
+                Some(target_id) => {
+                    if let Some(op) = ops.remove(&target_id) {
+                        vec![op]
+                    } else {
+                        vec![]
+                    }
                 }
+                None => ops.drain().map(|(_, op)| op).collect(),
             }
-            None => {
-                if ops.is_empty() {
-                    return false;
-                }
-                let all_ops: Vec<(u64, RunningOp)> = ops.drain().collect();
-                for (_, op) in all_ops {
-                    op.cancel_token.cancel();
-                    log.kill(op.id);
-                }
-                true
+        }; // running_ops lock dropped here
+
+        if killed_ops.is_empty() {
+            return false;
+        }
+
+        // Step 2: Cancel tokens — no lock needed.
+        for op in &killed_ops {
+            op.cancel_token.cancel();
+        }
+
+        // Step 3: Update action_log under its own lock (consistent order with other methods).
+        {
+            let mut log = self.action_log.lock().await;
+            for op in &killed_ops {
+                log.kill(op.id);
             }
         }
+
+        true
     }
 }
 
@@ -278,7 +289,9 @@ where
         tokio::select! {
             _ = token.cancelled() => {
                 warn!(id = id, "Operation {} killed by user", id);
-                state_clone.fail_op(id, "killed by user".to_string()).await;
+                // kill_op() already removed this op from running_ops and set its
+                // ActionLog status to Killed before cancelling the token.
+                // Calling fail_op() here would overwrite Killed with Failed — do nothing.
             }
             _ = async {
                 let config = state_clone.config.load_full();
