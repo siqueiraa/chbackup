@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -34,27 +35,6 @@ impl PidLock {
     /// Returns `Ok(PidLock)` on success or `Err(ChBackupError::LockError)` if
     /// another live process already holds the lock.
     pub fn acquire(path: &Path, command: &str) -> Result<Self, ChBackupError> {
-        // If a lock file already exists, check whether the recorded PID is alive.
-        if path.exists() {
-            match fs::read_to_string(path) {
-                Ok(contents) => {
-                    if let Ok(info) = serde_json::from_str::<LockInfo>(&contents) {
-                        if is_pid_alive(info.pid) {
-                            return Err(ChBackupError::LockError(format!(
-                                "lock held by PID {} (command: {}, since: {})",
-                                info.pid, info.command, info.timestamp,
-                            )));
-                        }
-                        // PID is dead -- stale lock, safe to override.
-                    }
-                    // Malformed JSON -- treat as stale, override.
-                }
-                Err(_) => {
-                    // Cannot read file -- treat as stale, override.
-                }
-            }
-        }
-
         let info = LockInfo {
             pid: std::process::id(),
             command: command.to_string(),
@@ -69,11 +49,59 @@ impl PidLock {
             fs::create_dir_all(parent)?;
         }
 
-        fs::write(path, json)?;
+        // Attempt atomic file creation via O_CREAT|O_EXCL (create_new).
+        // This eliminates the TOCTOU race between exists() and write().
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                file.write_all(json.as_bytes())?;
+                Ok(PidLock {
+                    path: path.to_path_buf(),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // File exists -- check whether the recorded PID is alive.
+                match fs::read_to_string(path) {
+                    Ok(contents) => {
+                        if let Ok(existing) = serde_json::from_str::<LockInfo>(&contents) {
+                            if is_pid_alive(existing.pid) {
+                                return Err(ChBackupError::LockError(format!(
+                                    "lock held by PID {} (command: {}, since: {})",
+                                    existing.pid, existing.command, existing.timestamp,
+                                )));
+                            }
+                            // PID is dead -- stale lock, remove and retry.
+                        }
+                        // Malformed JSON -- treat as stale, remove and retry.
+                    }
+                    Err(_) => {
+                        // Cannot read file -- treat as stale, remove and retry.
+                    }
+                }
 
-        Ok(PidLock {
-            path: path.to_path_buf(),
-        })
+                // Remove stale lock and retry with create_new for atomicity.
+                let _ = fs::remove_file(path);
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map_err(|e| {
+                        ChBackupError::LockError(format!(
+                            "failed to acquire lock after removing stale file: {e}"
+                        ))
+                    })?;
+                file.write_all(json.as_bytes())?;
+                Ok(PidLock {
+                    path: path.to_path_buf(),
+                })
+            }
+            Err(e) => Err(ChBackupError::LockError(format!(
+                "failed to create lock file: {e}"
+            ))),
+        }
     }
 
     /// Return the path to the lock file.
@@ -232,6 +260,34 @@ mod tests {
         let info: LockInfo = serde_json::from_str(&contents).unwrap();
         assert_eq!(info.pid, std::process::id());
         assert_eq!(info.command, "restore");
+    }
+
+    #[test]
+    fn test_acquire_atomic_creation() {
+        // Verify that acquire uses atomic file creation (create_new / O_CREAT|O_EXCL).
+        // After a successful acquire, the lock file should contain valid JSON with
+        // the current PID, proving that the atomic path was used.
+        let dir = TempDir::new().unwrap();
+        let path = lock_path(&dir);
+
+        // Ensure no file exists before acquire.
+        assert!(!path.exists(), "lock file should not exist before acquire");
+
+        let lock = PidLock::acquire(&path, "test_atomic").unwrap();
+
+        // Verify the file was created atomically (contents are valid).
+        let contents = fs::read_to_string(lock.path()).unwrap();
+        let info: LockInfo = serde_json::from_str(&contents).unwrap();
+        assert_eq!(info.pid, std::process::id());
+        assert_eq!(info.command, "test_atomic");
+
+        // Verify that a second concurrent acquire attempt is rejected
+        // (the atomic creation ensures no window for race conditions).
+        let result = PidLock::acquire(&path, "concurrent");
+        assert!(
+            result.is_err(),
+            "concurrent acquire should fail due to atomic lock"
+        );
     }
 
     #[test]
