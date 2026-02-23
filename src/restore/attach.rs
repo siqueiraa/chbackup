@@ -479,17 +479,6 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
     attach_parts_inner(&attach_params, &params.engine).await
 }
 
-/// Attach parts for a single table using borrowed parameters.
-///
-/// Hardlinks backup part files to the table's detached/ directory, then
-/// executes ALTER TABLE ATTACH PART for each part.
-#[allow(dead_code)]
-pub async fn attach_parts(params: &AttachParams<'_>) -> Result<u64> {
-    // When called from the borrowed API, we don't have engine info,
-    // so default to sequential (safe for all engines).
-    attach_parts_inner(params, "").await
-}
-
 /// Internal attach implementation with engine-aware routing.
 ///
 /// When `needs_sequential_attach(engine)` returns true (Replacing, Collapsing,
