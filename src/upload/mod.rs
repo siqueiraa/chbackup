@@ -35,6 +35,7 @@ use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, UploadState,
 };
 use crate::storage::s3::{calculate_chunk_size, RetryConfig};
+use crate::path_encoding::encode_path_component;
 use crate::storage::S3Client;
 
 /// Multipart upload threshold: parts with compressed data larger than 32 MiB
@@ -44,24 +45,6 @@ const MULTIPART_THRESHOLD: u64 = 32 * 1024 * 1024;
 /// Check if a given data size should use multipart upload.
 fn should_use_multipart(compressed_size: u64) -> bool {
     compressed_size > MULTIPART_THRESHOLD
-}
-
-/// URL-encode a component for use in S3 key paths.
-///
-/// Replaces special characters with percent-encoded equivalents, but keeps
-/// alphanumeric chars, `-`, `_`, and `.` as-is.
-/// Note: does NOT preserve `/` (unlike download::url_encode) since we
-/// encode individual path components.
-fn url_encode_component(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
-            }
-        })
-        .collect()
 }
 
 /// Generate the S3 key for a compressed part archive.
@@ -78,8 +61,8 @@ fn s3_key_for_part(
     format!(
         "{}/data/{}/{}/{}{}",
         backup_name,
-        url_encode_component(db),
-        url_encode_component(table),
+        encode_path_component(db),
+        encode_path_component(table),
         part_name,
         stream::archive_extension(data_format)
     )
@@ -342,8 +325,8 @@ pub async fn upload(
                     let metadata_key = format!(
                         "{}/data/{}/{}/{}/{}/",
                         backup_name,
-                        url_encode_component(db),
-                        url_encode_component(table),
+                        encode_path_component(db),
+                        encode_path_component(table),
                         disk_name,
                         part.name,
                     );
@@ -811,8 +794,8 @@ pub async fn upload(
             let metadata_backup_key = format!(
                 "{}/data/{}/{}/{}/{}/",
                 item.backup_name,
-                url_encode_component(&item.db),
-                url_encode_component(&item.table),
+                encode_path_component(&item.db),
+                encode_path_component(&item.table),
                 item.disk_name,
                 item.part.name,
             );
@@ -1081,8 +1064,8 @@ fn find_part_dir(
 ) -> Result<PathBuf> {
     use crate::backup::collect::resolve_shadow_part_path;
 
-    let url_db = url_encode_component(db);
-    let url_table = url_encode_component(table);
+    let url_db = encode_path_component(db);
+    let url_table = encode_path_component(table);
 
     resolve_shadow_part_path(
         backup_dir,
@@ -1192,15 +1175,15 @@ mod tests {
     }
 
     #[test]
-    fn test_url_encode_component_simple() {
-        assert_eq!(url_encode_component("default"), "default");
-        assert_eq!(url_encode_component("my_table"), "my_table");
+    fn test_encode_path_component_simple() {
+        assert_eq!(encode_path_component("default"), "default");
+        assert_eq!(encode_path_component("my_table"), "my_table");
     }
 
     #[test]
-    fn test_url_encode_component_special() {
-        assert_eq!(url_encode_component("my table"), "my%20table");
-        assert_eq!(url_encode_component("db:name"), "db%3Aname");
+    fn test_encode_path_component_special() {
+        assert_eq!(encode_path_component("my table"), "my%20table");
+        assert_eq!(encode_path_component("db:name"), "db%3Aname");
     }
 
     #[test]

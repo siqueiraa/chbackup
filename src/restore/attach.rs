@@ -20,6 +20,7 @@ use walkdir::WalkDir;
 
 use crate::backup::collect::resolve_shadow_part_path;
 use crate::clickhouse::client::ChClient;
+use crate::path_encoding::encode_path_component;
 use crate::manifest::PartInfo;
 use crate::object_disk::{is_s3_disk, parse_metadata, rewrite_metadata};
 use crate::resume::{save_state_graceful, RestoreState};
@@ -313,8 +314,8 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
 
             // Read metadata files from the backup shadow directory
             // Use source names for shadow path lookup (source == pre-remap names)
-            let url_src_db = url_encode(p.source_db);
-            let url_src_table = url_encode(p.source_table);
+            let url_src_db = encode_path_component(p.source_db);
+            let url_src_table = encode_path_component(p.source_table);
             let backup_name = p
                 .backup_dir
                 .file_name()
@@ -553,8 +554,8 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
             // URL-encode source db and table names for the backup shadow path
             // Use source_db/source_table (pre-remap names) since shadow dirs
             // are created during backup using the original ClickHouse names.
-            let url_src_db = url_encode(params.source_db);
-            let url_src_table = url_encode(params.source_table);
+            let url_src_db = encode_path_component(params.source_db);
+            let url_src_table = encode_path_component(params.source_table);
 
             let backup_name = params
                 .backup_dir
@@ -840,18 +841,6 @@ pub fn get_table_data_path(
         .join(table)
 }
 
-/// URL-encode a component for directory paths (same as download module).
-pub(crate) fn url_encode(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.' {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
-            }
-        })
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -945,9 +934,9 @@ mod tests {
     }
 
     #[test]
-    fn test_url_encode() {
-        assert_eq!(url_encode("default"), "default");
-        assert_eq!(url_encode("my table"), "my%20table");
+    fn test_encode_path_component() {
+        assert_eq!(encode_path_component("default"), "default");
+        assert_eq!(encode_path_component("my table"), "my%20table");
     }
 
     // ---- Task 8: UUID-isolated S3 restore tests ----

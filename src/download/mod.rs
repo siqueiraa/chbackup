@@ -32,23 +32,8 @@ use crate::rate_limiter::RateLimiter;
 use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, DownloadState,
 };
+use crate::path_encoding::encode_path_component;
 use crate::storage::S3Client;
-
-/// URL-encode a component for use in S3 key paths and local directory names.
-///
-/// Replaces special characters with percent-encoded equivalents, but keeps
-/// alphanumeric chars, `/`, `-`, `_`, and `.` as-is.
-fn url_encode(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.' {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
-            }
-        })
-        .collect()
-}
 
 /// Resolve the per-disk target backup directory for a download write path.
 ///
@@ -173,8 +158,8 @@ fn find_existing_part(
 
     // URL-encode the table_key components for filesystem path
     let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
-    let url_db = url_encode(db);
-    let url_table = url_encode(table);
+    let url_db = encode_path_component(db);
+    let url_table = encode_path_component(table);
 
     // Collect all backup base directories to search, deduped
     let mut search_bases: Vec<PathBuf> = Vec::new();
@@ -519,8 +504,8 @@ pub async fn download(
                 "Downloading part"
             );
 
-            let url_db = url_encode(&item.db);
-            let url_table = url_encode(&item.table);
+            let url_db = encode_path_component(&item.db);
+            let url_table = encode_path_component(&item.table);
 
             if item.is_s3_disk_part {
                 // S3 disk part: download only metadata files, not the full
@@ -588,8 +573,24 @@ pub async fn download(
                     let file_size = data.len() as u64;
                     total_metadata_bytes += file_size;
 
-                    // Write metadata file to local shadow directory
-                    let file_path = shadow_dir.join(relative_name);
+                    // Write metadata file to local shadow directory.
+                    // Sanitize relative_name to prevent path traversal via
+                    // crafted S3 keys containing ".." components.
+                    let safe_path: PathBuf = Path::new(relative_name)
+                        .components()
+                        .filter_map(|c| match c {
+                            std::path::Component::Normal(seg) => Some(seg),
+                            _ => None, // reject ParentDir (..), RootDir (/), CurDir (.), Prefix
+                        })
+                        .collect();
+                    if safe_path.as_os_str().is_empty() {
+                        warn!(
+                            relative_name = %relative_name,
+                            "Skipping metadata file with unsafe path"
+                        );
+                        continue;
+                    }
+                    let file_path = shadow_dir.join(&safe_path);
                     if let Some(parent) = file_path.parent() {
                         std::fs::create_dir_all(parent).with_context(|| {
                             format!("Failed to create parent dir: {}", parent.display())
@@ -844,12 +845,12 @@ pub async fn download(
     for (table_key, table_manifest) in &manifest.tables {
         let (db, table) = table_key.split_once('.').unwrap_or(("default", table_key));
 
-        let metadata_dir = backup_dir.join("metadata").join(url_encode(db));
+        let metadata_dir = backup_dir.join("metadata").join(encode_path_component(db));
         std::fs::create_dir_all(&metadata_dir).with_context(|| {
             format!("Failed to create metadata dir: {}", metadata_dir.display())
         })?;
 
-        let table_metadata_path = metadata_dir.join(format!("{}.json", url_encode(table)));
+        let table_metadata_path = metadata_dir.join(format!("{}.json", encode_path_component(table)));
         let table_json = serde_json::to_string_pretty(table_manifest)
             .context("Failed to serialize table manifest")?;
         std::fs::write(&table_metadata_path, &table_json).with_context(|| {
@@ -1097,27 +1098,22 @@ mod tests {
     }
 
     #[test]
-    fn test_url_encode_simple() {
-        assert_eq!(url_encode("default"), "default");
-        assert_eq!(url_encode("my_table"), "my_table");
-        assert_eq!(url_encode("my-table"), "my-table");
+    fn test_encode_path_component_simple() {
+        assert_eq!(encode_path_component("default"), "default");
+        assert_eq!(encode_path_component("my_table"), "my_table");
+        assert_eq!(encode_path_component("my-table"), "my-table");
     }
 
     #[test]
-    fn test_url_encode_special_chars() {
-        assert_eq!(url_encode("my table"), "my%20table");
-        assert_eq!(url_encode("db:name"), "db%3Aname");
-        assert_eq!(url_encode("test+data"), "test%2Bdata");
+    fn test_encode_path_component_special_chars() {
+        assert_eq!(encode_path_component("my table"), "my%20table");
+        assert_eq!(encode_path_component("db:name"), "db%3Aname");
+        assert_eq!(encode_path_component("test+data"), "test%2Bdata");
     }
 
     #[test]
-    fn test_url_encode_preserves_dots() {
-        assert_eq!(url_encode("db.table"), "db.table");
-    }
-
-    #[test]
-    fn test_url_encode_preserves_slashes() {
-        assert_eq!(url_encode("path/to/file"), "path/to/file");
+    fn test_encode_path_component_preserves_dots() {
+        assert_eq!(encode_path_component("db.table"), "db.table");
     }
 
     #[test]
