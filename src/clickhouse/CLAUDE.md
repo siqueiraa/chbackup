@@ -64,7 +64,6 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 ### Public API
 - `new(config) -> Result<Self>` -- Build from ClickHouseConfig (with TLS env var wiring)
 - `ping() -> Result<()>` -- Connectivity check
-- `inner() -> &clickhouse::Client` -- Access underlying client
 - `freeze_table(db, table, freeze_name) -> Result<()>` -- ALTER TABLE FREEZE
 - `freeze_partition(db, table, partition, freeze_name) -> Result<()>` -- ALTER TABLE FREEZE PARTITION (Phase 2d)
 - `unfreeze_table(db, table, freeze_name) -> Result<()>` -- ALTER TABLE UNFREEZE

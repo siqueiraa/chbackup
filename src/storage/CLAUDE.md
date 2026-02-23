@@ -43,7 +43,6 @@ pub struct S3Object {
 ### Public API
 - `new(config) -> Result<Self>` -- Build from S3Config (async)
 - `ping() -> Result<()>` -- Connectivity check via HeadBucket
-- `inner() -> &aws_sdk_s3::Client` -- Access underlying client
 - `bucket() -> &str` -- Configured bucket name
 - `prefix() -> &str` -- Configured key prefix
 - `full_key(relative_key) -> String` -- Prepend prefix to key

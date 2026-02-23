@@ -240,7 +240,6 @@ Queries `system.tables` for `data_paths` column to find the table's data directo
 - `restore_rbac(ch, config, backup_dir, resolve_conflicts) -> Result<()>` -- DDL-based RBAC restore from .jsonl files with conflict resolution (Phase 4e)
 - `restore_configs(config, backup_dir) -> Result<()>` -- Copy config files from backup to ClickHouse config dir (Phase 4e)
 - `execute_restart_commands(ch, restart_command) -> Result<()>` -- Execute semicolon-separated restart commands with exec:/sql: prefix routing (Phase 4e)
-- `attach_parts(params) -> Result<u64>` -- Hardlink + ATTACH PART (borrowed params), returns count
 - `attach_parts_owned(params) -> Result<u64>` -- Hardlink + ATTACH PART (owned params for tokio::spawn); handles both local and S3 disk parts; skips already-attached parts when resume is active (Phase 2d)
 - `OwnedAttachParams` -- Owned variant of AttachParams with engine field for spawn boundaries; includes `s3_client`, `disk_type_map`, `disk_remote_paths`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming` for Phase 2c; `already_attached`, `restore_state_path` for Phase 2d; `manifest_disks`, `source_db`, `source_table` for per-disk path resolution
 - `uuid_s3_prefix(uuid) -> String` -- Generate `store/{3char}/{uuid_with_dashes}/` prefix for S3 restore paths
