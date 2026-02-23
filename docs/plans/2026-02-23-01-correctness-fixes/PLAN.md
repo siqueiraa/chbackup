@@ -85,11 +85,12 @@ Group E (Final -- depends on all):
 1. Write test `test_encode_path_component_basic` in new module: encode ASCII letters, digits, `-`, `_`, `.` are preserved; spaces and special chars are percent-encoded
 2. Write test `test_encode_path_component_no_slash_preservation`: verify `/` is percent-encoded (unlike old url_encode_path)
 3. Write test `test_encode_path_component_multibyte_utf8`: verify multi-byte chars use byte-level percent-encoding (e.g., `"cafe\u{0301}"` encodes each UTF-8 byte)
-4. Write test `test_sanitize_path_component_blocks_traversal`: input `"../etc/passwd"` returns `"..%2Fetc%2Fpasswd"` (dots preserved but slash encoded)
-5. Write test `test_sanitize_path_component_strips_leading_slash`: input `"/foo"` returns `"foo"` (leading slash stripped)
-6. Write test `test_sanitize_path_component_normal_names`: normal db/table names pass through encoding unchanged
-7. Implement `pub fn encode_path_component(s: &str) -> String` -- percent-encodes non-safe chars, does NOT preserve `/`; uses byte-level encoding for multi-byte chars (matching collect.rs pattern)
-8. Implement `pub fn sanitize_path_component(s: &str) -> String` -- strips leading `/` then delegates to `encode_path_component()`
+4. Write test `test_sanitize_path_component_blocks_dotdot`: input `".."` returns `""` (rejected, not encoded)
+5. Write test `test_sanitize_path_component_blocks_dot`: input `"."` returns `""` (rejected)
+6. Write test `test_sanitize_path_component_strips_leading_slash`: input `"/foo"` returns `"foo"` (leading slash stripped)
+7. Write test `test_sanitize_path_component_normal_names`: normal db/table names pass through encoding unchanged
+8. Implement `pub fn encode_path_component(s: &str) -> String` -- percent-encodes non-safe chars, does NOT preserve `/`; uses byte-level encoding for multi-byte chars (matching collect.rs pattern)
+9. Implement `pub fn sanitize_path_component(s: &str) -> String` -- returns `""` for `""`, `"."`, `".."` (explicit rejection); strips leading `/` chars; then delegates to `encode_path_component()`
 9. Add `pub mod path_encoding;` to src/lib.rs (after `pub mod object_disk;` alphabetically)
 10. Verify all tests pass
 
@@ -97,7 +98,8 @@ Group E (Final -- depends on all):
 - Safe chars: `is_alphanumeric() || c == '-' || c == '_' || c == '.'`
 - NOT safe: `/` (this is the key difference from 3 of the 4 old implementations)
 - Byte-level encoding: `for byte in c.to_string().as_bytes() { format!("%{:02X}", byte) }` (matches collect.rs:36-38)
-- `sanitize_path_component` is a thin wrapper: strips leading `/` chars then calls `encode_path_component`
+- `sanitize_path_component` MUST explicitly reject `""`, `"."`, and `".."` by returning `""` — NOT by encoding them. A `"."` in safe chars means `".."` would survive as `".."` and still traverse when rejoined. Explicit rejection is required.
+- Callers that split on `/` and iterate components must skip empty returns from `sanitize_path_component`
 - All callers pass individual db or table names (not full paths), so not preserving `/` is correct
 
 **Files:** src/path_encoding.rs (NEW), src/lib.rs
@@ -127,20 +129,17 @@ Group E (Final -- depends on all):
 
 **TDD Steps:**
 1. Write test `test_mock_s3_client_no_tls_init` concept: verify that `mock_s3_client` for sync tests does NOT trigger TLS initialization
-2. Create `mock_s3_client_sync(bucket, prefix) -> S3Client` that builds the `S3Client` struct directly without calling `aws_sdk_s3::Client::from_conf()`:
-   - For the `inner` field: use a minimal `aws_sdk_s3::Client` built from an empty config with NO default behavior version or region (this avoids TLS init)
-   - Actually, `aws_sdk_s3::Client::from_conf()` always initializes a client -- but we can configure it to not load native roots by using `ConnectorBuilder::build_http()` for a plain HTTP connector
-3. Simpler approach: Keep `mock_s3_client` as-is for the 3 async tests; create a separate `mock_s3_fields(bucket, prefix) -> S3Client` helper for the 5 sync tests that only need bucket/prefix fields
-4. The `mock_s3_fields` approach: construct `S3Client` directly with struct literal, using a dummy `inner` that won't trigger TLS. Build the inner via `aws_sdk_s3::config::Builder::new().build()` WITHOUT `.behavior_version_latest()` to minimize initialization
-5. Replace 5 sync test calls to `mock_s3_client` with `mock_s3_fields`
-6. Verify `cargo test --locked --offline` passes for the 5 sync tests (the 3 async tests are expected to fail offline)
-7. Add `#[ignore]` attribute to the 3 async retry tests with comment `// Requires network: tests real S3 error paths`
+2. Create `mock_s3_fields(bucket: &str, prefix: &str) -> S3Client` helper: constructs `S3Client` struct with a dummy `inner` via `aws_sdk_s3::Client::from_conf(aws_sdk_s3::config::Builder::new().behavior_version_latest().build())` — the key insight is that TLS native-root init only fires when the runtime first connects; building the client object alone is safe
+3. Verify the above by running `cargo test --locked --offline` after the change — if TLS init still fires at build time, use an HTTP-only connector: `aws_sdk_s3::config::Builder::new().behavior_version_latest().http_client(aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder::new().build_http()).build()`
+4. Replace 5 sync test calls to `mock_s3_client` with `mock_s3_fields`
+5. Add `#[ignore]` attribute to the 3 async retry tests with comment `// Requires network: tests real S3 error paths`
+6. Verify `cargo test --locked --offline` passes completely (all non-ignored tests green)
 
 **Implementation Notes:**
 - 5 sync tests to update: `test_full_key_with_prefix`, `test_full_key_with_trailing_slash_prefix`, `test_full_key_empty_prefix`, `test_full_key_nested_prefix`, `test_copy_object_builds_correct_source`
 - 3 async tests to mark `#[ignore]`: `test_copy_object_with_retry_no_streaming_when_disabled`, `test_put_object_retry_config`, `test_upload_part_retry_config`
-- The `mock_s3_fields` function builds `S3Client { inner: ..., bucket, prefix, storage_class, sse, sse_kms_key_id, acl }` same as current `mock_s3_client` but uses `aws_sdk_s3::config::Builder::new().build()` (no `.behavior_version_latest()`)
-- If `.behavior_version_latest()` is required for compilation, keep it but test whether removing it avoids TLS init
+- The `mock_s3_fields` function builds `S3Client { inner: ..., bucket, prefix, storage_class, sse, sse_kms_key_id, acl }` — always include `.behavior_version_latest()` (required for compilation); if TLS still fires at object construction, use the HTTP-only connector fallback in step 3
+- **Acceptance gate**: `cargo test --locked --offline` must pass in full (not just the 5 sync tests in isolation)
 
 **Files:** src/storage/s3.rs (test section only)
 **Acceptance:** F003
@@ -229,7 +228,7 @@ Group E (Final -- depends on all):
 - **download:522-523,847,852**: `url_encode(&item.db)` -> `encode_path_component(&item.db)`. Same reasoning.
 - **upload:81-82,345-346,814-815,1084-1085**: `url_encode_component(&db)` -> `encode_path_component(&db)`. This was already not preserving `/`, so behavior is identical.
 - **restore:316-317,556-557,994-995**: `url_encode(&source_db)` -> `encode_path_component(&source_db)`. Same reasoning.
-- **Path traversal fix (Issue 1)**: In download/mod.rs at line 592 (`shadow_dir.join(relative_name)`), the `relative_name` comes from S3 object keys after stripping the prefix. A crafted key could contain `..`. Fix: `let safe_name = crate::path_encoding::sanitize_path_component(relative_name);` then `shadow_dir.join(&safe_name)`. However, `relative_name` may legitimately contain subdirectory structure. For this specific case, apply sanitization per-component: split on `/`, sanitize each component (stripping leading `/` and encoding special chars), rejoin.
+- **Path traversal fix (Issue 1)**: In download/mod.rs at line 592 (`shadow_dir.join(relative_name)`), the `relative_name` comes from S3 object keys after stripping the prefix. A crafted key could contain `..`. Fix: use `std::path::Path::new(relative_name).components()` and collect only `std::path::Component::Normal(c)` components (skipping `ParentDir`, `RootDir`, `CurDir`, `Prefix`). This is the correct approach — `Path::components()` parses at the type level so `..` maps to `ParentDir` (rejected) rather than a string that might slip through encoding. Rejoin with `PathBuf` `push()` calls.
 
 **Files:** src/backup/collect.rs, src/download/mod.rs, src/upload/mod.rs, src/restore/attach.rs, src/restore/mod.rs
 **Acceptance:** F007
@@ -241,13 +240,16 @@ Group E (Final -- depends on all):
 2. For each module, regenerate directory tree
 3. Update Key Patterns sections:
    - **src/backup/CLAUDE.md**: Note check_parts_columns now returns error (strict-fail) instead of warn+continue; note url_encode_path replaced by path_encoding::encode_path_component
-   - **src/download/CLAUDE.md**: Note path sanitization via path_encoding::sanitize_path_component for metadata file writes; note url_encode replaced by path_encoding::encode_path_component
+   - **src/download/CLAUDE.md**: Note path sanitization via Path::components() Normal-only filter for metadata file writes; note url_encode replaced by path_encoding::encode_path_component
    - **src/upload/CLAUDE.md**: Note url_encode_component replaced by path_encoding::encode_path_component
    - **src/restore/CLAUDE.md**: Note url_encode replaced by path_encoding::encode_path_component
    - **src/storage/CLAUDE.md**: Note disable_cert_verification now forces HTTP endpoint (broken env var approach removed); note disable_ssl wiring; note hermetic mock_s3_fields for sync tests
-4. Validate all CLAUDE.md files have required sections
+4. Update **docs/design.md** for behavioral contract changes:
+   - `--env` section (§2 / around line 936-938): add that env-style keys (`S3_BUCKET=val`) are now accepted in addition to dot-notation (`s3.bucket=val`)
+   - `s3.disable_cert_verification` entry (§12 / around line 2539): update semantics to reflect that this now forces the endpoint to HTTP (not a TLS skip); add note that an explicit endpoint URL is required
+5. Validate all CLAUDE.md files have required sections
 
-**Files:** src/backup/CLAUDE.md, src/download/CLAUDE.md, src/upload/CLAUDE.md, src/restore/CLAUDE.md, src/storage/CLAUDE.md
+**Files:** src/backup/CLAUDE.md, src/download/CLAUDE.md, src/upload/CLAUDE.md, src/restore/CLAUDE.md, src/storage/CLAUDE.md, docs/design.md
 **Acceptance:** FDOC
 
 ## Consistency Validation Results

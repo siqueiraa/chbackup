@@ -6,7 +6,7 @@
     {
       "id": "F001",
       "category": "feature",
-      "description": "Canonical path encoding module with sanitization (src/path_encoding.rs)",
+      "description": "Canonical path encoding module with sanitization (src/path_encoding.rs); sanitize_path_component rejects empty/./.. components explicitly",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
@@ -36,7 +36,7 @@
             "covered_by": ["F001"],
             "alternative_verification": {
               "command": "cargo test path_encoding -- --nocapture 2>&1 | grep -c 'test .* ok'",
-              "expected": "6"
+              "expected": "8"
             }
           }
         ]
@@ -88,7 +88,7 @@
     {
       "id": "F003",
       "category": "bugfix",
-      "description": "Hermetic S3 unit tests: 5 sync tests work offline, 3 async tests marked #[ignore]",
+      "description": "Hermetic S3 unit tests: cargo test --locked --offline passes in full (5 sync tests use mock_s3_fields, 3 async tests marked #[ignore])",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
@@ -107,9 +107,9 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --lib storage::s3::tests::test_full_key 2>&1 | grep -E 'test result:' | head -1",
+            "command": "cargo test --locked --offline 2>&1 | grep -E 'test result:' | tail -1",
             "expected": "test result: ok.",
-            "fail_message": "Sync S3 tests fail after mock change"
+            "fail_message": "cargo test --locked --offline does not pass in full after hermetic test fix"
           },
           {
             "name": "runtime",
@@ -117,8 +117,8 @@
             "justification": "Test infrastructure change -- no runtime binary behavior affected",
             "covered_by": ["F003"],
             "alternative_verification": {
-              "command": "cargo test --lib storage::s3::tests::test_full_key 2>&1 | grep -c 'test .* ok'",
-              "expected": "4"
+              "command": "cargo test --locked --offline 2>&1 | grep -E '^test result:' | grep -c 'ok'",
+              "expected": "1"
             }
           }
         ]
@@ -252,7 +252,7 @@
     {
       "id": "F007",
       "category": "refactor",
-      "description": "All 4 url_encode implementations replaced by single path_encoding module; path traversal sanitization added to download metadata write",
+      "description": "All 4 url_encode implementations replaced by single path_encoding module; path traversal uses Path::components() Normal-only filter in download metadata write",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
@@ -282,7 +282,7 @@
             "covered_by": ["F001"],
             "alternative_verification": {
               "command": "cargo test path_encoding 2>&1 | grep -c 'test .* ok'",
-              "expected": "6"
+              "expected": "8"
             }
           }
         ]
@@ -293,16 +293,16 @@
     {
       "id": "FDOC",
       "category": "documentation",
-      "description": "CLAUDE.md updated for all modified modules",
+      "description": "CLAUDE.md updated for all modified modules; docs/design.md updated for --env env-style keys and disable_cert_verification HTTP semantics",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
         "layers": [
           {
             "name": "structural",
-            "command": "for m in src/backup src/download src/upload src/restore src/storage; do test -f \"$m/CLAUDE.md\" || echo \"MISSING: $m/CLAUDE.md\"; done && echo PASS",
+            "command": "for m in src/backup src/download src/upload src/restore src/storage; do test -f \"$m/CLAUDE.md\" || echo \"MISSING: $m/CLAUDE.md\"; done && grep -q 'env-style' docs/design.md && grep -q 'disable_cert_verification' docs/design.md && echo PASS",
             "expected": "PASS",
-            "fail_message": "One or more CLAUDE.md files missing"
+            "fail_message": "One or more CLAUDE.md files missing, or docs/design.md not updated for --env/disable_cert_verification"
           },
           {
             "name": "compilation",
