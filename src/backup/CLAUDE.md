@@ -12,7 +12,7 @@ This module implements the `create` command -- the first step in the backup pipe
 src/backup/
   mod.rs          -- Entry point: create() orchestrates the full backup flow
   checksum.rs     -- CRC64 computation using crc crate (CRC_64_XZ algorithm)
-  collect.rs      -- Shadow directory walk, hardlink parts to backup staging, URL encoding
+  collect.rs      -- Shadow directory walk, hardlink parts to backup staging
   diff.rs         -- Incremental diff logic: diff_parts() compares current vs base manifest
   freeze.rs       -- FreezeGuard pattern for safe FREEZE/UNFREEZE lifecycle
   mutations.rs    -- Pre-flight pending mutation check (design 3.1)
@@ -37,6 +37,9 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - Used by upload (`find_part_dir`), restore (`attach_parts_inner`, `try_attach_table_mode`), and indirectly by download (write-path uses `per_disk_backup_dir` directly)
 - `collect_parts()` accepts `backup_name` parameter and stages parts to `per_disk_backup_dir(disk_path, backup_name).join("shadow/...")` instead of the single `backup_dir/shadow/...`
 - Logs `"staging per-disk backup dir"` per disk during collection (satisfies runtime log pattern requirement)
+
+### Path Encoding (collect.rs)
+- `url_encode_path()` has been removed; all call sites now use `crate::path_encoding::encode_path_component()` which provides a canonical, DRY percent-encoding implementation with byte-level multi-byte UTF-8 handling
 
 ### Shadow Walk and Hardlink (collect.rs)
 - Uses `walkdir` via `tokio::task::spawn_blocking` to iterate shadow directories
@@ -119,7 +122,8 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
   - Builds `Vec<(String, String)>` of (database, table) pairs from filtered tables
   - Calls `ch.check_parts_columns(&targets)` to find column type inconsistencies
   - Filters out benign drift: types containing "Enum", "Tuple", "Nullable", or "Array(Tuple"
-  - Remaining inconsistencies are logged as warnings per table/column
+  - Remaining (actionable) inconsistencies cause the backup to fail with `bail!()` (strict-fail). Use `--skip-check-parts-columns` to bypass.
+  - Query-level errors (e.g., ClickHouse unreachable) remain warn-only (do not block backup)
 - The check runs BEFORE FREEZE to avoid wasting time on tables that will fail on restore
 
 ### JSON/Object Column Detection (Phase 4f, design 16.4)

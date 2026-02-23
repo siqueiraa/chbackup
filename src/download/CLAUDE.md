@@ -104,8 +104,13 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
 - `tracker.finish()` called after all tasks join
 - Shows: operation label, progress bar, percentage, part count, throughput, ETA
 
-### URL Encoding
-- `url_encode()` preserves `/` (unlike upload's `url_encode_component`) since it handles full paths
+### Path Encoding
+- `url_encode()` has been removed; all call sites now use `crate::path_encoding::encode_path_component()` which does NOT preserve `/` (individual db/table name components are encoded, not full paths)
+
+### Path Traversal Sanitization
+- S3 metadata file `relative_name` values are sanitized before `shadow_dir.join()` using `Path::components()` with a `Normal`-only filter
+- Only `std::path::Component::Normal` segments are collected; `ParentDir` (`..`), `RootDir` (`/`), `CurDir` (`.`), and `Prefix` components are rejected
+- This prevents crafted S3 object keys containing `..` from escaping the shadow directory during metadata-only download for S3 disk parts
 
 ### Simple Directory Download (Phase 4e)
 - `download_simple_directory(s3, backup_name, local_dir, prefix)` -- Downloads all files under `{backup_name}/{prefix}/` from S3 to `{local_dir}/{prefix}/`. Uses `s3.list_objects()` to enumerate files, then `s3.get_object()` for each. Creates local directory structure as needed. No-op if no objects exist under the prefix. Called after part downloads complete for `access/` and `configs/` directories.

@@ -116,6 +116,9 @@ Key behaviors:
 - `is_replicated_engine()` (Phase 4d): Returns true if engine name starts with "Replicated" (covers all Replicated*MergeTree variants). Used by ZK conflict resolution, ATTACH TABLE mode, and schema creation logic.
 - `SYSTEM_DATABASES` (Phase 4d): Constant `&[&str]` listing databases that must never be dropped: `["system", "information_schema", "INFORMATION_SCHEMA"]`.
 
+### Path Encoding (attach.rs, mod.rs)
+- `url_encode()` in attach.rs has been removed; all call sites (including those in mod.rs that previously referenced `attach::url_encode`) now use `crate::path_encoding::encode_path_component()`
+
 ### Part Attachment (attach.rs)
 - Uses `AttachParams` struct to bundle all parameters for a table's attachment
 - `OwnedAttachParams` extended with per-disk fields:

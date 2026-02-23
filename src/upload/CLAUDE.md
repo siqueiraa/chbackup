@@ -62,9 +62,8 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 - Uses `std::fs::canonicalize()` + `HashSet` dedup to prevent double-delete (e.g., when symlinks resolve to the same path)
 - Per-disk dir deletion is non-fatal (warn on failure); default backup_dir deletion remains fatal (preserves existing `?` propagation semantics)
 
-### URL Encoding
-- `url_encode_component()` percent-encodes non-alphanumeric chars except `-`, `_`, `.`
-- Does NOT preserve `/` (encodes individual path components)
+### Path Encoding
+- `url_encode_component()` has been removed; all call sites now use `crate::path_encoding::encode_path_component()` which provides identical behavior (percent-encodes non-safe chars, does NOT preserve `/`)
 
 ### Incremental Upload (--diff-from-remote)
 - When `diff_from_remote` is set, `upload()` loads the remote base manifest from S3 (`{base_name}/metadata.json`) before building the work queue
