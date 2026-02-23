@@ -1,0 +1,62 @@
+{
+  "git_base": "master",
+  "modules": [
+    {
+      "path": "src/backup",
+      "claude_md": "exists",
+      "triggers": ["behavior_change"],
+      "action": "update",
+      "reason": "Issue 5 (check_parts_columns strict-fail), Issue 7 (DRY url_encode removal)"
+    },
+    {
+      "path": "src/download",
+      "claude_md": "exists",
+      "triggers": ["behavior_change"],
+      "action": "update",
+      "reason": "Issue 1 (path sanitization), Issue 7 (DRY url_encode removal)"
+    },
+    {
+      "path": "src/upload",
+      "claude_md": "exists",
+      "triggers": ["behavior_change"],
+      "action": "update",
+      "reason": "Issue 7 (DRY url_encode removal)"
+    },
+    {
+      "path": "src/restore",
+      "claude_md": "exists",
+      "triggers": ["behavior_change"],
+      "action": "update",
+      "reason": "Issue 1 (path sanitization), Issue 7 (DRY url_encode removal)"
+    },
+    {
+      "path": "src/storage",
+      "claude_md": "exists",
+      "triggers": ["behavior_change"],
+      "action": "update",
+      "reason": "Issue 2 (disable_cert_verification fix), Issue 3 (mock_s3_client hermetic), Issue 4 (disable_ssl wiring)"
+    },
+    {
+      "path": "src/config.rs",
+      "claude_md": "N/A (root-level file)",
+      "triggers": ["behavior_change"],
+      "action": "modify",
+      "reason": "Issue 6 (--env env-style keys)"
+    }
+  ],
+  "new_modules": [
+    {
+      "path": "src/path_encoding.rs",
+      "claude_md": "new_file",
+      "triggers": [],
+      "action": "create",
+      "reason": "Issue 7 (canonical path encoder) + Issue 1 (sanitization)"
+    }
+  ],
+  "summary": {
+    "to_create": ["src/path_encoding.rs"],
+    "to_update": ["src/backup", "src/download", "src/upload", "src/restore", "src/storage"],
+    "to_modify": ["src/config.rs"],
+    "total_affected": 7
+  }
+}

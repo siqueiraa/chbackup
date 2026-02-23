@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "generated_at": "2026-02-23T00:00:00Z",
+  "verified_symbols": {
+    "S3Client": {
+      "import": "crate::storage::s3::S3Client",
+      "kind": "struct",
+      "fields": ["inner", "bucket", "prefix", "storage_class", "sse", "sse_kms_key_id", "acl"],
+      "location": "src/storage/s3.rs:43"
+    },
+    "S3Config": {
+      "import": "crate::config::S3Config",
+      "kind": "struct",
+      "fields": ["bucket", "region", "endpoint", "prefix", "access_key", "secret_key", "assume_role_arn", "force_path_style", "disable_ssl", "disable_cert_verification", "acl", "storage_class", "sse", "sse_kms_key_id", "max_parts_count", "chunk_size", "concurrency", "object_disk_path", "allow_object_disk_streaming", "debug"],
+      "location": "src/config.rs:245"
+    },
+    "Config": {
+      "import": "crate::config::Config",
+      "kind": "struct",
+      "fields": ["general", "clickhouse", "s3", "backup", "retention", "watch", "api"],
+      "location": "src/config.rs:8"
+    },
+    "ColumnInconsistency": {
+      "import": "crate::clickhouse::client::ColumnInconsistency",
+      "kind": "struct",
+      "fields": ["database", "table", "column", "types"],
+      "location": "src/clickhouse/client.rs:71"
+    },
+    "RetryConfig": {
+      "import": "crate::storage::s3::RetryConfig",
+      "kind": "struct",
+      "fields": ["max_retries", "base_delay_secs", "jitter_factor"],
+      "location": "src/storage/s3.rs:18"
+    },
+    "S3Object": {
+      "import": "crate::storage::s3::S3Object",
+      "kind": "struct",
+      "fields": ["key", "size", "last_modified"],
+      "location": "src/storage/s3.rs:32"
+    },
+    "PartInfo": {
+      "import": "crate::manifest::PartInfo",
+      "kind": "struct",
+      "fields": ["name", "size", "backup_key", "source", "checksum_crc64", "s3_objects"],
+      "location": "src/manifest.rs"
+    },
+    "DownloadWorkItem": {
+      "import": "crate::download::DownloadWorkItem",
+      "kind": "struct",
+      "fields": ["table_key", "db", "table", "disk_name", "part", "is_s3_disk_part"],
+      "location": "src/download/mod.rs:76"
+    },
+    "url_encode_path": {
+      "import": "crate::backup::collect::url_encode_path",
+      "kind": "function",
+      "signature": "pub fn url_encode_path(s: &str) -> String",
+      "location": "src/backup/collect.rs:29"
+    },
+    "url_encode_download": {
+      "import": "crate::download::url_encode (private)",
+      "kind": "function",
+      "signature": "fn url_encode(s: &str) -> String",
+      "location": "src/download/mod.rs:41"
+    },
+    "url_encode_component": {
+      "import": "crate::upload::url_encode_component (private)",
+      "kind": "function",
+      "signature": "fn url_encode_component(s: &str) -> String",
+      "location": "src/upload/mod.rs:55"
+    },
+    "url_encode_restore": {
+      "import": "crate::restore::attach::url_encode (pub crate)",
+      "kind": "function",
+      "signature": "pub(crate) fn url_encode(s: &str) -> String",
+      "location": "src/restore/attach.rs:844"
+    },
+    "per_disk_backup_dir": {
+      "import": "crate::backup::collect::per_disk_backup_dir",
+      "kind": "function",
+      "signature": "pub fn per_disk_backup_dir(disk_path: &str, backup_name: &str) -> PathBuf",
+      "location": "src/backup/collect.rs:49"
+    },
+    "resolve_shadow_part_path": {
+      "import": "crate::backup::collect::resolve_shadow_part_path",
+      "kind": "function",
+      "signature": "pub fn resolve_shadow_part_path(backup_dir, manifest_disks, backup_name, disk_name, encoded_db, encoded_table, plain_db, plain_table, part_name) -> Option<PathBuf>",
+      "location": "src/backup/collect.rs:67"
+    },
+    "filter_benign_type_drift": {
+      "import": "crate::backup::filter_benign_type_drift (private)",
+      "kind": "function",
+      "signature": "fn filter_benign_type_drift(inconsistencies: Vec<ColumnInconsistency>) -> Vec<ColumnInconsistency>",
+      "location": "src/backup/mod.rs:803"
+    },
+    "set_field": {
+      "import": "crate::config::Config::set_field (private)",
+      "kind": "method",
+      "signature": "fn set_field(&mut self, key: &str, value: &str) -> Result<()>",
+      "location": "src/config.rs:1112"
+    },
+    "apply_cli_env_overrides": {
+      "import": "crate::config::Config::apply_cli_env_overrides (private)",
+      "kind": "method",
+      "signature": "fn apply_cli_env_overrides(&mut self, overrides: &[String]) -> Result<()>",
+      "location": "src/config.rs:1100"
+    },
+    "apply_env_overlay": {
+      "import": "crate::config::Config::apply_env_overlay (private)",
+      "kind": "method",
+      "signature": "fn apply_env_overlay(&mut self)",
+      "location": "src/config.rs:870"
+    },
+    "mock_s3_client": {
+      "import": "crate::storage::s3::tests::mock_s3_client (test-only)",
+      "kind": "function",
+      "signature": "fn mock_s3_client(bucket: &str, prefix: &str) -> S3Client",
+      "location": "src/storage/s3.rs:1520"
+    },
+    "calculate_chunk_size": {
+      "import": "crate::storage::s3::calculate_chunk_size",
+      "kind": "function",
+      "signature": "pub fn calculate_chunk_size(data_len: u64, config_chunk_size: u64, max_parts_count: u32) -> u64",
+      "location": "src/storage/s3.rs"
+    },
+    "aws_smithy_http_client::ConnectorBuilder": {
+      "import": "aws_smithy_http_client::ConnectorBuilder",
+      "kind": "struct",
+      "fields": ["connector_settings", "client_builder"],
+      "location": "aws-smithy-http-client-1.1.10/src/client.rs:112",
+      "notes": "Typestate builder: TlsUnset -> TlsProviderSelected. Key methods: tls_provider(), tls_context(), build()"
+    },
+    "aws_smithy_http_client::tls::TlsContext": {
+      "import": "aws_smithy_http_client::tls::TlsContext",
+      "kind": "struct",
+      "fields": ["trust_store"],
+      "location": "aws-smithy-http-client-1.1.10/src/client/tls.rs:26",
+      "notes": "NO skip-verification API. Only TrustStore configuration. Cannot disable cert verification through this API."
+    },
+    "aws_smithy_http_client::tls::TrustStore": {
+      "import": "aws_smithy_http_client::tls::TrustStore",
+      "kind": "struct",
+      "fields": ["enable_native_roots", "custom_certs"],
+      "location": "aws-smithy-http-client-1.1.10/src/client/tls.rs:87",
+      "notes": "Methods: empty(), with_native_roots(), with_pem_certificate()"
+    }
+  },
+  "constraints": [
+    "zero_warnings_policy",
+    "aws_sdk_uses_rustls_not_native_tls",
+    "static_musl_binary",
+    "process_global_env_vars_are_unsafe_for_cert_verification",
+    "aws_sdk_v1_has_no_public_skip_cert_verify_api",
+    "disable_cert_verification_requires_custom_rustls_ClientConfig_with_NoVerifier",
+    "aws_smithy_http_client_ConnectorBuilder_accepts_tls_context_but_no_danger_mode"
+  ]
+}

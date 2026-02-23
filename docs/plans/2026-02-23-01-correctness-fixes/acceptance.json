@@ -1,0 +1,335 @@
+{
+  "plan": "2026-02-23-01-correctness-fixes",
+  "status": {"pass": 0, "fail": 8, "total": 8},
+  "last_updated": "2026-02-23T00:00:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "feature",
+      "description": "Canonical path encoding module with sanitization (src/path_encoding.rs)",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub fn encode_path_component' src/path_encoding.rs && grep -c 'pub fn sanitize_path_component' src/path_encoding.rs && grep -c 'pub mod path_encoding' src/lib.rs",
+            "expected": "1\n1\n1",
+            "fail_message": "path_encoding.rs missing encode_path_component, sanitize_path_component, or lib.rs module declaration"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after adding path_encoding module"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test path_encoding 2>&1 | grep -E 'test result:' | head -1",
+            "expected": "test result: ok.",
+            "fail_message": "path_encoding tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Pure function module with no runtime behavior -- fully covered by unit tests",
+            "covered_by": ["F001"],
+            "alternative_verification": {
+              "command": "cargo test path_encoding -- --nocapture 2>&1 | grep -c 'test .* ok'",
+              "expected": "6"
+            }
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": null
+    },
+    {
+      "id": "F002",
+      "category": "bugfix",
+      "description": "disable_cert_verification uses HTTP fallback instead of broken env var approach",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'set_var.*AWS_CA_BUNDLE' src/storage/s3.rs || echo 0",
+            "expected": "0",
+            "fail_message": "Broken AWS_CA_BUNDLE env var approach still present in s3.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after disable_cert_verification fix"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test disable_cert_verification 2>&1 | grep -E 'test result:' | head -1",
+            "expected": "test result: ok.",
+            "fail_message": "disable_cert_verification tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "S3Client construction change -- runtime behavior requires real S3 endpoint with disable_cert_verification=true which is a dev/test-only config; covered by behavioral tests",
+            "covered_by": ["F002"],
+            "alternative_verification": {
+              "command": "cargo test disable_cert_verification 2>&1 | grep -c 'test .* ok'",
+              "expected": "2"
+            }
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": null
+    },
+    {
+      "id": "F003",
+      "category": "bugfix",
+      "description": "Hermetic S3 unit tests: 5 sync tests work offline, 3 async tests marked #[ignore]",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'fn mock_s3_fields' src/storage/s3.rs && grep -c '#\\[ignore\\]' src/storage/s3.rs",
+            "expected": "1\n3",
+            "fail_message": "mock_s3_fields not found or 3 async tests not marked #[ignore]"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check --tests 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Test compilation errors after mock_s3_client change"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib storage::s3::tests::test_full_key 2>&1 | grep -E 'test result:' | head -1",
+            "expected": "test result: ok.",
+            "fail_message": "Sync S3 tests fail after mock change"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Test infrastructure change -- no runtime binary behavior affected",
+            "covered_by": ["F003"],
+            "alternative_verification": {
+              "command": "cargo test --lib storage::s3::tests::test_full_key 2>&1 | grep -c 'test .* ok'",
+              "expected": "4"
+            }
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": null
+    },
+    {
+      "id": "F004",
+      "category": "bugfix",
+      "description": "s3.disable_ssl config field wired into S3Client construction (forces http:// endpoint)",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'disable_ssl' src/storage/s3.rs | grep -v '//' | grep -c 'config.disable_ssl'",
+            "expected": "1",
+            "fail_message": "config.disable_ssl not read in S3Client::new()"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after disable_ssl wiring"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test disable_ssl 2>&1 | grep -E 'test result:' | head -1",
+            "expected": "test result: ok.",
+            "fail_message": "disable_ssl tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "S3Client construction change -- runtime behavior requires S3 endpoint with disable_ssl=true which is a dev/test config; covered by behavioral tests",
+            "covered_by": ["F004"],
+            "alternative_verification": {
+              "command": "cargo test disable_ssl 2>&1 | grep -c 'test .* ok'",
+              "expected": "3"
+            }
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": null
+    },
+    {
+      "id": "F005",
+      "category": "bugfix",
+      "description": "check_parts_columns returns error when inconsistencies found (strict-fail instead of warn+continue)",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'proceeding anyway' src/backup/mod.rs || echo 0",
+            "expected": "0",
+            "fail_message": "Old 'proceeding anyway' message still present -- strict-fail not implemented"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after check_parts_columns strict-fail"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test check_parts_columns 2>&1 | grep -E 'test result:' | head -1",
+            "expected": "test result: ok.",
+            "fail_message": "check_parts_columns tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "check_parts_columns defaults to false; strict-fail only triggers with explicit config and real ClickHouse. Covered by unit tests with mock inconsistencies",
+            "covered_by": ["F005"],
+            "alternative_verification": {
+              "command": "cargo test parts_columns 2>&1 | grep -c 'test .* ok'",
+              "expected": "2"
+            }
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": null
+    },
+    {
+      "id": "F006",
+      "category": "feature",
+      "description": "--env flag accepts env-style keys (S3_BUCKET=val) in addition to dot-notation (s3.bucket=val)",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'fn env_key_to_dot_notation' src/config.rs",
+            "expected": "1",
+            "fail_message": "env_key_to_dot_notation function not found in config.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after env-key translation"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test env_key_to_dot_notation 2>&1 | grep -E 'test result:' | head -1",
+            "expected": "test result: ok.",
+            "fail_message": "env_key_to_dot_notation tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Config parsing change -- no runtime binary behavior; covered by unit tests that exercise apply_cli_env_overrides with env-style keys",
+            "covered_by": ["F006"],
+            "alternative_verification": {
+              "command": "cargo test env_key 2>&1 | grep -c 'test .* ok'",
+              "expected": "5"
+            }
+          }
+        ]
+      },
+      "related_tasks": [6],
+      "verified_at": null
+    },
+    {
+      "id": "F007",
+      "category": "refactor",
+      "description": "All 4 url_encode implementations replaced by single path_encoding module; path traversal sanitization added to download metadata write",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -rn 'fn url_encode' src/ | grep -v 'path_encoding' | grep -vc '//' || echo 0",
+            "expected": "0",
+            "fail_message": "Old url_encode function definitions still present in src/ (outside path_encoding.rs)"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after url_encode replacement"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test 2>&1 | grep -E 'test result:' | tail -1",
+            "expected": "test result: ok.",
+            "fail_message": "Tests failed after url_encode replacement"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Pure refactoring of string encoding functions -- identical output for all non-adversarial inputs. Path traversal sanitization tested via unit tests in path_encoding module",
+            "covered_by": ["F001"],
+            "alternative_verification": {
+              "command": "cargo test path_encoding 2>&1 | grep -c 'test .* ok'",
+              "expected": "6"
+            }
+          }
+        ]
+      },
+      "related_tasks": [7],
+      "verified_at": null
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for all modified modules",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "for m in src/backup src/download src/upload src/restore src/storage; do test -f \"$m/CLAUDE.md\" || echo \"MISSING: $m/CLAUDE.md\"; done && echo PASS",
+            "expected": "PASS",
+            "fail_message": "One or more CLAUDE.md files missing"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "for m in src/backup src/download src/upload src/restore src/storage; do grep -q 'Parent Context' \"$m/CLAUDE.md\" && grep -q 'Directory Structure' \"$m/CLAUDE.md\" && grep -q 'Key Patterns' \"$m/CLAUDE.md\" && grep -q 'Parent Rules' \"$m/CLAUDE.md\" || echo \"FAIL: $m\"; done && echo VALID",
+            "expected": "VALID",
+            "fail_message": "CLAUDE.md missing required sections (Parent Context, Directory Structure, Key Patterns, Parent Rules)"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Documentation file - no runtime behavior",
+            "covered_by": ["FDOC"],
+            "alternative_verification": {
+              "command": "for m in src/backup src/download src/upload src/restore src/storage; do test -f \"$m/CLAUDE.md\" && echo ok; done | wc -l | tr -d ' '",
+              "expected": "5"
+            }
+          }
+        ]
+      },
+      "related_tasks": [8],
+      "verified_at": null
+    }
+  ]
+}
