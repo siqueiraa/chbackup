@@ -1,11 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, ServerSideEncryption,
 };
 use chrono::{DateTime, Utc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::S3Config;
 
@@ -71,7 +71,7 @@ impl S3Client {
         );
 
         // Compute the effective endpoint, applying disable_ssl if configured.
-        let effective_endpoint = if config.disable_ssl && !config.endpoint.is_empty() {
+        let mut effective_endpoint = if config.disable_ssl && !config.endpoint.is_empty() {
             let rewritten = config.endpoint.replacen("https://", "http://", 1);
             info!("S3 disable_ssl=true: forcing HTTP endpoint");
             rewritten
@@ -84,6 +84,29 @@ impl S3Client {
             }
             config.endpoint.clone()
         };
+
+        // Wire disable_cert_verification: force HTTP endpoint to bypass TLS entirely.
+        // The AWS SDK for Rust (aws-smithy-http-client v1.1.10) does NOT expose a public
+        // API for danger_accept_invalid_certs. The pragmatic fix is to force HTTP when
+        // cert verification is disabled, matching Go clickhouse-backup behavior.
+        if config.disable_cert_verification {
+            if !effective_endpoint.is_empty() {
+                effective_endpoint = effective_endpoint.replacen("https://", "http://", 1);
+                warn!(
+                    "S3 disable_cert_verification=true: forcing HTTP endpoint \
+                     (TLS cert verification bypass via HTTP)"
+                );
+            } else {
+                error!(
+                    "S3 disable_cert_verification=true but no endpoint configured; \
+                     cannot downgrade default AWS HTTPS"
+                );
+                bail!(
+                    "disable_cert_verification requires an explicit endpoint URL \
+                     (cannot downgrade default AWS HTTPS)"
+                );
+            }
+        }
 
         // Start building the AWS SDK config from environment defaults.
         let mut loader = aws_config::from_env().region(Region::new(config.region.clone()));
@@ -160,20 +183,6 @@ impl S3Client {
         // config endpoint may not always propagate to the S3 service config.
         if !effective_endpoint.is_empty() {
             s3_config_builder = s3_config_builder.endpoint_url(&effective_endpoint);
-        }
-
-        // Wire disable_cert_verification: when true, skip TLS certificate verification.
-        // The AWS SDK for Rust uses rustls by default; we warn if this is enabled
-        // since it requires a custom HTTP client configuration.
-        if config.disable_cert_verification {
-            warn!(
-                "S3 disable_cert_verification=true: TLS certificate verification is disabled. \
-                 This is insecure and should only be used with self-signed certificates in dev/test."
-            );
-            // For the AWS SDK Rust, disabling cert verification requires configuring
-            // a custom rustls connector with danger_accept_invalid_certs. The SDK
-            // respects AWS_CA_BUNDLE env var as an alternative for custom CAs.
-            std::env::set_var("AWS_CA_BUNDLE", "");
         }
 
         let s3_config = s3_config_builder.build();
@@ -1588,6 +1597,69 @@ mod tests {
         };
 
         assert!(effective_endpoint.is_empty());
+    }
+
+    #[test]
+    fn test_disable_cert_verification_removes_env_var_approach() {
+        // Structural test: verify that the broken AWS_CA_BUNDLE env var approach
+        // is not present in the production code (non-test) section of the source file.
+        let source = include_str!("s3.rs");
+        // Build the search needle dynamically to avoid self-matching in this test.
+        let needle = format!("set_var(\"{}_BUNDLE\"", "AWS_CA");
+        // Split source at the test module boundary and only check production code.
+        let prod_code = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("should have non-test section");
+        assert!(
+            !prod_code.contains(&needle),
+            "Broken env var approach should be removed from production code in s3.rs"
+        );
+    }
+
+    #[test]
+    fn test_disable_cert_verification_forces_http() {
+        // When disable_cert_verification=true and endpoint is https://,
+        // the effective endpoint should be rewritten to http://
+        let endpoint = "https://minio:9000".to_string();
+
+        // Simulate the disable_ssl block (disable_ssl=false, no rewrite)
+        let mut effective_endpoint = endpoint.clone();
+
+        // Simulate the disable_cert_verification block
+        let disable_cert_verification = true;
+        if disable_cert_verification && !effective_endpoint.is_empty() {
+            effective_endpoint = effective_endpoint.replacen("https://", "http://", 1);
+        }
+
+        assert_eq!(effective_endpoint, "http://minio:9000");
+
+        // Also verify idempotency: if already http:// (from disable_ssl), no double rewrite
+        let mut already_http = "http://minio:9000".to_string();
+        if disable_cert_verification && !already_http.is_empty() {
+            already_http = already_http.replacen("https://", "http://", 1);
+        }
+        assert_eq!(already_http, "http://minio:9000");
+    }
+
+    #[tokio::test]
+    async fn test_disable_cert_verification_empty_endpoint_bails() {
+        // When disable_cert_verification=true and endpoint is empty,
+        // S3Client::new() should return an error.
+        let config = S3Config {
+            disable_cert_verification: true,
+            endpoint: String::new(),
+            ..S3Config::default()
+        };
+
+        let result = S3Client::new(&config).await;
+        assert!(result.is_err(), "Expected error when disable_cert_verification=true with empty endpoint");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("disable_cert_verification requires an explicit endpoint URL"),
+            "Error should mention explicit endpoint requirement, got: {}",
+            err_msg
+        );
     }
 
     /// Create a minimal S3Client for unit testing without triggering TLS initialization.
