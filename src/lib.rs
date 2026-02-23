@@ -9,6 +9,7 @@ pub mod lock;
 pub mod logging;
 pub mod manifest;
 pub mod object_disk;
+pub mod path_encoding;
 pub mod progress;
 pub mod rate_limiter;
 pub mod restore;
