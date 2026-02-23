@@ -20,9 +20,9 @@ use walkdir::WalkDir;
 
 use crate::backup::collect::resolve_shadow_part_path;
 use crate::clickhouse::client::ChClient;
-use crate::path_encoding::encode_path_component;
 use crate::manifest::PartInfo;
 use crate::object_disk::{is_s3_disk, parse_metadata, rewrite_metadata};
+use crate::path_encoding::encode_path_component;
 use crate::resume::{save_state_graceful, RestoreState};
 use crate::storage::S3Client;
 
@@ -840,7 +840,6 @@ pub fn get_table_data_path(
         .join(db)
         .join(table)
 }
-
 
 #[cfg(test)]
 mod tests {

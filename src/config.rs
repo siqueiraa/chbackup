@@ -1850,18 +1850,12 @@ mod tests {
 
     #[test]
     fn test_env_key_to_dot_notation_known_keys() {
-        assert_eq!(
-            env_key_to_dot_notation("S3_BUCKET"),
-            Some("s3.bucket")
-        );
+        assert_eq!(env_key_to_dot_notation("S3_BUCKET"), Some("s3.bucket"));
         assert_eq!(
             env_key_to_dot_notation("CLICKHOUSE_HOST"),
             Some("clickhouse.host")
         );
-        assert_eq!(
-            env_key_to_dot_notation("API_LISTEN"),
-            Some("api.listen")
-        );
+        assert_eq!(env_key_to_dot_notation("API_LISTEN"), Some("api.listen"));
         assert_eq!(
             env_key_to_dot_notation("WATCH_INTERVAL"),
             Some("watch.watch_interval")

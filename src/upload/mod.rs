@@ -29,13 +29,13 @@ use crate::concurrency::{effective_object_disk_copy_concurrency, effective_uploa
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo, S3ObjectInfo};
 use crate::object_disk::is_s3_disk;
+use crate::path_encoding::encode_path_component;
 use crate::progress::ProgressTracker;
 use crate::rate_limiter::RateLimiter;
 use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, UploadState,
 };
 use crate::storage::s3::{calculate_chunk_size, RetryConfig};
-use crate::path_encoding::encode_path_component;
 use crate::storage::S3Client;
 
 /// Multipart upload threshold: parts with compressed data larger than 32 MiB

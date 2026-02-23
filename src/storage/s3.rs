@@ -1653,7 +1653,10 @@ mod tests {
         };
 
         let result = S3Client::new(&config).await;
-        assert!(result.is_err(), "Expected error when disable_cert_verification=true with empty endpoint");
+        assert!(
+            result.is_err(),
+            "Expected error when disable_cert_verification=true with empty endpoint"
+        );
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
             err_msg.contains("disable_cert_verification requires an explicit endpoint URL"),

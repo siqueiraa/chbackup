@@ -27,12 +27,12 @@ use crate::concurrency::effective_download_concurrency;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo};
 use crate::object_disk::is_s3_disk;
+use crate::path_encoding::encode_path_component;
 use crate::progress::ProgressTracker;
 use crate::rate_limiter::RateLimiter;
 use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, DownloadState,
 };
-use crate::path_encoding::encode_path_component;
 use crate::storage::S3Client;
 
 /// Resolve the per-disk target backup directory for a download write path.
@@ -850,7 +850,8 @@ pub async fn download(
             format!("Failed to create metadata dir: {}", metadata_dir.display())
         })?;
 
-        let table_metadata_path = metadata_dir.join(format!("{}.json", encode_path_component(table)));
+        let table_metadata_path =
+            metadata_dir.join(format!("{}.json", encode_path_component(table)));
         let table_json = serde_json::to_string_pretty(table_manifest)
             .context("Failed to serialize table manifest")?;
         std::fs::write(&table_metadata_path, &table_json).with_context(|| {
