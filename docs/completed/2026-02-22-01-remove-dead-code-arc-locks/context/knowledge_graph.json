@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "generated_at": "2026-02-22T00:00:00Z",
+  "verified_symbols": {
+    "ChClient": {
+      "import": "crate::clickhouse::client::ChClient",
+      "kind": "struct",
+      "fields": ["inner", "host", "port", "log_sql_queries", "debug"],
+      "location": "src/clickhouse/client.rs:14",
+      "notes": "debug field is #[allow(dead_code)] -- stored but never read"
+    },
+    "ChClient::inner_method": {
+      "import": "crate::clickhouse::client::ChClient::inner",
+      "kind": "function",
+      "signature": "pub fn inner(&self) -> &clickhouse::Client",
+      "location": "src/clickhouse/client.rs:252",
+      "notes": "DEAD -- zero callers in entire codebase"
+    },
+    "S3Client": {
+      "import": "crate::storage::s3::S3Client",
+      "kind": "struct",
+      "fields": ["inner", "bucket", "prefix", "storage_class", "sse", "sse_kms_key_id", "acl", "concurrency", "object_disk_path"],
+      "location": "src/storage/s3.rs:41",
+      "notes": "concurrency and object_disk_path fields stored but only read by dead getters"
+    },
+    "S3Client::inner_method": {
+      "import": "crate::storage::s3::S3Client::inner",
+      "kind": "function",
+      "signature": "pub fn inner(&self) -> &aws_sdk_s3::Client",
+      "location": "src/storage/s3.rs:220",
+      "notes": "DEAD -- zero callers"
+    },
+    "S3Client::concurrency_method": {
+      "import": "crate::storage::s3::S3Client::concurrency",
+      "kind": "function",
+      "signature": "pub fn concurrency(&self) -> u32",
+      "location": "src/storage/s3.rs:235",
+      "notes": "DEAD -- zero callers"
+    },
+    "S3Client::object_disk_path_method": {
+      "import": "crate::storage::s3::S3Client::object_disk_path",
+      "kind": "function",
+      "signature": "pub fn object_disk_path(&self) -> &str",
+      "location": "src/storage/s3.rs:243",
+      "notes": "DEAD -- zero callers"
+    },
+    "attach_parts": {
+      "import": "crate::restore::attach::attach_parts",
+      "kind": "function",
+      "signature": "pub async fn attach_parts(params: &AttachParams<'_>) -> Result<u64>",
+      "location": "src/restore/attach.rs:487",
+      "notes": "DEAD -- #[allow(dead_code)], only attach_parts_owned is used in production"
+    },
+    "ProgressTracker": {
+      "import": "crate::progress::ProgressTracker",
+      "kind": "struct",
+      "fields": ["bar"],
+      "location": "src/progress.rs:16"
+    },
+    "ProgressTracker::disabled": {
+      "import": "crate::progress::ProgressTracker::disabled",
+      "kind": "function",
+      "signature": "pub fn disabled() -> Self",
+      "location": "src/progress.rs:48",
+      "notes": "TEST-ONLY -- used only in #[cfg(test)]"
+    },
+    "ProgressTracker::is_active": {
+      "import": "crate::progress::ProgressTracker::is_active",
+      "kind": "function",
+      "signature": "pub fn is_active(&self) -> bool",
+      "location": "src/progress.rs:67",
+      "notes": "TEST-ONLY -- used only in #[cfg(test)] for ProgressTracker"
+    },
+    "ActionLog::running": {
+      "import": "crate::server::actions::ActionLog::running",
+      "kind": "function",
+      "signature": "pub fn running(&self) -> Option<&ActionEntry>",
+      "location": "src/server/actions.rs:118",
+      "notes": "TEST-ONLY -- production code uses running_ops HashMap"
+    },
+    "AppState": {
+      "import": "crate::server::state::AppState",
+      "kind": "struct",
+      "fields": ["config", "ch", "s3", "action_log", "running_ops", "op_semaphore", "metrics", "watch_shutdown_tx", "watch_reload_tx", "watch_status", "config_path", "manifest_cache"],
+      "location": "src/server/state.rs:70",
+      "notes": "All Arc/Mutex wrapping is REQUIRED for concurrent access"
+    },
+    "ManifestCache": {
+      "import": "crate::list::ManifestCache",
+      "kind": "struct",
+      "fields": ["summaries", "populated_at", "ttl"],
+      "location": "src/list.rs:80"
+    },
+    "ChBackupError": {
+      "import": "crate::error::ChBackupError",
+      "kind": "enum",
+      "variants": ["ClickHouseError", "S3Error", "ConfigError", "LockError", "BackupError", "RestoreError", "ManifestError", "IoError"],
+      "location": "src/error.rs:5",
+      "notes": "Only LockError and IoError(#[from]) are constructed in production; ClickHouseError, S3Error, ConfigError, RestoreError unused outside tests"
+    },
+    "Metrics": {
+      "import": "crate::server::metrics::Metrics",
+      "kind": "struct",
+      "fields": ["registry", "backup_duration_seconds", "backup_size_bytes", "backup_last_success_timestamp", "parts_uploaded_total", "parts_skipped_incremental_total", "errors_total", "successful_operations_total", "number_backups_local", "number_backups_remote", "in_progress", "watch_state", "watch_last_full_timestamp", "watch_last_incremental_timestamp", "watch_consecutive_errors"],
+      "location": "src/server/metrics.rs:18",
+      "notes": "parts_uploaded_total and parts_skipped_incremental_total are registered but never incremented in production"
+    },
+    "ListParams": {
+      "import": "crate::server::routes::ListParams",
+      "kind": "struct",
+      "fields": ["location", "desc", "offset", "limit", "format"],
+      "location": "src/server/routes.rs:64",
+      "notes": "format field is intentionally stored but not read (integration table DDL compatibility)"
+    }
+  },
+  "constraints": [
+    "zero_warnings_policy",
+    "axum_state_requires_clone",
+    "arcswap_needed_for_hot_reload",
+    "tokio_mutex_for_async_lock_across_await"
+  ]
+}

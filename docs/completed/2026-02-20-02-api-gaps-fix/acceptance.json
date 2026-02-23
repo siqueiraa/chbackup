@@ -1,0 +1,335 @@
+{
+  "plan": "2026-02-20-02-api-gaps-fix",
+  "status": {"pass": 8, "fail": 0, "total": 8},
+  "last_updated": "2026-02-20T23:30:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "bugfix",
+      "description": "post_actions handler dispatches actual commands instead of stub no-op",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'crate::backup::create' src/server/routes.rs | awk '{print ($1 >= 2 ? \"PASS\" : \"FAIL\")}'",
+            "expected": "PASS",
+            "fail_message": "post_actions does not contain backup::create dispatch (should appear at least twice: once in create_backup, once in post_actions)"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors in routes.rs"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_post_actions -- --nocapture 2>&1 | tail -5 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "post_actions tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "API endpoint requires running server with ClickHouse+S3 infrastructure. Compilation + unit tests provide sufficient coverage.",
+            "covered_by": ["F001"],
+            "alternative_verification": {
+              "command": "cargo test test_post_actions -- --nocapture 2>&1 | grep -c 'ok'",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": "2026-02-20T22:20:00Z"
+    },
+    {
+      "id": "F002",
+      "category": "feature",
+      "description": "List endpoint supports offset/limit pagination with X-Total-Count header and format param",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub offset: Option<usize>' src/server/routes.rs | head -1 | grep -c 'ListParams' || grep -c 'offset.*Option.*usize' src/server/routes.rs",
+            "expected": "1",
+            "fail_message": "ListParams missing offset field"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after ListParams change"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_list_params -- --nocapture 2>&1 | tail -5 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "ListParams deserialization tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Pagination is a query param parsing + in-memory skip/take operation. Unit test for deserialization plus structural check for header are sufficient.",
+            "covered_by": ["F002"],
+            "alternative_verification": {
+              "command": "grep -c 'x-total-count' src/server/routes.rs | awk '{print ($1 >= 2 ? \"PASS\" : \"FAIL\")}'",
+              "expected": "PASS"
+            }
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": "2026-02-20T22:25:00Z"
+    },
+    {
+      "id": "F003",
+      "category": "feature",
+      "description": "BackupSummary has object_disk_size and required fields computed from manifest data",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'pub object_disk_size: u64' src/list.rs && grep -c 'pub required: String' src/list.rs | paste - - | awk '{print ($1 >= 1 && $2 >= 1 ? \"PASS\" : \"FAIL\")}'",
+            "expected": "PASS",
+            "fail_message": "BackupSummary missing object_disk_size or required fields"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after BackupSummary field additions"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_backup_summary_object_disk_size test_extract_required -- --nocapture 2>&1 | tail -5 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "BackupSummary field computation tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Field computation is pure in-memory manifest iteration. Unit tests with constructed manifests verify correctness.",
+            "covered_by": ["F003"],
+            "alternative_verification": {
+              "command": "cargo test backup_summary -- --nocapture 2>&1 | grep -c 'ok'",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": "2026-02-20T22:30:00Z"
+    },
+    {
+      "id": "F004",
+      "category": "bugfix",
+      "description": "ListResponse.object_disk_size and .required populated from BackupSummary instead of hardcoded defaults",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -A15 'fn summary_to_list_response' src/server/routes.rs | grep -c 's.object_disk_size'",
+            "expected": "1",
+            "fail_message": "summary_to_list_response still hardcodes object_disk_size"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_summary_to_list_response_sizes -- --nocapture 2>&1 | tail -5 | grep -c 'test result: ok' || echo 0",
+            "expected": "1",
+            "fail_message": "summary_to_list_response test failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Pure data mapping function (struct field copy). Unit test with known values is definitive.",
+            "covered_by": ["F003"],
+            "alternative_verification": {
+              "command": "grep -A15 'fn summary_to_list_response' src/server/routes.rs | grep -c 's.required'",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": "2026-02-20T23:30:00Z"
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "SIGTERM handler triggers graceful shutdown in server mode",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'SignalKind::terminate' src/server/mod.rs",
+            "expected": "1",
+            "fail_message": "SIGTERM handler not registered in server/mod.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after SIGTERM handler addition"
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -c 'shutdown_signal' src/server/mod.rs | awk '{print ($1 >= 2 ? \"PASS\" : \"FAIL\")}'",
+            "expected": "PASS",
+            "fail_message": "shutdown_signal helper not used in both TLS and plain paths"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Signal handlers cannot be unit tested. Structural verification confirms SIGTERM registration. Manual testing requires running server process.",
+            "covered_by": ["F005"],
+            "alternative_verification": {
+              "command": "grep -B2 -A5 'SignalKind::terminate' src/server/mod.rs | grep -c 'shutdown\\|terminate'",
+              "expected": "2"
+            }
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": "2026-02-20T22:15:00Z"
+    },
+    {
+      "id": "F006",
+      "category": "bugfix",
+      "description": "CLAUDE.md documentation errors corrected (param counts, phantom references)",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'general:15' CLAUDE.md && grep -c 'watch:8' CLAUDE.md | paste - - | awk '{print ($1 >= 1 && $2 >= 1 ? \"PASS\" : \"FAIL\")}'",
+            "expected": "PASS",
+            "fail_message": "CLAUDE.md still has wrong param counts"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -c 'named_collection_size' CLAUDE.md | awk '{print ($1 == 0 ? \"PASS\" : \"FAIL\")}'",
+            "expected": "PASS",
+            "fail_message": "CLAUDE.md still references phantom named_collection_size"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Documentation file - no runtime behavior",
+            "covered_by": ["F006"],
+            "alternative_verification": {
+              "command": "grep -c 'general:15' CLAUDE.md",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [6],
+      "verified_at": "2026-02-20T22:00:00Z"
+    },
+    {
+      "id": "F007",
+      "category": "bugfix",
+      "description": "docs/design.md section 7.1 corrected (parts_to_do type, required_backups reference)",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -A1 'parts_to_do' docs/design.md | grep -c '\\[' | awk '{print ($1 >= 1 ? \"PASS\" : \"FAIL\")}'",
+            "expected": "PASS",
+            "fail_message": "design.md still shows parts_to_do as integer instead of array"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -c 'required_backups.*field' docs/design.md | awk '{print ($1 == 0 ? \"PASS\" : \"FAIL\")}'",
+            "expected": "PASS",
+            "fail_message": "design.md still references required_backups as a manifest field"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Documentation file - no runtime behavior",
+            "covered_by": ["F007"],
+            "alternative_verification": {
+              "command": "grep -c 'parts_to_do.*\\[' docs/design.md",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [7],
+      "verified_at": "2026-02-20T23:30:00Z"
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for all modified modules",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f src/server/CLAUDE.md && echo PASS || echo FAIL",
+            "expected": "PASS",
+            "fail_message": "src/server/CLAUDE.md missing"
+          },
+          {
+            "name": "compilation",
+            "command": "echo 'N/A - documentation only'",
+            "expected": "N/A - documentation only",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -q 'Parent Context' src/server/CLAUDE.md && grep -q 'Directory Structure' src/server/CLAUDE.md && grep -q 'Key Patterns' src/server/CLAUDE.md && grep -q 'Parent Rules' src/server/CLAUDE.md && echo VALID || echo INVALID",
+            "expected": "VALID",
+            "fail_message": "src/server/CLAUDE.md missing required sections"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Documentation file - no runtime behavior",
+            "covered_by": ["FDOC"],
+            "alternative_verification": {
+              "command": "grep -c 'SIGTERM\\|post_actions.*dispatch\\|offset.*limit' src/server/CLAUDE.md | awk '{print ($1 >= 2 ? \"PASS\" : \"FAIL\")}'",
+              "expected": "PASS"
+            }
+          }
+        ]
+      },
+      "related_tasks": [8],
+      "verified_at": "2026-02-20T23:00:00Z"
+    }
+  ]
+}

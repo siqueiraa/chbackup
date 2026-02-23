@@ -1,0 +1,49 @@
+{
+  "git_base": "HEAD",
+  "modules": [
+    {
+      "path": "src/clickhouse",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "update",
+      "changes": "Remove dead debug field and inner() method from ChClient"
+    },
+    {
+      "path": "src/storage",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "update",
+      "changes": "Remove dead inner(), concurrency(), object_disk_path() methods and concurrency/object_disk_path fields from S3Client"
+    },
+    {
+      "path": "src/restore",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "update",
+      "changes": "Remove dead attach_parts() function and #[allow(dead_code)]"
+    },
+    {
+      "path": "src/server",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "no_change",
+      "changes": "No changes needed -- all Arc/Mutex wrapping is required; test-only methods (running(), disabled()) are acceptable"
+    }
+  ],
+  "standalone_files": [
+    {
+      "path": "src/progress.rs",
+      "changes": "Consider removing test-only disabled() and is_active() methods (low priority)"
+    },
+    {
+      "path": "src/error.rs",
+      "changes": "Consider removing unused ChBackupError variants (judgment call)"
+    }
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": ["src/clickhouse", "src/storage", "src/restore"],
+    "no_change": ["src/server"],
+    "total_affected": 3
+  }
+}

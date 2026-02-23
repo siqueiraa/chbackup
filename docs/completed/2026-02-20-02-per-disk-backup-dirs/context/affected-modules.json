@@ -1,0 +1,42 @@
+{
+  "git_base": "afa01dab",
+  "modules": [
+    {
+      "path": "src/backup",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["src/backup/collect.rs", "src/backup/mod.rs"]
+    },
+    {
+      "path": "src/upload",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["src/upload/mod.rs"]
+    },
+    {
+      "path": "src/download",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["src/download/mod.rs"]
+    },
+    {
+      "path": "src/restore",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["src/restore/attach.rs", "src/restore/mod.rs"]
+    }
+  ],
+  "top_level_files_modified": [
+    "src/list.rs"
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": ["src/backup", "src/upload", "src/download", "src/restore"],
+    "total_affected": 4,
+    "top_level_files": 1
+  }
+}
