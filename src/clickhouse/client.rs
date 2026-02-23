@@ -18,10 +18,6 @@ pub struct ChClient {
     port: u16,
     /// Whether to log SQL queries at info level (vs debug).
     log_sql_queries: bool,
-    /// Verbose debug logging of all queries and responses.
-    /// Stored for future use; currently wired via log_sql_queries override.
-    #[allow(dead_code)]
-    debug: bool,
 }
 
 /// Row from `system.tables` query.
@@ -217,7 +213,6 @@ impl ChClient {
             host: config.host.clone(),
             port: config.port,
             log_sql_queries: config.log_sql_queries || config.debug,
-            debug: config.debug,
         })
     }
 
@@ -243,14 +238,6 @@ impl ChClient {
 
         info!("ClickHouse ping succeeded");
         Ok(())
-    }
-
-    /// Returns a reference to the underlying `clickhouse::Client`.
-    ///
-    /// Useful for future phases that need direct access to execute queries,
-    /// insert data, etc.
-    pub fn inner(&self) -> &clickhouse::Client {
-        &self.inner
     }
 
     // -- Query execution helpers --
