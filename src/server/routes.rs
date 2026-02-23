@@ -283,14 +283,26 @@ pub async fn post_actions(
                 }
             }
 
-            let (id, token) = state.try_start_op(op_name).await.map_err(|e| {
-                (
-                    StatusCode::LOCKED,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-            })?;
+            // Compute backup_name for per-backup conflict detection before starting the op.
+            // For "delete <loc> <name>", the backup name is at parts[2]; for all other
+            // commands it is at parts[1] (may be absent for auto-named commands).
+            let conflict_backup_name: Option<String> = if op_name == "delete" {
+                parts.get(2).map(|s| s.to_string())
+            } else {
+                parts.get(1).map(|s| s.to_string())
+            };
+
+            let (id, token) = state
+                .try_start_op(op_name, conflict_backup_name)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::LOCKED,
+                        Json(ErrorResponse {
+                            error: e.to_string(),
+                        }),
+                    )
+                })?;
 
             let state_clone = state.clone();
             let command = request.command.clone();
@@ -692,7 +704,8 @@ pub async fn create_backup(
         &state,
         "create",
         "create",
-        false, // no cache invalidation
+        req.backup_name.clone(), // None when auto-generated (timestamp) inside closure
+        false,                   // no cache invalidation
         move |config, ch, _s3| async move {
             let backup_name = req
                 .backup_name
@@ -763,7 +776,8 @@ pub async fn upload_backup(
         &state,
         "upload",
         "upload",
-        true, // invalidate cache after upload
+        Some(name.clone()), // per-backup conflict detection
+        true,               // invalidate cache after upload
         move |config, _ch, s3| async move {
             info!(backup_name = %name, "Starting upload operation");
             let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
@@ -819,7 +833,8 @@ pub async fn download_backup(
         &state,
         "download",
         "download",
-        false, // no cache invalidation
+        Some(name.clone()), // per-backup conflict detection
+        false,              // no cache invalidation
         move |config, _ch, s3| async move {
             info!(backup_name = %name, hardlink_exists_files = hardlink, "Starting download operation");
             let effective_resume = config.general.use_resumable_state;
@@ -876,7 +891,8 @@ pub async fn restore_backup(
         &state,
         "restore",
         "restore",
-        false, // no cache invalidation
+        Some(name.clone()), // per-backup conflict detection
+        false,              // no cache invalidation
         move |config, ch, _s3| async move {
             info!(backup_name = %name, "Starting restore operation");
             let effective_resume = config.general.use_resumable_state;
@@ -947,7 +963,8 @@ pub async fn create_remote(
         &state,
         "create_remote",
         "create_remote",
-        true, // invalidate cache after upload
+        req.backup_name.clone(), // None when auto-generated inside closure
+        true,                    // invalidate cache after upload
         move |config, ch, s3| async move {
             let backup_name = req
                 .backup_name
@@ -1055,7 +1072,8 @@ pub async fn restore_remote(
         &state,
         "restore_remote",
         "restore_remote",
-        false, // no cache invalidation
+        Some(name.clone()), // per-backup conflict detection
+        false,              // no cache invalidation
         move |config, ch, s3| async move {
             info!(backup_name = %name, "Starting restore_remote operation");
 
@@ -1146,6 +1164,7 @@ pub async fn delete_backup(
         &state,
         "delete",
         "delete",
+        Some(name.clone()), // per-backup conflict detection
         invalidate,
         move |config, _ch, s3| async move {
             info!(backup_name = %name, location = %location, "Starting delete operation");
@@ -1172,6 +1191,7 @@ pub async fn clean_remote_broken(
         &state,
         "clean_broken_remote",
         "clean_broken_remote",
+        None, // no specific backup name
         true, // invalidate cache
         |_config, _ch, s3| async move {
             info!("Starting clean_broken_remote operation");
@@ -1191,6 +1211,7 @@ pub async fn clean_local_broken(
         &state,
         "clean_broken_local",
         "clean_broken_local",
+        None,  // no specific backup name
         false, // no cache invalidation
         |config, _ch, _s3| async move {
             info!("Starting clean_broken_local operation");
@@ -1239,6 +1260,7 @@ pub async fn clean(
         &state,
         "clean",
         "clean",
+        None,  // no specific backup name
         false, // no cache invalidation
         |config, ch, _s3| async move {
             info!("Starting clean operation");
@@ -1328,7 +1350,7 @@ pub async fn reload(
     state.s3.store(Arc::new(s3));
 
     // If watch loop is active, also send reload signal so it picks up changes
-    if let Some(tx) = &state.watch_reload_tx {
+    if let Some(tx) = &*state.watch_reload_tx.lock().await {
         tx.send(true).ok();
         info!("Config reload signal also sent to watch loop");
     }
@@ -1626,7 +1648,7 @@ pub async fn watch_stop(
         ));
     }
 
-    if let Some(tx) = &state.watch_shutdown_tx {
+    if let Some(tx) = &*state.watch_shutdown_tx.lock().await {
         tx.send(true).ok();
     }
 

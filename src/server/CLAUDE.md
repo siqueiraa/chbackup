@@ -29,8 +29,8 @@ src/server/
 - `running_ops: Arc<Mutex<HashMap<u64, RunningOp>>>` -- all currently running operations, keyed by action ID, for kill support and parallel tracking
 - `op_semaphore: Arc<Semaphore>` -- concurrency control (1 permit when `allow_parallel=false`)
 - `metrics: Option<Arc<Metrics>>` -- Prometheus metrics registry (`None` when `config.api.enable_metrics` is false)
-- `watch_shutdown_tx: Option<watch::Sender<bool>>` -- watch loop shutdown signal (`None` when watch inactive)
-- `watch_reload_tx: Option<watch::Sender<bool>>` -- watch loop config reload signal (`None` when watch inactive)
+- `watch_shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>` -- watch loop shutdown signal (`None` when watch inactive); mutex ensures `spawn_watch_from_state` updates are visible to all axum handler clones
+- `watch_reload_tx: Arc<Mutex<Option<watch::Sender<bool>>>>` -- watch loop config reload signal (`None` when watch inactive)
 - `watch_status: Arc<Mutex<WatchStatus>>` -- shared watch loop status for API queries
 - `config_path: PathBuf` -- path to config file, used for config reload
 - `manifest_cache: Arc<Mutex<ManifestCache>>` -- in-memory TTL-based cache for remote backup summaries
@@ -41,7 +41,7 @@ Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) since locks are held across `
 
 ### Operation Lifecycle (state.rs)
 Every mutating operation follows a three-phase lifecycle:
-1. **Start**: `try_start_op(command)` acquires a semaphore permit (non-blocking via `try_acquire_owned`), creates a `CancellationToken`, logs the start in `ActionLog`, inserts `RunningOp` into `running_ops` HashMap keyed by action ID
+1. **Start**: `try_start_op(command, backup_name)` acquires a semaphore permit (non-blocking via `try_acquire_owned`), checks for a same-name conflict in `running_ops` when `backup_name` is `Some` (rejects with 423 when `allow_parallel=true` and same backup is already running), creates a `CancellationToken`, logs the start in `ActionLog`, inserts `RunningOp` into `running_ops` HashMap keyed by action ID
 2. **Execute**: Background `tokio::spawn` task runs the actual command function, wrapped in `tokio::select!` with a cancellation branch
 3. **Complete**: One of three exit paths:
    - `finish_op(id)` -- success: marks `ActionStatus::Completed`, removes `RunningOp` from HashMap

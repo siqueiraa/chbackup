@@ -77,9 +77,11 @@ pub struct AppState {
     /// Prometheus metrics registry. `None` when `config.api.enable_metrics` is false.
     pub metrics: Option<Arc<Metrics>>,
     /// Watch loop shutdown signal sender. `None` when watch is not active.
-    pub watch_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Wrapped in `Arc<Mutex<Option<...>>>` so mutations made by `spawn_watch_from_state`
+    /// (called with a local axum `State` clone) are visible to all other handler clones.
+    pub watch_shutdown_tx: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
     /// Watch loop config reload signal sender. `None` when watch is not active.
-    pub watch_reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    pub watch_reload_tx: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
     /// Shared watch status for API queries.
     pub watch_status: Arc<Mutex<WatchStatus>>,
     /// Path to the config file, used for config reload.
@@ -93,6 +95,8 @@ pub struct AppState {
 pub struct RunningOp {
     pub id: u64,
     pub command: String,
+    /// The backup name this operation is working on, used for per-backup conflict detection.
+    pub backup_name: Option<String>,
     pub cancel_token: CancellationToken,
     /// Held for the duration of the operation to enforce concurrency limits.
     _permit: OwnedSemaphorePermit,
@@ -140,8 +144,8 @@ impl AppState {
             running_ops: Arc::new(Mutex::new(HashMap::new())),
             op_semaphore: Arc::new(Semaphore::new(permits)),
             metrics,
-            watch_shutdown_tx: None,
-            watch_reload_tx: None,
+            watch_shutdown_tx: Arc::new(Mutex::new(None)),
+            watch_reload_tx: Arc::new(Mutex::new(None)),
             watch_status: Arc::new(Mutex::new(WatchStatus::default())),
             config_path,
             manifest_cache,
@@ -152,9 +156,13 @@ impl AppState {
     ///
     /// If the semaphore cannot be acquired (another operation is running and
     /// allow_parallel=false), returns an error.
+    ///
+    /// When `backup_name` is `Some`, also rejects requests for the same backup name
+    /// as an already-running operation (relevant when `allow_parallel=true`).
     pub async fn try_start_op(
         &self,
         command: &str,
+        backup_name: Option<String>,
     ) -> Result<(u64, CancellationToken), &'static str> {
         let permit = self
             .op_semaphore
@@ -163,22 +171,50 @@ impl AppState {
             .map_err(|_| "operation already in progress")?;
 
         let token = CancellationToken::new();
+
+        // Log the action first (action_log lock acquired and released before running_ops).
+        // This preserves the existing lock order: action_log is never held simultaneously
+        // with running_ops.
         let id = {
             let mut log = self.action_log.lock().await;
             log.start(command.to_string())
         };
 
-        {
+        // Build the RunningOp outside the lock so the critical section stays minimal.
+        let running_op = RunningOp {
+            id,
+            command: command.to_string(),
+            backup_name: backup_name.clone(),
+            cancel_token: token.clone(),
+            _permit: permit,
+        };
+
+        // Atomically check for a same-backup conflict and insert — eliminates the TOCTOU
+        // race that existed when check and insert were separate lock acquisitions.
+        // If a conflict is detected, running_op (including the permit) is dropped here,
+        // releasing the semaphore permit.
+        let conflict = {
             let mut ops = self.running_ops.lock().await;
-            ops.insert(
-                id,
-                RunningOp {
+            let has_conflict = backup_name.as_deref().is_some_and(|name| {
+                ops.values()
+                    .any(|op| op.backup_name.as_deref() == Some(name))
+            });
+            if !has_conflict {
+                ops.insert(id, running_op);
+            }
+            has_conflict
+        };
+
+        if conflict {
+            // Record the rejection in the action log so GET /api/v1/actions shows it.
+            {
+                let mut log = self.action_log.lock().await;
+                log.fail(
                     id,
-                    command: command.to_string(),
-                    cancel_token: token.clone(),
-                    _permit: permit,
-                },
-            );
+                    "operation already in progress for this backup".to_string(),
+                );
+            }
+            return Err("operation already in progress for this backup");
         }
 
         Ok((id, token))
@@ -267,6 +303,7 @@ pub async fn run_operation<F, Fut>(
     state: &AppState,
     command: &str,
     op_label: &str,
+    backup_name: Option<String>,
     invalidate_cache: bool,
     f: F,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)>
@@ -274,14 +311,17 @@ where
     F: FnOnce(Arc<Config>, Arc<ChClient>, Arc<S3Client>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), anyhow::Error>> + Send,
 {
-    let (id, token) = state.try_start_op(command).await.map_err(|e| {
-        (
-            StatusCode::LOCKED,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
+    let (id, token) = state
+        .try_start_op(command, backup_name)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::LOCKED,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
 
     let state_clone = state.clone();
     let op_label_owned = op_label.to_string();
@@ -448,7 +488,10 @@ pub async fn auto_resume(state: &AppState) {
         match op_type.as_str() {
             "upload" => {
                 tokio::spawn(async move {
-                    let (id, _token) = match state_clone.try_start_op("upload").await {
+                    let (id, _token) = match state_clone
+                        .try_start_op("upload", Some(backup_name.clone()))
+                        .await
+                    {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(
@@ -493,7 +536,10 @@ pub async fn auto_resume(state: &AppState) {
             }
             "download" => {
                 tokio::spawn(async move {
-                    let (id, _token) = match state_clone.try_start_op("download").await {
+                    let (id, _token) = match state_clone
+                        .try_start_op("download", Some(backup_name.clone()))
+                        .await
+                    {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(
@@ -532,7 +578,10 @@ pub async fn auto_resume(state: &AppState) {
             }
             "restore" => {
                 tokio::spawn(async move {
-                    let (id, _token) = match state_clone.try_start_op("restore").await {
+                    let (id, _token) = match state_clone
+                        .try_start_op("restore", Some(backup_name.clone()))
+                        .await
+                    {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(
@@ -911,6 +960,7 @@ mod tests {
                     RunningOp {
                         id,
                         command: format!("op{}", i),
+                        backup_name: None,
                         cancel_token: token.clone(),
                         _permit: permit,
                     },
@@ -949,6 +999,7 @@ mod tests {
                     RunningOp {
                         id,
                         command: format!("op{}", i),
+                        backup_name: None,
                         cancel_token: token.clone(),
                         _permit: permit,
                     },
@@ -994,6 +1045,7 @@ mod tests {
                 RunningOp {
                     id,
                     command: "failing_op".to_string(),
+                    backup_name: None,
                     cancel_token: token,
                     _permit: permit,
                 },
@@ -1038,6 +1090,7 @@ mod tests {
                     RunningOp {
                         id,
                         command: format!("op{}", i),
+                        backup_name: None,
                         cancel_token: token.clone(),
                         _permit: permit,
                     },
@@ -1091,6 +1144,7 @@ mod tests {
                 RunningOp {
                     id,
                     command: "create".to_string(),
+                    backup_name: None,
                     cancel_token: token.clone(),
                     _permit: permit,
                 },
@@ -1157,6 +1211,7 @@ mod tests {
                 RunningOp {
                     id,
                     command: "upload".to_string(),
+                    backup_name: None,
                     cancel_token: token.clone(),
                     _permit: permit,
                 },

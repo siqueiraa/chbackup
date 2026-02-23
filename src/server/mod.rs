@@ -146,7 +146,7 @@ pub async fn start_server(
     watch: bool,
     config_path: PathBuf,
 ) -> Result<()> {
-    let mut state = AppState::new(config.clone(), ch.clone(), s3.clone(), config_path.clone());
+    let state = AppState::new(config.clone(), ch.clone(), s3.clone(), config_path.clone());
 
     // Determine if watch should be enabled (CLI flag or config)
     let watch_enabled = watch || config.watch.enabled;
@@ -156,9 +156,10 @@ pub async fn start_server(
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
 
-        // Store senders in AppState for API endpoint access
-        state.watch_shutdown_tx = Some(shutdown_tx.clone());
-        state.watch_reload_tx = Some(reload_tx.clone());
+        // Store senders in AppState for API endpoint access.
+        // Write through the Arc<Mutex> so that axum handler clones see the update.
+        *state.watch_shutdown_tx.lock().await = Some(shutdown_tx.clone());
+        *state.watch_reload_tx.lock().await = Some(reload_tx.clone());
 
         // Query macros from ClickHouse for template resolution
         let macros = ch.get_macros().await.unwrap_or_default();
@@ -385,8 +386,9 @@ pub async fn spawn_watch_from_state(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
 
-    state.watch_shutdown_tx = Some(shutdown_tx);
-    state.watch_reload_tx = Some(reload_tx);
+    // Write through the Arc<Mutex> so that all axum handler clones see the update.
+    *state.watch_shutdown_tx.lock().await = Some(shutdown_tx);
+    *state.watch_reload_tx.lock().await = Some(reload_tx);
 
     let watch_status = state.watch_status.clone();
     {

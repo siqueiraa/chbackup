@@ -1467,7 +1467,7 @@ pub fn parse_duration_secs(s: &str) -> Result<u64> {
         .parse()
         .with_context(|| format!("Invalid duration number: '{}'", num_str))?;
 
-    Ok(num * multiplier)
+    Ok(num.saturating_mul(multiplier))
 }
 
 /// Resolve effective retry configuration.

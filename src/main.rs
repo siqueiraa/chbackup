@@ -115,6 +115,16 @@ async fn run() -> Result<()> {
     // 3. Acquire lock based on command scope.
     let cmd_name = command_name(&cli.command);
     let bak_name = backup_name_from_command(&cli.command);
+
+    // Validate backup name BEFORE constructing the lock path to prevent path-traversal
+    // attacks where a name like "../etc/passwd" would create a lock at an unintended path.
+    if let Some(name) = bak_name {
+        if let Err(e) = validate_backup_name(name) {
+            eprintln!("Error: invalid backup name: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let scope = lock_for_command(cmd_name, bak_name);
     let lock_file_path = lock_path_for_scope(&scope);
 
