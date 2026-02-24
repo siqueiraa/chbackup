@@ -644,7 +644,7 @@ fn rewrite_distributed_engine(
     let table_val = strip_quotes(table_arg);
 
     // Only rewrite if the source matches
-    if db_val != src_db && table_val != src_table {
+    if db_val != src_db || table_val != src_table {
         return ddl.to_string();
     }
 
@@ -1454,6 +1454,58 @@ mod tests {
         assert!(result.contains("'mydb'"));
         assert!(result.contains("'mytable'"));
         assert!(result.contains("rand()"));
+    }
+
+    #[test]
+    fn test_rewrite_ddl_distributed_partial_match_db() {
+        // When Distributed engine references matching table but DIFFERENT database,
+        // the DDL should NOT be rewritten
+        let ddl = "CREATE TABLE other_db.dist (id UInt64) ENGINE = Distributed('cluster', other_db, src_table, rand())";
+        let result = rewrite_create_table_ddl(
+            ddl,
+            "src_db",
+            "src_table",
+            "dst_db",
+            "dst_table",
+            "/clickhouse/tables/{shard}/{database}/{table}",
+        );
+        // The Distributed engine args should be unchanged because db doesn't match
+        assert!(
+            result.contains("other_db, src_table"),
+            "Distributed args should be unchanged for partial db mismatch: {}",
+            result
+        );
+        assert!(
+            !result.contains("dst_table, rand"),
+            "Should NOT rewrite table arg when db doesn't match: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ddl_distributed_partial_match_table() {
+        // When Distributed engine references matching database but DIFFERENT table,
+        // the DDL should NOT be rewritten
+        let ddl = "CREATE TABLE src_db.dist (id UInt64) ENGINE = Distributed('cluster', src_db, other_table, rand())";
+        let result = rewrite_create_table_ddl(
+            ddl,
+            "src_db",
+            "src_table",
+            "dst_db",
+            "dst_table",
+            "/clickhouse/tables/{shard}/{database}/{table}",
+        );
+        // The Distributed engine args should be unchanged because table doesn't match
+        assert!(
+            result.contains("src_db, other_table"),
+            "Distributed args should be unchanged for partial table mismatch: {}",
+            result
+        );
+        assert!(
+            !result.contains("dst_db"),
+            "Should NOT rewrite db arg when table doesn't match: {}",
+            result
+        );
     }
 
     #[test]
