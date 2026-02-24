@@ -268,9 +268,20 @@ pub async fn create(
         .map(|t| (t.database.clone(), t.name.clone()))
         .collect();
 
-    let all_mutations =
-        mutations::check_mutations(ch, &mutation_targets, config.clickhouse.backup_mutations)
-            .await?;
+    let mutation_wait_secs =
+        crate::config::parse_duration_secs(&config.clickhouse.mutation_wait_timeout)
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "Failed to parse mutation_wait_timeout, defaulting to 0");
+                0
+            });
+
+    let all_mutations = mutations::check_mutations(
+        ch,
+        &mutation_targets,
+        config.clickhouse.backup_mutations,
+        mutation_wait_secs,
+    )
+    .await?;
 
     // 7. Sync replicas (design 3.2)
     if config.clickhouse.sync_replicated_tables {

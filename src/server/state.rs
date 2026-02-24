@@ -1325,8 +1325,8 @@ mod tests {
         let json = serde_json::to_string(&params).unwrap();
         let loaded: RestoreParams = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.backup_name, "test-backup");
-        assert_eq!(loaded.data_only, true);
-        assert_eq!(loaded.skip_empty_tables, true);
+        assert!(loaded.data_only);
+        assert!(loaded.skip_empty_tables);
         assert_eq!(loaded.tables, Some("mydb.*".to_string()));
     }
 }
