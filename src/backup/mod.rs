@@ -278,12 +278,28 @@ pub async fn create(
         sync_replica::sync_replicas(ch, &tables_vec).await?;
     }
 
-    // 8. Create backup directory
+    // 8. Create backup directory (fail if it already exists to prevent collision)
     let backup_dir = PathBuf::from(&config.clickhouse.data_path)
         .join("backup")
         .join(backup_name);
 
-    std::fs::create_dir_all(&backup_dir).with_context(|| {
+    // Ensure the parent backup/ directory exists, then create the leaf with create_dir
+    // which fails atomically if the directory was already created by a concurrent run.
+    let backup_parent = backup_dir.parent().expect("backup_dir always has a parent");
+    std::fs::create_dir_all(backup_parent).with_context(|| {
+        format!(
+            "Failed to create backup parent directory: {}",
+            backup_parent.display()
+        )
+    })?;
+    if backup_dir.exists() {
+        bail!(
+            "backup '{}' already exists at {}",
+            backup_name,
+            backup_dir.display()
+        );
+    }
+    std::fs::create_dir(&backup_dir).with_context(|| {
         format!(
             "Failed to create backup directory: {}",
             backup_dir.display()
@@ -1242,5 +1258,67 @@ mod tests {
             !per_disk_dir.exists(),
             "Per-disk backup dir should be cleaned up"
         );
+    }
+
+    #[test]
+    fn test_create_backup_dir_rejects_existing() {
+        // Verify that creating a backup directory fails if it already exists.
+        // This tests the collision detection logic added to prevent silent overwrites
+        // when two creates happen within the same second (same auto-generated name).
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_parent = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup_parent).unwrap();
+
+        let backup_name = "test-collision";
+        let backup_dir = backup_parent.join(backup_name);
+
+        // Create the directory ahead of time to simulate an existing backup
+        std::fs::create_dir(&backup_dir).unwrap();
+        assert!(backup_dir.exists());
+
+        // The same logic as in create(): check exists then create_dir
+        let check = |dir: &std::path::Path, name: &str| -> Result<()> {
+            if dir.exists() {
+                bail!("backup '{}' already exists at {}", name, dir.display());
+            }
+            std::fs::create_dir(dir)
+                .with_context(|| format!("Failed to create backup directory: {}", dir.display()))?;
+            Ok(())
+        };
+
+        let result = check(&backup_dir, backup_name);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("already exists"),
+            "Error should mention 'already exists', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_create_backup_dir_succeeds_when_new() {
+        // Verify that creating a backup directory succeeds when it does not exist.
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_parent = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup_parent).unwrap();
+
+        let backup_name = "new-backup";
+        let backup_dir = backup_parent.join(backup_name);
+
+        assert!(!backup_dir.exists());
+
+        // The same logic as in create(): check exists then create_dir
+        let check = |dir: &std::path::Path, name: &str| -> Result<()> {
+            if dir.exists() {
+                bail!("backup '{}' already exists at {}", name, dir.display());
+            }
+            std::fs::create_dir(dir)
+                .with_context(|| format!("Failed to create backup directory: {}", dir.display()))?;
+            Ok(())
+        };
+
+        let result = check(&backup_dir, backup_name);
+        assert!(result.is_ok());
+        assert!(backup_dir.exists());
     }
 }

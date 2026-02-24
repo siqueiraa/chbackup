@@ -20,27 +20,6 @@ use clap::Parser;
 use cli::{Cli, Command};
 use tracing::info;
 
-/// Extract the command name (as used by [`lock_for_command`]) from a [`Command`].
-fn command_name(cmd: &Command) -> &'static str {
-    match cmd {
-        Command::Create { .. } => "create",
-        Command::Upload { .. } => "upload",
-        Command::Download { .. } => "download",
-        Command::Restore { .. } => "restore",
-        Command::CreateRemote { .. } => "create_remote",
-        Command::RestoreRemote { .. } => "restore_remote",
-        Command::List { .. } => "list",
-        Command::Tables { .. } => "tables",
-        Command::Delete { .. } => "delete",
-        Command::Clean { .. } => "clean",
-        Command::CleanBroken { .. } => "clean_broken",
-        Command::DefaultConfig => "default-config",
-        Command::PrintConfig => "print-config",
-        Command::Watch { .. } => "watch",
-        Command::Server { .. } => "server",
-    }
-}
-
 /// Extract the optional backup name from a [`Command`], if applicable.
 fn backup_name_from_command(cmd: &Command) -> Option<&str> {
     match cmd {
@@ -52,6 +31,37 @@ fn backup_name_from_command(cmd: &Command) -> Option<&str> {
         | Command::RestoreRemote { backup_name, .. } => backup_name.as_deref(),
         Command::Delete { backup_name, .. } => backup_name.as_deref(),
         _ => None,
+    }
+}
+
+/// Acquire a per-backup PID lock AFTER shortcut resolution.
+///
+/// This ensures the lock is taken on the resolved (actual) backup name,
+/// not on a raw CLI shortcut like "latest" or "previous".
+fn acquire_backup_lock(cmd_name: &str, backup_name: &str) -> Result<Option<PidLock>> {
+    let scope = lock_for_command(cmd_name, Some(backup_name));
+    match lock_path_for_scope(&scope) {
+        Some(ref path) => {
+            info!(command = cmd_name, lock_path = %path.display(), "Acquiring lock");
+            let guard = PidLock::acquire(path, cmd_name)?;
+            info!("Lock acquired");
+            Ok(Some(guard))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Acquire a global PID lock for commands that don't have a backup name.
+fn acquire_global_lock(cmd_name: &str) -> Result<Option<PidLock>> {
+    let scope = lock_for_command(cmd_name, None);
+    match lock_path_for_scope(&scope) {
+        Some(ref path) => {
+            info!(command = cmd_name, lock_path = %path.display(), "Acquiring lock");
+            let guard = PidLock::acquire(path, cmd_name)?;
+            info!("Lock acquired");
+            Ok(Some(guard))
+        }
+        None => Ok(None),
     }
 }
 
@@ -112,12 +122,9 @@ async fn run() -> Result<()> {
         is_server,
     );
 
-    // 3. Acquire lock based on command scope.
-    let cmd_name = command_name(&cli.command);
-    let bak_name = backup_name_from_command(&cli.command);
-
-    // Validate backup name BEFORE constructing the lock path to prevent path-traversal
+    // 3. Validate backup name BEFORE any processing to prevent path-traversal
     // attacks where a name like "../etc/passwd" would create a lock at an unintended path.
+    let bak_name = backup_name_from_command(&cli.command);
     if let Some(name) = bak_name {
         if let Err(e) = validate_backup_name(name) {
             eprintln!("Error: invalid backup name: {e}");
@@ -125,27 +132,10 @@ async fn run() -> Result<()> {
         }
     }
 
-    let scope = lock_for_command(cmd_name, bak_name);
-    let lock_file_path = lock_path_for_scope(&scope);
-
-    let _lock_guard: Option<PidLock> = match lock_file_path {
-        Some(ref path) => {
-            info!(
-                command = cmd_name,
-                lock_path = %path.display(),
-                "Acquiring lock"
-            );
-            let guard = PidLock::acquire(path, cmd_name)?;
-            info!("Lock acquired");
-            Some(guard)
-        }
-        None => {
-            info!(command = cmd_name, "No lock required");
-            None
-        }
-    };
-
     // 4. Execute command.
+    // Lock acquisition is done INSIDE each command branch, AFTER shortcut resolution,
+    // so that the lock is always taken on the resolved (actual) backup name rather
+    // than a raw shortcut like "latest" or "previous".
     match cli.command {
         Command::Create {
             tables,
@@ -161,6 +151,7 @@ async fn run() -> Result<()> {
             backup_name,
         } => {
             let name = resolve_backup_name(backup_name)?;
+            let _lock = acquire_backup_lock("create", &name)?;
             let ch = ChClient::new(&config.clickhouse)?;
 
             // Design doc: create --resume is planned but explicitly deferred. The create
@@ -204,6 +195,7 @@ async fn run() -> Result<()> {
         } => {
             let raw_name = backup_name_required(backup_name, "upload")?;
             let name = resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?;
+            let _lock = acquire_backup_lock("upload", &name)?;
             let s3 = S3Client::new(&config.s3).await?;
 
             let backup_dir = PathBuf::from(&config.clickhouse.data_path)
@@ -236,6 +228,7 @@ async fn run() -> Result<()> {
             let raw_name = backup_name_required(backup_name, "download")?;
             let s3 = S3Client::new(&config.s3).await?;
             let name = resolve_remote_shortcut(&raw_name, &s3).await?;
+            let _lock = acquire_backup_lock("download", &name)?;
 
             let effective_resume = resume && config.general.use_resumable_state;
             let backup_dir =
@@ -266,6 +259,7 @@ async fn run() -> Result<()> {
         } => {
             let raw_name = backup_name_required(backup_name, "restore")?;
             let name = resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?;
+            let _lock = acquire_backup_lock("restore", &name)?;
             let ch = ChClient::new(&config.clickhouse)?;
 
             let db_mapping = match &database_mapping {
@@ -309,6 +303,7 @@ async fn run() -> Result<()> {
             backup_name,
         } => {
             let name = resolve_backup_name(backup_name)?;
+            let _lock = acquire_backup_lock("create_remote", &name)?;
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
 
@@ -374,6 +369,7 @@ async fn run() -> Result<()> {
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
             let name = resolve_remote_shortcut(&raw_name, &s3).await?;
+            let _lock = acquire_backup_lock("restore_remote", &name)?;
 
             let db_mapping = match &database_mapping {
                 Some(s) => Some(remap::parse_database_mapping(s)?),
@@ -525,6 +521,7 @@ async fn run() -> Result<()> {
                 }
                 list::Location::Remote => resolve_remote_shortcut(&raw_name, &s3).await?,
             };
+            let _lock = acquire_backup_lock("delete", &name)?;
 
             list::delete(&config.clickhouse.data_path, &s3, &loc, &name).await?;
 
@@ -532,6 +529,7 @@ async fn run() -> Result<()> {
         }
 
         Command::Clean { name } => {
+            let _lock = acquire_global_lock("clean")?;
             let ch = ChClient::new(&config.clickhouse)?;
             let data_path = &config.clickhouse.data_path;
             let count = list::clean_shadow(&ch, data_path, name.as_deref()).await?;
@@ -539,6 +537,7 @@ async fn run() -> Result<()> {
         }
 
         Command::CleanBroken { location } => {
+            let _lock = acquire_global_lock("clean_broken")?;
             let s3 = S3Client::new(&config.s3).await?;
             let loc = map_cli_location(location);
 
@@ -670,9 +669,7 @@ async fn run() -> Result<()> {
         Command::DefaultConfig | Command::PrintConfig => unreachable!(),
     }
 
-    // 5. Lock is released automatically when _lock_guard is dropped.
-    info!(command = cmd_name, "Command complete");
-
+    // 5. Per-branch locks are released automatically when _lock is dropped at end of branch.
     Ok(())
 }
 
