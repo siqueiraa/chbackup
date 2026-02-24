@@ -23,6 +23,8 @@ use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::backup::collect::per_disk_backup_dir;
 use crate::backup::diff::diff_parts;
 use crate::concurrency::{effective_object_disk_copy_concurrency, effective_upload_concurrency};
@@ -155,6 +157,7 @@ struct S3DiskUploadWorkItem {
 /// * `delete_local` - If true, remove local backup directory after successful upload
 /// * `diff_from_remote` - Optional remote base backup name for incremental upload
 /// * `resume` - If true and use_resumable_state config is set, load resume state
+#[allow(clippy::too_many_arguments)]
 pub async fn upload(
     config: &Config,
     s3: &S3Client,
@@ -163,6 +166,7 @@ pub async fn upload(
     delete_local: bool,
     diff_from_remote: Option<&str>,
     resume: bool,
+    cancel: CancellationToken,
 ) -> Result<()> {
     info!(
         backup_name = %backup_name,
@@ -487,12 +491,17 @@ pub async fn upload(
         let resume_state = resume_state.clone();
         let data_format_clone = data_format.clone();
         let progress = progress.clone();
+        let cancel_clone = cancel.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
                 .acquire()
                 .await
                 .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
+
+            if cancel_clone.is_cancelled() {
+                return Ok((item.table_key, item.disk_name, item.part.clone(), 0));
+            }
 
             debug!(
                 table = %item.table_key,
@@ -727,12 +736,17 @@ pub async fn upload(
         let s3 = s3.clone();
         let resume_state = resume_state.clone();
         let progress = progress.clone();
+        let cancel_clone = cancel.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
                 .acquire()
                 .await
                 .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
+
+            if cancel_clone.is_cancelled() {
+                return Ok((item.table_key, item.disk_name, item.part.clone(), 0));
+            }
 
             debug!(
                 table = %item.table_key,

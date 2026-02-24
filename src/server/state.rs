@@ -15,6 +15,18 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+
+/// Compute the semaphore permit count for a given `allow_parallel` setting.
+///
+/// `false` (default): 1 permit — operations are serialized.
+/// `true`: effectively unlimited permits.
+fn semaphore_permits(allow_parallel: bool) -> usize {
+    if allow_parallel {
+        Semaphore::MAX_PERMITS
+    } else {
+        1
+    }
+}
 use tokio_util::sync::CancellationToken;
 
 use crate::clickhouse::ChClient;
@@ -73,7 +85,11 @@ pub struct AppState {
     pub s3: Arc<ArcSwap<S3Client>>,
     pub action_log: Arc<Mutex<ActionLog>>,
     pub running_ops: Arc<Mutex<HashMap<u64, RunningOp>>>,
-    pub op_semaphore: Arc<Semaphore>,
+    /// Concurrency semaphore. Wrapped in `ArcSwap` so `/api/v1/restart` can
+    /// atomically replace it when `allow_parallel` changes between the old and
+    /// new config without disrupting in-flight operations (which hold permits
+    /// against the previous `Semaphore` instance).
+    pub op_semaphore: Arc<ArcSwap<Semaphore>>,
     /// Prometheus metrics registry. `None` when `config.api.enable_metrics` is false.
     pub metrics: Option<Arc<Metrics>>,
     /// Watch loop shutdown signal sender. `None` when watch is not active.
@@ -109,12 +125,7 @@ impl AppState {
     /// - `false` (default): 1 permit -- operations are serialized
     /// - `true`: effectively unlimited permits
     pub fn new(config: Arc<Config>, ch: ChClient, s3: S3Client, config_path: PathBuf) -> Self {
-        let permits = if config.api.allow_parallel {
-            // Use a large number to approximate unlimited
-            Semaphore::MAX_PERMITS
-        } else {
-            1
-        };
+        let permits = semaphore_permits(config.api.allow_parallel);
 
         // Conditionally create Prometheus metrics
         let metrics = if config.api.enable_metrics {
@@ -142,7 +153,7 @@ impl AppState {
             s3: Arc::new(ArcSwap::from_pointee(s3)),
             action_log: Arc::new(Mutex::new(ActionLog::new(100))),
             running_ops: Arc::new(Mutex::new(HashMap::new())),
-            op_semaphore: Arc::new(Semaphore::new(permits)),
+            op_semaphore: Arc::new(ArcSwap::from_pointee(Semaphore::new(permits))),
             metrics,
             watch_shutdown_tx: Arc::new(Mutex::new(None)),
             watch_reload_tx: Arc::new(Mutex::new(None)),
@@ -166,7 +177,7 @@ impl AppState {
     ) -> Result<(u64, CancellationToken), &'static str> {
         let permit = self
             .op_semaphore
-            .clone()
+            .load_full()
             .try_acquire_owned()
             .map_err(|_| "operation already in progress")?;
 
@@ -308,7 +319,7 @@ pub async fn run_operation<F, Fut>(
     f: F,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)>
 where
-    F: FnOnce(Arc<Config>, Arc<ChClient>, Arc<S3Client>) -> Fut + Send + 'static,
+    F: FnOnce(Arc<Config>, Arc<ChClient>, Arc<S3Client>, CancellationToken) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), anyhow::Error>> + Send,
 {
     let (id, token) = state
@@ -325,6 +336,7 @@ where
 
     let state_clone = state.clone();
     let op_label_owned = op_label.to_string();
+    let f_token = token.clone();
     tokio::spawn(async move {
         tokio::select! {
             _ = token.cancelled() => {
@@ -339,7 +351,7 @@ where
                 let s3 = state_clone.s3.load_full();
                 let start_time = std::time::Instant::now();
 
-                let result = f(config, ch, s3).await;
+                let result = f(config, ch, s3, f_token).await;
                 let duration = start_time.elapsed().as_secs_f64();
 
                 match result {
@@ -519,6 +531,7 @@ pub async fn auto_resume(state: &AppState) {
                         false, // delete_local
                         None,  // diff_from_remote
                         true,  // resume = true
+                        tokio_util::sync::CancellationToken::new(), // auto-resume: not cancellable
                     )
                     .await;
 
@@ -561,6 +574,7 @@ pub async fn auto_resume(state: &AppState) {
                         &backup_name,
                         true,  // resume = true
                         false, // hardlink_exists_files = false
+                        tokio_util::sync::CancellationToken::new(), // auto-resume: not cancellable
                     )
                     .await;
 
@@ -650,6 +664,7 @@ pub async fn auto_resume(state: &AppState) {
                         restore_params.named_collections,
                         restore_params.partitions.as_deref(),
                         restore_params.skip_empty_tables,
+                        tokio_util::sync::CancellationToken::new(), // auto-resume: not cancellable
                     )
                     .await;
 

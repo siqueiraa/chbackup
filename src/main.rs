@@ -15,6 +15,7 @@ use chbackup::server::state::validate_backup_name;
 use chbackup::storage::S3Client;
 use chbackup::table_filter::TableFilter;
 use chbackup::{backup, download, list, restore, upload};
+use tokio_util::sync::CancellationToken;
 use chrono::Utc;
 use clap::Parser;
 use cli::{Cli, Command};
@@ -202,6 +203,7 @@ async fn run() -> Result<()> {
                 delete_local,
                 diff_from_remote.as_deref(),
                 effective_resume,
+                CancellationToken::new(),
             )
             .await?;
 
@@ -222,9 +224,15 @@ async fn run() -> Result<()> {
             let _lock = acquire_backup_lock("download", &name)?;
 
             let effective_resume = resume && config.general.use_resumable_state;
-            let backup_dir =
-                download::download(&config, &s3, &name, effective_resume, hardlink_exists_files)
-                    .await?;
+            let backup_dir = download::download(
+                &config,
+                &s3,
+                &name,
+                effective_resume,
+                hardlink_exists_files,
+                CancellationToken::new(),
+            )
+            .await?;
 
             info!(
                 backup_name = %name,
@@ -275,6 +283,7 @@ async fn run() -> Result<()> {
                 named_collections,
                 partitions.as_deref(),
                 skip_empty_tables,
+                CancellationToken::new(),
             )
             .await?;
 
@@ -335,6 +344,7 @@ async fn run() -> Result<()> {
                 delete_source,
                 diff_from_remote.as_deref(),
                 effective_resume,
+                CancellationToken::new(),
             )
             .await?;
 
@@ -369,8 +379,15 @@ async fn run() -> Result<()> {
 
             // Step 1: Download from S3
             let effective_resume = resume && config.general.use_resumable_state;
-            let _backup_dir =
-                download::download(&config, &s3, &name, effective_resume, false).await?;
+            let _backup_dir = download::download(
+                &config,
+                &s3,
+                &name,
+                effective_resume,
+                false,
+                CancellationToken::new(),
+            )
+            .await?;
 
             // Step 2: Restore with remap
             restore::restore(
@@ -389,6 +406,7 @@ async fn run() -> Result<()> {
                 named_collections,
                 None, // partitions (not a flag on restore_remote per design)
                 skip_empty_tables,
+                CancellationToken::new(),
             )
             .await?;
 

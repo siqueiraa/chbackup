@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use crate::list;
 use crate::manifest::BackupManifest;
@@ -307,6 +308,7 @@ pub async fn post_actions(
             let state_clone = state.clone();
             let command = request.command.clone();
             let parts_owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+            let cancel_for_ops = token.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = token.cancelled() => {
@@ -360,6 +362,7 @@ pub async fn post_actions(
                             false, // delete_local
                             None,  // diff_from_remote
                             effective_resume,
+                            cancel_for_ops.clone(),
                         )
                         .await;
 
@@ -382,6 +385,7 @@ pub async fn post_actions(
                             &backup_name,
                             effective_resume,
                             false, // hardlink_exists_files
+                            cancel_for_ops.clone(),
                         )
                         .await
                         .map(|_| ())
@@ -404,6 +408,7 @@ pub async fn post_actions(
                             false, // named_collections
                             None,  // partitions
                             false, // skip_empty_tables
+                            cancel_for_ops.clone(),
                         )
                         .await
                     }
@@ -438,6 +443,7 @@ pub async fn post_actions(
                                     false, // delete_local
                                     None,  // diff_from_remote
                                     effective_resume,
+                                    cancel_for_ops.clone(),
                                 )
                                 .await;
 
@@ -463,6 +469,7 @@ pub async fn post_actions(
                             &backup_name,
                             effective_resume,
                             false, // hardlink_exists_files
+                            cancel_for_ops.clone(),
                         )
                         .await;
                         match dl {
@@ -483,6 +490,7 @@ pub async fn post_actions(
                                     false, // named_collections
                                     None,  // partitions
                                     false, // skip_empty_tables
+                                    cancel_for_ops.clone(),
                                 )
                                 .await
                             }
@@ -706,7 +714,7 @@ pub async fn create_backup(
         "create",
         req.backup_name.clone(), // None when auto-generated (timestamp) inside closure
         false,                   // no cache invalidation
-        move |config, ch, _s3| async move {
+        move |config, ch, _s3, _cancel| async move {
             let backup_name = req
                 .backup_name
                 .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
@@ -778,7 +786,7 @@ pub async fn upload_backup(
         "upload",
         Some(name.clone()), // per-backup conflict detection
         true,               // invalidate cache after upload
-        move |config, _ch, s3| async move {
+        move |config, _ch, s3, cancel| async move {
             info!(backup_name = %name, "Starting upload operation");
             let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
                 .join("backup")
@@ -792,6 +800,7 @@ pub async fn upload_backup(
                 req.delete_local.unwrap_or(false),
                 req.diff_from_remote.as_deref(),
                 effective_resume,
+                cancel,
             )
             .await?;
 
@@ -835,10 +844,10 @@ pub async fn download_backup(
         "download",
         Some(name.clone()), // per-backup conflict detection
         false,              // no cache invalidation
-        move |config, _ch, s3| async move {
+        move |config, _ch, s3, cancel| async move {
             info!(backup_name = %name, hardlink_exists_files = hardlink, "Starting download operation");
             let effective_resume = config.general.use_resumable_state;
-            crate::download::download(&config, &s3, &name, effective_resume, hardlink)
+            crate::download::download(&config, &s3, &name, effective_resume, hardlink, cancel)
                 .await
                 .map(|_| ())
         },
@@ -870,6 +879,16 @@ pub async fn restore_backup(
         )
     })?;
 
+    // Reject mutually exclusive flag combination
+    if req.schema.unwrap_or(false) && req.data_only.unwrap_or(false) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "schema and data_only are mutually exclusive".to_string(),
+            }),
+        ));
+    }
+
     // Parse remap parameters before starting the operation
     let db_mapping = match &req.database_mapping {
         Some(s) if !s.is_empty() => {
@@ -893,7 +912,7 @@ pub async fn restore_backup(
         "restore",
         Some(name.clone()), // per-backup conflict detection
         false,              // no cache invalidation
-        move |config, ch, _s3| async move {
+        move |config, ch, _s3, cancel| async move {
             info!(backup_name = %name, "Starting restore operation");
             let effective_resume = config.general.use_resumable_state;
             crate::restore::restore(
@@ -912,6 +931,7 @@ pub async fn restore_backup(
                 req.named_collections.unwrap_or(false),
                 req.partitions.as_deref(),
                 req.skip_empty_tables.unwrap_or(false),
+                cancel,
             )
             .await
         },
@@ -965,7 +985,7 @@ pub async fn create_remote(
         "create_remote",
         req.backup_name.clone(), // None when auto-generated inside closure
         true,                    // invalidate cache after upload
-        move |config, ch, s3| async move {
+        move |config, ch, s3, cancel| async move {
             let backup_name = req
                 .backup_name
                 .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
@@ -1003,6 +1023,7 @@ pub async fn create_remote(
                 req.delete_source.unwrap_or(false),
                 req.diff_from_remote.as_deref(),
                 effective_resume,
+                cancel,
             )
             .await?;
 
@@ -1074,24 +1095,33 @@ pub async fn restore_remote(
         "restore_remote",
         Some(name.clone()), // per-backup conflict detection
         false,              // no cache invalidation
-        move |config, ch, s3| async move {
+        move |config, ch, s3, cancel| async move {
             info!(backup_name = %name, "Starting restore_remote operation");
 
             let effective_resume = config.general.use_resumable_state;
 
             // Step 1: Download from S3
-            crate::download::download(&config, &s3, &name, effective_resume, false)
-                .await
-                .map(|_| ())?;
+            crate::download::download(
+                &config,
+                &s3,
+                &name,
+                effective_resume,
+                false,
+                cancel.clone(),
+            )
+            .await
+            .map(|_| ())?;
 
-            // Step 2: Restore with remap
+            // Step 2: Restore with remap.
+            // restore_remote does not support schema-only, data-only, or partition
+            // filtering (per design doc §2 flag table for restore_remote command).
             crate::restore::restore(
                 &config,
                 &ch,
                 &name,
                 req.tables.as_deref(),
-                req.schema.unwrap_or(false),
-                req.data_only.unwrap_or(false),
+                false, // schema: not supported by restore_remote
+                false, // data_only: not supported by restore_remote
                 req.rm.unwrap_or(false),
                 effective_resume,
                 req.rename_as.as_deref(),
@@ -1099,8 +1129,9 @@ pub async fn restore_remote(
                 req.rbac.unwrap_or(false),
                 req.configs.unwrap_or(false),
                 req.named_collections.unwrap_or(false),
-                req.partitions.as_deref(),
+                None, // partitions: not supported by restore_remote
                 req.skip_empty_tables.unwrap_or(false),
+                cancel,
             )
             .await
         },
@@ -1109,11 +1140,12 @@ pub async fn restore_remote(
 }
 
 /// Request body for POST /api/v1/restore_remote/{name}
+///
+/// Note: `schema`, `data_only`, and `partitions` are intentionally absent — they
+/// are not part of the `restore_remote` command spec (design doc §2 flag table).
 #[derive(Debug, Deserialize, Default)]
 pub struct RestoreRemoteRequest {
     pub tables: Option<String>,
-    pub schema: Option<bool>,
-    pub data_only: Option<bool>,
     #[serde(default)]
     pub rename_as: Option<String>,
     #[serde(default)]
@@ -1123,7 +1155,6 @@ pub struct RestoreRemoteRequest {
     pub rbac: Option<bool>,
     pub configs: Option<bool>,
     pub named_collections: Option<bool>,
-    pub partitions: Option<String>,
     pub skip_empty_tables: Option<bool>,
 }
 
@@ -1166,7 +1197,7 @@ pub async fn delete_backup(
         "delete",
         Some(name.clone()), // per-backup conflict detection
         invalidate,
-        move |config, _ch, s3| async move {
+        move |config, _ch, s3, _cancel| async move {
             info!(backup_name = %name, location = %location, "Starting delete operation");
             let data_path = config.clickhouse.data_path.clone();
             match loc {
@@ -1193,7 +1224,7 @@ pub async fn clean_remote_broken(
         "clean_broken_remote",
         None, // no specific backup name
         true, // invalidate cache
-        |_config, _ch, s3| async move {
+        |_config, _ch, s3, _cancel| async move {
             info!("Starting clean_broken_remote operation");
             let count = list::clean_broken_remote(&s3).await?;
             info!(count = count, "clean_broken_remote operation completed");
@@ -1213,7 +1244,7 @@ pub async fn clean_local_broken(
         "clean_broken_local",
         None,  // no specific backup name
         false, // no cache invalidation
-        |config, _ch, _s3| async move {
+        |config, _ch, _s3, _cancel| async move {
             info!("Starting clean_broken_local operation");
             let data_path = config.clickhouse.data_path.clone();
             let count = tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
@@ -1262,7 +1293,7 @@ pub async fn clean(
         "clean",
         None,  // no specific backup name
         false, // no cache invalidation
-        |config, ch, _s3| async move {
+        |config, ch, _s3, _cancel| async move {
             info!("Starting clean operation");
             let data_path = config.clickhouse.data_path.clone();
             let count = list::clean_shadow(&ch, &data_path, None).await?;
@@ -1396,6 +1427,26 @@ pub async fn restart(
             }),
         )
     })?;
+
+    // Rebuild op_semaphore when allow_parallel changes so new permit count takes
+    // effect immediately. In-flight operations hold permits against the old
+    // Semaphore instance; those permits are unaffected and complete normally.
+    let old_allow_parallel = state.config.load().api.allow_parallel;
+    if old_allow_parallel != config.api.allow_parallel {
+        let new_permits = if config.api.allow_parallel {
+            Semaphore::MAX_PERMITS
+        } else {
+            1
+        };
+        state
+            .op_semaphore
+            .store(Arc::new(Semaphore::new(new_permits)));
+        info!(
+            old = old_allow_parallel,
+            new = config.api.allow_parallel,
+            "Restart: op_semaphore rebuilt (allow_parallel changed)"
+        );
+    }
 
     // Atomically swap config and clients
     state.config.store(Arc::new(config));

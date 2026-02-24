@@ -546,6 +546,7 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             false, // delete_local handled separately below
             diff_from.as_deref(),
             ctx.config.general.use_resumable_state,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
 

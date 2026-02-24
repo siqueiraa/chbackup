@@ -33,6 +33,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use futures::future::try_join_all;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::clickhouse::client::ChClient;
@@ -93,6 +94,7 @@ pub async fn restore(
     named_collections_restore: bool,
     partitions: Option<&str>,
     skip_empty_tables: bool,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = PathBuf::from(data_path).join("backup").join(backup_name);
@@ -731,12 +733,17 @@ pub async fn restore(
 
     for (table_key, params) in restore_items {
         let sem = semaphore.clone();
+        let cancel_clone = cancel.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
                 .acquire()
                 .await
                 .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
+
+            if cancel_clone.is_cancelled() {
+                return Ok((table_key, 0u64));
+            }
 
             let attached = attach_parts_owned(params)
                 .await

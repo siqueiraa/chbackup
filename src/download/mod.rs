@@ -21,6 +21,8 @@ use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::backup::checksum::compute_crc64;
 use crate::backup::collect::per_disk_backup_dir;
 use crate::concurrency::effective_download_concurrency;
@@ -290,6 +292,7 @@ pub async fn download(
     backup_name: &str,
     resume: bool,
     hardlink_exists_files: bool,
+    cancel: CancellationToken,
 ) -> Result<PathBuf> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = Path::new(data_path).join("backup").join(backup_name);
@@ -488,12 +491,17 @@ pub async fn download(
         let backup_name_clone = backup_name.to_string();
         let progress = progress.clone();
         let manifest_disks = manifest_disks.clone();
+        let cancel_clone = cancel.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
                 .acquire()
                 .await
                 .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
+
+            if cancel_clone.is_cancelled() {
+                return Ok((item.table_key.clone(), 0u64));
+            }
 
             debug!(
                 table = %item.table_key,
