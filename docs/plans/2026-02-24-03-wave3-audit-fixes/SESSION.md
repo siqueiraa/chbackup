@@ -115,7 +115,7 @@ Group C (Always last -- after all code tasks):
 | 3 | W3-4 Remove watch.enabled validation gate | done | 0931f6c5 | F003 |
 | 4 | W3-3 watch/start accepts optional body | done | 9450b09b | F004 |
 | 5 | W3-5 Server CLI watch flags | done | 6dd4b671 | F005 |
-| 6 | Update CLAUDE.md for modified modules | pending | - | FDOC |
+| 6 | Update CLAUDE.md for modified modules | done | bdc8016f | FDOC |
 
 **Status values:** pending, in_progress, fixing, done
 
@@ -136,7 +136,7 @@ Group C (Always last -- after all code tasks):
 
 ## Acceptance Summary
 
-5/6 PASS
+6/6 PASS
 
 ---
 

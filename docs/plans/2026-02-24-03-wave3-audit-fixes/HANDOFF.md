@@ -58,6 +58,7 @@
 | 3 | 0931f6c5 | fix(config): always validate watch intervals regardless of watch.enabled |
 | 4 | 9450b09b | feat(server): accept optional body in watch/start for interval overrides |
 | 5 | 6dd4b671 | feat(cli): add --watch-interval and --full-interval flags to server command |
+| 6 | bdc8016f | docs(watch,server): update CLAUDE.md for wave-3 audit changes |
 
 ### Key Verified Facts
 - Config derives Clone (`#[derive(Debug, Clone, Default, Serialize, Deserialize)]` at config.rs:8)
