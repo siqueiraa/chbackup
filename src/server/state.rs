@@ -577,6 +577,34 @@ pub async fn auto_resume(state: &AppState) {
                 });
             }
             "restore" => {
+                // Load the params sidecar before spawning the task so we can skip this
+                // backup immediately if the sidecar is missing (avoids consuming a semaphore
+                // permit and logging a spurious "started" action for a backup that cannot
+                // be resumed correctly).
+                let data_path_for_params = config.clickhouse.data_path.clone();
+                let params_path = {
+                    let bd = std::path::Path::new(&data_path_for_params)
+                        .join("backup")
+                        .join(&backup_name);
+                    crate::resume::restore_params_path(&bd)
+                };
+
+                let restore_params: crate::resume::RestoreParams =
+                    match std::fs::read_to_string(&params_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                    {
+                        Some(p) => p,
+                        None => {
+                            tracing::warn!(
+                                backup_name = %backup_name,
+                                params_file = %params_path.display(),
+                                "Auto-resume: no restore.params.json found, skipping restore auto-resume"
+                            );
+                            continue;
+                        }
+                    };
+
                 tokio::spawn(async move {
                     let (id, _token) = match state_clone
                         .try_start_op("restore", Some(backup_name.clone()))
@@ -597,22 +625,30 @@ pub async fn auto_resume(state: &AppState) {
 
                     let config = state_clone.config.load();
                     let ch = state_clone.ch.load();
+
+                    // Parse database_mapping from the persisted HashMap.
+                    let db_mapping = if restore_params.database_mapping.is_empty() {
+                        None
+                    } else {
+                        Some(restore_params.database_mapping.clone())
+                    };
+
                     let result = crate::restore::restore(
                         &config,
                         &ch,
                         &backup_name,
-                        None,  // tables
-                        false, // schema_only
-                        false, // data_only
-                        false, // rm (auto-resume never drops)
+                        restore_params.tables.as_deref(),
+                        restore_params.schema_only,
+                        restore_params.data_only,
+                        false, // rm: always false on auto-resume -- never DROP tables on restart
                         true,  // resume = true
-                        None,  // rename_as (auto-resume restores to original names)
-                        None,  // database_mapping (auto-resume restores to original names)
-                        false, // rbac (auto-resume does not include RBAC restore)
-                        false, // configs (auto-resume does not include config restore)
-                        false, // named_collections (auto-resume does not include named collections restore)
-                        None,  // partitions (auto-resume restores all partitions)
-                        false, // skip_empty_tables
+                        restore_params.rename_as.as_deref(),
+                        db_mapping.as_ref(),
+                        restore_params.rbac,
+                        restore_params.configs,
+                        restore_params.named_collections,
+                        restore_params.partitions.as_deref(),
+                        restore_params.skip_empty_tables,
                     )
                     .await;
 
@@ -1266,5 +1302,31 @@ mod tests {
 
         let ops = scan_resumable_state_files(dir.path().to_str().unwrap());
         assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_restore_params_roundtrip() {
+        use crate::resume::RestoreParams;
+
+        let params = RestoreParams {
+            backup_name: "test-backup".to_string(),
+            tables: Some("mydb.*".to_string()),
+            schema_only: false,
+            data_only: true,
+            rm: false,
+            rename_as: None,
+            database_mapping: std::collections::HashMap::new(),
+            rbac: false,
+            configs: false,
+            named_collections: false,
+            partitions: None,
+            skip_empty_tables: true,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let loaded: RestoreParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.backup_name, "test-backup");
+        assert_eq!(loaded.data_only, true);
+        assert_eq!(loaded.skip_empty_tables, true);
+        assert_eq!(loaded.tables, Some("mydb.*".to_string()));
     }
 }

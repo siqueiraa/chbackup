@@ -320,6 +320,29 @@ pub async fn restore(
         return Ok(());
     }
 
+    // When resume is requested, persist the original parameters alongside the state file
+    // so that server auto-resume can replay with the same parameters after a restart.
+    if resume && config.general.use_resumable_state {
+        let params = crate::resume::RestoreParams {
+            backup_name: backup_name.to_string(),
+            tables: table_pattern.map(str::to_string),
+            schema_only,
+            data_only,
+            rm,
+            rename_as: rename_as.map(str::to_string),
+            database_mapping: database_mapping.cloned().unwrap_or_default(),
+            rbac: rbac_restore,
+            configs: configs_restore,
+            named_collections: named_collections_restore,
+            partitions: partitions.map(str::to_string),
+            skip_empty_tables,
+        };
+        let params_path = crate::resume::restore_params_path(&backup_dir);
+        if let Err(e) = crate::resume::save_state_file(&params_path, &params) {
+            warn!(error = %e, "Failed to save restore params sidecar (non-fatal)");
+        }
+    }
+
     // 5a. Resume state: load previously attached parts from state file + system.parts
     let state_path = backup_dir.join("restore.state.json");
     let mut already_attached: HashMap<String, HashSet<String>> = HashMap::new();
@@ -835,6 +858,9 @@ pub async fn restore(
     // Delete resume state file on successful completion
     if resume {
         delete_state_file(&state_path);
+        // Also delete the params sidecar written at the start of this resume run.
+        let params_path = crate::resume::restore_params_path(&backup_dir);
+        let _ = std::fs::remove_file(&params_path); // non-fatal
     }
 
     Ok(())

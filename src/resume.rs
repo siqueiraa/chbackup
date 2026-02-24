@@ -65,6 +65,43 @@ pub struct RestoreState {
     pub params_hash: String,
 }
 
+/// Serialized original parameters for a restore operation.
+///
+/// Written to `restore.params.json` alongside `restore.state.json` when
+/// `resume=true`. Loaded by `auto_resume()` on server restart to replay
+/// the restore with its original parameters instead of hardcoded defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RestoreParams {
+    pub backup_name: String,
+    #[serde(default)]
+    pub tables: Option<String>,
+    #[serde(default)]
+    pub schema_only: bool,
+    #[serde(default)]
+    pub data_only: bool,
+    #[serde(default)]
+    pub rm: bool,
+    #[serde(default)]
+    pub rename_as: Option<String>,
+    #[serde(default)]
+    pub database_mapping: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub rbac: bool,
+    #[serde(default)]
+    pub configs: bool,
+    #[serde(default)]
+    pub named_collections: bool,
+    #[serde(default)]
+    pub partitions: Option<String>,
+    #[serde(default)]
+    pub skip_empty_tables: bool,
+}
+
+/// Path of the restore parameters sidecar file alongside the state file.
+pub fn restore_params_path(backup_dir: &std::path::Path) -> std::path::PathBuf {
+    backup_dir.join("restore.params.json")
+}
+
 /// Atomically save a state file by writing to a temporary file then renaming.
 ///
 /// The temporary file is `{path}.tmp`. On success, the temp file is renamed
