@@ -1396,8 +1396,9 @@ impl Config {
         }
 
         // Watch interval validation: full_interval must be greater than watch_interval.
-        // We parse simple duration strings (e.g. "1h", "24h", "30m") for comparison.
-        if self.watch.enabled {
+        // Always validate regardless of watch.enabled -- watch can be started via CLI
+        // --watch flag, `chbackup watch` command, or API without setting watch.enabled=true.
+        {
             let watch_secs = parse_duration_secs(&self.watch.watch_interval)
                 .context("Invalid watch.watch_interval duration")?;
             let full_secs = parse_duration_secs(&self.watch.full_interval)
@@ -1906,6 +1907,29 @@ mod tests {
             .apply_cli_env_overrides(&["CLICKHOUSE_HOST=myhost.example.com".to_string()])
             .unwrap();
         assert_eq!(config.clickhouse.host, "myhost.example.com");
+    }
+
+    #[test]
+    fn test_validate_watch_intervals_always_checked() {
+        // Even with watch.enabled=false, invalid intervals should fail validation.
+        // This tests that the watch.enabled gate has been removed.
+        let mut config = Config::default();
+        config.watch.enabled = false;
+        // Set watch_interval > full_interval (invalid: full must be greater)
+        config.watch.watch_interval = "25h".to_string();
+        config.watch.full_interval = "24h".to_string();
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "validate() should fail when full_interval <= watch_interval even with enabled=false"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("watch.full_interval"),
+            "Error should mention watch.full_interval: {}",
+            err
+        );
     }
 
     #[test]
