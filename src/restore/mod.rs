@@ -370,8 +370,8 @@ pub async fn restore(
             if state.backup_name == backup_name {
                 // Validate params hash: non-empty hash mismatch => warn and ignore state.
                 // Empty hash (old state file without field) => load for safe rollout.
-                let hash_ok = state.params_hash.is_empty()
-                    || state.params_hash == current_params_hash;
+                let hash_ok =
+                    state.params_hash.is_empty() || state.params_hash == current_params_hash;
                 if !hash_ok {
                     warn!(
                         stored_hash = %state.params_hash,

@@ -589,21 +589,22 @@ pub async fn auto_resume(state: &AppState) {
                     crate::resume::restore_params_path(&bd)
                 };
 
-                let restore_params: crate::resume::RestoreParams =
-                    match std::fs::read_to_string(&params_path)
-                        .ok()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                    {
-                        Some(p) => p,
-                        None => {
-                            tracing::warn!(
-                                backup_name = %backup_name,
-                                params_file = %params_path.display(),
-                                "Auto-resume: no restore.params.json found, skipping restore auto-resume"
-                            );
-                            continue;
-                        }
-                    };
+                let restore_params: crate::resume::RestoreParams = match std::fs::read_to_string(
+                    &params_path,
+                )
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                {
+                    Some(p) => p,
+                    None => {
+                        tracing::warn!(
+                            backup_name = %backup_name,
+                            params_file = %params_path.display(),
+                            "Auto-resume: no restore.params.json found, skipping restore auto-resume"
+                        );
+                        continue;
+                    }
+                };
 
                 tokio::spawn(async move {
                     let (id, _token) = match state_clone

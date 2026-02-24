@@ -392,6 +392,9 @@ mod tests {
     fn test_create_has_no_resume_flag() {
         // --resume is intentionally absent from create; this test catches accidental re-addition
         let result = Cli::try_parse_from(["chbackup", "create", "--resume"]);
-        assert!(result.is_err(), "create --resume should not be a valid flag");
+        assert!(
+            result.is_err(),
+            "create --resume should not be a valid flag"
+        );
     }
 }

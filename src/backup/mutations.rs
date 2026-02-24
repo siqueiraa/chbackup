@@ -31,10 +31,7 @@ pub async fn check_mutations(
     }
 
     let deadline = if mutation_wait_timeout_secs > 0 {
-        Some(
-            std::time::Instant::now()
-                + std::time::Duration::from_secs(mutation_wait_timeout_secs),
-        )
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(mutation_wait_timeout_secs))
     } else {
         None
     };
