@@ -168,14 +168,14 @@ A `Metrics` struct holds a custom (non-global) `prometheus::Registry` and 14 met
 
 **WatchStatus struct** (state.rs): Shared between the watch loop and API handlers via `Arc<Mutex<WatchStatus>>`. Fields: `active`, `state` (string), `last_full`, `last_incr`, `consecutive_errors`, `next_backup_in`.
 
-**Watch loop spawn** (mod.rs): When `--watch` flag or `config.watch.enabled` is set, `start_server()` creates shutdown/reload channels, builds a `WatchContext`, and spawns `watch::run_watch_loop()` as a tokio background task. On server shutdown (Ctrl+C), the shutdown signal is sent to the watch loop.
+**Watch loop spawn** (mod.rs): When `--watch` flag or `config.watch.enabled` is set, `start_server()` creates shutdown/reload channels, builds a `WatchContext`, and spawns `watch::run_watch_loop()` as a tokio background task. On server shutdown (Ctrl+C), the shutdown signal is sent to the watch loop. CLI flags `--watch-interval` and `--full-interval` on the `server` command override `config.watch.watch_interval` and `config.watch.full_interval` before server startup (wired in `main.rs`).
 
 **SIGHUP handler** (mod.rs): Unix-only (`#[cfg(unix)]`). Spawns a task that listens for `SIGHUP` signals and sends `true` on the `reload_tx` channel, triggering config hot-reload in the watch loop. On non-Unix platforms, use the `/api/v1/reload` API endpoint instead.
 
 **spawn_watch_from_state()** (mod.rs): Creates new channels and a `WatchContext` from the current `AppState`, spawns the watch loop. Used by the `watch_start` API endpoint to start watch dynamically.
 
 **Watch API endpoints** (routes.rs -- replaced stubs):
-- `POST /api/v1/watch/start` -- Start watch loop; returns 423 if already active
+- `POST /api/v1/watch/start` -- Start watch loop; accepts optional `WatchStartRequest` JSON body with `watch_interval` and `full_interval` overrides; validates merged config before spawning; returns 423 if already active, 400 if interval validation fails
 - `POST /api/v1/watch/stop` -- Stop watch loop via shutdown signal; returns 404 if not active
 - `GET /api/v1/watch/status` -- Returns JSON with state, last_full, last_incr, consecutive_errors, next_in
 - `POST /api/v1/reload` -- Reloads config and creates new clients via `reload_config_and_clients()` helper; also sends reload signal to watch loop if active
@@ -203,6 +203,13 @@ NOT wired into the watch loop (it has its own retention logic) or auto-resume up
 
 ### Sync Function Handling
 Sync functions from `list` module (`delete_local`, `clean_broken_local`) are called via `tokio::task::spawn_blocking` to avoid blocking the async runtime.
+
+### WatchStartRequest (routes.rs)
+`WatchStartRequest` is an optional JSON body for `POST /api/v1/watch/start`. Derives `Debug`, `Deserialize`, `Default`. Fields:
+- `watch_interval: Option<String>` -- Override watch interval (e.g. "2h", "30m")
+- `full_interval: Option<String>` -- Override full backup interval (e.g. "48h")
+
+When either field is `Some`, the handler clones the current config, applies the overrides, validates via `Config::validate()` (returns 400 on failure), and atomically swaps the config via `ArcSwap::store()` before spawning the watch loop. When the body is absent or empty (`{}`), the handler starts watch with the current config unchanged (backward compatible).
 
 ### RBAC/Config/Named Collections Request Fields (Phase 4e)
 All four operation request types (`CreateRequest`, `RestoreRequest`, `CreateRemoteRequest`, `RestoreRemoteRequest`) include three optional boolean fields added in Phase 4e:

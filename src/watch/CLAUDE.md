@@ -23,10 +23,20 @@ Resolves backup name templates with macro substitution. Supported placeholders:
 
 Unrecognized `{...}` patterns are left as-is (not removed). Uses a char-by-char parser, not regex.
 
+### Backup Type Classification (classify_backup_type)
+Determines whether a backup name represents a "full" or "incr" backup by analyzing where `{type}` appears in the name template. Instead of fragile `name.contains("full")` substring matching (which breaks when shard names or other template segments contain "full" or "incr"), this function:
+1. Locates `{type}` in the template string
+2. Identifies static delimiter characters immediately before and after `{type}`
+3. Uses `count_static_chars()` to compute a minimum search offset (accounting for variable-length macro expansions like `{shard}`)
+4. Extracts the corresponding token from the backup name using the delimiters
+5. Returns `Some("full")`, `Some("incr")`, or `None` (if no `{type}` placeholder, name does not match template structure, or extracted token is neither "full" nor "incr")
+
+Used by `resume_state()` to classify backups as full or incremental.
+
 ### Resume State (resume_state)
 Determines what the watch loop should do next by examining remote backups:
 1. Filters backups by template prefix (`resolve_template_prefix`) and excludes broken ones
-2. Finds most recent full and incremental backups by name substring ("full" / "incr")
+2. Finds most recent full and incremental backups using `classify_backup_type()` (template-aware classification, not substring matching)
 3. Compares elapsed time against `watch_interval` and `full_interval`
 4. Returns a `ResumeDecision`:
    - `FullNow` -- no matching backups, or full interval has elapsed
@@ -80,6 +90,7 @@ Every state flag has explicit set/clear paths:
 
 - `resolve_name_template(template, backup_type, now, macros) -> String` -- Substitute template placeholders
 - `resolve_template_prefix(name_template) -> String` -- Extract static prefix before first `{`
+- `classify_backup_type(template, name) -> Option<&'static str>` -- Classify backup name as "full"/"incr" based on template structure (returns None if unclassifiable)
 - `resume_state(backups, name_template, watch_interval, full_interval, now) -> ResumeDecision` -- Determine next action
 - `run_watch_loop(ctx: WatchContext) -> WatchLoopExit` -- Main state machine loop (async)
 
