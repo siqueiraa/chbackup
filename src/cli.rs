@@ -86,10 +86,6 @@ pub enum Command {
         #[arg(long = "skip-check-parts-columns")]
         skip_check_parts_columns: bool,
 
-        /// Resume interrupted operation from state file
-        #[arg(long)]
-        resume: bool,
-
         /// Optional backup name (auto-generated if omitted)
         backup_name: Option<String>,
     },
@@ -390,5 +386,12 @@ mod tests {
     fn test_restore_data_only_alone_ok() {
         let result = Cli::try_parse_from(["chbackup", "restore", "--data-only", "test-backup"]);
         assert!(result.is_ok(), "Expected --data-only alone to be accepted");
+    }
+
+    #[test]
+    fn test_create_has_no_resume_flag() {
+        // --resume is intentionally absent from create; this test catches accidental re-addition
+        let result = Cli::try_parse_from(["chbackup", "create", "--resume"]);
+        assert!(result.is_err(), "create --resume should not be a valid flag");
     }
 }

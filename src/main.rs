@@ -147,20 +147,11 @@ async fn run() -> Result<()> {
             configs,
             named_collections,
             skip_check_parts_columns,
-            resume,
             backup_name,
         } => {
             let name = resolve_backup_name(backup_name)?;
             let _lock = acquire_backup_lock("create", &name)?;
             let ch = ChClient::new(&config.clickhouse)?;
-
-            // Design doc: create --resume is planned but explicitly deferred. The create
-            // command operates on local filesystem only (FREEZE + hardlink) with no remote
-            // state to resume from. Resume is meaningful for upload/download/restore which
-            // interact with S3 and can be interrupted mid-transfer.
-            if resume {
-                info!("--resume flag has no effect on the create command");
-            }
 
             // Merge CLI --skip-projections with config.backup.skip_projections
             let effective_skip_projections = merge_skip_projections(

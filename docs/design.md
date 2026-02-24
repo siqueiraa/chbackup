@@ -876,7 +876,7 @@ S3 test isolation: each CI run uses `S3_PATH: chbackup-test/{ch_version}/{run_id
 ```
 chbackup create          [-t db.table] [--partitions=X] [--diff-from=NAME] [--skip-projections=PATTERN]
                          [--schema] [--rbac] [--configs] [--named-collections]
-                         [--skip-check-parts-columns] [--resume] [backup_name]
+                         [--skip-check-parts-columns] [backup_name]
 chbackup upload          [--delete-local] [--diff-from-remote=NAME] [--resume] [backup_name]
 chbackup download        [--hardlink-exists-files] [--resume] [backup_name]
 chbackup restore         [-t db.table] [--as=dst_db.dst_table] [-m originDB:targetDB]
@@ -916,7 +916,7 @@ chbackup server          [--watch] (API mode for Kubernetes, optionally with wat
 | `--schema` | create, restore | Schema only (no data) |
 | `--data-only` | restore | Data only (no schema) |
 | `--rm, --drop` | restore, restore_remote | DROP existing tables before restore (Mode A) |
-| `--resume` | upload, download, restore | Resume interrupted operation from state file (create: deferred -- local-only operation, no remote state to resume from) |
+| `--resume` | upload, download, restore | Resume interrupted operation from state file |
 | `--delete-local` | upload | Delete local backup after successful upload |
 | `--hardlink-exists-files` | download | Deduplicate local parts via hardlinks |
 | `--skip-projections` | create, create_remote | Glob patterns for projections to skip |
