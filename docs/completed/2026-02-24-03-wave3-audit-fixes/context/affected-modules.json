@@ -1,0 +1,49 @@
+{
+  "git_base": "HEAD",
+  "modules": [
+    {
+      "path": "src/restore",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "none",
+      "files_modified": ["src/restore/remap.rs"],
+      "reason": "W3-1: Fix && to || in rewrite_distributed_engine, add test"
+    },
+    {
+      "path": "src/watch",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["src/watch/mod.rs"],
+      "reason": "W3-2: Add classify_backup_type helper, replace fragile heuristic"
+    },
+    {
+      "path": "src/server",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["src/server/routes.rs"],
+      "reason": "W3-3: Add WatchStartRequest type, modify watch_start handler"
+    }
+  ],
+  "standalone_files": [
+    {
+      "path": "src/config.rs",
+      "reason": "W3-4: Remove watch.enabled gate from validate()"
+    },
+    {
+      "path": "src/cli.rs",
+      "reason": "W3-5: Add --watch-interval/--full-interval to Server variant"
+    },
+    {
+      "path": "src/main.rs",
+      "reason": "W3-5: Wire Server watch_interval/full_interval into config before start_server"
+    }
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": ["src/watch", "src/server"],
+    "no_change": ["src/restore"],
+    "total_affected": 6
+  }
+}
