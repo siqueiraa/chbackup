@@ -345,6 +345,14 @@ pub enum Command {
         /// Enable watch loop alongside API server
         #[arg(long)]
         watch: bool,
+
+        /// Override watch interval (e.g. 1h, 30m)
+        #[arg(long = "watch-interval")]
+        watch_interval: Option<String>,
+
+        /// Override full backup interval (e.g. 24h)
+        #[arg(long = "full-interval")]
+        full_interval: Option<String>,
     },
 }
 
@@ -396,5 +404,51 @@ mod tests {
             result.is_err(),
             "create --resume should not be a valid flag"
         );
+    }
+
+    #[test]
+    fn test_server_cli_watch_interval_flags() {
+        let cli = Cli::try_parse_from([
+            "chbackup",
+            "server",
+            "--watch",
+            "--watch-interval",
+            "2h",
+            "--full-interval",
+            "48h",
+        ])
+        .expect("Should parse server command with watch interval flags");
+
+        match cli.command {
+            Command::Server {
+                watch,
+                watch_interval,
+                full_interval,
+            } => {
+                assert!(watch, "watch flag should be true");
+                assert_eq!(watch_interval.as_deref(), Some("2h"));
+                assert_eq!(full_interval.as_deref(), Some("48h"));
+            }
+            _ => panic!("Expected Command::Server"),
+        }
+    }
+
+    #[test]
+    fn test_server_cli_no_watch_flags() {
+        let cli = Cli::try_parse_from(["chbackup", "server", "--watch"])
+            .expect("Should parse server command with just --watch");
+
+        match cli.command {
+            Command::Server {
+                watch,
+                watch_interval,
+                full_interval,
+            } => {
+                assert!(watch, "watch flag should be true");
+                assert!(watch_interval.is_none());
+                assert!(full_interval.is_none());
+            }
+            _ => panic!("Expected Command::Server"),
+        }
     }
 }

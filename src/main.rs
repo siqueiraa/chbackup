@@ -649,7 +649,18 @@ async fn run() -> Result<()> {
             }
         }
 
-        Command::Server { watch } => {
+        Command::Server {
+            watch,
+            watch_interval,
+            full_interval,
+        } => {
+            let mut config = config;
+            if let Some(v) = watch_interval {
+                config.watch.watch_interval = v;
+            }
+            if let Some(v) = full_interval {
+                config.watch.full_interval = v;
+            }
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
             let config_path = PathBuf::from(&cli.config);
