@@ -42,7 +42,7 @@ use crate::concurrency::{
 use crate::config::Config;
 use crate::manifest::BackupManifest;
 use crate::object_disk::is_s3_disk;
-use crate::resume::{delete_state_file, load_state_file, RestoreState};
+use crate::resume::{compute_params_hash, delete_state_file, load_state_file, RestoreState};
 use crate::storage::S3Client;
 use crate::table_filter::TableFilter;
 
@@ -324,18 +324,47 @@ pub async fn restore(
     let state_path = backup_dir.join("restore.state.json");
     let mut already_attached: HashMap<String, HashSet<String>> = HashMap::new();
 
+    // Compute params hash from the subset of parameters that affect which parts to attach.
+    let current_params_hash = {
+        let db_mapping_sorted = database_mapping.map(|m| {
+            let mut pairs: Vec<String> = m.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            pairs.sort();
+            pairs.join(",")
+        });
+        compute_params_hash(&[
+            backup_name,
+            table_pattern.unwrap_or(""),
+            if schema_only { "schema" } else { "" },
+            if data_only { "data" } else { "" },
+            rename_as.unwrap_or(""),
+            db_mapping_sorted.as_deref().unwrap_or(""),
+        ])
+    };
+
     if resume {
         // Load state file (may not exist on first run)
         if let Ok(Some(state)) = load_state_file::<RestoreState>(&state_path) {
             if state.backup_name == backup_name {
-                let total_parts: usize = state.attached_parts.values().map(|v| v.len()).sum();
-                info!(
-                    tables = state.attached_parts.len(),
-                    parts = total_parts,
-                    "Loaded restore resume state"
-                );
-                for (table_key, parts) in state.attached_parts {
-                    already_attached.entry(table_key).or_default().extend(parts);
+                // Validate params hash: non-empty hash mismatch => warn and ignore state.
+                // Empty hash (old state file without field) => load for safe rollout.
+                let hash_ok = state.params_hash.is_empty()
+                    || state.params_hash == current_params_hash;
+                if !hash_ok {
+                    warn!(
+                        stored_hash = %state.params_hash,
+                        current_hash = %current_params_hash,
+                        "Ignoring stale restore state (parameters changed since last run)"
+                    );
+                } else {
+                    let total_parts: usize = state.attached_parts.values().map(|v| v.len()).sum();
+                    info!(
+                        tables = state.attached_parts.len(),
+                        parts = total_parts,
+                        "Loaded restore resume state"
+                    );
+                    for (table_key, parts) in state.attached_parts {
+                        already_attached.entry(table_key).or_default().extend(parts);
+                    }
                 }
             } else {
                 warn!(
@@ -451,6 +480,7 @@ pub async fn restore(
                 .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
                 .collect(),
             backup_name: backup_name.to_string(),
+            params_hash: current_params_hash.clone(),
         };
         Some(Arc::new(tokio::sync::Mutex::new((
             initial_state,
@@ -1141,6 +1171,7 @@ mod tests {
                 ),
             ]),
             backup_name: "daily-2024-01-15".to_string(),
+            params_hash: String::new(),
         };
 
         save_state_file(&state_path, &state).unwrap();
@@ -1194,6 +1225,7 @@ mod tests {
                 vec!["202401_1_50_3".to_string()],
             )]),
             backup_name: "old-backup-name".to_string(),
+            params_hash: String::new(),
         };
 
         save_state_file(&state_path, &state).unwrap();
@@ -1217,6 +1249,7 @@ mod tests {
         let state = RestoreState {
             attached_parts: HashMap::new(),
             backup_name: "test".to_string(),
+            params_hash: String::new(),
         };
 
         save_state_file(&state_path, &state).unwrap();

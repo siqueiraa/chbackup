@@ -58,6 +58,11 @@ pub struct RestoreState {
     pub attached_parts: HashMap<String, Vec<String>>,
     /// Backup name this state belongs to.
     pub backup_name: String,
+    /// Hash of operation parameters for invalidation.
+    /// Old state files without this field default to "" (empty = always-mismatch sentinel
+    /// that triggers a warning but does NOT discard state, for safe rollout).
+    #[serde(default)]
+    pub params_hash: String,
 }
 
 /// Atomically save a state file by writing to a temporary file then renaming.
@@ -206,6 +211,7 @@ mod tests {
         let state = RestoreState {
             attached_parts,
             backup_name: "daily-2024-01-15".to_string(),
+            params_hash: compute_params_hash(&["daily-2024-01-15", "*.*", "", "", "", ""]),
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -216,6 +222,7 @@ mod tests {
 
         assert_eq!(loaded.attached_parts, state.attached_parts);
         assert_eq!(loaded.backup_name, state.backup_name);
+        assert_eq!(loaded.params_hash, state.params_hash);
     }
 
     #[test]
@@ -320,5 +327,23 @@ mod tests {
 
         assert!(path.exists());
         assert!(!tmp_path.exists(), ".tmp file should be renamed away");
+    }
+
+    #[test]
+    fn test_restore_state_has_params_hash() {
+        let state = RestoreState {
+            attached_parts: Default::default(),
+            backup_name: "test".to_string(),
+            params_hash: compute_params_hash(&["test", "", "false", "false", "", ""]),
+        };
+        assert!(!state.params_hash.is_empty());
+    }
+
+    #[test]
+    fn test_restore_state_old_format_deserializes_with_default_hash() {
+        // Old state files without params_hash should deserialize to empty string (serde default)
+        let json = r#"{"attached_parts":{},"backup_name":"my-backup"}"#;
+        let state: RestoreState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.params_hash, "");
     }
 }

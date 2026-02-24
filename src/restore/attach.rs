@@ -1096,6 +1096,7 @@ mod tests {
         let state = RestoreState {
             attached_parts: HashMap::new(),
             backup_name: "test-backup".to_string(),
+            params_hash: String::new(),
         };
         let state_path = PathBuf::from("/tmp/test.state.json");
         let shared = Arc::new(tokio::sync::Mutex::new((state, state_path)));
