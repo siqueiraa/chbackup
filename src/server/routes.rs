@@ -1600,7 +1600,10 @@ pub async fn tables(
 /// the handles in AppState.
 pub async fn watch_start(
     State(mut state): State<AppState>,
+    body: Option<Json<WatchStartRequest>>,
 ) -> Result<Json<WatchActionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+
     // Check if watch is already active
     {
         let ws = state.watch_status.lock().await;
@@ -1612,6 +1615,27 @@ pub async fn watch_start(
                 }),
             ));
         }
+    }
+
+    // Apply optional interval overrides
+    if req.watch_interval.is_some() || req.full_interval.is_some() {
+        let mut config = (*state.config.load_full()).clone();
+        if let Some(v) = req.watch_interval {
+            config.watch.watch_interval = v;
+        }
+        if let Some(v) = req.full_interval {
+            config.watch.full_interval = v;
+        }
+        // Validate merged config before spawning
+        config.validate().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid config: {}", e),
+                }),
+            )
+        })?;
+        state.config.store(Arc::new(config));
     }
 
     // Query macros from ClickHouse for template resolution
@@ -1672,6 +1696,13 @@ pub async fn watch_status(State(state): State<AppState>) -> Json<WatchStatusResp
         consecutive_errors: ws.consecutive_errors,
         next_in,
     })
+}
+
+/// Optional request body for POST /api/v1/watch/start
+#[derive(Debug, Deserialize, Default)]
+pub struct WatchStartRequest {
+    pub watch_interval: Option<String>,
+    pub full_interval: Option<String>,
 }
 
 /// Response for POST /api/v1/watch/start and POST /api/v1/watch/stop
@@ -2179,6 +2210,37 @@ mod tests {
 
         let json = serde_json::to_string(&response).expect("WatchActionResponse should serialize");
         assert!(json.contains("\"status\":\"started\""));
+    }
+
+    #[test]
+    fn test_watch_start_request_deserialization() {
+        // With both fields
+        let json = r#"{"watch_interval": "2h", "full_interval": "48h"}"#;
+        let req: WatchStartRequest =
+            serde_json::from_str(json).expect("Should parse WatchStartRequest");
+        assert_eq!(req.watch_interval.as_deref(), Some("2h"));
+        assert_eq!(req.full_interval.as_deref(), Some("48h"));
+
+        // With only watch_interval
+        let json_partial = r#"{"watch_interval": "30m"}"#;
+        let req_partial: WatchStartRequest =
+            serde_json::from_str(json_partial).expect("Should parse partial WatchStartRequest");
+        assert_eq!(req_partial.watch_interval.as_deref(), Some("30m"));
+        assert!(req_partial.full_interval.is_none());
+
+        // Empty body (all defaults)
+        let json_empty = r#"{}"#;
+        let req_empty: WatchStartRequest =
+            serde_json::from_str(json_empty).expect("Should parse empty WatchStartRequest");
+        assert!(req_empty.watch_interval.is_none());
+        assert!(req_empty.full_interval.is_none());
+    }
+
+    #[test]
+    fn test_watch_start_request_default() {
+        let req = WatchStartRequest::default();
+        assert!(req.watch_interval.is_none());
+        assert!(req.full_interval.is_none());
     }
 
     #[test]
