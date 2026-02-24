@@ -235,12 +235,12 @@ pub fn resume_state(
     matching.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
     // Find most recent full and incremental using template-aware classification
-    let last_full = matching.iter().find(|b| {
-        classify_backup_type(name_template, &b.name) == Some("full")
-    });
-    let last_incr = matching.iter().find(|b| {
-        classify_backup_type(name_template, &b.name) == Some("incr")
-    });
+    let last_full = matching
+        .iter()
+        .find(|b| classify_backup_type(name_template, &b.name) == Some("full"));
+    let last_incr = matching
+        .iter()
+        .find(|b| classify_backup_type(name_template, &b.name) == Some("incr"));
 
     // The most recent backup overall (for diff_from in incremental)
     let most_recent = matching[0];
