@@ -561,7 +561,10 @@ pub async fn create(
                 engine: table_row_clone.engine.clone(),
                 total_bytes,
                 parts: parts_by_disk,
-                pending_mutations: all_mutations_clone,
+                pending_mutations: all_mutations_clone
+                    .get(&full_name)
+                    .cloned()
+                    .unwrap_or_default(),
                 metadata_only: false,
                 dependencies: deps_clone.get(&full_name).cloned().unwrap_or_default(),
             };
