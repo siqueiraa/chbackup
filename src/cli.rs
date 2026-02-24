@@ -145,7 +145,7 @@ pub enum Command {
         partitions: Option<String>,
 
         /// Schema only (no data)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "data_only")]
         schema: bool,
 
         /// Data only (no schema)
@@ -350,4 +350,45 @@ pub enum Command {
         #[arg(long)]
         watch: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn test_restore_schema_and_data_only_conflict() {
+        // Passing both --schema and --data-only should be rejected by clap
+        let result = Cli::try_parse_from([
+            "chbackup",
+            "restore",
+            "--schema",
+            "--data-only",
+            "test-backup",
+        ]);
+        assert!(
+            result.is_err(),
+            "Expected error when both --schema and --data-only are passed"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be used with") || err.contains("conflict"),
+            "Error should mention conflict: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_restore_schema_alone_ok() {
+        let result = Cli::try_parse_from(["chbackup", "restore", "--schema", "test-backup"]);
+        assert!(result.is_ok(), "Expected --schema alone to be accepted");
+    }
+
+    #[test]
+    fn test_restore_data_only_alone_ok() {
+        let result = Cli::try_parse_from(["chbackup", "restore", "--data-only", "test-backup"]);
+        assert!(result.is_ok(), "Expected --data-only alone to be accepted");
+    }
 }

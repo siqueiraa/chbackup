@@ -916,7 +916,7 @@ chbackup server          [--watch] (API mode for Kubernetes, optionally with wat
 | `--schema` | create, restore | Schema only (no data) |
 | `--data-only` | restore | Data only (no schema) |
 | `--rm, --drop` | restore, restore_remote | DROP existing tables before restore (Mode A) |
-| `--resume` | create, upload, download, restore | Resume interrupted operation from state file |
+| `--resume` | upload, download, restore | Resume interrupted operation from state file (create: deferred -- local-only operation, no remote state to resume from) |
 | `--delete-local` | upload | Delete local backup after successful upload |
 | `--hardlink-exists-files` | download | Deduplicate local parts via hardlinks |
 | `--skip-projections` | create, create_remote | Glob patterns for projections to skip |

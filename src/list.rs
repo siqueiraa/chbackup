@@ -310,16 +310,16 @@ fn format_delimited(summaries: &[BackupSummary], delimiter: char) -> String {
 /// by [`list_local`] and [`list_remote`]). Only non-broken backups are considered
 /// for shortcut resolution.
 pub fn resolve_backup_shortcut(name: &str, backups: &[BackupSummary]) -> Result<String> {
+    let mut valid: Vec<&BackupSummary> = backups.iter().filter(|b| !b.is_broken).collect();
+    // Sort by timestamp ascending; None timestamps sort first (before all Some values).
+    valid.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
     match name {
-        "latest" => {
-            let valid: Vec<&BackupSummary> = backups.iter().filter(|b| !b.is_broken).collect();
-            valid
-                .last()
-                .map(|b| b.name.clone())
-                .ok_or_else(|| anyhow::anyhow!("No backups found to resolve 'latest'"))
-        }
+        "latest" => valid
+            .last()
+            .map(|b| b.name.clone())
+            .ok_or_else(|| anyhow::anyhow!("No backups found to resolve 'latest'")),
         "previous" => {
-            let valid: Vec<&BackupSummary> = backups.iter().filter(|b| !b.is_broken).collect();
             if valid.len() < 2 {
                 anyhow::bail!(
                     "Not enough backups for 'previous' (found {} valid backups)",
@@ -2808,6 +2808,118 @@ mod tests {
         // previous should skip broken and return backup-a
         let resolved = resolve_backup_shortcut("previous", &backups).unwrap();
         assert_eq!(resolved, "backup-a");
+    }
+
+    #[test]
+    fn test_resolve_backup_shortcut_sorts_by_timestamp() {
+        use chrono::TimeZone;
+
+        // Names in alphabetical order but timestamps in reverse order.
+        // alpha has the newest timestamp, beta the oldest, gamma in the middle.
+        let backups = vec![
+            BackupSummary {
+                name: "alpha".to_string(),
+                timestamp: Some(chrono::Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap()),
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "beta".to_string(),
+                timestamp: Some(chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "gamma".to_string(),
+                timestamp: Some(chrono::Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap()),
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+        ];
+
+        // "latest" should resolve to "alpha" (most recent timestamp: 2024-03-01),
+        // NOT "gamma" (last by name).
+        let resolved = resolve_backup_shortcut("latest", &backups).unwrap();
+        assert_eq!(
+            resolved, "alpha",
+            "latest should resolve to backup with newest timestamp"
+        );
+
+        // "previous" should resolve to "gamma" (second-most-recent: 2024-02-01)
+        let resolved = resolve_backup_shortcut("previous", &backups).unwrap();
+        assert_eq!(
+            resolved, "gamma",
+            "previous should resolve to backup with second-newest timestamp"
+        );
+    }
+
+    #[test]
+    fn test_resolve_backup_shortcut_none_timestamps_sort_first() {
+        use chrono::TimeZone;
+
+        // Backups with None timestamp should sort before those with Some timestamp.
+        let backups = vec![
+            BackupSummary {
+                name: "no-ts".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "has-ts".to_string(),
+                timestamp: Some(chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+        ];
+
+        // "latest" should resolve to "has-ts" (Some > None in sort order)
+        let resolved = resolve_backup_shortcut("latest", &backups).unwrap();
+        assert_eq!(resolved, "has-ts");
+
+        // "previous" should resolve to "no-ts" (None sorts first)
+        let resolved = resolve_backup_shortcut("previous", &backups).unwrap();
+        assert_eq!(resolved, "no-ts");
     }
 
     #[test]
