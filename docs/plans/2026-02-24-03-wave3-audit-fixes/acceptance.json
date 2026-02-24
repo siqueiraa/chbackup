@@ -1,0 +1,281 @@
+{
+  "plan": "2026-02-24-03-wave3-audit-fixes",
+  "status": {
+    "pass": 5,
+    "fail": 1,
+    "total": 6
+  },
+  "last_updated": "2026-02-24T17:30:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "bugfix",
+      "description": "W3-1: Fix Distributed remap guard clause from && to || so partial matches are not rewritten",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'db_val != src_db || table_val != src_table' src/restore/remap.rs | head -1",
+            "expected_pattern": "647.*db_val != src_db \\|\\| table_val != src_table",
+            "fail_message": "Guard clause at line 647 not changed from && to ||"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after remap fix"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_rewrite_ddl_distributed_partial_match -- --quiet 2>&1 | tail -1",
+            "expected_pattern": "ok",
+            "fail_message": "Partial-match regression tests failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Pure function fix verified by unit tests -- no runtime binary execution needed",
+            "covered_by": [
+              "F001"
+            ],
+            "alternative_verification": {
+              "command": "cargo test test_rewrite_ddl_distributed_partial_match_db test_rewrite_ddl_distributed_partial_match_table -- --quiet 2>&1 | tail -1",
+              "expected": "ok"
+            }
+          }
+        ]
+      },
+      "related_tasks": [
+        1
+      ],
+      "verified_at": "2026-02-24T17:45:00Z"
+    },
+    {
+      "id": "F002",
+      "category": "bugfix",
+      "description": "W3-2: Replace fragile name.contains() backup type classification with template-aware classify_backup_type()",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub fn classify_backup_type' src/watch/mod.rs | head -1",
+            "expected_pattern": "pub fn classify_backup_type",
+            "fail_message": "classify_backup_type function not found in watch/mod.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after classify_backup_type addition"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_classify_backup_type -- --quiet 2>&1 | tail -1",
+            "expected_pattern": "ok",
+            "fail_message": "classify_backup_type unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Pure function verified by unit tests -- no runtime binary execution needed",
+            "covered_by": [
+              "F002"
+            ],
+            "alternative_verification": {
+              "command": "cargo test test_classify_backup_type test_resume_ -- --quiet 2>&1 | tail -1",
+              "expected": "ok"
+            }
+          }
+        ]
+      },
+      "related_tasks": [
+        2
+      ],
+      "verified_at": "2026-02-24T17:45:00Z"
+    },
+    {
+      "id": "F003",
+      "category": "bugfix",
+      "description": "W3-4: Remove watch.enabled gate so interval validation always runs in Config::validate()",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'if self.watch.enabled' src/config.rs",
+            "expected": "0",
+            "fail_message": "watch.enabled gate still present in config.rs validate()"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after validation gate removal"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_validate_watch_intervals_always_checked -- --quiet 2>&1 | tail -1",
+            "expected_pattern": "ok",
+            "fail_message": "Validation gate test failed -- intervals not validated when watch.enabled=false"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Config validation is compile-time/startup behavior verified by unit test",
+            "covered_by": [
+              "F003"
+            ],
+            "alternative_verification": {
+              "command": "cargo test test_validate_watch_intervals_always_checked -- --quiet 2>&1 | tail -1",
+              "expected": "ok"
+            }
+          }
+        ]
+      },
+      "related_tasks": [
+        3
+      ],
+      "verified_at": "2026-02-24T17:45:00Z"
+    },
+    {
+      "id": "F004",
+      "category": "feature",
+      "description": "W3-3: watch_start handler accepts optional JSON body with watch_interval/full_interval, validates merged config before spawn",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -n 'pub struct WatchStartRequest' src/server/routes.rs | head -1",
+            "expected_pattern": "pub struct WatchStartRequest",
+            "fail_message": "WatchStartRequest struct not found in routes.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after watch_start body addition"
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -n 'Option<Json<WatchStartRequest>>' src/server/routes.rs | head -1",
+            "expected_pattern": "Option<Json<WatchStartRequest>>",
+            "fail_message": "watch_start handler does not accept optional WatchStartRequest body"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "API handler change requires running server with ClickHouse + S3; structural + compilation verification sufficient for handler signature change",
+            "covered_by": [
+              "F004"
+            ],
+            "alternative_verification": {
+              "command": "grep -c 'config.validate()' src/server/routes.rs",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [
+        4
+      ],
+      "verified_at": "2026-02-24T18:00:00Z"
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "W3-5: Server CLI variant has --watch-interval and --full-interval flags, wired into config in main.rs",
+      "status": "pass",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -A10 'Server {' src/cli.rs | grep -c 'watch_interval\\|full_interval'",
+            "expected": "2",
+            "fail_message": "Server CLI variant missing watch_interval or full_interval fields"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after Server CLI flag addition"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test test_server_cli_watch_interval_flags -- --quiet 2>&1 | tail -1",
+            "expected_pattern": "ok",
+            "fail_message": "Server CLI flag parsing test failed"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "CLI flag parsing is compile-time/startup behavior verified by unit test",
+            "covered_by": [
+              "F005"
+            ],
+            "alternative_verification": {
+              "command": "cargo test test_server_cli_watch_interval_flags -- --quiet 2>&1 | tail -1",
+              "expected": "ok"
+            }
+          }
+        ]
+      },
+      "related_tasks": [
+        5
+      ],
+      "verified_at": "2026-02-24T18:00:00Z"
+    },
+    {
+      "id": "FDOC",
+      "category": "documentation",
+      "description": "CLAUDE.md updated for watch/ and server/ modules with new public API and handler changes",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "test -f src/watch/CLAUDE.md && test -f src/server/CLAUDE.md && echo PASS || echo FAIL",
+            "expected": "PASS",
+            "fail_message": "One or more CLAUDE.md files missing"
+          },
+          {
+            "name": "compilation",
+            "command": "echo N/A",
+            "expected": "N/A",
+            "fail_message": ""
+          },
+          {
+            "name": "behavioral",
+            "command": "grep -q 'classify_backup_type' src/watch/CLAUDE.md && grep -q 'WatchStartRequest' src/server/CLAUDE.md && echo VALID || echo INVALID",
+            "expected": "VALID",
+            "fail_message": "CLAUDE.md files missing documentation for new public API items"
+          },
+          {
+            "name": "runtime",
+            "not_applicable": true,
+            "justification": "Documentation file -- no runtime behavior",
+            "covered_by": [
+              "FDOC"
+            ],
+            "alternative_verification": {
+              "command": "grep -c 'classify_backup_type' src/watch/CLAUDE.md",
+              "expected": "1"
+            }
+          }
+        ]
+      },
+      "related_tasks": [
+        6
+      ],
+      "verified_at": null
+    }
+  ]
+}
