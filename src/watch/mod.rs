@@ -83,6 +83,99 @@ pub fn resolve_name_template(
 }
 
 // ---------------------------------------------------------------------------
+// Backup type classification
+// ---------------------------------------------------------------------------
+
+/// Classify a backup name as "full" or "incr" based on the template structure.
+///
+/// Finds where `{type}` appears in the template, extracts the corresponding
+/// substring from `name`, and checks if it matches "full" or "incr".
+/// Returns `None` if:
+/// - Template has no `{type}` placeholder
+/// - Name doesn't match the template structure around `{type}`
+/// - Extracted token is neither "full" nor "incr"
+pub fn classify_backup_type(template: &str, name: &str) -> Option<&'static str> {
+    let type_marker = "{type}";
+    let type_pos = template.find(type_marker)?;
+
+    // Extract prefix before {type} and suffix after {type}
+    let prefix = &template[..type_pos];
+    let after_type = &template[type_pos + type_marker.len()..];
+
+    // The delimiter after {type} is the first static character after {type}.
+    // If the next char is '{', it's another macro -- no static delimiter available.
+    let end_delim: Option<char> = after_type.chars().next().filter(|c| *c != '{');
+
+    // The delimiter before {type} is the last character of prefix (if static).
+    // If the preceding char is '}', it's the end of another macro -- no static delimiter.
+    let start_delim: Option<char> = prefix.chars().last().filter(|c| *c != '}');
+
+    // Count the number of static characters before {type} in the template prefix.
+    // This gives us a minimum offset to start searching for the delimiter in the name.
+    // Static chars are those outside of {...} blocks.
+    let static_char_count_before = count_static_chars(prefix);
+
+    // Extract token from name using delimiters and the static prefix hint.
+    let token_start = match start_delim {
+        Some(d) => {
+            // Search for the delimiter in the name starting from after the known
+            // static prefix length. We scan forward from the minimum possible position
+            // to find the first occurrence of the delimiter that could precede {type}.
+            // The minimum position is (static_char_count_before - 1) since that's
+            // where the delimiter char itself would be at minimum, but macros expand
+            // to variable length. We use the static count as a lower bound and
+            // search forward from there.
+            let search_start = if static_char_count_before > 0 {
+                static_char_count_before - 1
+            } else {
+                0
+            };
+            // Find the delimiter at or after search_start
+            name[search_start..]
+                .find(d)
+                .map(|p| search_start + p + d.len_utf8())?
+        }
+        None => 0, // {type} is at the start of template
+    };
+
+    let token_end = match end_delim {
+        Some(d) => name[token_start..]
+            .find(d)
+            .map(|p| token_start + p)
+            .unwrap_or(name.len()),
+        None => name.len(), // {type} is at the end of template
+    };
+
+    if token_start > name.len() || token_end > name.len() || token_start > token_end {
+        return None;
+    }
+
+    let token = &name[token_start..token_end];
+    match token {
+        "full" => Some("full"),
+        "incr" => Some("incr"),
+        _ => None,
+    }
+}
+
+/// Count the number of static (non-macro) characters in a template fragment.
+///
+/// Characters inside `{...}` blocks are not counted. Characters outside are counted.
+fn count_static_chars(s: &str) -> usize {
+    let mut count = 0;
+    let mut in_macro = false;
+    for ch in s.chars() {
+        match ch {
+            '{' => in_macro = true,
+            '}' => in_macro = false,
+            _ if !in_macro => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
+// ---------------------------------------------------------------------------
 // Resume state
 // ---------------------------------------------------------------------------
 
@@ -141,9 +234,13 @@ pub fn resume_state(
     // Sort by timestamp descending (most recent first)
     matching.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-    // Find most recent full and incremental
-    let last_full = matching.iter().find(|b| b.name.contains("full"));
-    let last_incr = matching.iter().find(|b| b.name.contains("incr"));
+    // Find most recent full and incremental using template-aware classification
+    let last_full = matching.iter().find(|b| {
+        classify_backup_type(name_template, &b.name) == Some("full")
+    });
+    let last_incr = matching.iter().find(|b| {
+        classify_backup_type(name_template, &b.name) == Some("incr")
+    });
 
     // The most recent backup overall (for diff_from in incremental)
     let most_recent = matching[0];
@@ -735,6 +832,63 @@ mod tests {
 
         let result = resolve_name_template("prefix-{unknown}-suffix", "full", now, &macros);
         assert_eq!(result, "prefix-{unknown}-suffix");
+    }
+
+    // -- classify_backup_type tests --
+
+    #[test]
+    fn test_classify_backup_type_default_template() {
+        let template = "shard{shard}-{type}-{time:%Y%m%d_%H%M%S}";
+        assert_eq!(
+            classify_backup_type(template, "shard01-full-20250315_120000"),
+            Some("full")
+        );
+        assert_eq!(
+            classify_backup_type(template, "shard01-incr-20250315_130000"),
+            Some("incr")
+        );
+    }
+
+    #[test]
+    fn test_classify_backup_type_prefix_only() {
+        let template = "{type}-backup-{time:%Y%m%d}";
+        assert_eq!(
+            classify_backup_type(template, "full-backup-20250315"),
+            Some("full")
+        );
+        assert_eq!(
+            classify_backup_type(template, "incr-backup-20250315"),
+            Some("incr")
+        );
+    }
+
+    #[test]
+    fn test_classify_backup_type_no_type_placeholder() {
+        let template = "daily-{time:%Y%m%d}";
+        assert_eq!(classify_backup_type(template, "daily-20250315"), None);
+    }
+
+    #[test]
+    fn test_classify_backup_type_ambiguous_name() {
+        let template = "shard{shard}-{type}-{time:%Y%m%d}";
+        // "fullmoon" is not "full" or "incr"
+        assert_eq!(
+            classify_backup_type(template, "shard01-fullmoon-20250315"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_backup_type_type_at_end() {
+        let template = "backup-{time:%Y%m%d}-{type}";
+        assert_eq!(
+            classify_backup_type(template, "backup-20250315-full"),
+            Some("full")
+        );
+        assert_eq!(
+            classify_backup_type(template, "backup-20250315-incr"),
+            Some("incr")
+        );
     }
 
     // -- Resume state tests --
