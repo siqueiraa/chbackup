@@ -933,7 +933,7 @@ chbackup server          [--watch] (API mode for Kubernetes, optionally with wat
 | Flag | Description |
 |------|-------------|
 | `--config, -c` | Config file path (default: `/etc/chbackup/config.yml`, override via `CHBACKUP_CONFIG` env) |
-| `--env` | Override any config param via CLI: `--env S3_BUCKET=other-bucket --env LOG_LEVEL=debug` |
+| `--env` | Override any config param via CLI: `--env S3_BUCKET=other-bucket --env LOG_LEVEL=debug`. Accepts both env-style keys (e.g., `S3_BUCKET=val`) and dot-notation keys (e.g., `s3.bucket=val`). Env-style keys are translated to dot-notation internally via a static lookup table matching the `apply_env_overlay()` mappings. |
 
 **Environment variable overlay**: Every config parameter can be overridden via an environment variable. Variable names are the UPPERCASE version of the config key path with underscores. Examples: `CLICKHOUSE_HOST=10.0.0.1`, `S3_BUCKET=my-bucket`, `BACKUPS_TO_KEEP_REMOTE=14`, `LOG_LEVEL=debug`, `API_LISTEN=0.0.0.0:7171`. This is essential for Kubernetes deployments where config is injected via `env:` in pod specs. Env vars take precedence over the config file; `--env` CLI flags take precedence over both.
 
@@ -2536,7 +2536,10 @@ s3:
   assume_role_arn: ""                # AWS IAM role to assume
   force_path_style: false            # true for MinIO, Ceph
   disable_ssl: false                 # true for local S3-compatible stores
-  disable_cert_verification: false   # skip S3 TLS certificate verification (separate from clickhouse.skip_verify)
+  disable_cert_verification: false   # forces endpoint to HTTP when true (requires explicit endpoint URL).
+                                     # The AWS SDK for Rust (aws-smithy-http-client v1.1.10) has no public API
+                                     # to skip TLS certificate verification, so HTTP fallback is used instead.
+                                     # Separate from clickhouse.skip_verify.
   acl: ""                            # S3 ACL ("private", "bucket-owner-full-control", or "" for disabled)
   storage_class: STANDARD
   sse: ""                            # AES256 | aws:kms

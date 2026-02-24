@@ -20,26 +20,8 @@ use super::checksum::compute_crc64;
 use crate::clickhouse::client::TableRow;
 use crate::manifest::{PartInfo, S3ObjectInfo};
 use crate::object_disk;
+use crate::path_encoding::encode_path_component;
 use crate::table_filter::is_disk_excluded;
-
-/// URL-encode a database or table name for use in file paths.
-///
-/// Replaces non-alphanumeric chars (except `/`, `-`, `_`, `.`) with
-/// percent-encoded form.
-pub fn url_encode_path(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.' {
-            result.push(c);
-        } else {
-            // Percent-encode the character
-            for byte in c.to_string().as_bytes() {
-                result.push_str(&format!("%{:02X}", byte));
-            }
-        }
-    }
-    result
-}
 
 /// Compute the per-disk backup directory for a given disk.
 ///
@@ -380,8 +362,8 @@ pub fn collect_parts(
                         );
                         let staging_dir = per_disk_dir
                             .join("shadow")
-                            .join(url_encode_path(&db))
-                            .join(url_encode_path(&table))
+                            .join(encode_path_component(&db))
+                            .join(encode_path_component(&table))
                             .join(&part_name);
 
                         hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
@@ -603,20 +585,21 @@ mod tests {
     }
 
     #[test]
-    fn test_url_encode_path_simple() {
-        assert_eq!(url_encode_path("default"), "default");
-        assert_eq!(url_encode_path("my_database"), "my_database");
+    fn test_encode_path_component_simple() {
+        assert_eq!(encode_path_component("default"), "default");
+        assert_eq!(encode_path_component("my_database"), "my_database");
     }
 
     #[test]
-    fn test_url_encode_path_special_chars() {
-        assert_eq!(url_encode_path("my db"), "my%20db");
-        assert_eq!(url_encode_path("test+table"), "test%2Btable");
+    fn test_encode_path_component_special_chars() {
+        assert_eq!(encode_path_component("my db"), "my%20db");
+        assert_eq!(encode_path_component("test+table"), "test%2Btable");
     }
 
     #[test]
-    fn test_url_encode_path_preserves_safe_chars() {
-        assert_eq!(url_encode_path("a-b_c.d/e"), "a-b_c.d/e");
+    fn test_encode_path_component_safe_chars() {
+        // encode_path_component does NOT preserve `/` (unlike old url_encode_path)
+        assert_eq!(encode_path_component("a-b_c.d"), "a-b_c.d");
     }
 
     #[test]

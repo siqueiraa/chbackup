@@ -1,0 +1,67 @@
+{
+  "git_base": "HEAD",
+  "modules": [
+    {
+      "path": "src/server",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["routes.rs", "state.rs", "mod.rs"]
+    },
+    {
+      "path": "src/lock.rs",
+      "claude_md": "n/a (single file)",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["lock.rs"]
+    },
+    {
+      "path": "src/backup",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "update",
+      "files_modified": ["mod.rs"]
+    },
+    {
+      "path": "src/upload",
+      "claude_md": "exists",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["mod.rs"]
+    },
+    {
+      "path": "src/watch",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "no_change",
+      "files_modified": []
+    },
+    {
+      "path": "src/main.rs",
+      "claude_md": "n/a (single file)",
+      "triggers": [],
+      "action": "update",
+      "files_modified": ["main.rs"]
+    },
+    {
+      "path": "src/list.rs",
+      "claude_md": "n/a (single file)",
+      "triggers": [],
+      "action": "update",
+      "files_modified": ["list.rs"]
+    },
+    {
+      "path": "test",
+      "claude_md": "n/a (test directory)",
+      "triggers": ["new_patterns"],
+      "action": "update",
+      "files_modified": ["run_tests.sh"]
+    }
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": ["src/server", "src/lock.rs", "src/backup", "src/upload", "src/main.rs", "src/list.rs", "test"],
+    "no_change": ["src/watch"],
+    "total_affected": 7
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "git_base": "3a6e946d",
+  "modules": [
+    {
+      "path": "src/server",
+      "claude_md": "exists",
+      "triggers": ["bug_fix", "new_feature"],
+      "action": "update",
+      "files_modified": ["routes.rs", "mod.rs"]
+    }
+  ],
+  "standalone_files": [
+    {
+      "path": "src/list.rs",
+      "triggers": ["field_additions"],
+      "action": "modify"
+    },
+    {
+      "path": "src/manifest.rs",
+      "triggers": [],
+      "action": "no_change"
+    },
+    {
+      "path": "CLAUDE.md",
+      "triggers": ["doc_fix"],
+      "action": "modify"
+    },
+    {
+      "path": "docs/design.md",
+      "triggers": ["doc_fix"],
+      "action": "modify"
+    }
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": ["src/server"],
+    "standalone_files_modified": ["src/list.rs", "CLAUDE.md", "docs/design.md"],
+    "total_affected": 5
+  }
+}

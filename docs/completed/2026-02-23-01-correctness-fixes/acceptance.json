@@ -1,13 +1,13 @@
 {
   "plan": "2026-02-23-01-correctness-fixes",
-  "status": {"pass": 0, "fail": 8, "total": 8},
-  "last_updated": "2026-02-23T00:00:00Z",
+  "status": {"pass": 8, "fail": 0, "total": 8},
+  "last_updated": "2026-02-23T23:45:00Z",
   "features": [
     {
       "id": "F001",
       "category": "feature",
       "description": "Canonical path encoding module with sanitization (src/path_encoding.rs); sanitize_path_component rejects empty/./.. components explicitly",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -42,13 +42,13 @@
         ]
       },
       "related_tasks": [1],
-      "verified_at": null
+      "verified_at": "2026-02-23T22:00:00Z"
     },
     {
       "id": "F002",
       "category": "bugfix",
       "description": "disable_cert_verification uses HTTP fallback instead of broken env var approach",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -77,19 +77,19 @@
             "covered_by": ["F002"],
             "alternative_verification": {
               "command": "cargo test disable_cert_verification 2>&1 | grep -c 'test .* ok'",
-              "expected": "2"
+              "expected": "3"
             }
           }
         ]
       },
       "related_tasks": [2],
-      "verified_at": null
+      "verified_at": "2026-02-23T23:30:00Z"
     },
     {
       "id": "F003",
       "category": "bugfix",
       "description": "Hermetic S3 unit tests: cargo test --locked --offline passes in full (5 sync tests use mock_s3_fields, 3 async tests marked #[ignore])",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -124,13 +124,13 @@
         ]
       },
       "related_tasks": [3],
-      "verified_at": null
+      "verified_at": "2026-02-23T21:30:00Z"
     },
     {
       "id": "F004",
       "category": "bugfix",
       "description": "s3.disable_ssl config field wired into S3Client construction (forces http:// endpoint)",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -165,13 +165,13 @@
         ]
       },
       "related_tasks": [4],
-      "verified_at": null
+      "verified_at": "2026-02-23T22:00:00Z"
     },
     {
       "id": "F005",
       "category": "bugfix",
       "description": "check_parts_columns returns error when inconsistencies found (strict-fail instead of warn+continue)",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -206,13 +206,13 @@
         ]
       },
       "related_tasks": [5],
-      "verified_at": null
+      "verified_at": "2026-02-23T22:00:00Z"
     },
     {
       "id": "F006",
       "category": "feature",
       "description": "--env flag accepts env-style keys (S3_BUCKET=val) in addition to dot-notation (s3.bucket=val)",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -247,13 +247,13 @@
         ]
       },
       "related_tasks": [6],
-      "verified_at": null
+      "verified_at": "2026-02-23T22:00:00Z"
     },
     {
       "id": "F007",
       "category": "refactor",
       "description": "All 4 url_encode implementations replaced by single path_encoding module; path traversal uses Path::components() Normal-only filter in download metadata write",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -288,13 +288,13 @@
         ]
       },
       "related_tasks": [7],
-      "verified_at": null
+      "verified_at": "2026-02-23T23:00:00Z"
     },
     {
       "id": "FDOC",
       "category": "documentation",
       "description": "CLAUDE.md updated for all modified modules; docs/design.md updated for --env env-style keys and disable_cert_verification HTTP semantics",
-      "status": "fail",
+      "status": "pass",
       "verification": {
         "type": "multi_layer",
         "layers": [
@@ -329,7 +329,7 @@
         ]
       },
       "related_tasks": [8],
-      "verified_at": null
+      "verified_at": "2026-02-23T23:45:00Z"
     }
   ]
 }

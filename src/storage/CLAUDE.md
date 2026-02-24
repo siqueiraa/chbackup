@@ -25,6 +25,15 @@ src/storage/
 - Static credentials or default AWS credential chain
 - Optional `assume_role_arn` for cross-account access
 
+### TLS / SSL Configuration (s3.rs)
+- **`disable_ssl=true`**: Rewrites `https://` endpoint to `http://` via `effective_endpoint` in `S3Client::new()`. When endpoint is empty (default AWS), logs a warning and continues (user may set endpoint via env var).
+- **`disable_cert_verification=true`**: Forces the endpoint scheme to HTTP (the broken `std::env::set_var("AWS_CA_BUNDLE", "")` approach has been removed). Requires an explicit endpoint URL -- bails with error if endpoint is empty. The AWS SDK for Rust (aws-smithy-http-client v1.1.10) has no public API for TLS certificate skip; HTTP fallback is the pragmatic solution.
+- Both flags compute an `effective_endpoint` that is used for the SDK loader and config builder. If both are true, the rewrite is idempotent (only one `https://` -> `http://` replacement).
+
+### Hermetic Test Helper (s3.rs, test module)
+- `mock_s3_fields(bucket, prefix) -> S3Client` constructs an `S3Client` with a dummy inner client (no TLS native-root initialization) for use in sync unit tests. Safe for `cargo test --locked --offline`.
+- The 3 async retry tests (`test_copy_object_with_retry_no_streaming_when_disabled`, `test_put_object_retry_config`, `test_upload_part_retry_config`) are marked `#[ignore]` as they require network/S3 error paths.
+
 ### S3Object Type
 ```rust
 pub struct S3Object {

@@ -67,6 +67,16 @@
 | 6 | P3 | 6 | --env supports env-style keys (S3_BUCKET=val) |
 | 7 | P3 | 1, 7 | DRY: canonical url_encode module |
 
+## Commit Log
+
+| Task | Commit | Description |
+|------|--------|-------------|
+| 3 | cbf1a3d2 | Hermetic S3 unit tests |
+| 1, 4, 5, 6 | 9ee9b616 | path_encoding module, disable_ssl wiring, strict check_parts_columns, env-style keys |
+| 7 | 17b6f855 | Replace all 4 url_encode implementations with path_encoding module |
+| 2 | a1c8be25 | disable_cert_verification forces HTTP endpoint (remove broken CA_BUNDLE approach) |
+| 8 | cedd2681 | Update CLAUDE.md for path_encoding, disable_ssl/cert_verification, check_parts_columns, env-style --env |
+
 ## AWS SDK Limitation (Important)
 
 The AWS SDK for Rust (aws-smithy-http-client v1.1.10) does NOT expose a public API to disable TLS certificate verification. The `TlsContext` API only provides `TrustStore` configuration (root CA certificates), not a "danger mode" to skip verification. Therefore, Issue 2 is resolved by forcing HTTP when `disable_cert_verification=true`, which is the pragmatic approach. Full HTTPS-without-verification would require a future SDK version or vendoring internal APIs.

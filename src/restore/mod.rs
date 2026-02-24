@@ -991,8 +991,8 @@ async fn try_attach_table_mode(
 
     // Step 3: Hardlink parts to the table's data directory (NOT detached/)
     // ATTACH TABLE reads from the main data directory, not detached/
-    let url_db = attach::url_encode(src_db);
-    let url_table = attach::url_encode(src_table);
+    let url_db = crate::path_encoding::encode_path_component(src_db);
+    let url_table = crate::path_encoding::encode_path_component(src_table);
     let data_path = table_data_path.to_owned();
     let backup_name = backup_dir
         .file_name()
