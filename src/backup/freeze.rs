@@ -58,7 +58,7 @@ impl FreezeGuard {
 
     /// Unfreeze all tables. Logs warnings on failure but does not fail
     /// the whole operation -- leftover shadow data can be cleaned later.
-    pub async fn unfreeze_all(&self, ch: &ChClient) -> Result<()> {
+    pub async fn unfreeze_all(&mut self, ch: &ChClient) -> Result<()> {
         for info in &self.frozen {
             info!(
                 db = %info.database,
@@ -80,6 +80,8 @@ impl FreezeGuard {
             }
         }
 
+        self.frozen.clear();
+
         Ok(())
     }
 }
@@ -89,59 +91,10 @@ impl Drop for FreezeGuard {
         if !self.frozen.is_empty() {
             warn!(
                 count = self.frozen.len(),
-                "FreezeGuard dropped with unfrozen tables -- call unfreeze_all() explicitly"
+                "FreezeGuard dropped with unfrozen tables -- shadow data may remain. \
+                 Run `chbackup clean` to remove leftover shadow directories"
             );
         }
     }
 }
 
-/// Freeze a single table and add it to the guard.
-///
-/// If `ignore_not_exists` is true and the table has been dropped during
-/// the backup, the error is logged as a warning and the table is skipped.
-pub async fn freeze_table(
-    ch: &ChClient,
-    guard: &mut FreezeGuard,
-    db: &str,
-    table: &str,
-    freeze_name: &str,
-    ignore_not_exists: bool,
-) -> Result<bool> {
-    info!(
-        db = %db,
-        table = %table,
-        freeze_name = %freeze_name,
-        "Freezing table"
-    );
-
-    match ch.freeze_table(db, table, freeze_name).await {
-        Ok(()) => {
-            guard.add(FreezeInfo {
-                database: db.to_string(),
-                table: table.to_string(),
-                freeze_name: freeze_name.to_string(),
-            });
-            Ok(true)
-        }
-        Err(e) => {
-            let err_msg = format!("{e:#}");
-            // ClickHouse error codes 60 (UNKNOWN_TABLE) and 81 (UNKNOWN_DATABASE)
-            if ignore_not_exists
-                && (err_msg.contains("UNKNOWN_TABLE")
-                    || err_msg.contains("UNKNOWN_DATABASE")
-                    || err_msg.contains("Code: 60")
-                    || err_msg.contains("Code: 81"))
-            {
-                warn!(
-                    db = %db,
-                    table = %table,
-                    error = %e,
-                    "Table not found during FREEZE (possibly dropped), skipping"
-                );
-                Ok(false)
-            } else {
-                Err(e)
-            }
-        }
-    }
-}

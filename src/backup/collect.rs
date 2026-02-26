@@ -9,7 +9,7 @@
 //! For S3 disk parts, metadata files are parsed to extract S3 object references
 //! instead of hardlinking data (the data lives on S3, not the local filesystem).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -48,7 +48,7 @@ pub fn per_disk_backup_dir(disk_path: &str, backup_name: &str) -> PathBuf {
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_shadow_part_path(
     backup_dir: &Path,
-    manifest_disks: &HashMap<String, String>,
+    manifest_disks: &BTreeMap<String, String>,
     backup_name: &str,
     disk_name: &str,
     encoded_db: &str,
@@ -168,26 +168,18 @@ pub struct CollectedPart {
 pub fn collect_parts(
     data_path: &str,
     freeze_name: &str,
-    backup_dir: &Path,
     backup_name: &str,
     tables: &[TableRow],
-    disk_type_map: &HashMap<String, String>,
-    disk_paths: &HashMap<String, String>,
+    disk_type_map: &BTreeMap<String, String>,
+    disk_paths: &BTreeMap<String, String>,
     skip_disks: &[String],
     skip_disk_types: &[String],
     skip_projections: &[String],
 ) -> Result<HashMap<String, Vec<CollectedPart>>> {
     let uuid_map = build_uuid_map(tables);
     let mut result: HashMap<String, Vec<CollectedPart>> = HashMap::new();
-
-    // Build reverse map: normalized disk path -> disk name
-    let disk_path_to_name: HashMap<String, String> = disk_paths
-        .iter()
-        .map(|(name, path)| {
-            let normalized = path.trim_end_matches('/').to_string();
-            (normalized, name.clone())
-        })
-        .collect();
+    // Track which disks have already been logged to avoid per-part log spam.
+    let mut logged_disks: HashSet<String> = HashSet::new();
 
     // Collect all disk paths to walk. Always include the default data_path
     // (for the "default" disk even if not explicitly in disk_paths).
@@ -232,9 +224,7 @@ pub fn collect_parts(
             continue;
         }
 
-        let is_s3 = disk_type_map
-            .get(disk_name)
-            .is_some_and(|t| object_disk::is_s3_disk(t));
+        let is_s3 = object_disk::is_s3_disk(disk_type);
 
         if is_s3 {
             info!(
@@ -270,7 +260,13 @@ pub fn collect_parts(
                     continue;
                 }
 
-                let uuid_dir_name = uuid_entry.file_name().to_string_lossy().to_string();
+                let uuid_dir_name = match uuid_entry.file_name().to_str() {
+                    Some(name) => name.to_string(),
+                    None => {
+                        warn!(path = %uuid_entry.path().display(), "Non-UTF-8 directory name, skipping");
+                        continue;
+                    }
+                };
 
                 // Look up which table this UUID belongs to
                 let (db, table) = match uuid_map.get(&uuid_dir_name) {
@@ -289,16 +285,19 @@ pub fn collect_parts(
                 // Iterate part directories under this UUID directory
                 for part_entry in std::fs::read_dir(uuid_entry.path())? {
                     let part_entry = part_entry?;
+                    // Non-directory entries (e.g. frozen_metadata.txt) are
+                    // already filtered here; only directories can be parts.
                     if !part_entry.file_type()?.is_dir() {
                         continue;
                     }
 
-                    let part_name = part_entry.file_name().to_string_lossy().to_string();
-
-                    // Skip frozen_metadata.txt (not a part directory)
-                    if part_name == "frozen_metadata.txt" {
-                        continue;
-                    }
+                    let part_name = match part_entry.file_name().to_str() {
+                        Some(name) => name.to_string(),
+                        None => {
+                            warn!(path = %part_entry.path().display(), "Non-UTF-8 directory name, skipping");
+                            continue;
+                        }
+                    };
 
                     // Verify this is a real part by checking for checksums.txt
                     let checksums_path = part_entry.path().join("checksums.txt");
@@ -331,14 +330,9 @@ pub fn collect_parts(
                             "Collected S3 disk part metadata"
                         );
 
-                        let part_info = PartInfo {
-                            name: part_name,
-                            size: part_size,
-                            backup_key: String::new(), // Set during upload
-                            source: "uploaded".to_string(),
-                            checksum_crc64: crc64,
-                            s3_objects: Some(s3_objects),
-                        };
+                        let part_info =
+                            PartInfo::new(part_name, part_size, crc64)
+                                .with_s3_objects(s3_objects);
 
                         result
                             .entry(full_table_name.clone())
@@ -355,11 +349,13 @@ pub fn collect_parts(
 
                         let disk_path_trimmed = disk_path.trim_end_matches('/');
                         let per_disk_dir = per_disk_backup_dir(disk_path_trimmed, backup_name);
-                        info!(
-                            disk = %disk_name,
-                            path = %per_disk_dir.display(),
-                            "staging per-disk backup dir"
-                        );
+                        if logged_disks.insert(disk_name.clone()) {
+                            info!(
+                                disk = %disk_name,
+                                path = %per_disk_dir.display(),
+                                "staging per-disk backup dir"
+                            );
+                        }
                         let staging_dir = per_disk_dir
                             .join("shadow")
                             .join(encode_path_component(&db))
@@ -368,14 +364,7 @@ pub fn collect_parts(
 
                         hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
 
-                        let part_info = PartInfo {
-                            name: part_name,
-                            size: part_size,
-                            backup_key: String::new(), // Set during upload
-                            source: "uploaded".to_string(),
-                            checksum_crc64: crc64,
-                            s3_objects: None,
-                        };
+                        let part_info = PartInfo::new(part_name, part_size, crc64);
 
                         result
                             .entry(full_table_name.clone())
@@ -391,10 +380,6 @@ pub fn collect_parts(
             }
         }
     }
-
-    // Suppress unused variable warnings (reserved for future use)
-    let _ = &disk_path_to_name;
-    let _ = backup_dir;
 
     Ok(result)
 }
@@ -416,7 +401,13 @@ fn collect_s3_part_metadata(part_dir: &Path) -> Result<(Vec<S3ObjectInfo>, u64)>
             continue;
         }
 
-        let file_name = entry.file_name().to_string_lossy().to_string();
+        let file_name = match entry.file_name().to_str() {
+            Some(name) => name.to_string(),
+            None => {
+                warn!(path = %entry.path().display(), "Non-UTF-8 file name, skipping");
+                continue;
+            }
+        };
 
         // Skip checksums.txt -- it's the checksum file, not a metadata file
         if file_name == "checksums.txt" {
@@ -499,8 +490,7 @@ fn hardlink_dir(src_dir: &Path, dst_dir: &Path, skip_proj_patterns: &[String]) -
         } else {
             // Try hardlink first, fall back to copy on cross-device
             if let Err(e) = std::fs::hard_link(entry.path(), &target) {
-                // EXDEV = cross-device link (error code 18 on Linux/macOS)
-                let is_exdev = e.raw_os_error() == Some(18);
+                let is_exdev = e.raw_os_error() == Some(libc::EXDEV);
                 if is_exdev {
                     debug!(
                         src = %entry.path().display(),
@@ -716,8 +706,8 @@ mod tests {
             total_bytes: Some(1000),
         }];
 
-        let disk_type_map = HashMap::from([("default".to_string(), "local".to_string())]);
-        let disk_paths = HashMap::from([(
+        let disk_type_map = BTreeMap::from([("default".to_string(), "local".to_string())]);
+        let disk_paths = BTreeMap::from([(
             "default".to_string(),
             data_path.to_string_lossy().to_string(),
         )]);
@@ -725,7 +715,6 @@ mod tests {
         let result = collect_parts(
             &data_path.to_string_lossy(),
             freeze,
-            &backup_dir,
             "test-backup",
             &tables,
             &disk_type_map,
@@ -791,11 +780,11 @@ mod tests {
             total_bytes: Some(1000),
         }];
 
-        let disk_type_map = HashMap::from([
+        let disk_type_map = BTreeMap::from([
             ("default".to_string(), "local".to_string()),
             ("s3disk".to_string(), "s3".to_string()),
         ]);
-        let disk_paths = HashMap::from([
+        let disk_paths = BTreeMap::from([
             (
                 "default".to_string(),
                 local_data.to_string_lossy().to_string(),
@@ -809,7 +798,6 @@ mod tests {
         let result = collect_parts(
             &local_data.to_string_lossy(),
             freeze,
-            &backup_dir,
             "test-backup",
             &tables,
             &disk_type_map,
@@ -919,14 +907,7 @@ mod tests {
         let part = CollectedPart {
             database: "default".to_string(),
             table: "trades".to_string(),
-            part_info: PartInfo {
-                name: "202401_1_50_3".to_string(),
-                size: 1024,
-                backup_key: String::new(),
-                source: "uploaded".to_string(),
-                checksum_crc64: 12345,
-                s3_objects: None,
-            },
+            part_info: PartInfo::new("202401_1_50_3", 1024, 12345),
             disk_name: "s3disk".to_string(),
         };
         assert_eq!(part.disk_name, "s3disk");
@@ -980,11 +961,11 @@ mod tests {
             },
         ];
 
-        let disk_type_map = HashMap::from([
+        let disk_type_map = BTreeMap::from([
             ("default".to_string(), "local".to_string()),
             ("nvme1".to_string(), "local".to_string()),
         ]);
-        let disk_paths = HashMap::from([
+        let disk_paths = BTreeMap::from([
             ("default".to_string(), disk1.to_string_lossy().to_string()),
             ("nvme1".to_string(), disk2.to_string_lossy().to_string()),
         ]);
@@ -992,7 +973,6 @@ mod tests {
         let result = collect_parts(
             &disk1.to_string_lossy(),
             freeze,
-            &backup_dir,
             "my-backup",
             &tables,
             &disk_type_map,
@@ -1083,7 +1063,7 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&per_disk_part).unwrap();
 
-        let disks = HashMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
+        let disks = BTreeMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
 
         let result = resolve_shadow_part_path(
             &backup_dir,
@@ -1116,7 +1096,7 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&legacy_path).unwrap();
 
-        let disks = HashMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
+        let disks = BTreeMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
 
         let result = resolve_shadow_part_path(
             &backup_dir,
@@ -1148,7 +1128,7 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&legacy_plain).unwrap();
 
-        let disks = HashMap::new();
+        let disks = BTreeMap::new();
 
         let result = resolve_shadow_part_path(
             &backup_dir,
@@ -1180,7 +1160,7 @@ mod tests {
         std::fs::create_dir_all(&legacy_path).unwrap();
 
         // Empty disks map -- disk_name "nvme1" not found
-        let disks = HashMap::new();
+        let disks = BTreeMap::new();
 
         let result = resolve_shadow_part_path(
             &backup_dir,
@@ -1205,7 +1185,7 @@ mod tests {
         let backup_dir = tmp.path().join("default_backup");
 
         // Don't create any paths -- result should be None
-        let disks = HashMap::new();
+        let disks = BTreeMap::new();
 
         let result = resolve_shadow_part_path(
             &backup_dir,
@@ -1229,7 +1209,7 @@ mod tests {
         let backup_dir = tmp.path().join("default_backup");
         std::fs::create_dir_all(&backup_dir).unwrap();
 
-        let disks = HashMap::from([(
+        let disks = BTreeMap::from([(
             "default".to_string(),
             tmp.path().to_string_lossy().to_string(),
         )]);

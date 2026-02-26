@@ -6,6 +6,7 @@
 //! System databases are always skipped: system, INFORMATION_SCHEMA, information_schema.
 
 use glob::Pattern;
+use tracing::warn;
 
 /// System databases that are always excluded from backups.
 const SYSTEM_DATABASES: &[&str] = &["system", "INFORMATION_SCHEMA", "information_schema"];
@@ -36,7 +37,13 @@ impl TableFilter {
             .split(',')
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
-            .filter_map(|p| Pattern::new(p).ok())
+            .filter_map(|p| {
+                Pattern::new(p)
+                    .map_err(
+                        |e| warn!(pattern = %p, error = %e, "Invalid table glob pattern, skipping"),
+                    )
+                    .ok()
+            })
             .collect();
         Self { patterns }
     }

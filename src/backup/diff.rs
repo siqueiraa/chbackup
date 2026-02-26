@@ -93,70 +93,35 @@ pub fn diff_parts(current: &mut BackupManifest, base: &BackupManifest) -> DiffRe
 mod tests {
     use super::*;
     use crate::manifest::{BackupManifest, DatabaseInfo, PartInfo, TableManifest};
-    use chrono::Utc;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     /// Helper: create a PartInfo with given name, crc64, and optionally a backup_key.
     fn make_part(name: &str, crc64: u64, backup_key: &str) -> PartInfo {
-        PartInfo {
-            name: name.to_string(),
-            size: 1024,
-            backup_key: backup_key.to_string(),
-            source: "uploaded".to_string(),
-            checksum_crc64: crc64,
-            s3_objects: None,
-        }
+        let mut p = PartInfo::new(name, 1024, crc64);
+        p.backup_key = backup_key.to_string();
+        p
     }
 
     /// Helper: create a minimal TableManifest with given parts on a specified disk.
     fn make_table(disk: &str, parts: Vec<PartInfo>) -> TableManifest {
-        let mut parts_map = HashMap::new();
+        let mut parts_map = BTreeMap::new();
         parts_map.insert(disk.to_string(), parts);
-        TableManifest {
-            ddl: "CREATE TABLE test (id UInt64) ENGINE = MergeTree ORDER BY id".to_string(),
-            uuid: None,
-            engine: "MergeTree".to_string(),
-            total_bytes: 0,
-            parts: parts_map,
-            pending_mutations: Vec::new(),
-            metadata_only: false,
-            dependencies: Vec::new(),
-        }
+        TableManifest::test_new("MergeTree").with_parts(parts_map)
     }
 
     /// Helper: create a minimal BackupManifest with given name and tables.
-    fn make_manifest(name: &str, tables: HashMap<String, TableManifest>) -> BackupManifest {
-        BackupManifest {
-            manifest_version: 1,
-            name: name.to_string(),
-            timestamp: Utc::now(),
-            clickhouse_version: "24.1.3".to_string(),
-            chbackup_version: "0.1.0".to_string(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: HashMap::new(),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables,
-            databases: vec![DatabaseInfo {
-                name: "default".to_string(),
-                ddl: "CREATE DATABASE default ENGINE = Atomic".to_string(),
-            }],
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        }
+    fn make_manifest(name: &str, tables: BTreeMap<String, TableManifest>) -> BackupManifest {
+        BackupManifest::test_new(name)
+            .with_tables(tables)
+            .with_databases(vec![DatabaseInfo::test_new("default")])
     }
 
     #[test]
     fn test_diff_parts_no_base() {
         // Base manifest has no tables -- all current parts should remain "uploaded"
-        let base = make_manifest("base-backup", HashMap::new());
+        let base = make_manifest("base-backup", BTreeMap::new());
 
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.trades".to_string(),
             make_table(
@@ -188,7 +153,7 @@ mod tests {
         let base_key1 = "s3://bucket/base/data/default/trades/202401_1_50_3.tar.lz4";
         let base_key2 = "s3://bucket/base/data/default/trades/202402_1_1_0.tar.lz4";
 
-        let mut base_tables = HashMap::new();
+        let mut base_tables = BTreeMap::new();
         base_tables.insert(
             "default.trades".to_string(),
             make_table(
@@ -201,7 +166,7 @@ mod tests {
         );
         let base = make_manifest("base-backup", base_tables);
 
-        let mut current_tables = HashMap::new();
+        let mut current_tables = BTreeMap::new();
         current_tables.insert(
             "default.trades".to_string(),
             make_table(
@@ -234,14 +199,14 @@ mod tests {
         // One part matches, one is new (not in base)
         let base_key = "s3://bucket/base/data/default/trades/202401_1_50_3.tar.lz4";
 
-        let mut base_tables = HashMap::new();
+        let mut base_tables = BTreeMap::new();
         base_tables.insert(
             "default.trades".to_string(),
             make_table("default", vec![make_part("202401_1_50_3", 111, base_key)]),
         );
         let base = make_manifest("base-backup", base_tables);
 
-        let mut current_tables = HashMap::new();
+        let mut current_tables = BTreeMap::new();
         current_tables.insert(
             "default.trades".to_string(),
             make_table(
@@ -276,14 +241,14 @@ mod tests {
         // Same part name but different CRC64 -- part stays "uploaded" (re-uploaded)
         let base_key = "s3://bucket/base/data/default/trades/202401_1_50_3.tar.lz4";
 
-        let mut base_tables = HashMap::new();
+        let mut base_tables = BTreeMap::new();
         base_tables.insert(
             "default.trades".to_string(),
             make_table("default", vec![make_part("202401_1_50_3", 111, base_key)]),
         );
         let base = make_manifest("base-backup", base_tables);
 
-        let mut current_tables = HashMap::new();
+        let mut current_tables = BTreeMap::new();
         current_tables.insert(
             "default.trades".to_string(),
             make_table(
@@ -312,7 +277,7 @@ mod tests {
         let base_key_default = "s3://bucket/base/data/default/trades/part_default.tar.lz4";
         let base_key_ssd = "s3://bucket/base/data/ssd/trades/part_ssd.tar.lz4";
 
-        let mut base_parts_map = HashMap::new();
+        let mut base_parts_map = BTreeMap::new();
         base_parts_map.insert(
             "default".to_string(),
             vec![make_part("part_default", 100, base_key_default)],
@@ -321,38 +286,20 @@ mod tests {
             "ssd".to_string(),
             vec![make_part("part_ssd", 200, base_key_ssd)],
         );
-        let base_table = TableManifest {
-            ddl: "CREATE TABLE test (id UInt64) ENGINE = MergeTree ORDER BY id".to_string(),
-            uuid: None,
-            engine: "MergeTree".to_string(),
-            total_bytes: 0,
-            parts: base_parts_map,
-            pending_mutations: Vec::new(),
-            metadata_only: false,
-            dependencies: Vec::new(),
-        };
-        let mut base_tables = HashMap::new();
+        let base_table = TableManifest::test_new("MergeTree").with_parts(base_parts_map);
+        let mut base_tables = BTreeMap::new();
         base_tables.insert("default.trades".to_string(), base_table);
         let base = make_manifest("base-backup", base_tables);
 
         // Current has same parts on same disks with same CRC64
-        let mut current_parts_map = HashMap::new();
+        let mut current_parts_map = BTreeMap::new();
         current_parts_map.insert(
             "default".to_string(),
             vec![make_part("part_default", 100, "")],
         );
         current_parts_map.insert("ssd".to_string(), vec![make_part("part_ssd", 200, "")]);
-        let current_table = TableManifest {
-            ddl: "CREATE TABLE test (id UInt64) ENGINE = MergeTree ORDER BY id".to_string(),
-            uuid: None,
-            engine: "MergeTree".to_string(),
-            total_bytes: 0,
-            parts: current_parts_map,
-            pending_mutations: Vec::new(),
-            metadata_only: false,
-            dependencies: Vec::new(),
-        };
-        let mut current_tables = HashMap::new();
+        let current_table = TableManifest::test_new("MergeTree").with_parts(current_parts_map);
+        let mut current_tables = BTreeMap::new();
         current_tables.insert("default.trades".to_string(), current_table);
         let mut current = make_manifest("new-backup", current_tables);
 
@@ -375,7 +322,7 @@ mod tests {
     #[test]
     fn test_diff_parts_extra_table_in_base() {
         // Base has a table not in current -- gracefully ignored
-        let mut base_tables = HashMap::new();
+        let mut base_tables = BTreeMap::new();
         base_tables.insert(
             "default.trades".to_string(),
             make_table(
@@ -396,7 +343,7 @@ mod tests {
         );
         let base = make_manifest("base-backup", base_tables);
 
-        let mut current_tables = HashMap::new();
+        let mut current_tables = BTreeMap::new();
         current_tables.insert(
             "default.trades".to_string(),
             make_table("default", vec![make_part("part1", 111, "")]),
@@ -433,7 +380,7 @@ mod tests {
         let mut base_part = make_part("202401_1_50_3", 111, "s3://bucket/base/part.tar.lz4");
         base_part.s3_objects = Some(s3_objects.clone());
 
-        let mut base_tables = HashMap::new();
+        let mut base_tables = BTreeMap::new();
         base_tables.insert(
             "default.trades".to_string(),
             make_table("s3disk", vec![base_part]),
@@ -444,7 +391,7 @@ mod tests {
         let current_part = make_part("202401_1_50_3", 111, "");
         assert!(current_part.s3_objects.is_none()); // verify None before diff
 
-        let mut current_tables = HashMap::new();
+        let mut current_tables = BTreeMap::new();
         current_tables.insert(
             "default.trades".to_string(),
             make_table("s3disk", vec![current_part]),
@@ -478,14 +425,14 @@ mod tests {
         // After diff_parts, s3_objects should remain None (cloning None is a no-op).
         let base_key = "s3://bucket/base/data/default/trades/part1.tar.lz4";
 
-        let mut base_tables = HashMap::new();
+        let mut base_tables = BTreeMap::new();
         base_tables.insert(
             "default.trades".to_string(),
             make_table("default", vec![make_part("part1", 111, base_key)]),
         );
         let base = make_manifest("base-backup", base_tables);
 
-        let mut current_tables = HashMap::new();
+        let mut current_tables = BTreeMap::new();
         current_tables.insert(
             "default.trades".to_string(),
             make_table("default", vec![make_part("part1", 111, "")]),

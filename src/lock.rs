@@ -112,6 +112,27 @@ impl Drop for PidLock {
     }
 }
 
+/// Return `true` if `path` names an existing PID lock file that is owned by a
+/// live process.
+///
+/// Returns `false` on any I/O or parse error, and on non-Unix platforms.
+/// Safe to call concurrently; reads are atomic at the OS level for small files.
+pub fn is_lock_file_active(path: &Path) -> bool {
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let info: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let pid = match info.get("pid").and_then(|v| v.as_u64()) {
+        Some(p) => p as u32,
+        None => return false,
+    };
+    is_pid_alive(pid)
+}
+
 // ---------------------------------------------------------------------------
 // Lock scope
 // ---------------------------------------------------------------------------
@@ -145,7 +166,11 @@ pub fn lock_for_command(command: &str, backup_name: Option<&str>) -> LockScope {
                 _ => LockScope::Global,
             }
         }
-        "clean" | "clean_broken" | "delete" => LockScope::Global,
+        // API routes use "clean_broken_remote" / "clean_broken_local" as the
+        // command name; they must also acquire the global lock.
+        "clean" | "clean_broken" | "clean_broken_remote" | "clean_broken_local" | "delete" => {
+            LockScope::Global
+        }
         // list, tables, default-config, print-config, watch, server
         _ => LockScope::None,
     }
@@ -170,13 +195,25 @@ pub fn lock_path_for_scope(scope: &LockScope) -> Option<PathBuf> {
 ///
 /// Uses `kill(pid, 0)` on Unix.  Returns `false` on any error or on
 /// non-Unix platforms.
+///
+/// POSIX semantics:
+/// - `ret == 0`          → process exists and we can signal it → alive
+/// - `ret == -1, ESRCH`  → no such process → dead
+/// - `ret == -1, EPERM`  → process exists but permission denied → alive
+///   (can happen in containers with security contexts or cross-uid scenarios)
 fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // SAFETY: signal 0 does not send a signal; it only checks that the
         // process exists and we have permission to signal it.
         let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        ret == 0
+        if ret == 0 {
+            return true;
+        }
+        // EPERM means the process exists but we lack permission to signal it.
+        // Treat as alive so we never steal a live process's lock.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        errno == libc::EPERM
     }
     #[cfg(not(unix))]
     {

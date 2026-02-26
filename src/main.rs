@@ -15,10 +15,10 @@ use chbackup::server::state::validate_backup_name;
 use chbackup::storage::S3Client;
 use chbackup::table_filter::TableFilter;
 use chbackup::{backup, download, list, restore, upload};
-use tokio_util::sync::CancellationToken;
 use chrono::Utc;
 use clap::Parser;
 use cli::{Cli, Command};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 /// Extract the optional backup name from a [`Command`], if applicable.
@@ -35,26 +35,13 @@ fn backup_name_from_command(cmd: &Command) -> Option<&str> {
     }
 }
 
-/// Acquire a per-backup PID lock AFTER shortcut resolution.
+/// Acquire a PID lock for a command, optionally scoped to a backup name.
 ///
-/// This ensures the lock is taken on the resolved (actual) backup name,
-/// not on a raw CLI shortcut like "latest" or "previous".
-fn acquire_backup_lock(cmd_name: &str, backup_name: &str) -> Result<Option<PidLock>> {
-    let scope = lock_for_command(cmd_name, Some(backup_name));
-    match lock_path_for_scope(&scope) {
-        Some(ref path) => {
-            info!(command = cmd_name, lock_path = %path.display(), "Acquiring lock");
-            let guard = PidLock::acquire(path, cmd_name)?;
-            info!("Lock acquired");
-            Ok(Some(guard))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Acquire a global PID lock for commands that don't have a backup name.
-fn acquire_global_lock(cmd_name: &str) -> Result<Option<PidLock>> {
-    let scope = lock_for_command(cmd_name, None);
+/// When `backup_name` is `Some`, the lock is per-backup (used after shortcut
+/// resolution so the lock targets the real name, not "latest"/"previous").
+/// When `None`, the lock is global (for commands like `clean` and `clean_broken`).
+fn acquire_lock(cmd_name: &str, backup_name: Option<&str>) -> Result<Option<PidLock>> {
+    let scope = lock_for_command(cmd_name, backup_name);
     match lock_path_for_scope(&scope) {
         Some(ref path) => {
             info!(command = cmd_name, lock_path = %path.display(), "Acquiring lock");
@@ -128,8 +115,7 @@ async fn run() -> Result<()> {
     let bak_name = backup_name_from_command(&cli.command);
     if let Some(name) = bak_name {
         if let Err(e) = validate_backup_name(name) {
-            eprintln!("Error: invalid backup name: {e}");
-            std::process::exit(1);
+            bail!("invalid backup name '{}': {}", name, e);
         }
     }
 
@@ -151,7 +137,7 @@ async fn run() -> Result<()> {
             backup_name,
         } => {
             let name = resolve_backup_name(backup_name)?;
-            let _lock = acquire_backup_lock("create", &name)?;
+            let _lock = acquire_lock("create", Some(&name))?;
             let ch = ChClient::new(&config.clickhouse)?;
 
             // Merge CLI --skip-projections with config.backup.skip_projections
@@ -173,6 +159,7 @@ async fn run() -> Result<()> {
                 configs,
                 named_collections,
                 &effective_skip_projections,
+                CancellationToken::new(),
             )
             .await?;
 
@@ -187,7 +174,7 @@ async fn run() -> Result<()> {
         } => {
             let raw_name = backup_name_required(backup_name, "upload")?;
             let name = resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?;
-            let _lock = acquire_backup_lock("upload", &name)?;
+            let _lock = acquire_lock("upload", Some(&name))?;
             let s3 = S3Client::new(&config.s3).await?;
 
             let backup_dir = PathBuf::from(&config.clickhouse.data_path)
@@ -208,7 +195,7 @@ async fn run() -> Result<()> {
             .await?;
 
             // Apply retention after successful upload (design doc 3.6 step 7)
-            list::apply_retention_after_upload(&config, &s3, None).await;
+            list::apply_retention_after_upload(&config, &s3, Some(&name), None).await;
 
             info!(backup_name = %name, "Upload command complete");
         }
@@ -221,7 +208,7 @@ async fn run() -> Result<()> {
             let raw_name = backup_name_required(backup_name, "download")?;
             let s3 = S3Client::new(&config.s3).await?;
             let name = resolve_remote_shortcut(&raw_name, &s3).await?;
-            let _lock = acquire_backup_lock("download", &name)?;
+            let _lock = acquire_lock("download", Some(&name))?;
 
             let effective_resume = resume && config.general.use_resumable_state;
             let backup_dir = download::download(
@@ -258,7 +245,7 @@ async fn run() -> Result<()> {
         } => {
             let raw_name = backup_name_required(backup_name, "restore")?;
             let name = resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?;
-            let _lock = acquire_backup_lock("restore", &name)?;
+            let _lock = acquire_lock("restore", Some(&name))?;
             let ch = ChClient::new(&config.clickhouse)?;
 
             let db_mapping = match &database_mapping {
@@ -303,7 +290,7 @@ async fn run() -> Result<()> {
             backup_name,
         } => {
             let name = resolve_backup_name(backup_name)?;
-            let _lock = acquire_backup_lock("create_remote", &name)?;
+            let _lock = acquire_lock("create_remote", Some(&name))?;
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
 
@@ -327,6 +314,7 @@ async fn run() -> Result<()> {
                 configs,
                 named_collections,
                 &effective_skip_projections,
+                CancellationToken::new(),
             )
             .await?;
 
@@ -349,7 +337,7 @@ async fn run() -> Result<()> {
             .await?;
 
             // Apply retention after successful upload (design doc 3.6 step 7)
-            list::apply_retention_after_upload(&config, &s3, None).await;
+            list::apply_retention_after_upload(&config, &s3, Some(&name), None).await;
 
             info!(backup_name = %name, "CreateRemote command complete");
         }
@@ -370,7 +358,7 @@ async fn run() -> Result<()> {
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
             let name = resolve_remote_shortcut(&raw_name, &s3).await?;
-            let _lock = acquire_backup_lock("restore_remote", &name)?;
+            let _lock = acquire_lock("restore_remote", Some(&name))?;
 
             let db_mapping = match &database_mapping {
                 Some(s) => Some(remap::parse_database_mapping(s)?),
@@ -414,11 +402,23 @@ async fn run() -> Result<()> {
         }
 
         Command::List { location, format } => {
-            let s3 = S3Client::new(&config.s3).await?;
             let loc = location.map(map_cli_location);
             let fmt = map_cli_list_format(format);
 
-            list::list(&config.clickhouse.data_path, &s3, loc.as_ref(), &fmt).await?;
+            // Only initialize S3 when remote listing is needed.
+            let needs_remote = loc.is_none() || loc == Some(list::Location::Remote);
+            let s3 = if needs_remote {
+                Some(S3Client::new(&config.s3).await?)
+            } else {
+                None
+            };
+            list::list(
+                &config.clickhouse.data_path,
+                s3.as_ref(),
+                loc.as_ref(),
+                &fmt,
+            )
+            .await?;
 
             info!("List command complete");
         }
@@ -449,7 +449,12 @@ async fn run() -> Result<()> {
                     };
 
                     if let Some(ref f) = filter {
-                        if !f.matches(db, tbl) {
+                        let matched = if all {
+                            f.matches_including_system(db, tbl)
+                        } else {
+                            f.matches(db, tbl)
+                        };
+                        if !matched {
                             continue;
                         }
                     }
@@ -521,24 +526,28 @@ async fn run() -> Result<()> {
             backup_name,
         } => {
             let raw_name = backup_name_required(backup_name, "delete")?;
-            let s3 = S3Client::new(&config.s3).await?;
             let loc = map_cli_location(location);
 
-            let name = match &loc {
+            // Only initialize S3 for remote delete.
+            match loc {
                 list::Location::Local => {
-                    resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?
+                    let name = resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?;
+                    let _lock = acquire_lock("delete", Some(&name))?;
+                    list::delete_local(&config.clickhouse.data_path, &name)?;
+                    info!(backup_name = %name, "Delete command complete");
                 }
-                list::Location::Remote => resolve_remote_shortcut(&raw_name, &s3).await?,
-            };
-            let _lock = acquire_backup_lock("delete", &name)?;
-
-            list::delete(&config.clickhouse.data_path, &s3, &loc, &name).await?;
-
-            info!(backup_name = %name, "Delete command complete");
+                list::Location::Remote => {
+                    let s3 = S3Client::new(&config.s3).await?;
+                    let name = resolve_remote_shortcut(&raw_name, &s3).await?;
+                    let _lock = acquire_lock("delete", Some(&name))?;
+                    list::delete_remote(&s3, &name).await?;
+                    info!(backup_name = %name, "Delete command complete");
+                }
+            }
         }
 
         Command::Clean { name } => {
-            let _lock = acquire_global_lock("clean")?;
+            let _lock = acquire_lock("clean", None)?;
             let ch = ChClient::new(&config.clickhouse)?;
             let data_path = &config.clickhouse.data_path;
             let count = list::clean_shadow(&ch, data_path, name.as_deref()).await?;
@@ -546,11 +555,21 @@ async fn run() -> Result<()> {
         }
 
         Command::CleanBroken { location } => {
-            let _lock = acquire_global_lock("clean_broken")?;
-            let s3 = S3Client::new(&config.s3).await?;
+            let _lock = acquire_lock("clean_broken", None)?;
             let loc = map_cli_location(location);
 
-            list::clean_broken(&config.clickhouse.data_path, &s3, &loc).await?;
+            // Only initialize S3 for remote clean_broken.
+            match loc {
+                list::Location::Local => {
+                    let count = list::clean_broken_local(&config.clickhouse.data_path)?;
+                    info!(count = count, "CleanBroken local complete");
+                }
+                list::Location::Remote => {
+                    let s3 = S3Client::new(&config.s3).await?;
+                    let count = list::clean_broken_remote(&s3).await?;
+                    info!(count = count, "CleanBroken remote complete");
+                }
+            }
 
             info!("CleanBroken command complete");
         }
@@ -575,6 +594,8 @@ async fn run() -> Result<()> {
             if tables.is_some() {
                 config.watch.tables = tables;
             }
+            // Re-validate after CLI overrides; catches invalid interval combinations.
+            config.validate()?;
 
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
@@ -646,6 +667,10 @@ async fn run() -> Result<()> {
                 config_path,
                 macros,
                 manifest_cache: None, // No cache in standalone watch mode
+                // Standalone watch has no API server; use a dummy WatchStatus
+                watch_status: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    chbackup::server::state::WatchStatus::default(),
+                )),
             };
 
             let exit = chbackup::watch::run_watch_loop(ctx).await;
@@ -679,6 +704,8 @@ async fn run() -> Result<()> {
             if let Some(v) = full_interval {
                 config.watch.full_interval = v;
             }
+            // Re-validate after CLI overrides; catches invalid interval combinations.
+            config.validate()?;
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
             let config_path = PathBuf::from(&cli.config);
@@ -702,6 +729,11 @@ fn resolve_backup_name(name: Option<String>) -> Result<String> {
         Some(n) => {
             validate_backup_name(&n)
                 .map_err(|e| anyhow::anyhow!("invalid backup name '{}': {}", n, e))?;
+            if n == "latest" || n == "previous" {
+                anyhow::bail!(
+                    "'latest' and 'previous' are reserved shortcut names and cannot be used as backup names"
+                );
+            }
             Ok(n)
         }
         None => Ok(Utc::now().format("%Y-%m-%dT%H%M%S").to_string()),

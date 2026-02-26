@@ -171,13 +171,6 @@ mod tests {
     }
 
     fn make_part(name: &str) -> PartInfo {
-        PartInfo {
-            name: name.to_string(),
-            size: 0,
-            backup_key: String::new(),
-            source: "uploaded".to_string(),
-            checksum_crc64: 0,
-            s3_objects: None,
-        }
+        PartInfo::new(name, 0, 0)
     }
 }

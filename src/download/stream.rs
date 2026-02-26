@@ -2,7 +2,6 @@
 //!
 //! Supports LZ4, zstd, gzip, and uncompressed (none) formats.
 
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -81,6 +80,10 @@ pub fn decompress_part(data: &[u8], output_dir: &Path, data_format: &str) -> Res
 ///
 /// This function runs synchronously and should be called within
 /// `tokio::task::spawn_blocking`.
+///
+/// Only used in tests to create test data for decompression round-trip verification.
+/// The production compress path lives in `upload::stream::compress_part`.
+#[cfg(test)]
 pub fn compress_part(
     part_dir: &Path,
     archive_name: &str,
@@ -168,7 +171,12 @@ pub fn compress_part(
 }
 
 /// Decompress raw LZ4 frame data to bytes.
+///
+/// Only used in tests for LZ4 round-trip verification.
+/// The production decompression path uses `decompress_part` with format dispatch.
+#[cfg(test)]
 pub fn decompress_lz4(data: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read;
     let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
     let mut decompressed = Vec::new();
     decoder

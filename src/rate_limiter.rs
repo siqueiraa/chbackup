@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 /// Internal state for the token bucket.
 struct TokenBucketState {
@@ -81,7 +82,17 @@ impl RateLimiter {
             // If tokens went negative, calculate how long to sleep
             if state.tokens < 0.0 {
                 let deficit = -state.tokens;
-                Duration::from_secs_f64(deficit / state.rate)
+                let computed = Duration::from_secs_f64(deficit / state.rate);
+                // Cap at 5 minutes to prevent indefinite hang from corrupt manifests
+                // with extremely large part sizes.
+                let capped = computed.min(Duration::from_secs(300));
+                if capped < computed {
+                    warn!(
+                        computed_secs = computed.as_secs_f64(),
+                        "Rate limiter sleep capped at 5m; part size may be corrupt"
+                    );
+                }
+                capped
             } else {
                 Duration::ZERO
             }
@@ -89,6 +100,7 @@ impl RateLimiter {
 
         // Sleep outside the lock to avoid blocking other consumers
         if !sleep_duration.is_zero() {
+            debug!(sleep_ms = sleep_duration.as_millis(), "Rate limiter sleeping");
             tokio::time::sleep(sleep_duration).await;
         }
     }

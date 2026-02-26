@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::clickhouse::ChClient;
 use crate::config::Config;
 use crate::list::ManifestCache;
+use crate::lock::{lock_for_command, lock_path_for_scope, PidLock};
 use crate::storage::S3Client;
 
 use tracing::{info, warn};
@@ -322,6 +323,10 @@ where
     F: FnOnce(Arc<Config>, Arc<ChClient>, Arc<S3Client>, CancellationToken) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), anyhow::Error>> + Send,
 {
+    // Clone before try_start_op so the spawned task can use them for PID lock.
+    let backup_name_for_lock = backup_name.clone();
+    let command_for_lock = command.to_string();
+
     let (id, token) = state
         .try_start_op(command, backup_name)
         .await
@@ -346,6 +351,22 @@ where
                 // Calling fail_op() here would overwrite Killed with Failed — do nothing.
             }
             _ = async {
+                // Acquire PID lock before loading clients or running the operation.
+                // This provides cross-process exclusion (CLI vs server) per design §9.
+                let lock_scope = lock_for_command(&command_for_lock, backup_name_for_lock.as_deref());
+                let _pid_lock = if let Some(lock_path) = lock_path_for_scope(&lock_scope) {
+                    match PidLock::acquire(&lock_path, &command_for_lock) {
+                        Ok(lock) => Some(lock),
+                        Err(e) => {
+                            warn!(op = %op_label_owned, error = %e, "Failed to acquire PID lock");
+                            state_clone.fail_op(id, e.to_string()).await;
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let config = state_clone.config.load_full();
                 let ch = state_clone.ch.load_full();
                 let s3 = state_clone.s3.load_full();
@@ -414,6 +435,23 @@ pub fn validate_backup_name(name: &str) -> Result<(), &'static str> {
     if name.contains('\0') {
         return Err("backup name must not contain NUL byte");
     }
+    if name == "." {
+        return Err("backup name must not be '.'");
+    }
+    Ok(())
+}
+
+/// Returns an error if `name` is a reserved backup shortcut.
+///
+/// `"latest"` and `"previous"` are dynamic shortcuts resolved at runtime; they
+/// cannot be used as names for newly-created backups because they would collide
+/// with shortcut resolution in `list.rs`.  This check is separate from
+/// `validate_backup_name`, which is also called for non-create operations
+/// (e.g. `upload latest`) where shortcuts *are* valid inputs.
+pub fn reject_reserved_backup_name(name: &str) -> Result<(), &'static str> {
+    if name == "latest" || name == "previous" {
+        return Err("backup name must not be a reserved shortcut ('latest' or 'previous')");
+    }
     Ok(())
 }
 
@@ -449,6 +487,12 @@ pub fn scan_resumable_state_files(data_path: &str) -> Vec<ResumableOp> {
             Some(name) => name.to_string(),
             None => continue,
         };
+
+        // Validate name to prevent path traversal from crafted filesystem entries.
+        if validate_backup_name(&backup_name).is_err() {
+            tracing::warn!(backup_name = %backup_name, "scan_resumable_state_files: skipping directory with invalid backup name");
+            continue;
+        }
 
         for (state_file, op_type) in &[
             ("upload.state.json", "upload"),
@@ -500,7 +544,7 @@ pub async fn auto_resume(state: &AppState) {
         match op_type.as_str() {
             "upload" => {
                 tokio::spawn(async move {
-                    let (id, _token) = match state_clone
+                    let (id, token) = match state_clone
                         .try_start_op("upload", Some(backup_name.clone()))
                         .await
                     {
@@ -517,39 +561,60 @@ pub async fn auto_resume(state: &AppState) {
 
                     tracing::info!(backup_name = %backup_name, "Auto-resume: resuming upload");
 
-                    let config = state_clone.config.load();
-                    let s3 = state_clone.s3.load();
-                    let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
-                        .join("backup")
-                        .join(&backup_name);
-
-                    let result = crate::upload::upload(
-                        &config,
-                        &s3,
-                        &backup_name,
-                        &backup_dir,
-                        false, // delete_local
-                        None,  // diff_from_remote
-                        true,  // resume = true
-                        tokio_util::sync::CancellationToken::new(), // auto-resume: not cancellable
-                    )
-                    .await;
-
-                    match result {
-                        Ok(_) => {
-                            tracing::info!(backup_name = %backup_name, "Auto-resume: upload completed");
-                            state_clone.finish_op(id).await;
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            tracing::warn!(backup_name = %backup_name, "Auto-resume: upload killed");
+                            // kill_op already updated action log; nothing else to do.
                         }
-                        Err(e) => {
-                            tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: upload failed");
-                            state_clone.fail_op(id, e.to_string()).await;
-                        }
+                        _ = async {
+                            let lock_scope = lock_for_command("upload", Some(&backup_name));
+                            let _pid_lock = if let Some(lock_path) = lock_path_for_scope(&lock_scope) {
+                                match PidLock::acquire(&lock_path, "upload") {
+                                    Ok(l) => Some(l),
+                                    Err(e) => {
+                                        tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: upload PID lock failed");
+                                        state_clone.fail_op(id, e.to_string()).await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            let config = state_clone.config.load();
+                            let s3 = state_clone.s3.load();
+                            let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
+                                .join("backup")
+                                .join(&backup_name);
+
+                            match crate::upload::upload(
+                                &config,
+                                &s3,
+                                &backup_name,
+                                &backup_dir,
+                                false, // delete_local
+                                None,  // diff_from_remote
+                                true,  // resume = true
+                                token.clone(),
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    tracing::info!(backup_name = %backup_name, "Auto-resume: upload completed");
+                                    state_clone.finish_op(id).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: upload failed");
+                                    state_clone.fail_op(id, e.to_string()).await;
+                                }
+                            }
+                        } => {}
                     }
                 });
             }
             "download" => {
                 tokio::spawn(async move {
-                    let (id, _token) = match state_clone
+                    let (id, token) = match state_clone
                         .try_start_op("download", Some(backup_name.clone()))
                         .await
                     {
@@ -566,27 +631,48 @@ pub async fn auto_resume(state: &AppState) {
 
                     tracing::info!(backup_name = %backup_name, "Auto-resume: resuming download");
 
-                    let config = state_clone.config.load();
-                    let s3 = state_clone.s3.load();
-                    let result = crate::download::download(
-                        &config,
-                        &s3,
-                        &backup_name,
-                        true,  // resume = true
-                        false, // hardlink_exists_files = false
-                        tokio_util::sync::CancellationToken::new(), // auto-resume: not cancellable
-                    )
-                    .await;
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            tracing::warn!(backup_name = %backup_name, "Auto-resume: download killed");
+                        }
+                        _ = async {
+                            let lock_scope = lock_for_command("download", Some(&backup_name));
+                            let _pid_lock = if let Some(lock_path) = lock_path_for_scope(&lock_scope) {
+                                match PidLock::acquire(&lock_path, "download") {
+                                    Ok(l) => Some(l),
+                                    Err(e) => {
+                                        tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: download PID lock failed");
+                                        state_clone.fail_op(id, e.to_string()).await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
 
-                    match result {
-                        Ok(_) => {
-                            tracing::info!(backup_name = %backup_name, "Auto-resume: download completed");
-                            state_clone.finish_op(id).await;
-                        }
-                        Err(e) => {
-                            tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: download failed");
-                            state_clone.fail_op(id, e.to_string()).await;
-                        }
+                            let config = state_clone.config.load();
+                            let s3 = state_clone.s3.load();
+
+                            match crate::download::download(
+                                &config,
+                                &s3,
+                                &backup_name,
+                                true,  // resume = true
+                                false, // hardlink_exists_files = false
+                                token.clone(),
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    tracing::info!(backup_name = %backup_name, "Auto-resume: download completed");
+                                    state_clone.finish_op(id).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: download failed");
+                                    state_clone.fail_op(id, e.to_string()).await;
+                                }
+                            }
+                        } => {}
                     }
                 });
             }
@@ -621,7 +707,7 @@ pub async fn auto_resume(state: &AppState) {
                 };
 
                 tokio::spawn(async move {
-                    let (id, _token) = match state_clone
+                    let (id, token) = match state_clone
                         .try_start_op("restore", Some(backup_name.clone()))
                         .await
                     {
@@ -638,45 +724,65 @@ pub async fn auto_resume(state: &AppState) {
 
                     tracing::info!(backup_name = %backup_name, "Auto-resume: resuming restore");
 
-                    let config = state_clone.config.load();
-                    let ch = state_clone.ch.load();
-
-                    // Parse database_mapping from the persisted HashMap.
-                    let db_mapping = if restore_params.database_mapping.is_empty() {
-                        None
-                    } else {
-                        Some(restore_params.database_mapping.clone())
-                    };
-
-                    let result = crate::restore::restore(
-                        &config,
-                        &ch,
-                        &backup_name,
-                        restore_params.tables.as_deref(),
-                        restore_params.schema_only,
-                        restore_params.data_only,
-                        false, // rm: always false on auto-resume -- never DROP tables on restart
-                        true,  // resume = true
-                        restore_params.rename_as.as_deref(),
-                        db_mapping.as_ref(),
-                        restore_params.rbac,
-                        restore_params.configs,
-                        restore_params.named_collections,
-                        restore_params.partitions.as_deref(),
-                        restore_params.skip_empty_tables,
-                        tokio_util::sync::CancellationToken::new(), // auto-resume: not cancellable
-                    )
-                    .await;
-
-                    match result {
-                        Ok(_) => {
-                            tracing::info!(backup_name = %backup_name, "Auto-resume: restore completed");
-                            state_clone.finish_op(id).await;
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            tracing::warn!(backup_name = %backup_name, "Auto-resume: restore killed");
                         }
-                        Err(e) => {
-                            tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: restore failed");
-                            state_clone.fail_op(id, e.to_string()).await;
-                        }
+                        _ = async {
+                            let lock_scope = lock_for_command("restore", Some(&backup_name));
+                            let _pid_lock = if let Some(lock_path) = lock_path_for_scope(&lock_scope) {
+                                match PidLock::acquire(&lock_path, "restore") {
+                                    Ok(l) => Some(l),
+                                    Err(e) => {
+                                        tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: restore PID lock failed");
+                                        state_clone.fail_op(id, e.to_string()).await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            let config = state_clone.config.load();
+                            let ch = state_clone.ch.load();
+
+                            // Parse database_mapping from the persisted HashMap.
+                            let db_mapping = if restore_params.database_mapping.is_empty() {
+                                None
+                            } else {
+                                Some(restore_params.database_mapping.clone())
+                            };
+
+                            match crate::restore::restore(
+                                &config,
+                                &ch,
+                                &backup_name,
+                                restore_params.tables.as_deref(),
+                                restore_params.schema_only,
+                                restore_params.data_only,
+                                false, // rm: always false on auto-resume -- never DROP tables on restart
+                                true,  // resume = true
+                                restore_params.rename_as.as_deref(),
+                                db_mapping.as_ref(),
+                                restore_params.rbac,
+                                restore_params.configs,
+                                restore_params.named_collections,
+                                restore_params.partitions.as_deref(),
+                                restore_params.skip_empty_tables,
+                                token.clone(),
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    tracing::info!(backup_name = %backup_name, "Auto-resume: restore completed");
+                                    state_clone.finish_op(id).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: restore failed");
+                                    state_clone.fail_op(id, e.to_string()).await;
+                                }
+                            }
+                        } => {}
                     }
                 });
             }
@@ -987,6 +1093,23 @@ mod tests {
     #[test]
     fn test_validate_backup_name_rejects_nul() {
         assert!(validate_backup_name("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_backup_name_allows_reserved_shortcuts() {
+        // validate_backup_name intentionally allows "latest"/"previous" --
+        // they are valid inputs for upload/download/restore commands.
+        assert!(validate_backup_name("latest").is_ok());
+        assert!(validate_backup_name("previous").is_ok());
+    }
+
+    #[test]
+    fn test_reject_reserved_backup_name() {
+        assert!(reject_reserved_backup_name("latest").is_err());
+        assert!(reject_reserved_backup_name("previous").is_err());
+        // Normal names are accepted.
+        assert!(reject_reserved_backup_name("daily-2024-01-15").is_ok());
+        assert!(reject_reserved_backup_name("my_backup").is_ok());
     }
 
     #[tokio::test]

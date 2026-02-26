@@ -86,16 +86,29 @@ impl ActionLog {
     }
 
     /// Mark an action as completed successfully.
+    ///
+    /// No-op if the entry is already in a terminal `Killed` state so that
+    /// auto-resume tasks (which run on a fresh token and cannot be cancelled)
+    /// cannot overwrite a `Killed` status set by an explicit kill request.
     pub fn finish(&mut self, id: u64) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            if matches!(entry.status, ActionStatus::Killed) {
+                return;
+            }
             entry.finish = Some(Utc::now());
             entry.status = ActionStatus::Completed;
         }
     }
 
     /// Mark an action as failed with an error message.
+    ///
+    /// No-op if the entry is already in a terminal `Killed` state (same
+    /// reasoning as `finish`).
     pub fn fail(&mut self, id: u64, error: String) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            if matches!(entry.status, ActionStatus::Killed) {
+                return;
+            }
             entry.finish = Some(Utc::now());
             entry.status = ActionStatus::Failed(error);
         }

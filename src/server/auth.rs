@@ -63,12 +63,32 @@ pub async fn auth_middleware(
         return unauthorized_response();
     };
 
-    // Compare credentials
-    if req_user == username && req_pass == password {
+    // Compare credentials using constant-time comparison to prevent timing attacks.
+    // Evaluate both comparisons to avoid short-circuit leaking which credential failed.
+    let user_ok = constant_time_eq(req_user.as_bytes(), username.as_bytes());
+    let pass_ok = constant_time_eq(req_pass.as_bytes(), password.as_bytes());
+    if user_ok & pass_ok {
         next.run(request).await
     } else {
         unauthorized_response()
     }
+}
+
+/// Constant-time byte comparison to prevent timing attacks.
+///
+/// Returns `true` only when both slices have the same length AND identical
+/// contents. For HTTP Basic auth credentials, leaking length via the early
+/// return is acceptable (credential length is bounded and chosen by the
+/// operator). The XOR-fold loop remains constant-time with respect to
+/// content, which is the security-relevant property.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Build a 401 Unauthorized response with WWW-Authenticate header.
@@ -90,9 +110,13 @@ mod tests {
         let encoded = STANDARD.encode("admin:secret123");
         let decoded_bytes = STANDARD.decode(&encoded).unwrap();
         let decoded = String::from_utf8(decoded_bytes).unwrap();
-        let (user, pass) = decoded.split_once(':').unwrap();
-        assert_eq!(user, "admin");
-        assert_eq!(pass, "secret123");
+        match decoded.split_once(':') {
+            Some((user, pass)) => {
+                assert_eq!(user, "admin");
+                assert_eq!(pass, "secret123");
+            }
+            None => panic!("expected colon-separated credentials, got: {decoded}"),
+        }
     }
 
     #[test]
@@ -100,9 +124,13 @@ mod tests {
         let encoded = STANDARD.encode(":");
         let decoded_bytes = STANDARD.decode(&encoded).unwrap();
         let decoded = String::from_utf8(decoded_bytes).unwrap();
-        let (user, pass) = decoded.split_once(':').unwrap();
-        assert_eq!(user, "");
-        assert_eq!(pass, "");
+        match decoded.split_once(':') {
+            Some((user, pass)) => {
+                assert_eq!(user, "");
+                assert_eq!(pass, "");
+            }
+            None => panic!("expected colon-separated credentials, got: {decoded}"),
+        }
     }
 
     #[test]
@@ -111,9 +139,25 @@ mod tests {
         let encoded = STANDARD.encode("user:pass:with:colons");
         let decoded_bytes = STANDARD.decode(&encoded).unwrap();
         let decoded = String::from_utf8(decoded_bytes).unwrap();
-        let (user, pass) = decoded.split_once(':').unwrap();
-        assert_eq!(user, "user");
-        assert_eq!(pass, "pass:with:colons");
+        match decoded.split_once(':') {
+            Some((user, pass)) => {
+                assert_eq!(user, "user");
+                assert_eq!(pass, "pass:with:colons");
+            }
+            None => panic!("expected colon-separated credentials, got: {decoded}"),
+        }
+    }
+
+    #[test]
+    fn test_auth_decode_no_colon_returns_none() {
+        // Malformed input without a colon should not be accepted
+        let encoded = STANDARD.encode("nocolonhere");
+        let decoded_bytes = STANDARD.decode(&encoded).unwrap();
+        let decoded = String::from_utf8(decoded_bytes).unwrap();
+        assert!(
+            decoded.split_once(':').is_none(),
+            "expected None for input without colon"
+        );
     }
 
     #[test]
@@ -135,5 +179,25 @@ mod tests {
     fn test_unauthorized_response_status() {
         let response = unauthorized_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_constant_time_eq_equal() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"\x00\x01\x02", b"\x00\x01\x02"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_content() {
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_length() {
+        assert!(!constant_time_eq(b"hello", b"hell"));
+        assert!(!constant_time_eq(b"hi", b"hello"));
+        assert!(!constant_time_eq(b"", b"a"));
     }
 }

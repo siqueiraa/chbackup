@@ -49,6 +49,22 @@ pub fn effective_object_disk_copy_concurrency(config: &Config) -> u32 {
     config.backup.object_disk_copy_concurrency
 }
 
+pub fn effective_upload_rate_limit(config: &Config) -> u64 {
+    if config.backup.upload_max_bytes_per_second > 0 {
+        config.backup.upload_max_bytes_per_second
+    } else {
+        config.general.upload_max_bytes_per_second
+    }
+}
+
+pub fn effective_download_rate_limit(config: &Config) -> u64 {
+    if config.backup.download_max_bytes_per_second > 0 {
+        config.backup.download_max_bytes_per_second
+    } else {
+        config.general.download_max_bytes_per_second
+    }
+}
+
 /// Resolve the effective object disk server-side copy concurrency for restore.
 ///
 /// Returns `general.object_disk_server_side_copy_concurrency` directly (default 32).
@@ -130,5 +146,33 @@ mod tests {
             effective_object_disk_server_side_copy_concurrency(&config),
             64
         );
+    }
+
+    #[test]
+    fn test_effective_upload_rate_limit() {
+        let mut config = Config::default();
+        config.backup.upload_max_bytes_per_second = 1000;
+        config.general.upload_max_bytes_per_second = 500;
+        assert_eq!(effective_upload_rate_limit(&config), 1000);
+
+        config.backup.upload_max_bytes_per_second = 0;
+        assert_eq!(effective_upload_rate_limit(&config), 500);
+
+        config.general.upload_max_bytes_per_second = 0;
+        assert_eq!(effective_upload_rate_limit(&config), 0);
+    }
+
+    #[test]
+    fn test_effective_download_rate_limit() {
+        let mut config = Config::default();
+        config.backup.download_max_bytes_per_second = 2000;
+        config.general.download_max_bytes_per_second = 800;
+        assert_eq!(effective_download_rate_limit(&config), 2000);
+
+        config.backup.download_max_bytes_per_second = 0;
+        assert_eq!(effective_download_rate_limit(&config), 800);
+
+        config.general.download_max_bytes_per_second = 0;
+        assert_eq!(effective_download_rate_limit(&config), 0);
     }
 }

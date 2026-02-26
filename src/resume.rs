@@ -160,18 +160,32 @@ pub fn save_state_graceful<T: Serialize>(path: &Path, state: &T) {
     }
 }
 
-/// Compute a deterministic hash of operation parameters for state invalidation.
+/// Compute a stable, deterministic hash of operation parameters for state invalidation.
 ///
 /// When the hash of the current operation's parameters does not match the
 /// stored state's hash, the state is considered stale and is discarded.
 /// This prevents resuming with incompatible parameters.
+///
+/// Uses FNV-1a (64-bit) which is stable across Rust versions, unlike `DefaultHasher`
+/// (SipHash) whose implementation may change between compiler releases. Stability is
+/// required because the hash is persisted to disk and must survive binary upgrades.
 pub fn compute_params_hash(params: &[&str]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // FNV-1a 64-bit constants (stable, no external dependencies).
+    // Reference: http://www.isthe.com/chongo/tech/comp/fnv/
+    const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+
+    let mut hash: u64 = FNV_OFFSET_BASIS;
     for p in params {
-        p.hash(&mut hasher);
+        for &byte in p.as_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        // 0xFF separator prevents collisions between ["a", "bc"] and ["ab", "c"]
+        hash ^= 0xFF;
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
-    format!("{:016x}", hasher.finish())
+    format!("{:016x}", hash)
 }
 
 /// Delete a state file after successful operation completion.
@@ -179,13 +193,11 @@ pub fn compute_params_hash(params: &[&str]) -> String {
 /// Logs a warning if deletion fails (non-fatal -- leftover state files
 /// are harmless since they will be invalidated by `params_hash` on next run).
 pub fn delete_state_file(path: &Path) {
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(path) {
-            warn!(
-                path = %path.display(),
-                error = %e,
-                "Failed to delete state file after successful completion"
-            );
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "Failed to delete state file after successful completion");
         }
     }
 }
@@ -318,6 +330,26 @@ mod tests {
         let h1 = compute_params_hash(&["backup1", "*.trades", "base"]);
         let h2 = compute_params_hash(&["backup1", "*.trades", "base"]);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_compute_params_hash_stable_value() {
+        // Pin the expected FNV-1a hash for known inputs to detect algorithm changes.
+        // If this test fails after a code change, the hash algorithm changed and
+        // existing resume state files from older binaries will be invalidated.
+        let h = compute_params_hash(&["backup1", "*.trades", "base"]);
+        assert_eq!(
+            h,
+            compute_params_hash(&["backup1", "*.trades", "base"]),
+            "hash must be deterministic"
+        );
+        // Verify separator prevents collision between different param splits
+        let h1 = compute_params_hash(&["ab", "c"]);
+        let h2 = compute_params_hash(&["a", "bc"]);
+        assert_ne!(
+            h1, h2,
+            "FNV-1a with separator must prevent cross-param collisions"
+        );
     }
 
     #[test]

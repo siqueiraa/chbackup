@@ -24,6 +24,13 @@ pub enum ChBackupError {
     #[error("Manifest error: {0}")]
     ManifestError(String),
 
+    /// Backup or manifest does not exist. Maps to exit code 3.
+    ///
+    /// Use this variant instead of `BackupError("... not found ...")` so that
+    /// exit code 3 is determined structurally rather than by string scanning.
+    #[error("Backup not found: {0}")]
+    BackupNotFound(String),
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 }
@@ -42,11 +49,7 @@ impl ChBackupError {
     pub fn exit_code(&self) -> i32 {
         match self {
             ChBackupError::LockError(_) => 4,
-            ChBackupError::BackupError(msg) | ChBackupError::ManifestError(msg)
-                if msg.contains("not found") =>
-            {
-                3
-            }
+            ChBackupError::BackupNotFound(_) => 3,
             _ => 1,
         }
     }
@@ -74,19 +77,21 @@ mod tests {
 
     #[test]
     fn test_exit_code_backup_not_found() {
-        let err = ChBackupError::BackupError("backup 'daily' not found".to_string());
-        assert_eq!(err.exit_code(), 3);
-    }
-
-    #[test]
-    fn test_exit_code_manifest_not_found() {
-        let err = ChBackupError::ManifestError("manifest not found in S3".to_string());
+        let err = ChBackupError::BackupNotFound("daily".to_string());
         assert_eq!(err.exit_code(), 3);
     }
 
     #[test]
     fn test_exit_code_general_backup_error() {
         let err = ChBackupError::BackupError("disk full".to_string());
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_exit_code_manifest_not_found() {
+        // ManifestError is NOT exit code 3 unless it wraps BackupNotFound.
+        // Use ChBackupError::BackupNotFound for structured not-found signalling.
+        let err = ChBackupError::ManifestError("manifest not found in S3".to_string());
         assert_eq!(err.exit_code(), 1);
     }
 
@@ -120,5 +125,11 @@ mod tests {
     fn test_exit_code_from_non_chbackup_error() {
         let err = anyhow::anyhow!("some generic error");
         assert_eq!(exit_code_from_error(&err), 1);
+    }
+
+    #[test]
+    fn test_exit_code_backup_not_found_via_anyhow() {
+        let err: anyhow::Error = ChBackupError::BackupNotFound("my-backup".to_string()).into();
+        assert_eq!(exit_code_from_error(&err), 3);
     }
 }

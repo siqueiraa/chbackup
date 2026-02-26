@@ -6,7 +6,7 @@
 //!
 //! Format matches design doc section 7.1.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -48,21 +48,21 @@ pub struct BackupManifest {
     pub metadata_size: u64,
 
     /// Disk name -> disk path mapping from ClickHouse.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub disks: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub disks: BTreeMap<String, String>,
 
     /// Disk name -> disk type mapping (e.g. "local", "s3").
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub disk_types: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub disk_types: BTreeMap<String, String>,
 
     /// Disk name -> remote_path mapping for S3 disks (e.g. "s3disk" -> "s3://bucket/prefix/").
     /// Empty for local disks. Used by upload to determine CopyObject source.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub disk_remote_paths: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub disk_remote_paths: BTreeMap<String, String>,
 
     /// Tables included in this backup. Key is "db.table".
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub tables: HashMap<String, TableManifest>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tables: BTreeMap<String, TableManifest>,
 
     /// Databases included in this backup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -108,8 +108,8 @@ pub struct TableManifest {
     pub total_bytes: u64,
 
     /// Parts grouped by disk name. Key is disk name (e.g. "default", "s3disk").
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub parts: HashMap<String, Vec<PartInfo>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parts: BTreeMap<String, Vec<PartInfo>>,
 
     /// Pending mutations at backup time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -151,6 +151,33 @@ pub struct PartInfo {
     /// None for local disk parts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_objects: Option<Vec<S3ObjectInfo>>,
+
+    /// Compressed size of this part on S3 in bytes. Set during upload for newly
+    /// uploaded parts; carried forward from the base manifest for incremental parts.
+    /// Zero for old manifests that predate this field (backward compatible).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub backup_size: u64,
+}
+
+impl PartInfo {
+    /// Create a new PartInfo with default values for a freshly collected part.
+    pub fn new(name: impl Into<String>, size: u64, crc64: u64) -> Self {
+        Self {
+            name: name.into(),
+            size,
+            backup_key: String::new(),
+            source: "uploaded".to_string(),
+            checksum_crc64: crc64,
+            s3_objects: None,
+            backup_size: 0,
+        }
+    }
+
+    /// Set S3 objects for an S3 disk part.
+    pub fn with_s3_objects(mut self, objects: Vec<S3ObjectInfo>) -> Self {
+        self.s3_objects = Some(objects);
+        self
+    }
 }
 
 /// Reference to an S3 object within a part (for S3 object disk parts).
@@ -167,6 +194,64 @@ pub struct S3ObjectInfo {
     pub backup_key: String,
 }
 
+impl TableManifest {
+    /// Create a minimal TableManifest for testing. The DDL is auto-generated from
+    /// the engine name, and all other fields use sensible defaults (empty parts,
+    /// no mutations, no dependencies, metadata_only = false).
+    #[cfg(test)]
+    pub fn test_new(engine: &str) -> Self {
+        Self {
+            ddl: format!(
+                "CREATE TABLE test (id UInt64) ENGINE = {} ORDER BY id",
+                engine
+            ),
+            uuid: None,
+            engine: engine.to_string(),
+            total_bytes: 0,
+            parts: std::collections::BTreeMap::new(),
+            pending_mutations: Vec::new(),
+            metadata_only: false,
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_parts(mut self, parts: std::collections::BTreeMap<String, Vec<PartInfo>>) -> Self {
+        self.parts = parts;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_ddl(mut self, ddl: impl Into<String>) -> Self {
+        self.ddl = ddl.into();
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_metadata_only(mut self, metadata_only: bool) -> Self {
+        self.metadata_only = metadata_only;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_dependencies(mut self, deps: Vec<String>) -> Self {
+        self.dependencies = deps;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_total_bytes(mut self, bytes: u64) -> Self {
+        self.total_bytes = bytes;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_uuid(mut self, uuid: impl Into<String>) -> Self {
+        self.uuid = Some(uuid.into());
+        self
+    }
+}
+
 /// Database metadata in the manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseInfo {
@@ -175,6 +260,19 @@ pub struct DatabaseInfo {
 
     /// CREATE DATABASE DDL statement.
     pub ddl: String,
+}
+
+impl DatabaseInfo {
+    /// Create a minimal DatabaseInfo for testing. The DDL is auto-generated as
+    /// `CREATE DATABASE {name} ENGINE = Atomic`.
+    #[cfg(test)]
+    pub fn test_new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            ddl: format!("CREATE DATABASE {} ENGINE = Atomic", name),
+            name,
+        }
+    }
 }
 
 /// Mutation metadata in the manifest (pending mutations at backup time).
@@ -210,6 +308,10 @@ fn default_data_format() -> String {
 
 fn default_source() -> String {
     "uploaded".to_string()
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 // -- File I/O helpers --
@@ -252,75 +354,125 @@ impl BackupManifest {
     }
 }
 
+// -- Test builder helpers --
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_manifest() -> BackupManifest {
-        let mut tables = HashMap::new();
-        let mut parts = HashMap::new();
-        parts.insert(
-            "default".to_string(),
-            vec![
-                PartInfo {
-                    name: "202401_1_50_3".to_string(),
-                    size: 134_217_728,
-                    backup_key: "chbackup/daily/data/default/trades/202401_1_50_3.tar.lz4"
-                        .to_string(),
-                    source: "uploaded".to_string(),
-                    checksum_crc64: 12345678901234,
-                    s3_objects: None,
-                },
-                PartInfo {
-                    name: "202402_1_1_0".to_string(),
-                    size: 4096,
-                    backup_key: "chbackup/daily/data/default/trades/202402_1_1_0.tar.lz4"
-                        .to_string(),
-                    source: "uploaded".to_string(),
-                    checksum_crc64: 11111111111111,
-                    s3_objects: None,
-                },
-            ],
-        );
-
-        tables.insert(
-            "default.trades".to_string(),
-            TableManifest {
-                ddl: "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id"
-                    .to_string(),
-                uuid: Some("5f3a7b2c-1234-5678-9abc-def012345678".to_string()),
-                engine: "MergeTree".to_string(),
-                total_bytes: 134_221_824,
-                parts,
-                pending_mutations: Vec::new(),
-                metadata_only: false,
-                dependencies: Vec::new(),
-            },
-        );
-
-        BackupManifest {
+impl BackupManifest {
+    /// Create a minimal manifest for testing with sensible defaults.
+    pub fn test_new(name: impl Into<String>) -> Self {
+        Self {
             manifest_version: 1,
-            name: "daily-2024-01-15".to_string(),
-            timestamp: Utc::now(),
+            name: name.into(),
+            timestamp: chrono::Utc::now(),
             clickhouse_version: "24.1.3.31".to_string(),
             chbackup_version: "0.1.0".to_string(),
             data_format: "lz4".to_string(),
-            compressed_size: 1_073_741_824,
-            metadata_size: 524_288,
-            disks: HashMap::from([("default".to_string(), "/var/lib/clickhouse".to_string())]),
-            disk_types: HashMap::from([("default".to_string(), "local".to_string())]),
-            disk_remote_paths: HashMap::new(),
-            tables,
-            databases: vec![DatabaseInfo {
-                name: "default".to_string(),
-                ddl: "CREATE DATABASE default ENGINE = Atomic".to_string(),
-            }],
+            compressed_size: 0,
+            metadata_size: 0,
+            disks: BTreeMap::new(),
+            disk_types: BTreeMap::new(),
+            disk_remote_paths: BTreeMap::new(),
+            tables: BTreeMap::new(),
+            databases: Vec::new(),
             functions: Vec::new(),
             named_collections: Vec::new(),
             rbac: None,
             rbac_size: 0,
             config_size: 0,
         }
+    }
+
+    pub fn with_tables(mut self, tables: BTreeMap<String, TableManifest>) -> Self {
+        self.tables = tables;
+        self
+    }
+
+    pub fn with_databases(mut self, databases: Vec<DatabaseInfo>) -> Self {
+        self.databases = databases;
+        self
+    }
+
+    pub fn with_disks(mut self, disks: BTreeMap<String, String>) -> Self {
+        self.disks = disks;
+        self
+    }
+
+    pub fn with_disk_types(mut self, disk_types: BTreeMap<String, String>) -> Self {
+        self.disk_types = disk_types;
+        self
+    }
+
+    pub fn with_disk_remote_paths(
+        mut self,
+        disk_remote_paths: BTreeMap<String, String>,
+    ) -> Self {
+        self.disk_remote_paths = disk_remote_paths;
+        self
+    }
+
+    pub fn with_compressed_size(mut self, size: u64) -> Self {
+        self.compressed_size = size;
+        self
+    }
+
+    pub fn with_metadata_size(mut self, size: u64) -> Self {
+        self.metadata_size = size;
+        self
+    }
+
+    pub fn with_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
+        self.timestamp = timestamp;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_manifest() -> BackupManifest {
+        let mut parts = BTreeMap::new();
+        parts.insert(
+            "default".to_string(),
+            vec![
+                {
+                    let mut p = PartInfo::new("202401_1_50_3", 134_217_728, 12345678901234);
+                    p.backup_key =
+                        "chbackup/daily/data/default/trades/202401_1_50_3.tar.lz4".to_string();
+                    p
+                },
+                {
+                    let mut p = PartInfo::new("202402_1_1_0", 4096, 11111111111111);
+                    p.backup_key =
+                        "chbackup/daily/data/default/trades/202402_1_1_0.tar.lz4".to_string();
+                    p
+                },
+            ],
+        );
+
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "default.trades".to_string(),
+            TableManifest::test_new("MergeTree")
+                .with_ddl("CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id")
+                .with_uuid("5f3a7b2c-1234-5678-9abc-def012345678")
+                .with_total_bytes(134_221_824)
+                .with_parts(parts),
+        );
+
+        BackupManifest::test_new("daily-2024-01-15")
+            .with_compressed_size(1_073_741_824)
+            .with_metadata_size(524_288)
+            .with_disks(BTreeMap::from([(
+                "default".to_string(),
+                "/var/lib/clickhouse".to_string(),
+            )]))
+            .with_disk_types(BTreeMap::from([(
+                "default".to_string(),
+                "local".to_string(),
+            )]))
+            .with_tables(tables)
+            .with_databases(vec![DatabaseInfo::test_new("default")])
     }
 
     #[test]
@@ -508,16 +660,7 @@ mod tests {
 
     #[test]
     fn test_table_manifest_empty_parts_not_serialized() {
-        let table = TableManifest {
-            ddl: "CREATE TABLE test.t (id UInt64) ENGINE = MergeTree ORDER BY id".to_string(),
-            uuid: None,
-            engine: "MergeTree".to_string(),
-            total_bytes: 0,
-            parts: HashMap::new(),
-            pending_mutations: Vec::new(),
-            metadata_only: true,
-            dependencies: Vec::new(),
-        };
+        let table = TableManifest::test_new("MergeTree").with_metadata_only(true);
         let json = serde_json::to_string(&table).unwrap();
         // Empty parts, mutations, and dependencies should not appear in output
         assert!(!json.contains("\"parts\""));

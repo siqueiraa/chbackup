@@ -93,14 +93,7 @@ mod tests {
             database: "default".to_string(),
             table: "test_table".to_string(),
             disk_name: "s3disk".to_string(),
-            part_info: PartInfo {
-                name: "202401_1_50_3".to_string(),
-                size: 1024,
-                backup_key: String::new(),
-                source: "uploaded".to_string(),
-                checksum_crc64: 0,
-                s3_objects: None,
-            },
+            part_info: PartInfo::new("202401_1_50_3", 1024, 0),
         };
         assert_eq!(part.disk_name, "s3disk");
         assert_eq!(part.database, "default");

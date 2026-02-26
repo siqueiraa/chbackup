@@ -14,7 +14,7 @@
 
 pub mod stream;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,9 +25,11 @@ use tracing::{debug, info, warn};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::backup::collect::per_disk_backup_dir;
 use crate::backup::diff::diff_parts;
-use crate::concurrency::{effective_object_disk_copy_concurrency, effective_upload_concurrency};
+use crate::concurrency::{
+    effective_object_disk_copy_concurrency, effective_upload_concurrency,
+    effective_upload_rate_limit,
+};
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo, S3ObjectInfo};
 use crate::object_disk::is_s3_disk;
@@ -450,7 +452,7 @@ pub async fn upload(
     // 3. Upload both queues in parallel
     let upload_semaphore = Arc::new(Semaphore::new(concurrency));
     let object_disk_copy_semaphore = Arc::new(Semaphore::new(object_disk_concurrency));
-    let rate_limiter = RateLimiter::new(config.backup.upload_max_bytes_per_second);
+    let rate_limiter = RateLimiter::new(effective_upload_rate_limit(config));
     let s3_chunk_size = config.s3.chunk_size;
     let s3_max_parts_count = config.s3.max_parts_count;
     let allow_object_disk_streaming = config.s3.allow_object_disk_streaming;
@@ -499,9 +501,34 @@ pub async fn upload(
                 .await
                 .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
 
-            if cancel_clone.is_cancelled() {
-                return Ok((item.table_key, item.disk_name, item.part.clone(), 0));
-            }
+            // Pre-clone values needed by the cancel arm before item is moved.
+            let cancel_table_key = item.table_key.clone();
+            let cancel_disk_name = item.disk_name.clone();
+            let cancel_part = item.part.clone();
+
+            // Track in-progress multipart upload ID so the cancel arm can abort it
+            // (design §3.6, §11.5: AbortMultipartUpload on cancellation).
+            // std::sync::Mutex is used so set/clear are non-blocking (no await needed).
+            let active_mpu: Arc<std::sync::Mutex<Option<String>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let active_mpu_cancel = active_mpu.clone();
+            let s3_abort = s3.clone();
+            let abort_key = item.s3_key.clone();
+
+            tokio::select! {
+                biased;
+                _ = cancel_clone.cancelled() => {
+                    // Abort any in-progress multipart upload before returning.
+                    let uid = active_mpu_cancel
+                        .lock()
+                        .expect("MPU lock poisoned")
+                        .take();
+                    if let Some(uid) = uid {
+                        let _ = s3_abort.abort_multipart_upload(&abort_key, &uid).await;
+                    }
+                    Ok((cancel_table_key, cancel_disk_name, cancel_part, 0))
+                },
+                result = async move {
 
             debug!(
                 table = %item.table_key,
@@ -553,30 +580,37 @@ pub async fn upload(
 
                 // Create multipart upload
                 let upload_id = s3.create_multipart_upload(&item.s3_key).await?;
+                // Register upload_id so the cancel arm can abort it if needed.
+                *active_mpu.lock().expect("MPU lock poisoned") = Some(upload_id.clone());
 
-                // Collect all chunks from the compression thread via spawn_blocking
-                // (bridges sync mpsc::Receiver to async context)
-                let part_name_for_err = item.part.name.clone();
-                let chunks: Vec<Vec<u8>> = tokio::task::spawn_blocking(move || {
-                    let mut chunks = Vec::new();
+                // Pipeline: bridge the sync mpsc::Receiver (compression thread) to async
+                // upload via a tokio channel.  Compression and upload run concurrently:
+                // as soon as a chunk is ready it is uploaded, so only one chunk_size of
+                // memory is held at a time instead of all chunks.
+                let (tokio_tx, mut tokio_rx) =
+                    tokio::sync::mpsc::channel::<Result<Vec<u8>>>(2);
+
+                let bridge = tokio::task::spawn_blocking(move || {
                     for chunk_result in receiver.iter() {
-                        let chunk = chunk_result.with_context(|| {
-                            format!("Streaming compression error for part {}", part_name_for_err)
-                        })?;
-                        chunks.push(chunk);
+                        if tokio_tx.blocking_send(chunk_result).is_err() {
+                            break; // upload side aborted
+                        }
                     }
-                    Ok::<Vec<Vec<u8>>, anyhow::Error>(chunks)
-                })
-                .await
-                .context("Chunk collector task panicked")??;
+                });
 
-                // Upload each chunk as a multipart part
+                let part_name_for_err = item.part.name.clone();
                 let upload_result = async {
                     let mut completed_parts: Vec<(i32, String)> = Vec::new();
                     let mut total_compressed: u64 = 0;
+                    let mut part_number = 1i32;
 
-                    for (idx, chunk_data) in chunks.into_iter().enumerate() {
-                        let part_number = (idx + 1) as i32;
+                    while let Some(chunk_result) = tokio_rx.recv().await {
+                        let chunk_data = chunk_result.with_context(|| {
+                            format!(
+                                "Streaming compression error for part {}",
+                                part_name_for_err
+                            )
+                        })?;
                         total_compressed += chunk_data.len() as u64;
                         let e_tag = s3
                             .upload_part_with_retry(
@@ -588,6 +622,18 @@ pub async fn upload(
                             )
                             .await?;
                         completed_parts.push((part_number, e_tag));
+                        part_number += 1;
+                    }
+
+                    bridge.await.context("Chunk bridge task panicked")?;
+
+                    if completed_parts.is_empty() {
+                        // No chunks produced -- abort the multipart upload
+                        let _ = s3.abort_multipart_upload(&item.s3_key, &upload_id).await;
+                        anyhow::bail!(
+                            "Streaming compression produced zero chunks for part {}",
+                            part_name_for_err
+                        );
                     }
 
                     s3.complete_multipart_upload(&item.s3_key, &upload_id, completed_parts)
@@ -596,6 +642,11 @@ pub async fn upload(
                     Ok::<u64, anyhow::Error>(total_compressed)
                 }
                 .await;
+
+                // Clear tracking before handling result.  The error arm below calls abort
+                // explicitly; the cancel arm uses take() so clearing here prevents a
+                // redundant abort if cancel fires after the upload_result block finishes.
+                *active_mpu.lock().expect("MPU lock poisoned") = None;
 
                 match upload_result {
                     Ok(total) => total,
@@ -645,6 +696,8 @@ pub async fn upload(
 
                     // Create multipart upload
                     let upload_id = s3.create_multipart_upload(&item.s3_key).await?;
+                    // Register upload_id so the cancel arm can abort it if needed.
+                    *active_mpu.lock().expect("MPU lock poisoned") = Some(upload_id.clone());
 
                     // Upload chunks, aborting on error
                     let upload_result = async {
@@ -676,6 +729,9 @@ pub async fn upload(
                     }
                     .await;
 
+                    // Clear tracking before handling result.
+                    *active_mpu.lock().expect("MPU lock poisoned") = None;
+
                     if let Err(e) = upload_result {
                         // Best-effort abort to clean up partial upload
                         let _ = s3.abort_multipart_upload(&item.s3_key, &upload_id).await;
@@ -702,6 +758,7 @@ pub async fn upload(
             let mut updated_part = item.part.clone();
             updated_part.backup_key = item.s3_key.clone();
             updated_part.source = "uploaded".to_string();
+            updated_part.backup_size = compressed_size;
 
             debug!(
                 table = %item.table_key,
@@ -725,6 +782,9 @@ pub async fn upload(
                 updated_part,
                 compressed_size,
             ))
+
+            } => result,
+            }
         });
 
         handles.push(handle);
@@ -744,9 +804,17 @@ pub async fn upload(
                 .await
                 .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
 
-            if cancel_clone.is_cancelled() {
-                return Ok((item.table_key, item.disk_name, item.part.clone(), 0));
-            }
+            // Pre-clone values needed by the cancel arm before item is moved.
+            let cancel_table_key = item.table_key.clone();
+            let cancel_disk_name = item.disk_name.clone();
+            let cancel_part = item.part.clone();
+            // Clone cancel token for use inside the CopyObject loop.
+            let inner_cancel = cancel_clone.clone();
+
+            tokio::select! {
+                biased;
+                _ = cancel_clone.cancelled() => Ok((cancel_table_key, cancel_disk_name, cancel_part, 0)),
+                result = async move {
 
             debug!(
                 table = %item.table_key,
@@ -760,7 +828,12 @@ pub async fn upload(
                 Vec::with_capacity(item.s3_objects.len());
 
             // CopyObject for each S3 object in the part
+            let mut cancelled_during_copy = false;
             for s3_obj in &item.s3_objects {
+                if inner_cancel.is_cancelled() {
+                    cancelled_during_copy = true;
+                    break;
+                }
                 // Skip zero-size objects (inline data in v4+ metadata)
                 if s3_obj.size == 0 {
                     updated_s3_objects.push(S3ObjectInfo {
@@ -803,6 +876,13 @@ pub async fn upload(
                 });
             }
 
+            // If cancelled mid-copy, return early without recording completion
+            if cancelled_during_copy {
+                let mut updated_part = item.part.clone();
+                updated_part.s3_objects = Some(updated_s3_objects);
+                return Ok((item.table_key, item.disk_name, updated_part, 0u64));
+            }
+
             // Upload metadata files for this S3 disk part.
             // The metadata files are in the local part_dir (from shadow walk).
             let metadata_backup_key = format!(
@@ -815,7 +895,8 @@ pub async fn upload(
             );
 
             if item.part_dir.exists() {
-                upload_metadata_files(&s3, &item.part_dir, &metadata_backup_key).await?;
+                upload_metadata_files(&s3, &item.part_dir, &metadata_backup_key, retry_config)
+                    .await?;
             }
 
             // Build updated part info
@@ -823,6 +904,8 @@ pub async fn upload(
             updated_part.s3_objects = Some(updated_s3_objects);
             updated_part.backup_key = metadata_backup_key.clone();
             updated_part.source = "uploaded".to_string();
+            // S3 disk parts are not compressed; backup_size equals original size
+            updated_part.backup_size = item.part.size;
 
             debug!(
                 table = %item.table_key,
@@ -841,6 +924,9 @@ pub async fn upload(
 
             // S3 disk parts have no compressed_size (no compression)
             Ok((item.table_key, item.disk_name, updated_part, 0u64))
+
+            } => result,
+            }
         });
 
         handles.push(handle);
@@ -852,6 +938,14 @@ pub async fn upload(
         .context("An upload task panicked")?
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
+
+    // Guard: workers return Ok on cancel (not Err), so try_join_all succeeds even when
+    // the operation was killed. Without this check the sync manifest-update code below
+    // would run before the outer tokio::select! gets a chance to detect the cancellation,
+    // potentially producing a manifest with empty backup_key values for unfinished parts.
+    if cancel.is_cancelled() {
+        return Err(anyhow::anyhow!("upload cancelled"));
+    }
 
     progress.finish();
 
@@ -868,24 +962,27 @@ pub async fn upload(
             .push(updated_part);
     }
 
-    for ((table_key, disk_name), uploaded_parts) in updates {
-        if let Some(tm) = manifest.tables.get_mut(&table_key) {
-            // Preserve carried parts (already have correct backup_key from diff),
-            // then append the newly uploaded parts with updated S3 keys.
-            let carried: Vec<PartInfo> = tm
+    for ((table_key, disk_name), uploaded_parts) in &updates {
+        if let Some(tm) = manifest.tables.get_mut(table_key) {
+            // Build a set of part names that were uploaded this run.
+            // Parts not in this set were either carried (diff) or resume-skipped;
+            // both already have a correct backup_key in the manifest and must be preserved.
+            let uploaded_names: std::collections::HashSet<&str> =
+                uploaded_parts.iter().map(|p| p.name.as_str()).collect();
+            let existing: Vec<PartInfo> = tm
                 .parts
-                .get(&disk_name)
+                .get(disk_name)
                 .map(|parts| {
                     parts
                         .iter()
-                        .filter(|p| p.source.starts_with("carried:"))
+                        .filter(|p| !uploaded_names.contains(p.name.as_str()))
                         .cloned()
                         .collect()
                 })
                 .unwrap_or_default();
-            let mut merged = carried;
-            merged.extend(uploaded_parts);
-            tm.parts.insert(disk_name, merged);
+            let mut merged = existing;
+            merged.extend(uploaded_parts.iter().cloned());
+            tm.parts.insert(disk_name.clone(), merged);
         }
     }
 
@@ -896,14 +993,14 @@ pub async fn upload(
     // 5a. Upload access/ directory (RBAC files) if present
     let access_dir = backup_dir.join("access");
     if access_dir.exists() {
-        upload_simple_directory(s3, backup_name, &access_dir, "access").await?;
+        upload_simple_directory(s3, backup_name, &access_dir, "access", retry_config).await?;
         info!("Uploaded access/ directory to S3");
     }
 
     // 5b. Upload configs/ directory if present
     let configs_dir = backup_dir.join("configs");
     if configs_dir.exists() {
-        upload_simple_directory(s3, backup_name, &configs_dir, "configs").await?;
+        upload_simple_directory(s3, backup_name, &configs_dir, "configs", retry_config).await?;
         info!("Uploaded configs/ directory to S3");
     }
 
@@ -963,39 +1060,14 @@ pub async fn upload(
 
     // 9. Delete local backup if requested
     if delete_local {
-        // First: delete per-disk dirs (non-fatal, warn on failure)
-        // These are "bonus" cleanup -- failing here is not critical.
-        let canonical_default =
-            std::fs::canonicalize(backup_dir).unwrap_or_else(|_| backup_dir.to_path_buf());
-        let mut seen: HashSet<PathBuf> = HashSet::new();
-        seen.insert(canonical_default);
-
-        for disk_path in manifest.disks.values() {
-            let per_disk = per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
-            if per_disk.exists() {
-                let canonical =
-                    std::fs::canonicalize(&per_disk).unwrap_or_else(|_| per_disk.clone());
-                if seen.insert(canonical) {
-                    info!(path = %per_disk.display(), "Deleting per-disk backup dir");
-                    if let Err(e) = std::fs::remove_dir_all(&per_disk) {
-                        warn!(
-                            path = %per_disk.display(),
-                            error = %e,
-                            "Failed to remove per-disk backup dir"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Last: delete default backup_dir (FATAL with ? -- preserves existing semantics)
-        info!(backup_dir = %backup_dir.display(), "Deleting local backup after upload");
-        std::fs::remove_dir_all(backup_dir).with_context(|| {
-            format!(
-                "Failed to delete local backup directory: {}",
-                backup_dir.display()
-            )
-        })?;
+        let data_path = config.clickhouse.data_path.clone();
+        let backup_name_owned = backup_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::list::delete_local(&data_path, &backup_name_owned)
+        })
+        .await
+        .context("delete_local task panicked")?
+        .with_context(|| format!("Failed to delete local backup '{}'", backup_name))?;
     }
 
     Ok(())
@@ -1006,8 +1078,12 @@ pub async fn upload(
 /// Walks the part directory and uploads each file under the given S3 key prefix.
 /// Used for S3 disk parts whose metadata files need to be stored alongside
 /// the CopyObject-ed data objects.
-async fn upload_metadata_files(s3: &S3Client, part_dir: &Path, key_prefix: &str) -> Result<()> {
-    // Read directory entries synchronously (small number of metadata files)
+async fn upload_metadata_files(
+    s3: &S3Client,
+    part_dir: &Path,
+    key_prefix: &str,
+    retry: RetryConfig,
+) -> Result<()> {
     let part_dir_owned = part_dir.to_path_buf();
     let entries: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
@@ -1019,7 +1095,7 @@ async fn upload_metadata_files(s3: &S3Client, part_dir: &Path, key_prefix: &str)
 
     for (relative_name, data) in entries {
         let file_key = format!("{}{}", key_prefix.trim_end_matches('/'), relative_name);
-        s3.put_object(&file_key, data)
+        s3.put_object_with_retry(&file_key, data, retry)
             .await
             .with_context(|| format!("Failed to upload metadata file: {}", file_key))?;
     }
@@ -1046,14 +1122,15 @@ fn collect_files_recursive(
         if path.is_dir() {
             collect_files_recursive(base_dir, &path, files)?;
         } else if path.is_file() {
-            let relative = path
-                .strip_prefix(base_dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
+            let relative = match path.strip_prefix(base_dir).unwrap_or(&path).to_str() {
+                Some(s) => s.to_string(),
+                None => {
+                    warn!("Skipping non-UTF-8 filename: {}", path.display());
+                    continue;
+                }
+            };
             let data = std::fs::read(&path)
                 .with_context(|| format!("Failed to read file: {}", path.display()))?;
-            // Use forward-slash path separator for S3 keys
             let relative_key = format!("/{}", relative.replace('\\', "/"));
             files.push((relative_key, data));
         }
@@ -1072,7 +1149,7 @@ fn find_part_dir(
     db: &str,
     table: &str,
     part_name: &str,
-    manifest_disks: &HashMap<String, String>,
+    manifest_disks: &BTreeMap<String, String>,
     backup_name: &str,
     disk_name: &str,
 ) -> Result<PathBuf> {
@@ -1109,13 +1186,20 @@ async fn upload_simple_directory(
     backup_name: &str,
     local_dir: &Path,
     prefix: &str,
+    retry: RetryConfig,
 ) -> Result<()> {
     let local_dir_owned = local_dir.to_path_buf();
     let entries: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
         for entry in walkdir::WalkDir::new(&local_dir_owned)
             .into_iter()
-            .filter_map(|e| e.ok())
+            .filter_map(|e| match e {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    tracing::warn!(error = %err, "Skipping file during directory upload");
+                    None
+                }
+            })
         {
             if entry.file_type().is_file() {
                 let rel = entry
@@ -1134,7 +1218,7 @@ async fn upload_simple_directory(
 
     for (rel_path, data) in entries {
         let key = format!("{}/{}/{}", backup_name, prefix, rel_path);
-        s3.put_object(&key, data)
+        s3.put_object_with_retry(&key, data, retry)
             .await
             .with_context(|| format!("Failed to upload {}/{}", prefix, rel_path))?;
     }
@@ -1161,14 +1245,7 @@ mod tests {
     #[test]
     fn test_upload_work_item_construction() {
         // Verify work items collect correct fields from manifest data
-        let part = PartInfo {
-            name: "202401_1_50_3".to_string(),
-            size: 134_217_728,
-            backup_key: String::new(),
-            source: "uploaded".to_string(),
-            checksum_crc64: 12345,
-            s3_objects: None,
-        };
+        let part = PartInfo::new("202401_1_50_3", 134_217_728, 12345);
 
         let work_item = UploadWorkItem {
             table_key: "default.trades".to_string(),
@@ -1260,7 +1337,7 @@ mod tests {
         std::fs::create_dir_all(&part_path).unwrap();
 
         // No disk in manifest_disks => falls back to legacy path under backup_dir
-        let manifest_disks: HashMap<String, String> = HashMap::new();
+        let manifest_disks: BTreeMap<String, String> = BTreeMap::new();
         let found = find_part_dir(
             dir.path(),
             "default",
@@ -1289,8 +1366,8 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&per_disk_part).unwrap();
 
-        let manifest_disks: HashMap<String, String> =
-            HashMap::from([("nvme1".to_string(), disk_path.to_str().unwrap().to_string())]);
+        let manifest_disks: BTreeMap<String, String> =
+            BTreeMap::from([("nvme1".to_string(), disk_path.to_str().unwrap().to_string())]);
 
         // backup_dir is a separate temp dir (the default data_path location)
         let backup_dir = tempfile::tempdir().unwrap();
@@ -1321,7 +1398,7 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&legacy_part).unwrap();
 
-        let manifest_disks: HashMap<String, String> = HashMap::from([(
+        let manifest_disks: BTreeMap<String, String> = BTreeMap::from([(
             "default".to_string(),
             dir.path().to_str().unwrap().to_string(),
         )]);
@@ -1355,7 +1432,7 @@ mod tests {
 
         // manifest_disks points to a different path that has no backup data
         let disk_dir = tempfile::tempdir().unwrap();
-        let manifest_disks: HashMap<String, String> = HashMap::from([(
+        let manifest_disks: BTreeMap<String, String> = BTreeMap::from([(
             "nvme1".to_string(),
             disk_dir.path().to_str().unwrap().to_string(),
         )]);
@@ -1411,18 +1488,13 @@ mod tests {
     #[test]
     fn test_upload_routes_s3_disk_to_copy() {
         // Verify that S3 disk parts are routed to the S3DiskUploadWorkItem queue
-        let s3_part = PartInfo {
-            name: "202401_1_50_3".to_string(),
-            size: 134_217_728,
-            backup_key: String::new(),
-            source: "uploaded".to_string(),
-            checksum_crc64: 12345,
-            s3_objects: Some(vec![S3ObjectInfo {
+        let s3_part = PartInfo::new("202401_1_50_3", 134_217_728, 12345).with_s3_objects(vec![
+            S3ObjectInfo {
                 path: "store/abc/def/data.bin".to_string(),
                 size: 134_217_000,
                 backup_key: String::new(),
-            }]),
-        };
+            },
+        ]);
 
         let disk_types: HashMap<String, String> = HashMap::from([
             ("default".to_string(), "local".to_string()),
@@ -1470,14 +1542,7 @@ mod tests {
     #[test]
     fn test_upload_local_parts_unchanged() {
         // Verify that local disk parts use the standard compress+upload path
-        let local_part = PartInfo {
-            name: "202401_1_50_3".to_string(),
-            size: 4096,
-            backup_key: String::new(),
-            source: "uploaded".to_string(),
-            checksum_crc64: 11111,
-            s3_objects: None,
-        };
+        let local_part = PartInfo::new("202401_1_50_3", 4096, 11111);
 
         let disk_types: HashMap<String, String> =
             HashMap::from([("default".to_string(), "local".to_string())]);
@@ -1517,14 +1582,8 @@ mod tests {
             backup_key: String::new(),
         };
 
-        let part = PartInfo {
-            name: "202401_1_50_3".to_string(),
-            size: 134_217_728,
-            backup_key: String::new(),
-            source: "uploaded".to_string(),
-            checksum_crc64: 12345,
-            s3_objects: Some(vec![s3_obj.clone()]),
-        };
+        let part = PartInfo::new("202401_1_50_3", 134_217_728, 12345)
+            .with_s3_objects(vec![s3_obj.clone()]);
 
         let work_item = S3DiskUploadWorkItem {
             table_key: "default.trades".to_string(),

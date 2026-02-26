@@ -36,8 +36,10 @@ use self::state::AppState;
 
 /// Build the axum `Router` with all API endpoints.
 ///
-/// If `config.api.username` and `config.api.password` are both non-empty,
-/// the auth middleware is applied to all routes.
+/// Auth middleware is always applied unconditionally. The middleware itself
+/// reads live config on every request and passes through when both
+/// `config.api.username` and `config.api.password` are empty, so auth can
+/// be enabled at runtime via `/api/v1/restart` without rebuilding the router.
 pub fn build_router(state: AppState) -> Router {
     let router = Router::new()
         // Health check
@@ -89,19 +91,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/tables", get(routes::tables))
         .route("/metrics", get(routes::metrics));
 
-    // Conditionally apply auth middleware
-    let config = state.config.load();
-    let has_auth = !config.api.username.is_empty() && !config.api.password.is_empty();
-
-    let router = if has_auth {
-        info!("API authentication enabled");
-        router.layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::auth_middleware,
-        ))
-    } else {
-        router
-    };
+    // Always apply auth middleware unconditionally. The middleware itself
+    // reads live config on every request and passes through when credentials
+    // are empty, so hot-reload via /api/v1/restart can enable auth at runtime.
+    let router = router.layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth::auth_middleware,
+    ));
 
     router.with_state(state)
 }
@@ -191,48 +187,14 @@ pub async fn start_server(
             config_path: config_path.clone(),
             macros,
             manifest_cache: Some(state.manifest_cache.clone()),
+            watch_status: watch_status.clone(),
         };
 
         let watch_status_clone = watch_status.clone();
         let watch_is_main = config.api.watch_is_main_process;
         tokio::spawn(async move {
             let exit = watch::run_watch_loop(ctx).await;
-            // Mark watch as inactive on exit
-            let mut ws = watch_status_clone.lock().await;
-            ws.active = false;
-            ws.state = "inactive".to_string();
-            drop(ws);
-
-            let should_shutdown = watch_is_main
-                && !matches!(
-                    exit,
-                    watch::WatchLoopExit::Shutdown | watch::WatchLoopExit::Stopped
-                );
-
-            info!(
-                watch_is_main_process = watch_is_main,
-                shutting_down = should_shutdown,
-                "Watch loop exited, watch_is_main_process={}, shutting down={}",
-                watch_is_main,
-                should_shutdown
-            );
-
-            match exit {
-                watch::WatchLoopExit::Shutdown => {
-                    info!("Watch loop stopped by shutdown signal");
-                }
-                watch::WatchLoopExit::MaxErrors => {
-                    warn!("Watch loop aborted: max consecutive errors reached");
-                }
-                watch::WatchLoopExit::Stopped => {
-                    info!("Watch loop stopped via API");
-                }
-            }
-
-            if should_shutdown {
-                info!("watch_is_main_process is true, terminating server process");
-                std::process::exit(0);
-            }
+            handle_watch_exit(exit, watch_status_clone, watch_is_main).await;
         });
 
         // Spawn SIGHUP handler for config reload (Unix only)
@@ -374,6 +336,54 @@ pub async fn start_server(
     Ok(())
 }
 
+/// Handle the exit of a watch loop by updating status, logging, and
+/// conditionally terminating the server process.
+///
+/// Shared between `start_server()` and `spawn_watch_from_state()` to avoid
+/// code duplication (~30 lines of identical logic).
+async fn handle_watch_exit(
+    exit: watch::WatchLoopExit,
+    watch_status: Arc<tokio::sync::Mutex<state::WatchStatus>>,
+    watch_is_main: bool,
+) {
+    // Mark watch as inactive
+    let mut ws = watch_status.lock().await;
+    ws.active = false;
+    ws.state = "inactive".to_string();
+    drop(ws);
+
+    let should_shutdown = watch_is_main
+        && !matches!(
+            exit,
+            watch::WatchLoopExit::Shutdown | watch::WatchLoopExit::Stopped
+        );
+
+    info!(
+        watch_is_main_process = watch_is_main,
+        shutting_down = should_shutdown,
+        "Watch loop exited, watch_is_main_process={}, shutting down={}",
+        watch_is_main,
+        should_shutdown
+    );
+
+    match exit {
+        watch::WatchLoopExit::Shutdown => {
+            info!("Watch loop stopped by shutdown signal");
+        }
+        watch::WatchLoopExit::MaxErrors => {
+            warn!("Watch loop aborted: max consecutive errors reached");
+        }
+        watch::WatchLoopExit::Stopped => {
+            info!("Watch loop stopped via API");
+        }
+    }
+
+    if should_shutdown {
+        info!("watch_is_main_process is true, terminating server process");
+        std::process::exit(1);
+    }
+}
+
 /// Spawn a watch loop from API state (for the watch/start endpoint).
 ///
 /// Creates new channels and a WatchContext, spawns the loop, and stores
@@ -414,47 +424,14 @@ pub async fn spawn_watch_from_state(
         config_path,
         macros,
         manifest_cache: Some(state.manifest_cache.clone()),
+        watch_status: state.watch_status.clone(),
     };
 
     let watch_status_clone = watch_status;
     let watch_is_main = config.api.watch_is_main_process;
     tokio::spawn(async move {
         let exit = watch::run_watch_loop(ctx).await;
-        let mut ws = watch_status_clone.lock().await;
-        ws.active = false;
-        ws.state = "inactive".to_string();
-        drop(ws);
-
-        let should_shutdown = watch_is_main
-            && !matches!(
-                exit,
-                watch::WatchLoopExit::Shutdown | watch::WatchLoopExit::Stopped
-            );
-
-        info!(
-            watch_is_main_process = watch_is_main,
-            shutting_down = should_shutdown,
-            "Watch loop exited, watch_is_main_process={}, shutting down={}",
-            watch_is_main,
-            should_shutdown
-        );
-
-        match exit {
-            watch::WatchLoopExit::Shutdown => {
-                info!("Watch loop stopped by shutdown signal");
-            }
-            watch::WatchLoopExit::MaxErrors => {
-                warn!("Watch loop aborted: max consecutive errors reached");
-            }
-            watch::WatchLoopExit::Stopped => {
-                info!("Watch loop stopped via API");
-            }
-        }
-
-        if should_shutdown {
-            info!("watch_is_main_process is true, terminating server process");
-            std::process::exit(0);
-        }
+        handle_watch_exit(exit, watch_status_clone, watch_is_main).await;
     });
 }
 

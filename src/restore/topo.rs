@@ -8,7 +8,7 @@
 //!   (Kahn's algorithm), falling back to engine-priority sorting when
 //!   dependency info is unavailable
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use anyhow::Result;
 use tracing::{info, warn};
@@ -165,7 +165,7 @@ pub fn classify_restore_tables(manifest: &BackupManifest, table_keys: &[String])
 ///
 /// Handles cycles by breaking them (removes back-edges) with a warning log.
 pub fn topological_sort(
-    tables: &HashMap<String, TableManifest>,
+    tables: &BTreeMap<String, TableManifest>,
     keys: &[String],
 ) -> Result<Vec<String>> {
     // Check if any table has non-empty dependencies
@@ -277,46 +277,18 @@ pub fn topological_sort(
 mod tests {
     use super::*;
     use crate::manifest::{BackupManifest, DatabaseInfo, TableManifest};
-    use chrono::Utc;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     fn make_table_manifest(engine: &str, metadata_only: bool, deps: Vec<String>) -> TableManifest {
-        TableManifest {
-            ddl: format!("CREATE TABLE test (id UInt64) ENGINE = {}", engine),
-            uuid: None,
-            engine: engine.to_string(),
-            total_bytes: 0,
-            parts: HashMap::new(),
-            pending_mutations: Vec::new(),
-            metadata_only,
-            dependencies: deps,
-        }
+        TableManifest::test_new(engine)
+            .with_metadata_only(metadata_only)
+            .with_dependencies(deps)
     }
 
-    fn make_manifest(tables: HashMap<String, TableManifest>) -> BackupManifest {
-        BackupManifest {
-            manifest_version: 1,
-            name: "test-backup".to_string(),
-            timestamp: Utc::now(),
-            clickhouse_version: "24.1.0".to_string(),
-            chbackup_version: "0.1.0".to_string(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: HashMap::new(),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables,
-            databases: vec![DatabaseInfo {
-                name: "default".to_string(),
-                ddl: "CREATE DATABASE default ENGINE = Atomic".to_string(),
-            }],
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        }
+    fn make_manifest(tables: BTreeMap<String, TableManifest>) -> BackupManifest {
+        BackupManifest::test_new("test-backup")
+            .with_tables(tables)
+            .with_databases(vec![DatabaseInfo::test_new("default")])
     }
 
     #[test]
@@ -343,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_classify_restore_tables_basic() {
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.trades".to_string(),
             make_table_manifest("MergeTree", false, vec![]),
@@ -385,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_classify_with_inner_tables() {
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.trades".to_string(),
             make_table_manifest("MergeTree", false, vec![]),
@@ -408,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_topological_sort_simple() {
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         // Dict depends on source table (but source table is in Phase 2, so external)
         // View B depends on View A
         tables.insert(
@@ -443,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_topological_sort_cycle_detection() {
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         // Circular dependency: A -> B -> C -> A
         tables.insert(
             "default.a".to_string(),
@@ -476,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_topological_sort_empty_deps() {
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         // No dependencies at all -- should use engine-priority fallback
         tables.insert(
             "default.my_view".to_string(),
@@ -507,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_classify_streaming_engines_postponed() {
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.trades".to_string(),
             make_table_manifest("MergeTree", false, vec![]),
@@ -542,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_classify_refreshable_mv_postponed() {
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.trades".to_string(),
             make_table_manifest("MergeTree", false, vec![]),
@@ -578,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_classify_all_streaming_engines() {
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.kafka_src".to_string(),
             make_table_manifest("Kafka", false, vec![]),
@@ -696,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_sort_tables_for_drop() {
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.trades".to_string(),
             make_table_manifest("MergeTree", false, vec![]),
@@ -740,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_sort_tables_for_drop_empty() {
-        let tables = HashMap::new();
+        let tables = BTreeMap::new();
         let manifest = make_manifest(tables);
         let keys: Vec<String> = vec![];
         let sorted = sort_tables_for_drop(&manifest, &keys);

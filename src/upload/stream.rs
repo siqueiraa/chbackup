@@ -63,20 +63,27 @@ pub fn compress_part(
     }
 }
 
+/// Create a tar archive of `part_dir` into `writer`, using `archive_name` as the
+/// root directory name inside the archive.
+///
+/// This is the shared tar-creation logic used by all buffered compression functions.
+/// The writer is borrowed mutably, so the caller retains ownership and can finalize
+/// any encoder wrapping it after this returns.
+fn tar_into_writer<W: std::io::Write>(writer: &mut W, part_dir: &Path, archive_name: &str) -> Result<()> {
+    let mut tar_builder = tar::Builder::new(writer);
+    tar_builder
+        .append_dir_all(archive_name, part_dir)
+        .with_context(|| format!("Failed to add directory to tar: {}", part_dir.display()))?;
+    tar_builder
+        .finish()
+        .context("Failed to finish tar archive")?;
+    Ok(())
+}
+
 /// Compress with LZ4 frame format.
 fn compress_lz4(part_dir: &Path, archive_name: &str) -> Result<Vec<u8>> {
     let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
-
-    {
-        let mut tar_builder = tar::Builder::new(&mut encoder);
-        tar_builder
-            .append_dir_all(archive_name, part_dir)
-            .with_context(|| format!("Failed to add directory to tar: {}", part_dir.display()))?;
-        tar_builder
-            .finish()
-            .context("Failed to finish tar archive")?;
-    }
-
+    tar_into_writer(&mut encoder, part_dir, archive_name)?;
     let compressed = encoder
         .finish()
         .context("Failed to finish LZ4 compression")?;
@@ -85,19 +92,10 @@ fn compress_lz4(part_dir: &Path, archive_name: &str) -> Result<Vec<u8>> {
 
 /// Compress with Zstandard format.
 fn compress_zstd(part_dir: &Path, archive_name: &str, compression_level: u32) -> Result<Vec<u8>> {
-    let mut encoder = zstd::Encoder::new(Vec::new(), compression_level as i32)
+    let level = compression_level.min(22) as i32;
+    let mut encoder = zstd::Encoder::new(Vec::new(), level)
         .context("Failed to create zstd encoder")?;
-
-    {
-        let mut tar_builder = tar::Builder::new(&mut encoder);
-        tar_builder
-            .append_dir_all(archive_name, part_dir)
-            .with_context(|| format!("Failed to add directory to tar: {}", part_dir.display()))?;
-        tar_builder
-            .finish()
-            .context("Failed to finish tar archive")?;
-    }
-
+    tar_into_writer(&mut encoder, part_dir, archive_name)?;
     let compressed = encoder
         .finish()
         .context("Failed to finish zstd compression")?;
@@ -108,18 +106,7 @@ fn compress_zstd(part_dir: &Path, archive_name: &str, compression_level: u32) ->
 fn compress_gzip(part_dir: &Path, archive_name: &str, compression_level: u32) -> Result<Vec<u8>> {
     let mut encoder =
         flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(compression_level));
-
-    {
-        let mut tar_builder = tar::Builder::new(&mut encoder);
-        tar_builder
-            .append_dir_all(archive_name, part_dir)
-            .with_context(|| format!("Failed to add directory to tar: {}", part_dir.display()))?;
-        tar_builder
-            .finish()
-            .context("Failed to finish tar archive")?;
-    }
-
-    // Flush and finalize the gzip stream
+    tar_into_writer(&mut encoder, part_dir, archive_name)?;
     encoder.flush().context("Failed to flush gzip encoder")?;
     let compressed = encoder
         .finish()
@@ -130,17 +117,7 @@ fn compress_gzip(part_dir: &Path, archive_name: &str, compression_level: u32) ->
 /// No compression -- raw tar only.
 fn compress_none(part_dir: &Path, archive_name: &str) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
-
-    {
-        let mut tar_builder = tar::Builder::new(&mut buffer);
-        tar_builder
-            .append_dir_all(archive_name, part_dir)
-            .with_context(|| format!("Failed to add directory to tar: {}", part_dir.display()))?;
-        tar_builder
-            .finish()
-            .context("Failed to finish tar archive")?;
-    }
-
+    tar_into_writer(&mut buffer, part_dir, archive_name)?;
     Ok(buffer)
 }
 
@@ -276,21 +253,17 @@ fn streaming_compress_inner(
     chunk_size: usize,
     sender: &mpsc::Sender<Result<Vec<u8>>>,
 ) -> Result<()> {
+    // NOTE: Each match arm cannot fully share tar_into_writer because the encoder
+    // types (FrameEncoder, zstd::Encoder, GzEncoder, ChunkedWriter) each have
+    // different finalization methods (.finish() returning different types) and
+    // require different post-tar cleanup. The tar creation itself is shared via
+    // tar_into_writer, but each arm must still handle encoder-specific finalization
+    // and flushing the final chunk through the ChunkedWriter.
     match data_format {
         "lz4" => {
             let chunked = ChunkedWriter::new(chunk_size, sender.clone());
             let mut encoder = lz4_flex::frame::FrameEncoder::new(chunked);
-            {
-                let mut tar_builder = tar::Builder::new(&mut encoder);
-                tar_builder
-                    .append_dir_all(archive_name, part_dir)
-                    .with_context(|| {
-                        format!("Failed to add directory to tar: {}", part_dir.display())
-                    })?;
-                tar_builder
-                    .finish()
-                    .context("Failed to finish tar archive")?;
-            }
+            tar_into_writer(&mut encoder, part_dir, archive_name)?;
             let mut chunked = encoder
                 .finish()
                 .context("Failed to finish LZ4 compression")?;
@@ -299,19 +272,10 @@ fn streaming_compress_inner(
         }
         "zstd" => {
             let chunked = ChunkedWriter::new(chunk_size, sender.clone());
-            let mut encoder = zstd::Encoder::new(chunked, compression_level as i32)
+            let level = compression_level.min(22) as i32;
+            let mut encoder = zstd::Encoder::new(chunked, level)
                 .context("Failed to create zstd encoder")?;
-            {
-                let mut tar_builder = tar::Builder::new(&mut encoder);
-                tar_builder
-                    .append_dir_all(archive_name, part_dir)
-                    .with_context(|| {
-                        format!("Failed to add directory to tar: {}", part_dir.display())
-                    })?;
-                tar_builder
-                    .finish()
-                    .context("Failed to finish tar archive")?;
-            }
+            tar_into_writer(&mut encoder, part_dir, archive_name)?;
             let mut chunked = encoder
                 .finish()
                 .context("Failed to finish zstd compression")?;
@@ -322,17 +286,7 @@ fn streaming_compress_inner(
             let chunked = ChunkedWriter::new(chunk_size, sender.clone());
             let mut encoder =
                 flate2::write::GzEncoder::new(chunked, flate2::Compression::new(compression_level));
-            {
-                let mut tar_builder = tar::Builder::new(&mut encoder);
-                tar_builder
-                    .append_dir_all(archive_name, part_dir)
-                    .with_context(|| {
-                        format!("Failed to add directory to tar: {}", part_dir.display())
-                    })?;
-                tar_builder
-                    .finish()
-                    .context("Failed to finish tar archive")?;
-            }
+            tar_into_writer(&mut encoder, part_dir, archive_name)?;
             encoder.flush().context("Failed to flush gzip encoder")?;
             let mut chunked = encoder
                 .finish()
@@ -342,17 +296,7 @@ fn streaming_compress_inner(
         }
         "none" => {
             let mut chunked = ChunkedWriter::new(chunk_size, sender.clone());
-            {
-                let mut tar_builder = tar::Builder::new(&mut chunked);
-                tar_builder
-                    .append_dir_all(archive_name, part_dir)
-                    .with_context(|| {
-                        format!("Failed to add directory to tar: {}", part_dir.display())
-                    })?;
-                tar_builder
-                    .finish()
-                    .context("Failed to finish tar archive")?;
-            }
+            tar_into_writer(&mut chunked, part_dir, archive_name)?;
             chunked.flush().context("Failed to flush final chunk")?;
             Ok(())
         }

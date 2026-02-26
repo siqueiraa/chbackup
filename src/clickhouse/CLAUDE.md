@@ -21,7 +21,8 @@ src/clickhouse/
 - Config-driven construction from `ClickHouseConfig` (host, port, username, password, secure)
 - URL construction: `http(s)://{host}:{port}` (default HTTP port is 8123, NOT 9000)
 - `log_sql_queries` flag: logs SQL at `info!` when true, `debug!` when false
-- `log_and_execute()` internal helper for conditional SQL logging
+- `log_sql()` internal helper for conditional SQL logging (DRY: single implementation of level selection)
+- `log_and_execute()` internal helper that calls `log_sql()` then executes the query
 
 ### TLS Support (Phase 2d)
 - When `secure: true`, URL scheme is `https://` (existing behavior)

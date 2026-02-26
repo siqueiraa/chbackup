@@ -176,8 +176,7 @@ pub async fn drop_tables(
 
     info!(
         count = sorted.len(),
-        "Phase 0: Dropping {} tables (Mode A)",
-        sorted.len()
+        "Phase 0: Dropping tables (Mode A)"
     );
 
     let mut pending = sorted;
@@ -209,7 +208,7 @@ pub async fn drop_tables(
                 .await
             {
                 Ok(()) => {
-                    info!(table = %dst_key, "Dropping table");
+                    info!(table = %dst_key, "Dropped table");
                     dropped_this_round += 1;
                 }
                 Err(e) => {
@@ -253,6 +252,15 @@ pub async fn drop_tables(
         );
 
         pending = failed.into_iter().map(|(k, _)| k).collect();
+    }
+
+    if !pending.is_empty() {
+        anyhow::bail!(
+            "Failed to process {} items after {} rounds: {:?}",
+            pending.len(),
+            max_rounds,
+            pending.iter().take(5).collect::<Vec<_>>()
+        );
     }
 
     info!(count = table_keys.len(), "Table drop phase complete");
@@ -395,14 +403,27 @@ pub async fn resolve_zk_conflict(
 /// Query which databases use the Replicated engine.
 ///
 /// Returns a set of database names that should skip ON CLUSTER.
+/// When `remap` is active, queries the destination database names
+/// (which are the actual databases that exist in ClickHouse) rather
+/// than the source names from the manifest.
 pub async fn detect_replicated_databases(
     ch: &ChClient,
     manifest: &BackupManifest,
+    remap: Option<&RemapConfig>,
 ) -> HashSet<String> {
     let mut replicated = HashSet::new();
 
-    // Collect unique database names from manifest
-    let db_names: HashSet<String> = manifest.databases.iter().map(|d| d.name.clone()).collect();
+    let mut db_names: HashSet<String> = HashSet::new();
+    for d in &manifest.databases {
+        let dst_db = match remap {
+            Some(rc) if rc.is_active() => {
+                let (remapped, _) = rc.remap_table_key(&format!("{}.dummy", d.name));
+                remapped
+            }
+            _ => d.name.clone(),
+        };
+        db_names.insert(dst_db);
+    }
 
     for db_name in &db_names {
         match ch.query_database_engine(db_name).await {
@@ -708,6 +729,15 @@ pub async fn create_ddl_objects(
         pending = failed.into_iter().map(|(k, _)| k).collect();
     }
 
+    if !pending.is_empty() {
+        anyhow::bail!(
+            "Failed to process {} items after {} rounds: {:?}",
+            pending.len(),
+            max_rounds,
+            pending.iter().take(5).collect::<Vec<_>>()
+        );
+    }
+
     info!(count = ddl_keys.len(), "DDL-only objects created");
     Ok(())
 }
@@ -768,15 +798,50 @@ fn ensure_if_not_exists_table(ddl: &str) -> String {
     if ddl.contains("IF NOT EXISTS") {
         return ddl.to_string();
     }
-    // Handle various CREATE types
-    let ddl = ddl.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1);
-    let ddl = ddl.replacen(
-        "CREATE MATERIALIZED VIEW",
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS",
-        1,
-    );
-    let ddl = ddl.replacen("CREATE VIEW", "CREATE VIEW IF NOT EXISTS", 1);
-    ddl.replacen("CREATE DICTIONARY", "CREATE DICTIONARY IF NOT EXISTS", 1)
+    // Order matters: check MATERIALIZED VIEW before VIEW to avoid substring match
+    if let Some(pos) = ddl.find("CREATE MATERIALIZED VIEW") {
+        return format!(
+            "{}CREATE MATERIALIZED VIEW IF NOT EXISTS{}",
+            &ddl[..pos],
+            &ddl[pos + "CREATE MATERIALIZED VIEW".len()..]
+        );
+    }
+    if let Some(pos) = ddl.find("CREATE LIVE VIEW") {
+        return format!(
+            "{}CREATE LIVE VIEW IF NOT EXISTS{}",
+            &ddl[..pos],
+            &ddl[pos + "CREATE LIVE VIEW".len()..]
+        );
+    }
+    if let Some(pos) = ddl.find("CREATE WINDOW VIEW") {
+        return format!(
+            "{}CREATE WINDOW VIEW IF NOT EXISTS{}",
+            &ddl[..pos],
+            &ddl[pos + "CREATE WINDOW VIEW".len()..]
+        );
+    }
+    if let Some(pos) = ddl.find("CREATE TABLE") {
+        return format!(
+            "{}CREATE TABLE IF NOT EXISTS{}",
+            &ddl[..pos],
+            &ddl[pos + "CREATE TABLE".len()..]
+        );
+    }
+    if let Some(pos) = ddl.find("CREATE VIEW") {
+        return format!(
+            "{}CREATE VIEW IF NOT EXISTS{}",
+            &ddl[..pos],
+            &ddl[pos + "CREATE VIEW".len()..]
+        );
+    }
+    if let Some(pos) = ddl.find("CREATE DICTIONARY") {
+        return format!(
+            "{}CREATE DICTIONARY IF NOT EXISTS{}",
+            &ddl[..pos],
+            &ddl[pos + "CREATE DICTIONARY".len()..]
+        );
+    }
+    ddl.to_string()
 }
 
 #[cfg(test)]
@@ -829,36 +894,30 @@ mod tests {
         assert!(result.contains("CREATE DICTIONARY IF NOT EXISTS"));
     }
 
+    #[test]
+    fn test_ensure_if_not_exists_live_view() {
+        let ddl = "CREATE LIVE VIEW default.my_live AS SELECT count() FROM default.trades";
+        let result = ensure_if_not_exists_table(ddl);
+        assert!(result.contains("CREATE LIVE VIEW IF NOT EXISTS"));
+        assert!(!result.contains("CREATE LIVE VIEW IF NOT EXISTS IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_ensure_if_not_exists_window_view() {
+        let ddl = "CREATE WINDOW VIEW default.my_window TO default.target AS SELECT count() FROM default.trades GROUP BY tumble(timestamp, INTERVAL '1' HOUR)";
+        let result = ensure_if_not_exists_table(ddl);
+        assert!(result.contains("CREATE WINDOW VIEW IF NOT EXISTS"));
+        assert!(!result.contains("CREATE WINDOW VIEW IF NOT EXISTS IF NOT EXISTS"));
+    }
+
     /// Verify that create_functions handles empty manifest.functions correctly.
     /// The function returns Ok(()) immediately when no functions are present.
     #[test]
     fn test_create_functions_skips_empty() {
         use crate::manifest::{BackupManifest, DatabaseInfo};
-        use chrono::Utc;
 
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: "test".to_string(),
-            timestamp: Utc::now(),
-            clickhouse_version: String::new(),
-            chbackup_version: String::new(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: std::collections::HashMap::new(),
-            disk_types: std::collections::HashMap::new(),
-            disk_remote_paths: std::collections::HashMap::new(),
-            tables: std::collections::HashMap::new(),
-            databases: vec![DatabaseInfo {
-                name: "default".to_string(),
-                ddl: "CREATE DATABASE default ENGINE = Atomic".to_string(),
-            }],
-            functions: Vec::new(), // Empty -- should return immediately
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("test")
+            .with_databases(vec![DatabaseInfo::test_new("default")]);
 
         assert!(manifest.functions.is_empty());
         // create_functions() is async and needs a ChClient, so we verify the
@@ -881,6 +940,14 @@ mod tests {
             (
                 "CREATE MATERIALIZED VIEW default.mv TO default.t AS SELECT 1",
                 "CREATE MATERIALIZED VIEW IF NOT EXISTS",
+            ),
+            (
+                "CREATE LIVE VIEW default.lv AS SELECT count() FROM default.t",
+                "CREATE LIVE VIEW IF NOT EXISTS",
+            ),
+            (
+                "CREATE WINDOW VIEW default.wv TO default.t AS SELECT count() FROM default.src GROUP BY tumble(ts, INTERVAL '1' HOUR)",
+                "CREATE WINDOW VIEW IF NOT EXISTS",
             ),
         ];
 
