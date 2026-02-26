@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Top-level configuration for chbackup.
 /// Matches §12 of the design doc with ~106 params across 7 sections.
@@ -806,7 +806,7 @@ fn default_object_disk_copy_concurrency() -> u32 {
 }
 
 fn default_retries_duration() -> String {
-    "10s".to_string()
+    String::new()
 }
 
 fn default_watch_interval() -> String {
@@ -882,26 +882,36 @@ impl Config {
         if let Ok(v) = std::env::var("CHBACKUP_BACKUPS_TO_KEEP_LOCAL") {
             if let Ok(n) = v.parse::<i32>() {
                 self.general.backups_to_keep_local = n;
+            } else {
+                warn!("CHBACKUP_BACKUPS_TO_KEEP_LOCAL='{}' is not a valid i32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUPS_TO_KEEP_REMOTE") {
             if let Ok(n) = v.parse::<i32>() {
                 self.general.backups_to_keep_remote = n;
+            } else {
+                warn!("CHBACKUP_BACKUPS_TO_KEEP_REMOTE='{}' is not a valid i32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_UPLOAD_CONCURRENCY") {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.upload_concurrency = n;
+            } else {
+                warn!("CHBACKUP_UPLOAD_CONCURRENCY='{}' is not a valid u32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_DOWNLOAD_CONCURRENCY") {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.download_concurrency = n;
+            } else {
+                warn!("CHBACKUP_DOWNLOAD_CONCURRENCY='{}' is not a valid u32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_RETRIES_ON_FAILURE") {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.retries_on_failure = n;
+            } else {
+                warn!("CHBACKUP_RETRIES_ON_FAILURE='{}' is not a valid u32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_RETRIES_PAUSE") {
@@ -910,6 +920,8 @@ impl Config {
         if let Ok(v) = std::env::var("CHBACKUP_REMOTE_CACHE_TTL_SECS") {
             if let Ok(n) = v.parse::<u64>() {
                 self.general.remote_cache_ttl_secs = n;
+            } else {
+                warn!("CHBACKUP_REMOTE_CACHE_TTL_SECS='{}' is not a valid u64, ignoring", v);
             }
         }
 
@@ -920,6 +932,8 @@ impl Config {
         if let Ok(v) = std::env::var("CLICKHOUSE_PORT") {
             if let Ok(port) = v.parse::<u16>() {
                 self.clickhouse.port = port;
+            } else {
+                warn!("CLICKHOUSE_PORT='{}' is not a valid u16, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_USERNAME") {
@@ -934,11 +948,15 @@ impl Config {
         if let Ok(v) = std::env::var("CLICKHOUSE_SECURE") {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.secure = b;
+            } else {
+                warn!("CLICKHOUSE_SECURE='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_SKIP_VERIFY") {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.skip_verify = b;
+            } else {
+                warn!("CLICKHOUSE_SKIP_VERIFY='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_TLS_KEY") {
@@ -953,11 +971,15 @@ impl Config {
         if let Ok(v) = std::env::var("CLICKHOUSE_SYNC_REPLICATED_TABLES") {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.sync_replicated_tables = b;
+            } else {
+                warn!("CLICKHOUSE_SYNC_REPLICATED_TABLES='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_MAX_CONNECTIONS") {
             if let Ok(n) = v.parse::<u32>() {
                 self.clickhouse.max_connections = n;
+            } else {
+                warn!("CLICKHOUSE_MAX_CONNECTIONS='{}' is not a valid u32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_TIMEOUT") {
@@ -969,7 +991,37 @@ impl Config {
         if let Ok(v) = std::env::var("CLICKHOUSE_DEBUG") {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.debug = b;
+            } else {
+                warn!("CLICKHOUSE_DEBUG='{}' is not a valid bool, ignoring", v);
             }
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_SKIP_TABLE_ENGINES") {
+            self.clickhouse.skip_table_engines = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_SKIP_DISKS") {
+            self.clickhouse.skip_disks = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_SKIP_DISK_TYPES") {
+            self.clickhouse.skip_disk_types = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_SKIP_TABLES") {
+            self.clickhouse.skip_tables = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
 
         // S3
@@ -997,6 +1049,8 @@ impl Config {
         if let Ok(v) = std::env::var("S3_FORCE_PATH_STYLE") {
             if let Ok(b) = v.parse::<bool>() {
                 self.s3.force_path_style = b;
+            } else {
+                warn!("S3_FORCE_PATH_STYLE='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("S3_ACL") {
@@ -1014,16 +1068,22 @@ impl Config {
         if let Ok(v) = std::env::var("S3_DISABLE_SSL") {
             if let Ok(b) = v.parse::<bool>() {
                 self.s3.disable_ssl = b;
+            } else {
+                warn!("S3_DISABLE_SSL='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("S3_DISABLE_CERT_VERIFICATION") {
             if let Ok(b) = v.parse::<bool>() {
                 self.s3.disable_cert_verification = b;
+            } else {
+                warn!("S3_DISABLE_CERT_VERIFICATION='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("S3_CONCURRENCY") {
             if let Ok(n) = v.parse::<u32>() {
                 self.s3.concurrency = n;
+            } else {
+                warn!("S3_CONCURRENCY='{}' is not a valid u32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("S3_OBJECT_DISK_PATH") {
@@ -1037,16 +1097,22 @@ impl Config {
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_UPLOAD_CONCURRENCY") {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.upload_concurrency = n;
+            } else {
+                warn!("CHBACKUP_BACKUP_UPLOAD_CONCURRENCY='{}' is not a valid u32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY") {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.download_concurrency = n;
+            } else {
+                warn!("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY='{}' is not a valid u32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_RETRIES_ON_FAILURE") {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.retries_on_failure = n;
+            } else {
+                warn!("CHBACKUP_BACKUP_RETRIES_ON_FAILURE='{}' is not a valid u32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_RETRIES_DURATION") {
@@ -1054,6 +1120,20 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_TABLES") {
             self.backup.tables = v;
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_SKIP_PROJECTIONS") {
+            self.backup.skip_projections = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.backup.streaming_upload_threshold = n;
+            } else {
+                warn!("CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD='{}' is not a valid u64, ignoring", v);
+            }
         }
 
         // API
@@ -1063,6 +1143,8 @@ impl Config {
         if let Ok(v) = std::env::var("API_SECURE") {
             if let Ok(b) = v.parse::<bool>() {
                 self.api.secure = b;
+            } else {
+                warn!("API_SECURE='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("API_USERNAME") {
@@ -1074,6 +1156,8 @@ impl Config {
         if let Ok(v) = std::env::var("API_CREATE_INTEGRATION_TABLES") {
             if let Ok(b) = v.parse::<bool>() {
                 self.api.create_integration_tables = b;
+            } else {
+                warn!("API_CREATE_INTEGRATION_TABLES='{}' is not a valid bool, ignoring", v);
             }
         }
 
@@ -1087,11 +1171,15 @@ impl Config {
         if let Ok(v) = std::env::var("WATCH_ENABLED") {
             if let Ok(b) = v.parse::<bool>() {
                 self.watch.enabled = b;
+            } else {
+                warn!("WATCH_ENABLED='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("WATCH_MAX_CONSECUTIVE_ERRORS") {
             if let Ok(n) = v.parse::<u32>() {
                 self.watch.max_consecutive_errors = n;
+            } else {
+                warn!("WATCH_MAX_CONSECUTIVE_ERRORS='{}' is not a valid u32, ignoring", v);
             }
         }
     }
@@ -1259,6 +1347,34 @@ impl Config {
                 self.clickhouse.default_replica_name = value.to_string()
             }
             "clickhouse.timeout" => self.clickhouse.timeout = value.to_string(),
+            "clickhouse.skip_disks" => {
+                self.clickhouse.skip_disks = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            "clickhouse.skip_disk_types" => {
+                self.clickhouse.skip_disk_types = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            "clickhouse.skip_table_engines" => {
+                self.clickhouse.skip_table_engines = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            "clickhouse.skip_tables" => {
+                self.clickhouse.skip_tables = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
 
             // S3
             "s3.bucket" => self.s3.bucket = value.to_string(),
@@ -1320,6 +1436,18 @@ impl Config {
             "backup.retries_duration" => self.backup.retries_duration = value.to_string(),
             "backup.retries_jitter" => {
                 self.backup.retries_jitter = value.parse().context("Invalid f64")?
+            }
+            "backup.skip_projections" => {
+                self.backup.skip_projections = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            "backup.streaming_upload_threshold" => {
+                self.backup.streaming_upload_threshold = value
+                    .parse()
+                    .context("Invalid u64 for backup.streaming_upload_threshold")?
             }
 
             // Retention
@@ -1385,14 +1513,24 @@ impl Config {
         if self.general.download_concurrency == 0 {
             return Err(anyhow::anyhow!("general.download_concurrency must be > 0"));
         }
-        if self.backup.upload_concurrency == 0 {
-            return Err(anyhow::anyhow!("backup.upload_concurrency must be > 0"));
-        }
-        if self.backup.download_concurrency == 0 {
-            return Err(anyhow::anyhow!("backup.download_concurrency must be > 0"));
-        }
         if self.s3.concurrency == 0 {
             return Err(anyhow::anyhow!("s3.concurrency must be > 0"));
+        }
+        if self.clickhouse.max_connections == 0 {
+            return Err(anyhow::anyhow!("clickhouse.max_connections must be > 0"));
+        }
+        if self.backup.object_disk_copy_concurrency == 0 {
+            return Err(anyhow::anyhow!(
+                "backup.object_disk_copy_concurrency must be > 0"
+            ));
+        }
+        if self.general.object_disk_server_side_copy_concurrency == 0 {
+            return Err(anyhow::anyhow!(
+                "general.object_disk_server_side_copy_concurrency must be > 0"
+            ));
+        }
+        if self.s3.max_parts_count == 0 {
+            return Err(anyhow::anyhow!("s3.max_parts_count must be > 0"));
         }
 
         // Watch interval validation: full_interval must be greater than watch_interval.
@@ -1445,6 +1583,20 @@ impl Config {
             }
         }
 
+        // Validate compression_level bounds per format
+        if self.backup.compression == "zstd" && self.backup.compression_level > 22 {
+            return Err(anyhow::anyhow!(
+                "zstd compression_level must be 0-22, got {}",
+                self.backup.compression_level
+            ));
+        }
+        if self.backup.compression == "gzip" && self.backup.compression_level > 9 {
+            return Err(anyhow::anyhow!(
+                "gzip compression_level must be 0-9, got {}",
+                self.backup.compression_level
+            ));
+        }
+
         // Validate rbac_resolve_conflicts
         match self.clickhouse.rbac_resolve_conflicts.as_str() {
             "recreate" | "ignore" | "fail" => {}
@@ -1494,6 +1646,10 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CLICKHOUSE_TIMEOUT" => Some("clickhouse.timeout"),
         "CLICKHOUSE_CONFIG_DIR" => Some("clickhouse.config_dir"),
         "CLICKHOUSE_DEBUG" => Some("clickhouse.debug"),
+        "CLICKHOUSE_SKIP_DISKS" => Some("clickhouse.skip_disks"),
+        "CLICKHOUSE_SKIP_DISK_TYPES" => Some("clickhouse.skip_disk_types"),
+        "CLICKHOUSE_SKIP_TABLE_ENGINES" => Some("clickhouse.skip_table_engines"),
+        "CLICKHOUSE_SKIP_TABLES" => Some("clickhouse.skip_tables"),
 
         // S3
         "S3_BUCKET" => Some("s3.bucket"),
@@ -1520,6 +1676,8 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CHBACKUP_BACKUP_RETRIES_ON_FAILURE" => Some("backup.retries_on_failure"),
         "CHBACKUP_BACKUP_RETRIES_DURATION" => Some("backup.retries_duration"),
         "CHBACKUP_BACKUP_TABLES" => Some("backup.tables"),
+        "CHBACKUP_BACKUP_SKIP_PROJECTIONS" => Some("backup.skip_projections"),
+        "CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD" => Some("backup.streaming_upload_threshold"),
 
         // API
         "API_LISTEN" => Some("api.listen"),
@@ -1575,7 +1733,23 @@ pub fn effective_retries(config: &Config) -> (u32, u64, f64) {
         config.general.retries_on_failure
     };
 
-    let base_delay_secs = parse_duration_secs(&config.backup.retries_duration).unwrap_or(10);
+    let base_delay_secs = if !config.backup.retries_duration.is_empty() {
+        parse_duration_secs(&config.backup.retries_duration).unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %config.backup.retries_duration,
+                "Invalid backup.retries_duration, using default 10s"
+            );
+            10
+        })
+    } else {
+        parse_duration_secs(&config.general.retries_pause).unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %config.general.retries_pause,
+                "Invalid general.retries_pause, using default 5s"
+            );
+            5
+        })
+    };
 
     // backup.retries_jitter is 0.0-1.0 (fraction), general.retries_jitter is 0-100 (percent)
     let jitter = if config.backup.retries_jitter > 0.0 {
@@ -1593,16 +1767,18 @@ pub fn effective_retries(config: &Config) -> (u32, u64, f64) {
 /// Uses a simple XorShift-based PRNG seeded from the current time to avoid
 /// adding a `rand` dependency.
 pub fn apply_jitter(base_delay_ms: u64, jitter_factor: f64) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     if jitter_factor <= 0.0 || base_delay_ms == 0 {
         return base_delay_ms;
     }
-    // Simple pseudo-random: use current nanoseconds as entropy source
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    // Map to 0.0..1.0 range
-    let random_fraction = (nanos as f64) / (u32::MAX as f64);
+    let seed = nanos as u64 ^ JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let random_fraction = (seed % 1_000_000_000) as f64 / 1_000_000_000.0;
     let jittered = base_delay_ms as f64 * (1.0 + random_fraction * jitter_factor);
     jittered as u64
 }

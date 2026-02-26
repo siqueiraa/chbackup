@@ -5,6 +5,7 @@
 //! background tasks and return immediately with an action ID.
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
@@ -23,7 +24,61 @@ use crate::table_filter::TableFilter;
 
 use super::actions::ActionStatus;
 use super::metrics::Metrics;
-use super::state::{run_operation, validate_backup_name, AppState};
+use super::state::{reject_reserved_backup_name, run_operation, validate_backup_name, AppState};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build a BAD_REQUEST error response for backup name validation failures.
+///
+/// Consolidates the `validate_backup_name` / `reject_reserved_backup_name`
+/// error mapping that previously appeared ~12 times across route handlers.
+fn validation_error(name: &str, e: &str) -> (StatusCode, Json<ErrorResponse>) {
+    warn!(backup_name = %name, "backup name rejected: {}", e);
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: format!("invalid backup name: {e}"),
+        }),
+    )
+}
+
+fn paginate<T>(
+    items: Vec<T>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    label: &str,
+) -> (
+    [(
+        axum::http::header::HeaderName,
+        axum::http::header::HeaderValue,
+    ); 1],
+    Vec<T>,
+) {
+    let total_count = items.len();
+    let offset = offset.unwrap_or(0);
+    let paginated: Vec<T> = if let Some(limit) = limit {
+        info!(
+            offset = offset,
+            limit = limit,
+            total = total_count,
+            "{label}: offset/limit applied"
+        );
+        items.into_iter().skip(offset).take(limit).collect()
+    } else {
+        if offset > 0 {
+            info!(offset = offset, total = total_count, "{label}: offset applied");
+        }
+        items.into_iter().skip(offset).collect()
+    };
+    let header = [(
+        axum::http::header::HeaderName::from_static("x-total-count"),
+        axum::http::header::HeaderValue::from_str(&total_count.to_string())
+            .unwrap_or_else(|_| axum::http::header::HeaderValue::from_static("0")),
+    )];
+    (header, paginated)
+}
 
 // ---------------------------------------------------------------------------
 // Response / Request types
@@ -233,18 +288,40 @@ pub async fn get_actions(State(state): State<AppState>) -> Json<Vec<ActionRespon
 /// Parses the first command string and dispatches to the appropriate handler.
 ///
 /// NOTE: This handler is intentionally excluded from the `run_operation()` DRY helper
-/// because it returns `(StatusCode, Json<OperationStarted>)` (201 CREATED compatible)
+/// because it returns `(StatusCode, Json<OperationStarted>)` (200 OK with action ID)
 /// which is incompatible with the helper's `Result<Json<OperationStarted>, ...>` return type.
 /// The inline try_start_op + tokio::spawn + tokio::select! pattern is retained here.
 pub async fn post_actions(
     State(state): State<AppState>,
-    Json(body): Json<Vec<ActionRequest>>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<OperationStarted>), (StatusCode, Json<ErrorResponse>)> {
-    let request = body.into_iter().next().ok_or_else(|| {
+    // Accept two body formats:
+    // 1. JSON array:   [{"command":"create foo"}]  (direct API clients)
+    // 2. JSONEachRow:  {"command":"create foo"}     (ClickHouse URL-engine INSERT, one object per line)
+    let parsed: Vec<ActionRequest> =
+        if let Ok(arr) = serde_json::from_slice::<Vec<ActionRequest>>(&body) {
+            arr
+        } else {
+            let mut items = Vec::new();
+            for line in body.split(|&b| b == b'\n') {
+                if let Ok(s) = std::str::from_utf8(line) {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if let Ok(req) = serde_json::from_str::<ActionRequest>(s) {
+                        items.push(req);
+                    }
+                }
+            }
+            items
+        };
+
+    let request = parsed.into_iter().next().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "empty request body".to_string(),
+                error: "empty or unparseable request body".to_string(),
             }),
         )
     })?;
@@ -260,35 +337,46 @@ pub async fn post_actions(
             // For most commands the name is parts[1]; for "delete <location> <name>"
             // the location is parts[1] and the backup name is parts[2].
             if let Some(name) = parts.get(1) {
-                validate_backup_name(name).map_err(|e| {
-                    warn!(backup_name = %name, "backup name rejected: {}", e);
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: format!("invalid backup name: {e}"),
-                        }),
-                    )
-                })?;
+                validate_backup_name(name).map_err(|e| validation_error(name, e))?;
             }
             if op_name == "delete" {
+                // Reject "delete local" / "delete remote" without a backup name.
+                // parts[1] is a location keyword only when there's no parts[2];
+                // in that case the user forgot the name and we must not silently
+                // treat "local"/"remote" as the backup name.
+                if parts.len() == 2
+                    && matches!(parts.get(1).copied(), Some("local") | Some("remote"))
+                {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error:
+                                "delete: missing backup name (usage: delete [local|remote] <name>)"
+                                    .to_string(),
+                        }),
+                    ));
+                }
                 if let Some(name) = parts.get(2) {
-                    validate_backup_name(name).map_err(|e| {
-                        warn!(backup_name = %name, "backup name rejected: {}", e);
-                        (
-                            StatusCode::BAD_REQUEST,
-                            Json(ErrorResponse {
-                                error: format!("invalid backup name: {e}"),
-                            }),
-                        )
-                    })?;
+                    validate_backup_name(name).map_err(|e| validation_error(name, e))?;
+                }
+            }
+
+            // For create/create_remote, also reject reserved shortcut names.
+            // Other commands (upload, download, restore) accept "latest"/"previous"
+            // as shortcut inputs that get resolved at runtime.
+            if matches!(op_name, "create" | "create_remote") {
+                if let Some(name) = parts.get(1) {
+                    reject_reserved_backup_name(name)
+                        .map_err(|e| validation_error(name, e))?;
                 }
             }
 
             // Compute backup_name for per-backup conflict detection before starting the op.
-            // For "delete <loc> <name>", the backup name is at parts[2]; for all other
+            // For "delete <loc> <name>", the backup name is at parts[2]; for
+            // "delete <name>" (no location), it is at parts[1]; for all other
             // commands it is at parts[1] (may be absent for auto-named commands).
             let conflict_backup_name: Option<String> = if op_name == "delete" {
-                parts.get(2).map(|s| s.to_string())
+                parts.get(2).or_else(|| parts.get(1)).map(|s| s.to_string())
             } else {
                 parts.get(1).map(|s| s.to_string())
             };
@@ -324,11 +412,28 @@ pub async fn post_actions(
                     .cloned()
                     .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
 
+                let op = parts_owned[0].as_str();
+
+                // Acquire PID lock before loading clients — provides cross-process
+                // exclusion between CLI and server (design §9, same as run_operation).
+                let lock_scope = crate::lock::lock_for_command(op, Some(&backup_name));
+                let _pid_lock = if let Some(lock_path) = crate::lock::lock_path_for_scope(&lock_scope) {
+                    match crate::lock::PidLock::acquire(&lock_path, op) {
+                        Ok(lock) => Some(lock),
+                        Err(e) => {
+                            warn!(id = id, error = %e, "post_actions: failed to acquire PID lock");
+                            state_clone.fail_op(id, e.to_string()).await;
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let config = state_clone.config.load();
                 let ch = state_clone.ch.load();
                 let s3 = state_clone.s3.load();
                 let start_time = std::time::Instant::now();
-                let op = parts_owned[0].as_str();
 
                 let result: Result<(), anyhow::Error> = match op {
                     "create" => {
@@ -345,6 +450,7 @@ pub async fn post_actions(
                             false, // configs
                             false, // named_collections
                             &config.backup.skip_projections,
+                            cancel_for_ops.clone(),
                         )
                         .await
                         .map(|_| ())
@@ -371,6 +477,7 @@ pub async fn post_actions(
                             list::apply_retention_after_upload(
                                 &config,
                                 &s3,
+                                Some(&backup_name),
                                 Some(&state_clone.manifest_cache),
                             )
                             .await;
@@ -426,6 +533,7 @@ pub async fn post_actions(
                             false, // configs
                             false, // named_collections
                             &config.backup.skip_projections,
+                            cancel_for_ops.clone(),
                         )
                         .await;
                         match create_result {
@@ -452,6 +560,7 @@ pub async fn post_actions(
                                     list::apply_retention_after_upload(
                                         &config,
                                         &s3,
+                                        Some(&backup_name),
                                         Some(&state_clone.manifest_cache),
                                     )
                                     .await;
@@ -520,17 +629,44 @@ pub async fn post_actions(
                         }
                     }
                     "clean_broken" => {
-                        let s3_result = list::clean_broken_remote(&s3).await;
-                        let data_path = config.clickhouse.data_path.clone();
-                        let local_result = tokio::task::spawn_blocking(move || {
-                            list::clean_broken_local(&data_path)
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)));
-                        // Combine results -- fail if either failed
-                        match (s3_result, local_result) {
-                            (Ok(_), Ok(_)) => Ok(()),
-                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        // Respect optional location token: "clean_broken [local|remote]"
+                        // No token (or unknown token) → clean both.
+                        let location = parts_owned.get(1).map(String::as_str).unwrap_or("");
+                        match location {
+                            "local" => {
+                                let data_path = config.clickhouse.data_path.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    list::clean_broken_local(&data_path)
+                                })
+                                .await
+                                .unwrap_or_else(|e| {
+                                    Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
+                                })
+                                .map(|_| ())
+                            }
+                            "remote" => {
+                                list::clean_broken_remote(&s3).await.map(|_| ())
+                            }
+                            _ => {
+                                // Both (default when no location specified)
+                                let s3_result = list::clean_broken_remote(&s3).await;
+                                let data_path = config.clickhouse.data_path.clone();
+                                let local_result = tokio::task::spawn_blocking(move || {
+                                    list::clean_broken_local(&data_path)
+                                })
+                                .await
+                                .unwrap_or_else(|e| {
+                                    Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
+                                });
+                                match (s3_result, local_result) {
+                                    (Ok(_), Ok(_)) => Ok(()),
+                                    (Err(s3_err), Err(local_err)) => Err(anyhow::anyhow!(
+                                        "Both remote and local clean_broken failed: remote: {}; local: {}",
+                                        s3_err, local_err
+                                    )),
+                                    (Err(e), _) | (_, Err(e)) => Err(e),
+                                }
+                            }
                         }
                     }
                     _ => Err(anyhow::anyhow!("unknown command: {}", op)),
@@ -599,6 +735,18 @@ pub async fn list_backups(
     ),
     (StatusCode, Json<ErrorResponse>),
 > {
+    // Validate location param: must be absent, "local", or "remote"
+    if let Some(loc) = params.location.as_deref() {
+        if loc != "local" && loc != "remote" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid location: must be 'local' or 'remote'".to_string(),
+                }),
+            ));
+        }
+    }
+
     let config = state.config.load();
     let data_path = &config.clickhouse.data_path;
     let mut results = Vec::new();
@@ -607,14 +755,18 @@ pub async fn list_backups(
     let show_remote = params.location.is_none() || params.location.as_deref() == Some("remote");
 
     if show_local {
-        match list::list_local(data_path) {
-            Ok(summaries) => {
+        let dp = data_path.to_string();
+        match tokio::task::spawn_blocking(move || list::list_local(&dp)).await {
+            Ok(Ok(summaries)) => {
                 for s in summaries {
                     results.push(summary_to_list_response(s, "local"));
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(error = %e, "Failed to list local backups");
+            }
+            Err(e) => {
+                warn!(error = %e, "spawn_blocking panicked for list_local");
             }
         }
     }
@@ -638,32 +790,9 @@ pub async fn list_backups(
         results.reverse();
     }
 
-    // Apply pagination (offset/limit) -- same pattern as tables()
-    let total_count = results.len();
-    let offset = params.offset.unwrap_or(0);
-    let results: Vec<ListResponse> = if let Some(limit) = params.limit {
-        info!(
-            offset = offset,
-            limit = limit,
-            total = total_count,
-            "list: offset/limit applied"
-        );
-        results.into_iter().skip(offset).take(limit).collect()
-    } else {
-        if offset > 0 {
-            info!(offset = offset, total = total_count, "list: offset applied");
-        }
-        results.into_iter().skip(offset).collect()
-    };
+    let (header, results) = paginate(results, params.offset, params.limit, "list");
 
-    Ok((
-        [(
-            axum::http::header::HeaderName::from_static("x-total-count"),
-            axum::http::header::HeaderValue::from_str(&total_count.to_string())
-                .unwrap_or_else(|_| axum::http::header::HeaderValue::from_static("0")),
-        )],
-        Json(results),
-    ))
+    Ok((header, Json(results)))
 }
 
 /// Convert a BackupSummary to a ListResponse with all integration table columns.
@@ -696,29 +825,25 @@ pub async fn create_backup(
 
     // Validate backup name if provided (auto-generated names are always safe)
     if let Some(ref name) = req.backup_name {
-        validate_backup_name(name).map_err(|e| {
-            warn!(backup_name = %name, "backup name rejected: {}", e);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("invalid backup name: {e}"),
-                }),
-            )
-        })?;
+        validate_backup_name(name).map_err(|e| validation_error(name, e))?;
+        reject_reserved_backup_name(name).map_err(|e| validation_error(name, e))?;
     }
+
+    // Pre-generate the backup name so run_operation() can acquire a per-backup
+    // PID lock instead of falling back to the global lock when no name is given.
+    let backup_name = req
+        .backup_name
+        .clone()
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
 
     let metrics_clone = state.metrics.clone();
     run_operation(
         &state,
         "create",
         "create",
-        req.backup_name.clone(), // None when auto-generated (timestamp) inside closure
-        false,                   // no cache invalidation
-        move |config, ch, _s3, _cancel| async move {
-            let backup_name = req
-                .backup_name
-                .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
-
+        Some(backup_name.clone()),
+        false, // no cache invalidation
+        move |config, ch, _s3, cancel| async move {
             info!(backup_name = %backup_name, "Starting create operation");
             let manifest = crate::backup::create(
                 &config,
@@ -732,7 +857,10 @@ pub async fn create_backup(
                 req.rbac.unwrap_or(false),
                 req.configs.unwrap_or(false),
                 req.named_collections.unwrap_or(false),
-                &config.backup.skip_projections,
+                req.skip_projections
+                    .as_ref()
+                    .unwrap_or(&config.backup.skip_projections),
+                cancel,
             )
             .await?;
 
@@ -759,6 +887,8 @@ pub struct CreateRequest {
     pub rbac: Option<bool>,
     pub configs: Option<bool>,
     pub named_collections: Option<bool>,
+    /// Override config.backup.skip_projections for this request.
+    pub skip_projections: Option<Vec<String>>,
 }
 
 /// POST /api/v1/upload/{name} -- upload a local backup to S3
@@ -769,15 +899,7 @@ pub async fn upload_backup(
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
 
-    validate_backup_name(&name).map_err(|e| {
-        warn!(backup_name = %name, "backup name rejected: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid backup name: {e}"),
-            }),
-        )
-    })?;
+    validate_backup_name(&name).map_err(|e| validation_error(&name, e))?;
 
     let cache_clone = state.manifest_cache.clone();
     run_operation(
@@ -791,7 +913,7 @@ pub async fn upload_backup(
             let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
                 .join("backup")
                 .join(&name);
-            let effective_resume = config.general.use_resumable_state;
+            let effective_resume = req.resume.unwrap_or(config.general.use_resumable_state);
             crate::upload::upload(
                 &config,
                 &s3,
@@ -805,7 +927,7 @@ pub async fn upload_backup(
             .await?;
 
             // Apply retention after successful upload (design doc 3.6 step 7)
-            list::apply_retention_after_upload(&config, &s3, Some(&cache_clone)).await;
+            list::apply_retention_after_upload(&config, &s3, Some(&name), Some(&cache_clone)).await;
             Ok(())
         },
     )
@@ -817,6 +939,8 @@ pub async fn upload_backup(
 pub struct UploadRequest {
     pub delete_local: Option<bool>,
     pub diff_from_remote: Option<String>,
+    /// Override config.general.use_resumable_state for this request.
+    pub resume: Option<bool>,
 }
 
 /// POST /api/v1/download/{name} -- download a backup from S3
@@ -827,17 +951,10 @@ pub async fn download_backup(
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
 
-    validate_backup_name(&name).map_err(|e| {
-        warn!(backup_name = %name, "backup name rejected: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid backup name: {e}"),
-            }),
-        )
-    })?;
+    validate_backup_name(&name).map_err(|e| validation_error(&name, e))?;
 
     let hardlink = req.hardlink_exists_files.unwrap_or(false);
+    let resume_override = req.resume;
     run_operation(
         &state,
         "download",
@@ -846,7 +963,7 @@ pub async fn download_backup(
         false,              // no cache invalidation
         move |config, _ch, s3, cancel| async move {
             info!(backup_name = %name, hardlink_exists_files = hardlink, "Starting download operation");
-            let effective_resume = config.general.use_resumable_state;
+            let effective_resume = resume_override.unwrap_or(config.general.use_resumable_state);
             crate::download::download(&config, &s3, &name, effective_resume, hardlink, cancel)
                 .await
                 .map(|_| ())
@@ -859,6 +976,8 @@ pub async fn download_backup(
 #[derive(Debug, Deserialize, Default)]
 pub struct DownloadRequest {
     pub hardlink_exists_files: Option<bool>,
+    /// Override config.general.use_resumable_state for this request.
+    pub resume: Option<bool>,
 }
 
 /// POST /api/v1/restore/{name} -- restore a downloaded backup
@@ -869,15 +988,7 @@ pub async fn restore_backup(
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
 
-    validate_backup_name(&name).map_err(|e| {
-        warn!(backup_name = %name, "backup name rejected: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid backup name: {e}"),
-            }),
-        )
-    })?;
+    validate_backup_name(&name).map_err(|e| validation_error(&name, e))?;
 
     // Reject mutually exclusive flag combination
     if req.schema.unwrap_or(false) && req.data_only.unwrap_or(false) {
@@ -914,7 +1025,7 @@ pub async fn restore_backup(
         false,              // no cache invalidation
         move |config, ch, _s3, cancel| async move {
             info!(backup_name = %name, "Starting restore operation");
-            let effective_resume = config.general.use_resumable_state;
+            let effective_resume = req.resume.unwrap_or(config.general.use_resumable_state);
             crate::restore::restore(
                 &config,
                 &ch,
@@ -955,6 +1066,8 @@ pub struct RestoreRequest {
     pub named_collections: Option<bool>,
     pub partitions: Option<String>,
     pub skip_empty_tables: Option<bool>,
+    /// Override config.general.use_resumable_state for this request.
+    pub resume: Option<bool>,
 }
 
 /// POST /api/v1/create_remote -- create local backup then upload to S3
@@ -966,16 +1079,16 @@ pub async fn create_remote(
 
     // Validate backup name if provided (auto-generated names are always safe)
     if let Some(ref name) = req.backup_name {
-        validate_backup_name(name).map_err(|e| {
-            warn!(backup_name = %name, "backup name rejected: {}", e);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("invalid backup name: {e}"),
-                }),
-            )
-        })?;
+        validate_backup_name(name).map_err(|e| validation_error(name, e))?;
+        reject_reserved_backup_name(name).map_err(|e| validation_error(name, e))?;
     }
+
+    // Pre-generate the backup name so run_operation() can acquire a per-backup
+    // PID lock instead of falling back to the global lock when no name is given.
+    let backup_name = req
+        .backup_name
+        .clone()
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
 
     let metrics_clone = state.metrics.clone();
     let cache_clone = state.manifest_cache.clone();
@@ -983,13 +1096,9 @@ pub async fn create_remote(
         &state,
         "create_remote",
         "create_remote",
-        req.backup_name.clone(), // None when auto-generated inside closure
-        true,                    // invalidate cache after upload
+        Some(backup_name.clone()),
+        true, // invalidate cache after upload
         move |config, ch, s3, cancel| async move {
-            let backup_name = req
-                .backup_name
-                .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
-
             info!(backup_name = %backup_name, "Starting create_remote operation");
 
             // Step 1: Create local backup
@@ -1005,7 +1114,10 @@ pub async fn create_remote(
                 req.rbac.unwrap_or(false),
                 req.configs.unwrap_or(false),
                 req.named_collections.unwrap_or(false),
-                &config.backup.skip_projections,
+                req.skip_projections
+                    .as_ref()
+                    .unwrap_or(&config.backup.skip_projections),
+                cancel.clone(),
             )
             .await?;
 
@@ -1028,7 +1140,13 @@ pub async fn create_remote(
             .await?;
 
             // Apply retention after successful upload (design doc 3.6 step 7)
-            list::apply_retention_after_upload(&config, &s3, Some(&cache_clone)).await;
+            list::apply_retention_after_upload(
+                &config,
+                &s3,
+                Some(&backup_name),
+                Some(&cache_clone),
+            )
+            .await;
 
             if let Some(m) = &metrics_clone {
                 m.backup_last_success_timestamp
@@ -1052,6 +1170,8 @@ pub struct CreateRemoteRequest {
     pub rbac: Option<bool>,
     pub configs: Option<bool>,
     pub named_collections: Option<bool>,
+    /// Override config.backup.skip_projections for this request.
+    pub skip_projections: Option<Vec<String>>,
 }
 
 /// POST /api/v1/restore_remote/{name} -- download then restore
@@ -1062,15 +1182,7 @@ pub async fn restore_remote(
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
 
-    validate_backup_name(&name).map_err(|e| {
-        warn!(backup_name = %name, "backup name rejected: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid backup name: {e}"),
-            }),
-        )
-    })?;
+    validate_backup_name(&name).map_err(|e| validation_error(&name, e))?;
 
     // Parse remap parameters before starting the operation
     let db_mapping = match &req.database_mapping {
@@ -1101,16 +1213,9 @@ pub async fn restore_remote(
             let effective_resume = config.general.use_resumable_state;
 
             // Step 1: Download from S3
-            crate::download::download(
-                &config,
-                &s3,
-                &name,
-                effective_resume,
-                false,
-                cancel.clone(),
-            )
-            .await
-            .map(|_| ())?;
+            crate::download::download(&config, &s3, &name, effective_resume, false, cancel.clone())
+                .await
+                .map(|_| ())?;
 
             // Step 2: Restore with remap.
             // restore_remote does not support schema-only, data-only, or partition
@@ -1167,15 +1272,7 @@ pub async fn delete_backup(
     State(state): State<AppState>,
     Path((location, name)): Path<(String, String)>,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)> {
-    validate_backup_name(&name).map_err(|e| {
-        warn!(backup_name = %name, "backup name rejected: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid backup name: {e}"),
-            }),
-        )
-    })?;
+    validate_backup_name(&name).map_err(|e| validation_error(&name, e))?;
 
     let loc = match location.as_str() {
         "local" => list::Location::Local,
@@ -1363,6 +1460,43 @@ async fn reload_config_and_clients(
     Ok((config, ch, s3))
 }
 
+/// Rebuild `op_semaphore` if `allow_parallel` changed between old and new config.
+///
+/// In-flight operations hold permits against the old `Semaphore` instance and
+/// are unaffected. Shared by `reload()` and `restart()`.
+fn maybe_rebuild_semaphore(
+    state: &AppState,
+    new_config: &crate::config::Config,
+    caller: &str,
+) {
+    let old_allow_parallel = state.config.load().api.allow_parallel;
+    if old_allow_parallel != new_config.api.allow_parallel {
+        let new_permits = if new_config.api.allow_parallel {
+            Semaphore::MAX_PERMITS
+        } else {
+            1
+        };
+        state
+            .op_semaphore
+            .store(Arc::new(Semaphore::new(new_permits)));
+        info!(
+            old = old_allow_parallel,
+            new = new_config.api.allow_parallel,
+            "{}: op_semaphore rebuilt (allow_parallel changed)", caller
+        );
+    }
+}
+
+/// Update `ManifestCache` TTL after config reload/restart so the cache picks
+/// up any change to `general.remote_cache_ttl_secs`.
+async fn update_manifest_cache_ttl(
+    state: &AppState,
+    new_config: &crate::config::Config,
+) {
+    let ttl = std::time::Duration::from_secs(new_config.general.remote_cache_ttl_secs);
+    state.manifest_cache.lock().await.set_ttl(ttl);
+}
+
 /// POST /api/v1/reload -- config hot-reload
 ///
 /// Reloads config from disk, creates new ChClient and S3Client, and atomically
@@ -1375,10 +1509,16 @@ pub async fn reload(
 
     let (config, ch, s3) = reload_config_and_clients(&state).await?;
 
+    // Rebuild op_semaphore when allow_parallel changes
+    maybe_rebuild_semaphore(&state, &config, "Reload");
+
     // Atomically swap config and clients
-    state.config.store(Arc::new(config));
+    state.config.store(Arc::new(config.clone()));
     state.ch.store(Arc::new(ch));
     state.s3.store(Arc::new(s3));
+
+    // Update ManifestCache TTL to reflect new config
+    update_manifest_cache_ttl(&state, &config).await;
 
     // If watch loop is active, also send reload signal so it picks up changes
     if let Some(tx) = &*state.watch_reload_tx.lock().await {
@@ -1428,30 +1568,22 @@ pub async fn restart(
         )
     })?;
 
-    // Rebuild op_semaphore when allow_parallel changes so new permit count takes
-    // effect immediately. In-flight operations hold permits against the old
-    // Semaphore instance; those permits are unaffected and complete normally.
-    let old_allow_parallel = state.config.load().api.allow_parallel;
-    if old_allow_parallel != config.api.allow_parallel {
-        let new_permits = if config.api.allow_parallel {
-            Semaphore::MAX_PERMITS
-        } else {
-            1
-        };
-        state
-            .op_semaphore
-            .store(Arc::new(Semaphore::new(new_permits)));
-        info!(
-            old = old_allow_parallel,
-            new = config.api.allow_parallel,
-            "Restart: op_semaphore rebuilt (allow_parallel changed)"
-        );
-    }
+    // Rebuild op_semaphore when allow_parallel changes
+    maybe_rebuild_semaphore(&state, &config, "Restart");
 
     // Atomically swap config and clients
-    state.config.store(Arc::new(config));
+    state.config.store(Arc::new(config.clone()));
     state.ch.store(Arc::new(ch));
     state.s3.store(Arc::new(s3));
+
+    // Update ManifestCache TTL to reflect new config
+    update_manifest_cache_ttl(&state, &config).await;
+
+    // If watch loop is active, send reload signal so it picks up the new config
+    if let Some(tx) = &*state.watch_reload_tx.lock().await {
+        tx.send(true).ok();
+        info!("Config reload signal sent to watch loop");
+    }
 
     info!("Restart completed: config reloaded and clients reconnected");
 
@@ -1612,36 +1744,9 @@ pub async fn tables(
         results
     };
 
-    // Apply pagination (offset/limit)
-    let total_count = results.len();
-    let offset = params.offset.unwrap_or(0);
-    let results: Vec<TablesResponseEntry> = if let Some(limit) = params.limit {
-        info!(
-            offset = offset,
-            limit = limit,
-            total = total_count,
-            "tables: offset/limit applied"
-        );
-        results.into_iter().skip(offset).take(limit).collect()
-    } else {
-        if offset > 0 {
-            info!(
-                offset = offset,
-                total = total_count,
-                "tables: offset applied"
-            );
-        }
-        results.into_iter().skip(offset).collect()
-    };
+    let (header, results) = paginate(results, params.offset, params.limit, "tables");
 
-    Ok((
-        [(
-            axum::http::header::HeaderName::from_static("x-total-count"),
-            axum::http::header::HeaderValue::from_str(&total_count.to_string())
-                .unwrap_or_else(|_| axum::http::header::HeaderValue::from_static("0")),
-        )],
-        Json(results),
-    ))
+    Ok((header, Json(results)))
 }
 
 /// POST /api/v1/watch/start -- start the watch loop
@@ -1655,9 +1760,10 @@ pub async fn watch_start(
 ) -> Result<Json<WatchActionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
 
-    // Check if watch is already active
+    // Reserve the slot atomically: check-and-set while holding the lock to
+    // prevent two concurrent requests from both passing the active check.
     {
-        let ws = state.watch_status.lock().await;
+        let mut ws = state.watch_status.lock().await;
         if ws.active {
             return Err((
                 StatusCode::LOCKED,
@@ -1666,6 +1772,7 @@ pub async fn watch_start(
                 }),
             ));
         }
+        ws.active = true; // Reserve the slot
     }
 
     // Apply optional interval overrides
@@ -1678,14 +1785,16 @@ pub async fn watch_start(
             config.watch.full_interval = v;
         }
         // Validate merged config before spawning
-        config.validate().map_err(|e| {
-            (
+        if let Err(e) = config.validate() {
+            // Undo the reservation on validation failure
+            state.watch_status.lock().await.active = false;
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: format!("invalid config: {}", e),
                 }),
-            )
-        })?;
+            ));
+        }
         state.config.store(Arc::new(config));
     }
 
@@ -1729,7 +1838,7 @@ pub async fn watch_stop(
 
     info!("Watch loop stop signal sent via API");
     Ok(Json(WatchActionResponse {
-        status: "stopped".to_string(),
+        status: "stopping".to_string(),
     }))
 }
 

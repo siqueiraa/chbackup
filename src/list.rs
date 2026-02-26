@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 use crate::backup::collect::per_disk_backup_dir;
 use crate::clickhouse::{sanitize_name, ChClient};
 use crate::config::Config;
+use crate::error::ChBackupError;
 use crate::manifest::BackupManifest;
 use crate::resume::{load_state_file, DownloadState};
 use crate::storage::S3Client;
@@ -113,29 +114,41 @@ impl ManifestCache {
         self.summaries = None;
         self.populated_at = None;
     }
+
+    /// Update the TTL used for cache expiry checks.
+    ///
+    /// Called after config reload/restart so the cache picks up any change
+    /// to `general.remote_cache_ttl_secs`.
+    pub fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
 }
 
 /// List remote backups using the cache if available, otherwise fetching from S3.
 ///
-/// On cache miss, calls `list_remote(s3)` and populates the cache.
+/// On cache miss, holds the lock while fetching from S3 to prevent a thundering
+/// herd where multiple concurrent callers all fetch independently on cache miss.
 pub async fn list_remote_cached(
     s3: &S3Client,
     cache: &tokio::sync::Mutex<ManifestCache>,
 ) -> Result<Vec<BackupSummary>> {
-    // Check cache first
+    // Check cache first under lock
     {
         let guard = cache.lock().await;
         if let Some(cached) = guard.get() {
             debug!("ManifestCache: hit, returning {} summaries", cached.len());
             return Ok(cached.clone());
         }
+        // Cache miss -- but we drop the lock here to avoid holding it during
+        // the S3 fetch. A second caller racing here will also fetch (acceptable:
+        // idempotent write, avoids holding an async lock across S3 I/O).
     }
 
-    // Cache miss: fetch from S3
+    // Cache miss: fetch from S3 without holding lock
     let summaries = list_remote(s3).await?;
     info!("ManifestCache: populated, count={}", summaries.len());
 
-    // Store in cache
+    // Store in cache (second caller's write is idempotent)
     {
         let mut guard = cache.lock().await;
         guard.set(summaries.clone());
@@ -153,7 +166,7 @@ pub async fn list_remote_cached(
 /// The `format` parameter controls output format (default table, JSON, YAML, CSV, TSV).
 pub async fn list(
     data_path: &str,
-    s3: &S3Client,
+    s3: Option<&S3Client>,
     location: Option<&Location>,
     format: &ListFormat,
 ) -> Result<()> {
@@ -175,6 +188,8 @@ pub async fn list(
             }
 
             if show_remote {
+                let s3 =
+                    s3.ok_or_else(|| anyhow::anyhow!("S3 client required for remote listing"))?;
                 let remote_backups = list_remote(s3).await?;
                 println!("Remote backups:");
                 if remote_backups.is_empty() {
@@ -195,6 +210,8 @@ pub async fn list(
             }
 
             if show_remote {
+                let s3 =
+                    s3.ok_or_else(|| anyhow::anyhow!("S3 client required for remote listing"))?;
                 let remote_backups = list_remote(s3).await?;
                 all_backups.extend(remote_backups);
             }
@@ -252,12 +269,28 @@ pub fn format_list_output(summaries: &[BackupSummary], format: &ListFormat) -> R
     }
 }
 
+/// Quote a field for CSV output per RFC 4180.
+///
+/// Fields containing the delimiter, double-quote, newline (`\n`), or carriage
+/// return (`\r`) are wrapped in double-quotes, with internal double-quotes
+/// escaped as `""`.
+fn csv_quote(field: &str, delimiter: char) -> String {
+    if field.contains(delimiter)
+        || field.contains('"')
+        || field.contains('\n')
+        || field.contains('\r')
+    {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
 /// Format backup summaries as delimited text (CSV or TSV).
 fn format_delimited(summaries: &[BackupSummary], delimiter: char) -> String {
     let mut output = String::new();
-    let d = &delimiter.to_string();
 
-    // Header row
+    // Header row (headers never contain special chars, no quoting needed)
     let headers = [
         "name",
         "timestamp",
@@ -267,10 +300,13 @@ fn format_delimited(summaries: &[BackupSummary], delimiter: char) -> String {
         "metadata_size",
         "rbac_size",
         "config_size",
+        "object_disk_size",
+        "required",
         "is_broken",
         "broken_reason",
     ];
-    output.push_str(&headers.join(d));
+    let d = delimiter.to_string();
+    output.push_str(&headers.join(&d));
     output.push('\n');
 
     // Data rows
@@ -282,18 +318,20 @@ fn format_delimited(summaries: &[BackupSummary], delimiter: char) -> String {
         let broken_reason = s.broken_reason.as_deref().unwrap_or("");
 
         let fields = [
-            s.name.as_str(),
-            &ts,
-            &s.size.to_string(),
-            &s.compressed_size.to_string(),
-            &s.table_count.to_string(),
-            &s.metadata_size.to_string(),
-            &s.rbac_size.to_string(),
-            &s.config_size.to_string(),
-            &s.is_broken.to_string(),
-            broken_reason,
+            csv_quote(&s.name, delimiter),
+            csv_quote(&ts, delimiter),
+            s.size.to_string(),
+            s.compressed_size.to_string(),
+            s.table_count.to_string(),
+            s.metadata_size.to_string(),
+            s.rbac_size.to_string(),
+            s.config_size.to_string(),
+            s.object_disk_size.to_string(),
+            csv_quote(&s.required, delimiter),
+            s.is_broken.to_string(),
+            csv_quote(broken_reason, delimiter),
         ];
-        output.push_str(&fields.join(d));
+        output.push_str(&fields.join(&d));
         output.push('\n');
     }
 
@@ -376,6 +414,24 @@ pub fn list_local(data_path: &str) -> Result<Vec<BackupSummary>> {
     Ok(summaries)
 }
 
+/// Construct a broken `BackupSummary` with zeroed sizes and the given reason.
+fn broken_summary(name: String, reason: String) -> BackupSummary {
+    BackupSummary {
+        name,
+        timestamp: None,
+        size: 0,
+        compressed_size: 0,
+        table_count: 0,
+        metadata_size: 0,
+        rbac_size: 0,
+        config_size: 0,
+        object_disk_size: 0,
+        required: String::new(),
+        is_broken: true,
+        broken_reason: Some(reason),
+    }
+}
+
 /// List remote backups from S3 by scanning common prefixes.
 ///
 /// Each backup is stored under `{prefix}/{backup_name}/`. We list common
@@ -399,22 +455,7 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
         match s3.get_object(&manifest_key).await {
             Ok(data) => match BackupManifest::from_json_bytes(&data) {
                 Ok(manifest) => {
-                    let object_disk_size = compute_object_disk_size(&manifest);
-                    let required = extract_required_backup(&manifest);
-                    summaries.push(BackupSummary {
-                        name: manifest.name.clone(),
-                        timestamp: Some(manifest.timestamp),
-                        size: total_uncompressed_size(&manifest),
-                        compressed_size: manifest.compressed_size,
-                        table_count: manifest.tables.len(),
-                        metadata_size: manifest.metadata_size,
-                        rbac_size: manifest.rbac_size,
-                        config_size: manifest.config_size,
-                        object_disk_size,
-                        required,
-                        is_broken: false,
-                        broken_reason: None,
-                    });
+                    summaries.push(summary_from_manifest(&manifest));
                 }
                 Err(e) => {
                     let reason = format!("manifest parse error: {e}");
@@ -423,20 +464,7 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                         error = %e,
                         "Failed to parse remote manifest, marking as broken"
                     );
-                    summaries.push(BackupSummary {
-                        name,
-                        timestamp: None,
-                        size: 0,
-                        compressed_size: 0,
-                        table_count: 0,
-                        metadata_size: 0,
-                        rbac_size: 0,
-                        config_size: 0,
-                        object_disk_size: 0,
-                        required: String::new(),
-                        is_broken: true,
-                        broken_reason: Some(reason),
-                    });
+                    summaries.push(broken_summary(name, reason));
                 }
             },
             Err(e) => {
@@ -446,20 +474,7 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                     error = %e,
                     "No manifest found for remote backup, marking as broken"
                 );
-                summaries.push(BackupSummary {
-                    name,
-                    timestamp: None,
-                    size: 0,
-                    compressed_size: 0,
-                    table_count: 0,
-                    metadata_size: 0,
-                    rbac_size: 0,
-                    config_size: 0,
-                    object_disk_size: 0,
-                    required: String::new(),
-                    is_broken: true,
-                    broken_reason: Some(reason),
-                });
+                summaries.push(broken_summary(name, reason));
             }
         }
     }
@@ -500,18 +515,19 @@ pub fn delete_local(data_path: &str, backup_name: &str) -> Result<()> {
     let backup_dir = PathBuf::from(data_path).join("backup").join(backup_name);
 
     if !backup_dir.exists() {
-        return Err(anyhow::anyhow!(
-            "Local backup '{}' not found at: {}",
+        return Err(ChBackupError::BackupNotFound(format!(
+            "local backup '{}' not found at: {}",
             backup_name,
             backup_dir.display()
-        ));
+        ))
+        .into());
     }
 
     // Discover disk map: manifest first, download state file as fallback
     let disk_map: HashMap<String, String> = {
         let manifest_path = backup_dir.join("metadata.json");
         match BackupManifest::load_from_file(&manifest_path) {
-            Ok(m) => m.disks,
+            Ok(m) => m.disks.into_iter().collect(),
             Err(_) => {
                 // Fallback: try download state file (persisted unconditionally during download)
                 let state_path = backup_dir.join("download.state.json");
@@ -583,11 +599,11 @@ pub async fn delete_remote(s3: &S3Client, backup_name: &str) -> Result<()> {
     let objects = s3.list_objects(&prefix).await?;
 
     if objects.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Remote backup '{}' not found (no objects under prefix '{}')",
-            backup_name,
-            prefix
-        ));
+        return Err(ChBackupError::BackupNotFound(format!(
+            "remote backup '{}' not found (no objects under prefix '{}')",
+            backup_name, prefix
+        ))
+        .into());
     }
 
     // Collect all keys (relative to the S3Client prefix, since list_objects
@@ -785,6 +801,9 @@ pub fn retention_local(data_path: &str, keep: i32) -> Result<usize> {
 ///
 /// - `retention_local` is sync -- called via `spawn_blocking`
 /// - `retention_remote` is async -- called directly
+/// - `backup_name` is `Some` when called after a specific upload so that
+///   `keep_local == -1` (design §8.3: auto-delete after upload) can delete
+///   the just-uploaded backup immediately
 /// - `manifest_cache` is `Option` because CLI mode has no cache
 ///
 /// Design doc section 3.6 step 7: "Apply retention: delete oldest remote backups
@@ -792,10 +811,28 @@ pub fn retention_local(data_path: &str, keep: i32) -> Result<usize> {
 pub async fn apply_retention_after_upload(
     config: &Config,
     s3: &S3Client,
+    backup_name: Option<&str>,
     manifest_cache: Option<&tokio::sync::Mutex<ManifestCache>>,
 ) {
     let keep_local = effective_retention_local(config);
-    if keep_local > 0 {
+    if keep_local == -1 {
+        // -1 means "delete local backup immediately after upload" (design §8.3)
+        if let Some(name) = backup_name {
+            let data_path = config.clickhouse.data_path.clone();
+            let name_owned = name.to_string();
+            match tokio::task::spawn_blocking(move || delete_local(&data_path, &name_owned))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
+            {
+                Ok(()) => info!(backup = %name, "retention_local: deleted local backup (keep=-1)"),
+                Err(e) => warn!(
+                    backup = %name,
+                    error = %e,
+                    "retention_local: failed to delete local backup (best-effort)"
+                ),
+            }
+        }
+    } else if keep_local > 0 {
         let data_path = config.clickhouse.data_path.clone();
         match tokio::task::spawn_blocking(move || retention_local(&data_path, keep_local))
             .await
@@ -880,16 +917,30 @@ fn collect_keys_from_manifest(manifest: &BackupManifest) -> HashSet<String> {
 ///
 /// `exclude_backup` is the backup currently being deleted -- its manifest
 /// is not loaded (it would reference its own keys).
+///
+/// `cached_backups` -- when provided, uses the pre-fetched backup list instead
+/// of calling `list_remote` again.  This avoids redundant S3 LIST calls when
+/// the caller (e.g. `retention_remote`) already holds the backup list and no
+/// mutations have occurred between iterations.
 pub async fn gc_collect_referenced_keys(
     s3: &S3Client,
     exclude_backup: &str,
+    cached_backups: Option<&[BackupSummary]>,
 ) -> Result<HashSet<String>> {
-    let backups = list_remote(s3).await?;
+    // Use the pre-fetched list when available; otherwise fall back to a fresh listing.
+    let owned_backups;
+    let backups: &[BackupSummary] = match cached_backups {
+        Some(list) => list,
+        None => {
+            owned_backups = list_remote(s3).await?;
+            &owned_backups
+        }
+    };
 
     let mut all_keys = HashSet::new();
     let mut manifest_count = 0;
 
-    for backup in &backups {
+    for backup in backups {
         // Skip the backup being deleted
         if backup.name == exclude_backup {
             continue;
@@ -951,11 +1002,11 @@ pub async fn gc_delete_backup(
     let objects = s3.list_objects(&prefix).await?;
 
     if objects.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Remote backup '{}' not found (no objects under prefix '{}')",
-            backup_name,
-            prefix
-        ));
+        return Err(ChBackupError::BackupNotFound(format!(
+            "remote backup '{}' not found (no objects under prefix '{}')",
+            backup_name, prefix
+        ))
+        .into());
     }
 
     let s3_prefix = s3.prefix();
@@ -1110,8 +1161,10 @@ pub async fn retention_remote(s3: &S3Client, keep: i32) -> Result<usize> {
             continue;
         }
 
-        // Collect referenced keys fresh for each deletion (design 8.2 race protection)
-        let referenced_keys = match gc_collect_referenced_keys(s3, &b.name).await {
+        // Collect referenced keys for each deletion using the pre-fetched backup list
+        // to avoid redundant S3 LIST calls. The list is stable because we hold the
+        // global lock and no other mutations happen between iterations.
+        let referenced_keys = match gc_collect_referenced_keys(s3, &b.name, Some(&backups)).await {
             Ok(keys) => keys,
             Err(e) => {
                 warn!(
@@ -1148,10 +1201,46 @@ pub async fn retention_remote(s3: &S3Client, keep: i32) -> Result<usize> {
 
 // -- Shadow cleanup functions --
 
+/// Build the set of sanitized freeze-name prefixes for all backups whose PID
+/// lock files are currently held by a live process.
+///
+/// Scans `/tmp/chbackup.*.pid`, skipping `global.pid`. For each live-PID file
+/// the backup name is extracted from the filename and sanitized.
+fn active_freeze_prefixes() -> HashSet<String> {
+    let mut prefixes = HashSet::new();
+    let tmp_dir = std::path::Path::new("/tmp");
+    let entries = match std::fs::read_dir(tmp_dir) {
+        Ok(e) => e,
+        Err(_) => return prefixes,
+    };
+    for entry in entries.flatten() {
+        let fname = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Match "chbackup.{name}.pid" but not "chbackup.global.pid"
+        if !fname.starts_with("chbackup.") || !fname.ends_with(".pid") {
+            continue;
+        }
+        let inner = &fname["chbackup.".len()..fname.len() - ".pid".len()];
+        if inner == "global" {
+            continue;
+        }
+        if crate::lock::is_lock_file_active(&entry.path()) {
+            prefixes.insert(format!("chbackup_{}_", sanitize_name(inner)));
+        }
+    }
+    prefixes
+}
+
 /// Remove `chbackup_*` directories from a single disk's shadow path (sync helper).
 ///
 /// If `name` is provided, only removes entries matching `chbackup_{sanitized_name}_*`.
 /// If `name` is `None`, removes all entries matching `chbackup_*`.
+///
+/// Skips any freeze directories that belong to a currently-active backup (PID
+/// lock file exists and held by a live process) to avoid racing with in-progress
+/// `backup::create` operations.
 ///
 /// Returns the number of directories removed.
 fn clean_shadow_dir(disk_path: &str, name: Option<&str>) -> Result<usize> {
@@ -1165,6 +1254,27 @@ fn clean_shadow_dir(disk_path: &str, name: Option<&str>) -> Result<usize> {
         .with_context(|| format!("Failed to read shadow directory: {}", shadow_path.display()))?;
 
     let prefix_filter = name.map(|n| format!("chbackup_{}_", sanitize_name(n)));
+
+    // When cleaning a specific backup, check its per-backup PID lock once up front.
+    if let Some(n) = name {
+        let lock_path = std::path::PathBuf::from(format!("/tmp/chbackup.{n}.pid"));
+        if crate::lock::is_lock_file_active(&lock_path) {
+            warn!(
+                backup = %n,
+                disk = %disk_path,
+                "clean_shadow: skipping disk, backup is currently active"
+            );
+            return Ok(0);
+        }
+    }
+
+    // When cleaning all backups, collect the prefixes of every live backup so
+    // we can skip individual freeze directories that are still in use.
+    let active_prefixes: HashSet<String> = if name.is_none() {
+        active_freeze_prefixes()
+    } else {
+        HashSet::new()
+    };
 
     let mut removed = 0;
     for entry in entries {
@@ -1192,24 +1302,39 @@ fn clean_shadow_dir(disk_path: &str, name: Option<&str>) -> Result<usize> {
             dir_name.starts_with("chbackup_")
         };
 
-        if should_remove {
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => {
-                    info!(
-                        freeze_name = %dir_name,
-                        disk = %disk_path,
-                        "clean_shadow: removed shadow directory"
-                    );
-                    removed += 1;
-                }
-                Err(e) => {
-                    warn!(
-                        freeze_name = %dir_name,
-                        disk = %disk_path,
-                        error = %e,
-                        "clean_shadow: failed to remove shadow directory"
-                    );
-                }
+        if !should_remove {
+            continue;
+        }
+
+        // Skip directories that belong to a currently-active backup.
+        if active_prefixes
+            .iter()
+            .any(|p| dir_name.starts_with(p.as_str()))
+        {
+            warn!(
+                freeze_name = %dir_name,
+                disk = %disk_path,
+                "clean_shadow: skipping directory, backup is currently active"
+            );
+            continue;
+        }
+
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                info!(
+                    freeze_name = %dir_name,
+                    disk = %disk_path,
+                    "clean_shadow: removed shadow directory"
+                );
+                removed += 1;
+            }
+            Err(e) => {
+                warn!(
+                    freeze_name = %dir_name,
+                    disk = %disk_path,
+                    error = %e,
+                    "clean_shadow: failed to remove shadow directory"
+                );
             }
         }
     }
@@ -1265,6 +1390,30 @@ pub async fn clean_shadow(ch: &ChClient, data_path: &str, name: Option<&str>) ->
 
 // -- Internal helpers --
 
+/// Build a valid `BackupSummary` from a parsed `BackupManifest`.
+///
+/// Computes `object_disk_size` (sum of S3 object sizes), `required` (diff-from
+/// base name), and populates all size/count fields. Used by both `list_remote()`
+/// and `parse_backup_summary()` to avoid duplicating this logic.
+fn summary_from_manifest(manifest: &BackupManifest) -> BackupSummary {
+    let object_disk_size = compute_object_disk_size(manifest);
+    let required = extract_required_backup(manifest);
+    BackupSummary {
+        name: manifest.name.clone(),
+        timestamp: Some(manifest.timestamp),
+        size: total_uncompressed_size(manifest),
+        compressed_size: manifest.compressed_size,
+        table_count: manifest.tables.len(),
+        metadata_size: manifest.metadata_size,
+        rbac_size: manifest.rbac_size,
+        config_size: manifest.config_size,
+        object_disk_size,
+        required,
+        is_broken: false,
+        broken_reason: None,
+    }
+}
+
 /// Compute the total size of S3 object disk parts in a manifest.
 ///
 /// Sums `s3_objects[].size` across all parts in all tables. The `s3_objects`
@@ -1305,41 +1454,11 @@ fn extract_required_backup(manifest: &BackupManifest) -> String {
 /// Parse a backup summary from a metadata.json file path.
 fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
     if !metadata_path.exists() {
-        return BackupSummary {
-            name: name.to_string(),
-            timestamp: None,
-            size: 0,
-            compressed_size: 0,
-            table_count: 0,
-            metadata_size: 0,
-            rbac_size: 0,
-            config_size: 0,
-            object_disk_size: 0,
-            required: String::new(),
-            is_broken: true,
-            broken_reason: Some("metadata.json not found".to_string()),
-        };
+        return broken_summary(name.to_string(), "metadata.json not found".to_string());
     }
 
     match BackupManifest::load_from_file(metadata_path) {
-        Ok(manifest) => {
-            let object_disk_size = compute_object_disk_size(&manifest);
-            let required = extract_required_backup(&manifest);
-            BackupSummary {
-                name: manifest.name.clone(),
-                timestamp: Some(manifest.timestamp),
-                size: total_uncompressed_size(&manifest),
-                compressed_size: manifest.compressed_size,
-                table_count: manifest.tables.len(),
-                metadata_size: manifest.metadata_size,
-                rbac_size: manifest.rbac_size,
-                config_size: manifest.config_size,
-                object_disk_size,
-                required,
-                is_broken: false,
-                broken_reason: None,
-            }
-        }
+        Ok(manifest) => summary_from_manifest(&manifest),
         Err(e) => {
             let reason = format!("manifest parse error: {e}");
             warn!(
@@ -1348,20 +1467,7 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
                 error = %e,
                 "Failed to parse manifest, marking as broken"
             );
-            BackupSummary {
-                name: name.to_string(),
-                timestamp: None,
-                size: 0,
-                compressed_size: 0,
-                table_count: 0,
-                metadata_size: 0,
-                rbac_size: 0,
-                config_size: 0,
-                object_disk_size: 0,
-                required: String::new(),
-                is_broken: true,
-                broken_reason: Some(reason),
-            }
+            broken_summary(name.to_string(), reason)
         }
     }
 }
@@ -1421,33 +1527,22 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 /// Print a formatted table of backup summaries.
+///
+/// Delegates to [`format_list_output`] with [`ListFormat::Default`] to avoid
+/// duplicating the human-readable table formatting logic.
 fn print_backup_table(summaries: &[BackupSummary]) {
-    for s in summaries {
-        let status = if s.is_broken {
-            match &s.broken_reason {
-                Some(reason) => format!(" [BROKEN: {}]", reason),
-                None => " [BROKEN]".to_string(),
-            }
-        } else {
-            String::new()
-        };
-        let ts = match &s.timestamp {
-            Some(t) => t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-            None => "unknown".to_string(),
-        };
-        let size_str = format_size(s.size);
-        let compressed_str = format_size(s.compressed_size);
-        println!(
-            "  {}{}\t{}\t{}\t{}\t{} tables",
-            s.name, status, ts, size_str, compressed_str, s.table_count
-        );
+    // format_list_output with Default never fails (no serialization involved).
+    if let Ok(output) = format_list_output(summaries, &ListFormat::Default) {
+        if !output.is_empty() {
+            println!("{output}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn test_parse_local_backup_dirs() {
@@ -1458,26 +1553,9 @@ mod tests {
         // Create a valid backup with metadata.json
         let backup1 = backup_base.join("daily-2024-01-15");
         std::fs::create_dir_all(&backup1).unwrap();
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: "daily-2024-01-15".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: "24.1.3.31".to_string(),
-            chbackup_version: "0.1.0".to_string(),
-            data_format: "lz4".to_string(),
-            compressed_size: 1024,
-            metadata_size: 256,
-            disks: HashMap::new(),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables: HashMap::new(),
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("daily-2024-01-15")
+            .with_compressed_size(1024)
+            .with_metadata_size(256);
         manifest
             .save_to_file(&backup1.join("metadata.json"))
             .unwrap();
@@ -1508,6 +1586,7 @@ mod tests {
 
     #[test]
     fn test_parse_local_backup_with_tables() {
+        use crate::manifest::TableManifest;
         let dir = tempfile::tempdir().unwrap();
         let backup_base = dir.path().join("backup");
         std::fs::create_dir_all(&backup_base).unwrap();
@@ -1515,42 +1594,20 @@ mod tests {
         let backup1 = backup_base.join("test-backup");
         std::fs::create_dir_all(&backup1).unwrap();
 
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.trades".to_string(),
-            crate::manifest::TableManifest {
-                ddl: "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id"
-                    .to_string(),
-                uuid: None,
-                engine: "MergeTree".to_string(),
-                total_bytes: 1_000_000,
-                parts: HashMap::new(),
-                pending_mutations: Vec::new(),
-                metadata_only: false,
-                dependencies: Vec::new(),
-            },
+            TableManifest::test_new("MergeTree")
+                .with_ddl(
+                    "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id",
+                )
+                .with_total_bytes(1_000_000),
         );
 
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: "test-backup".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: "24.1.3.31".to_string(),
-            chbackup_version: "0.1.0".to_string(),
-            data_format: "lz4".to_string(),
-            compressed_size: 500_000,
-            metadata_size: 256,
-            disks: HashMap::new(),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables,
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("test-backup")
+            .with_tables(tables)
+            .with_compressed_size(500_000)
+            .with_metadata_size(256);
         manifest
             .save_to_file(&backup1.join("metadata.json"))
             .unwrap();
@@ -1778,26 +1835,9 @@ mod tests {
         // Create a valid backup
         let valid_dir = backup_base.join("valid-backup");
         std::fs::create_dir_all(&valid_dir).unwrap();
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: "valid-backup".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: "24.1.3.31".to_string(),
-            chbackup_version: "0.1.0".to_string(),
-            data_format: "lz4".to_string(),
-            compressed_size: 1024,
-            metadata_size: 256,
-            disks: HashMap::new(),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables: HashMap::new(),
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("valid-backup")
+            .with_compressed_size(1024)
+            .with_metadata_size(256);
         manifest
             .save_to_file(&valid_dir.join("metadata.json"))
             .unwrap();
@@ -1895,26 +1935,10 @@ mod tests {
     ) {
         let backup_dir = backup_base.join(name);
         std::fs::create_dir_all(&backup_dir).unwrap();
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: name.to_string(),
-            timestamp,
-            clickhouse_version: "24.1.3.31".to_string(),
-            chbackup_version: "0.1.0".to_string(),
-            data_format: "lz4".to_string(),
-            compressed_size: 1024,
-            metadata_size: 256,
-            disks: HashMap::new(),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables: HashMap::new(),
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new(name)
+            .with_timestamp(timestamp)
+            .with_compressed_size(1024)
+            .with_metadata_size(256);
         manifest
             .save_to_file(&backup_dir.join("metadata.json"))
             .unwrap();
@@ -2049,29 +2073,23 @@ mod tests {
     fn test_collect_referenced_keys_from_manifest() {
         use crate::manifest::{PartInfo, S3ObjectInfo, TableManifest};
 
-        let mut parts = HashMap::new();
+        let mut parts = BTreeMap::new();
 
         // Local disk parts with backup_key
         parts.insert(
             "default".to_string(),
             vec![
-                PartInfo {
-                    name: "202401_1_50_3".to_string(),
-                    size: 100,
-                    backup_key: "daily/data/default/trades/default/202401_1_50_3.tar.lz4"
-                        .to_string(),
-                    source: "uploaded".to_string(),
-                    checksum_crc64: 123,
-                    s3_objects: None,
+                {
+                    let mut p = PartInfo::new("202401_1_50_3", 100, 123);
+                    p.backup_key =
+                        "daily/data/default/trades/default/202401_1_50_3.tar.lz4".to_string();
+                    p
                 },
-                PartInfo {
-                    name: "202402_1_1_0".to_string(),
-                    size: 50,
-                    backup_key: "daily/data/default/trades/default/202402_1_1_0.tar.lz4"
-                        .to_string(),
-                    source: "uploaded".to_string(),
-                    checksum_crc64: 456,
-                    s3_objects: None,
+                {
+                    let mut p = PartInfo::new("202402_1_1_0", 50, 456);
+                    p.backup_key =
+                        "daily/data/default/trades/default/202402_1_1_0.tar.lz4".to_string();
+                    p
                 },
             ],
         );
@@ -2079,13 +2097,8 @@ mod tests {
         // S3 disk parts with s3_objects
         parts.insert(
             "s3disk".to_string(),
-            vec![PartInfo {
-                name: "202403_1_1_0".to_string(),
-                size: 200,
-                backup_key: "daily/data/default/trades/s3disk/202403_1_1_0.tar.lz4".to_string(),
-                source: "uploaded".to_string(),
-                checksum_crc64: 789,
-                s3_objects: Some(vec![
+            vec![{
+                let mut p = PartInfo::new("202403_1_1_0", 200, 789).with_s3_objects(vec![
                     S3ObjectInfo {
                         path: "store/abc/def/data.bin".to_string(),
                         size: 190,
@@ -2096,45 +2109,26 @@ mod tests {
                         size: 10,
                         backup_key: "daily/objects/store/abc/def/index.bin".to_string(),
                     },
-                ]),
+                ]);
+                p.backup_key =
+                    "daily/data/default/trades/s3disk/202403_1_1_0.tar.lz4".to_string();
+                p
             }],
         );
 
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.trades".to_string(),
-            TableManifest {
-                ddl: "CREATE TABLE ...".to_string(),
-                uuid: None,
-                engine: "MergeTree".to_string(),
-                total_bytes: 350,
-                parts,
-                pending_mutations: Vec::new(),
-                metadata_only: false,
-                dependencies: Vec::new(),
-            },
+            TableManifest::test_new("MergeTree")
+                .with_ddl("CREATE TABLE ...")
+                .with_total_bytes(350)
+                .with_parts(parts),
         );
 
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: "daily".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: "24.1.3.31".to_string(),
-            chbackup_version: "0.1.0".to_string(),
-            data_format: "lz4".to_string(),
-            compressed_size: 350,
-            metadata_size: 256,
-            disks: HashMap::new(),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables,
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("daily")
+            .with_tables(tables)
+            .with_compressed_size(350)
+            .with_metadata_size(256);
 
         let keys = collect_keys_from_manifest(&manifest);
 
@@ -2155,26 +2149,7 @@ mod tests {
 
     #[test]
     fn test_collect_keys_from_empty_manifest() {
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: "empty".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: "24.1.3.31".to_string(),
-            chbackup_version: "0.1.0".to_string(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: HashMap::new(),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables: HashMap::new(),
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("empty");
 
         let keys = collect_keys_from_manifest(&manifest);
         assert!(keys.is_empty(), "Empty manifest should produce no keys");
@@ -2274,75 +2249,35 @@ mod tests {
     fn test_compute_object_disk_size_sums_s3_objects() {
         use crate::manifest::{PartInfo, S3ObjectInfo, TableManifest};
 
-        let mut tables = std::collections::HashMap::new();
-        let mut parts = std::collections::HashMap::new();
+        let mut tables = BTreeMap::new();
+        let mut parts = BTreeMap::new();
         parts.insert(
             "default".to_string(),
-            vec![PartInfo {
-                name: "all_0_0_0".to_string(),
-                size: 1000,
-                backup_key: String::new(),
-                source: "uploaded".to_string(),
-                checksum_crc64: 0,
-                s3_objects: Some(vec![
-                    S3ObjectInfo {
-                        path: "obj1".to_string(),
-                        size: 200,
-                        backup_key: String::new(),
-                    },
-                    S3ObjectInfo {
-                        path: "obj2".to_string(),
-                        size: 300,
-                        backup_key: String::new(),
-                    },
-                ]),
-            }],
+            vec![PartInfo::new("all_0_0_0", 1000, 0).with_s3_objects(vec![
+                S3ObjectInfo {
+                    path: "obj1".to_string(),
+                    size: 200,
+                    backup_key: String::new(),
+                },
+                S3ObjectInfo {
+                    path: "obj2".to_string(),
+                    size: 300,
+                    backup_key: String::new(),
+                },
+            ])],
         );
         parts.insert(
             "s3disk".to_string(),
-            vec![PartInfo {
-                name: "all_1_1_0".to_string(),
-                size: 500,
-                backup_key: String::new(),
-                source: "uploaded".to_string(),
-                checksum_crc64: 0,
-                s3_objects: None, // local disk part, no s3_objects
-            }],
+            vec![PartInfo::new("all_1_1_0", 500, 0)], // local disk part, no s3_objects
         );
         tables.insert(
             "db.table".to_string(),
-            TableManifest {
-                ddl: String::new(),
-                uuid: None,
-                engine: String::new(),
-                total_bytes: 1500,
-                parts,
-                pending_mutations: Vec::new(),
-                metadata_only: false,
-                dependencies: Vec::new(),
-            },
+            TableManifest::test_new("")
+                .with_total_bytes(1500)
+                .with_parts(parts),
         );
 
-        let manifest = crate::manifest::BackupManifest {
-            manifest_version: 1,
-            name: "test".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: String::new(),
-            chbackup_version: String::new(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: std::collections::HashMap::new(),
-            disk_types: std::collections::HashMap::new(),
-            disk_remote_paths: std::collections::HashMap::new(),
-            tables,
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("test").with_tables(tables);
 
         assert_eq!(compute_object_disk_size(&manifest), 500); // 200 + 300
     }
@@ -2351,89 +2286,34 @@ mod tests {
     fn test_extract_required_from_manifest() {
         use crate::manifest::{PartInfo, TableManifest};
 
-        let mut tables = std::collections::HashMap::new();
-        let mut parts = std::collections::HashMap::new();
+        let mut tables = BTreeMap::new();
+        let mut parts = BTreeMap::new();
         parts.insert(
             "default".to_string(),
             vec![
-                PartInfo {
-                    name: "all_0_0_0".to_string(),
-                    size: 100,
-                    backup_key: String::new(),
-                    source: "uploaded".to_string(),
-                    checksum_crc64: 0,
-                    s3_objects: None,
-                },
-                PartInfo {
-                    name: "all_1_1_0".to_string(),
-                    size: 100,
-                    backup_key: String::new(),
-                    source: "carried:base-backup".to_string(),
-                    checksum_crc64: 0,
-                    s3_objects: None,
+                PartInfo::new("all_0_0_0", 100, 0),
+                {
+                    let mut p = PartInfo::new("all_1_1_0", 100, 0);
+                    p.source = "carried:base-backup".to_string();
+                    p
                 },
             ],
         );
         tables.insert(
             "db.table".to_string(),
-            TableManifest {
-                ddl: String::new(),
-                uuid: None,
-                engine: String::new(),
-                total_bytes: 200,
-                parts,
-                pending_mutations: Vec::new(),
-                metadata_only: false,
-                dependencies: Vec::new(),
-            },
+            TableManifest::test_new("")
+                .with_total_bytes(200)
+                .with_parts(parts),
         );
 
-        let manifest = crate::manifest::BackupManifest {
-            manifest_version: 1,
-            name: "incr-backup".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: String::new(),
-            chbackup_version: String::new(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: std::collections::HashMap::new(),
-            disk_types: std::collections::HashMap::new(),
-            disk_remote_paths: std::collections::HashMap::new(),
-            tables,
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("incr-backup").with_tables(tables);
 
         assert_eq!(extract_required_backup(&manifest), "base-backup");
     }
 
     #[test]
     fn test_extract_required_empty_for_full_backup() {
-        let manifest = crate::manifest::BackupManifest {
-            manifest_version: 1,
-            name: "full-backup".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: String::new(),
-            chbackup_version: String::new(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: std::collections::HashMap::new(),
-            disk_types: std::collections::HashMap::new(),
-            disk_remote_paths: std::collections::HashMap::new(),
-            tables: std::collections::HashMap::new(),
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("full-backup");
 
         assert_eq!(extract_required_backup(&manifest), "");
     }
@@ -2445,26 +2325,9 @@ mod tests {
         let backup_dir = dir.path().join("test-backup");
         std::fs::create_dir_all(&backup_dir).unwrap();
 
-        let manifest = crate::manifest::BackupManifest {
-            manifest_version: 1,
-            name: "test-backup".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: String::new(),
-            chbackup_version: String::new(),
-            data_format: "lz4".to_string(),
-            compressed_size: 500,
-            metadata_size: 1024,
-            disks: std::collections::HashMap::new(),
-            disk_types: std::collections::HashMap::new(),
-            disk_remote_paths: std::collections::HashMap::new(),
-            tables: std::collections::HashMap::new(),
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("test-backup")
+            .with_compressed_size(500)
+            .with_metadata_size(1024);
 
         let metadata_path = backup_dir.join("metadata.json");
         manifest.save_to_file(&metadata_path).unwrap();
@@ -3032,35 +2895,16 @@ mod tests {
         std::fs::write(per_disk_dir.join("shadow").join("data.bin"), b"data").unwrap();
 
         // Write a manifest with disks pointing to both paths
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: "test-del".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: String::new(),
-            chbackup_version: String::new(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: HashMap::from([
-                (
-                    "default".to_string(),
-                    data_path.to_string_lossy().to_string(),
-                ),
-                (
-                    "nvme1".to_string(),
-                    disk2_path.to_string_lossy().to_string(),
-                ),
-            ]),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables: HashMap::new(),
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("test-del").with_disks(BTreeMap::from([
+            (
+                "default".to_string(),
+                data_path.to_string_lossy().to_string(),
+            ),
+            (
+                "nvme1".to_string(),
+                disk2_path.to_string_lossy().to_string(),
+            ),
+        ]));
         manifest
             .save_to_file(&backup_dir.join("metadata.json"))
             .unwrap();
@@ -3164,40 +3008,21 @@ mod tests {
         let per_disk_real = real_disk.join("backup").join("test-sym");
         std::fs::create_dir_all(per_disk_real.join("shadow")).unwrap();
 
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: "test-sym".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: String::new(),
-            chbackup_version: String::new(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: HashMap::from([
-                (
-                    "default".to_string(),
-                    data_path.to_string_lossy().to_string(),
-                ),
-                // Both point to the same canonical path
-                (
-                    "disk_a".to_string(),
-                    real_disk.to_string_lossy().to_string(),
-                ),
-                (
-                    "disk_b".to_string(),
-                    symlink_disk.to_string_lossy().to_string(),
-                ),
-            ]),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables: HashMap::new(),
-            databases: Vec::new(),
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("test-sym").with_disks(BTreeMap::from([
+            (
+                "default".to_string(),
+                data_path.to_string_lossy().to_string(),
+            ),
+            // Both point to the same canonical path
+            (
+                "disk_a".to_string(),
+                real_disk.to_string_lossy().to_string(),
+            ),
+            (
+                "disk_b".to_string(),
+                symlink_disk.to_string_lossy().to_string(),
+            ),
+        ]));
         manifest
             .save_to_file(&backup_dir.join("metadata.json"))
             .unwrap();

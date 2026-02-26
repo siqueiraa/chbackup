@@ -5,9 +5,33 @@ use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, ServerSideEncryption,
 };
 use chrono::{DateTime, Utc};
+use std::fmt::Write as _;
 use tracing::{debug, error, info, warn};
 
 use crate::config::S3Config;
+
+/// Percent-encode an S3 key for use in a CopySource header.
+///
+/// AWS S3 requires the CopySource value (`{bucket}/{key}`) to be URL-encoded.
+/// `/` is preserved as a path separator; all other non-unreserved characters
+/// (outside A-Z a-z 0-9 `-` `_` `.` `~`) are percent-encoded.
+///
+/// Reference: <https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html>
+fn percent_encode_s3_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for byte in key.bytes() {
+        match byte {
+            // RFC 3986 unreserved + '/' (path separator in S3 keys)
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char);
+            }
+            _ => {
+                write!(out, "%{:02X}", byte).unwrap();
+            }
+        }
+    }
+    out
+}
 
 /// Retry configuration for S3 operations.
 ///
@@ -26,6 +50,40 @@ pub struct RetryConfig {
 
 /// S3 canned ACL type alias for convenience.
 type ObjectCannedAcl = aws_sdk_s3::types::ObjectCannedAcl;
+
+/// Apply SSE, storage class, and ACL options to an S3 request builder.
+///
+/// All four S3 builder types (`PutObjectFluentBuilder`, `CreateMultipartUploadFluentBuilder`,
+/// `CopyObjectFluentBuilder`, `CreateMultipartUploadFluentBuilder` in `copy_object_multipart`)
+/// expose the same setter methods for these options. This macro eliminates the
+/// ~20-line copy-pasted block that was previously repeated in each call site.
+///
+/// # Arguments
+/// * `$req` - The builder variable to apply options to (must support `.storage_class()`,
+///   `.server_side_encryption()`, `.ssekms_key_id()`, and `.acl()` methods)
+/// * `$self` - The `S3Client` instance to read config fields from
+macro_rules! apply_s3_object_options {
+    ($req:expr, $self:expr) => {{
+        let mut req = $req;
+        if !$self.storage_class.is_empty() {
+            let sc: aws_sdk_s3::types::StorageClass = $self.storage_class.as_str().into();
+            req = req.storage_class(sc);
+        }
+        if $self.sse == "aws:kms" {
+            req = req.server_side_encryption(ServerSideEncryption::AwsKms);
+            if !$self.sse_kms_key_id.is_empty() {
+                req = req.ssekms_key_id(&$self.sse_kms_key_id);
+            }
+        } else if $self.sse == "AES256" {
+            req = req.server_side_encryption(ServerSideEncryption::Aes256);
+        }
+        if !$self.acl.is_empty() {
+            let acl: ObjectCannedAcl = $self.acl.as_str().into();
+            req = req.acl(acl);
+        }
+        req
+    }};
+}
 
 /// Metadata about an S3 object returned by list operations.
 #[derive(Debug, Clone)]
@@ -153,6 +211,14 @@ impl S3Client {
             let secret_key = sts_creds.secret_access_key().to_string();
             let session_token = sts_creds.session_token().to_string();
 
+            // STS credentials have a limited TTL (default 1 hour, max 12 hours).
+            // In long-running server mode they will expire and S3 operations will fail.
+            // Use POST /api/v1/restart to refresh credentials before expiry.
+            warn!(
+                assume_role_arn = %arn,
+                "STS temporary credentials obtained -- they will expire (default 1h). \
+                 In server mode, use POST /api/v1/restart to refresh before expiry"
+            );
             info!(assume_role_arn = %arn, "Successfully assumed IAM role");
 
             // Rebuild SDK config with the temporary credentials from STS
@@ -285,34 +351,15 @@ impl S3Client {
             "Uploading object to S3"
         );
 
-        let mut req = self
+        let req = self
             .inner
             .put_object()
             .bucket(&self.bucket)
             .key(&full_key)
             .body(ByteStream::from(body));
 
-        // Apply storage class
-        if !self.storage_class.is_empty() {
-            let sc: aws_sdk_s3::types::StorageClass = self.storage_class.as_str().into();
-            req = req.storage_class(sc);
-        }
-
-        // Apply server-side encryption
-        if self.sse == "aws:kms" {
-            req = req.server_side_encryption(ServerSideEncryption::AwsKms);
-            if !self.sse_kms_key_id.is_empty() {
-                req = req.ssekms_key_id(&self.sse_kms_key_id);
-            }
-        } else if self.sse == "AES256" {
-            req = req.server_side_encryption(ServerSideEncryption::Aes256);
-        }
-
-        // Apply ACL
-        if !self.acl.is_empty() {
-            let acl: ObjectCannedAcl = self.acl.as_str().into();
-            req = req.acl(acl);
-        }
+        // Apply SSE, storage class, and ACL
+        let mut req = apply_s3_object_options!(req, self);
 
         // Apply content type
         if let Some(ct) = content_type {
@@ -518,13 +565,36 @@ impl S3Client {
 
             debug!(count = chunk.len(), "Batch deleting objects from S3");
 
-            self.inner
+            let resp = self
+                .inner
                 .delete_objects()
                 .bucket(&self.bucket)
                 .delete(delete)
                 .send()
                 .await
                 .context("Failed to batch delete objects")?;
+
+            let errors = resp.errors();
+            if !errors.is_empty() {
+                let failed_keys: Vec<_> =
+                    errors.iter().filter_map(|e| e.key()).take(5).collect();
+                let sample_errors: Vec<_> =
+                    errors.iter().filter_map(|e| e.message()).take(3).collect();
+                warn!(
+                    failed_count = errors.len(),
+                    total_count = chunk.len(),
+                    sample_keys = ?failed_keys,
+                    sample_errors = ?sample_errors,
+                    "Some objects failed to delete in batch"
+                );
+                if errors.len() == chunk.len() {
+                    bail!(
+                        "Batch delete failed for all {} objects (sample errors: {:?})",
+                        errors.len(),
+                        sample_errors
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -550,7 +620,7 @@ impl S3Client {
             .await
         {
             Ok(resp) => {
-                let size = resp.content_length().unwrap_or(0) as u64;
+                let size = resp.content_length().unwrap_or(0).max(0) as u64;
                 Ok(Some(size))
             }
             Err(err) => {
@@ -580,33 +650,14 @@ impl S3Client {
 
         debug!(key = %full_key, "Creating multipart upload");
 
-        let mut req = self
+        let req = self
             .inner
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(&full_key);
 
-        // Apply storage class (same as put_object)
-        if !self.storage_class.is_empty() {
-            let sc: aws_sdk_s3::types::StorageClass = self.storage_class.as_str().into();
-            req = req.storage_class(sc);
-        }
-
-        // Apply server-side encryption (same as put_object)
-        if self.sse == "aws:kms" {
-            req = req.server_side_encryption(ServerSideEncryption::AwsKms);
-            if !self.sse_kms_key_id.is_empty() {
-                req = req.ssekms_key_id(&self.sse_kms_key_id);
-            }
-        } else if self.sse == "AES256" {
-            req = req.server_side_encryption(ServerSideEncryption::Aes256);
-        }
-
-        // Apply ACL (same as put_object)
-        if !self.acl.is_empty() {
-            let acl: ObjectCannedAcl = self.acl.as_str().into();
-            req = req.acl(acl);
-        }
+        // Apply SSE, storage class, and ACL (same as put_object)
+        let req = apply_s3_object_options!(req, self);
 
         let resp = req
             .send()
@@ -798,7 +849,7 @@ impl S3Client {
             .send()
             .await
         {
-            Ok(resp) => Some(resp.content_length().unwrap_or(0) as u64),
+            Ok(resp) => Some(resp.content_length().unwrap_or(0).max(0) as u64),
             Err(_) => None,
         };
 
@@ -817,7 +868,7 @@ impl S3Client {
 
         // Single CopyObject for objects <= 5 GiB (or when size is unknown)
         let full_dest_key = self.full_key(dest_key);
-        let copy_source = format!("{}/{}", source_bucket, source_key);
+        let copy_source = format!("{}/{}", source_bucket, percent_encode_s3_key(source_key));
 
         debug!(
             source = %copy_source,
@@ -825,34 +876,15 @@ impl S3Client {
             "Copying object (server-side CopyObject)"
         );
 
-        let mut req = self
+        let req = self
             .inner
             .copy_object()
             .bucket(&self.bucket)
             .copy_source(&copy_source)
             .key(&full_dest_key);
 
-        // Apply storage class
-        if !self.storage_class.is_empty() {
-            let sc: aws_sdk_s3::types::StorageClass = self.storage_class.as_str().into();
-            req = req.storage_class(sc);
-        }
-
-        // Apply server-side encryption
-        if self.sse == "aws:kms" {
-            req = req.server_side_encryption(ServerSideEncryption::AwsKms);
-            if !self.sse_kms_key_id.is_empty() {
-                req = req.ssekms_key_id(&self.sse_kms_key_id);
-            }
-        } else if self.sse == "AES256" {
-            req = req.server_side_encryption(ServerSideEncryption::Aes256);
-        }
-
-        // Apply ACL
-        if !self.acl.is_empty() {
-            let acl: ObjectCannedAcl = self.acl.as_str().into();
-            req = req.acl(acl);
-        }
+        // Apply SSE, storage class, and ACL
+        let req = apply_s3_object_options!(req, self);
 
         req.send().await.with_context(|| {
             format!(
@@ -887,33 +919,14 @@ impl S3Client {
         let full_dest_key = self.full_key(dest_key);
 
         // Create multipart upload with same settings as put_object/copy_object
-        let mut create_req = self
+        let create_req = self
             .inner
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(&full_dest_key);
 
-        // Apply storage class
-        if !self.storage_class.is_empty() {
-            let sc: aws_sdk_s3::types::StorageClass = self.storage_class.as_str().into();
-            create_req = create_req.storage_class(sc);
-        }
-
-        // Apply server-side encryption
-        if self.sse == "aws:kms" {
-            create_req = create_req.server_side_encryption(ServerSideEncryption::AwsKms);
-            if !self.sse_kms_key_id.is_empty() {
-                create_req = create_req.ssekms_key_id(&self.sse_kms_key_id);
-            }
-        } else if self.sse == "AES256" {
-            create_req = create_req.server_side_encryption(ServerSideEncryption::Aes256);
-        }
-
-        // Apply ACL
-        if !self.acl.is_empty() {
-            let acl: ObjectCannedAcl = self.acl.as_str().into();
-            create_req = create_req.acl(acl);
-        }
+        // Apply SSE, storage class, and ACL
+        let create_req = apply_s3_object_options!(create_req, self);
 
         let create_resp = create_req.send().await.with_context(|| {
             format!(
@@ -945,7 +958,7 @@ impl S3Client {
         );
 
         // Copy parts; on any error, abort the multipart upload
-        let copy_source = format!("{}/{}", source_bucket, source_key);
+        let copy_source = format!("{}/{}", source_bucket, percent_encode_s3_key(source_key));
         let result = self
             .copy_parts(
                 &full_dest_key,
@@ -1061,7 +1074,12 @@ impl S3Client {
             let e_tag = resp
                 .copy_part_result()
                 .and_then(|r| r.e_tag().map(|s| s.to_string()))
-                .unwrap_or_default();
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Missing ETag in UploadPartCopy response for part {}",
+                        part_number
+                    )
+                })?;
 
             completed_parts.push(
                 CompletedPart::builder()
@@ -1077,14 +1095,19 @@ impl S3Client {
     /// Streaming copy fallback: downloads from source then uploads to dest.
     ///
     /// Used when server-side CopyObject fails (e.g., cross-region).
-    /// Uses the underlying AWS SDK client directly for the source since
-    /// it may be in a different bucket.
+    /// For small objects (≤ 32 MiB) the body is buffered and uploaded with a
+    /// single PutObject.  For large objects the body is read chunk-by-chunk and
+    /// uploaded via S3 multipart upload so memory usage is bounded to one chunk
+    /// at a time instead of the entire object.
     pub async fn copy_object_streaming(
         &self,
         source_bucket: &str,
         source_key: &str,
         dest_key: &str,
     ) -> Result<()> {
+        // 32 MiB: below this, buffer for simplicity; above, use multipart.
+        const STREAMING_COPY_THRESHOLD: u64 = 32 * 1024 * 1024;
+
         let full_dest_key = self.full_key(dest_key);
 
         debug!(
@@ -1109,22 +1132,99 @@ impl S3Client {
                 )
             })?;
 
-        let body = get_resp.body.collect().await.with_context(|| {
-            format!(
-                "Streaming copy: failed to read body of {}/{}",
-                source_bucket, source_key
-            )
-        })?;
+        let content_length = get_resp.content_length().unwrap_or(0).max(0) as u64;
 
-        let bytes = body.into_bytes().to_vec();
+        if content_length <= STREAMING_COPY_THRESHOLD {
+            // Small object: buffer and use single PutObject
+            let body = get_resp.body.collect().await.with_context(|| {
+                format!(
+                    "Streaming copy: failed to read body of {}/{}",
+                    source_bucket, source_key
+                )
+            })?;
+            let bytes = body.into_bytes().to_vec();
+            return self.put_object(dest_key, bytes).await.with_context(|| {
+                format!(
+                    "Streaming copy: failed to upload to {}/{}",
+                    self.bucket, full_dest_key
+                )
+            });
+        }
 
-        // Upload to destination using self.put_object
-        self.put_object(dest_key, bytes).await.with_context(|| {
-            format!(
-                "Streaming copy: failed to upload to {}/{}",
-                self.bucket, full_dest_key
-            )
-        })?;
+        // Large object: stream through multipart upload to bound memory usage.
+        // Chunk size is at least S3_MIN_PART_SIZE (5 MiB).
+        let chunk_size =
+            calculate_chunk_size(content_length, 0, 10_000).max(S3_MIN_PART_SIZE) as usize;
+
+        debug!(
+            content_length = content_length,
+            chunk_size = chunk_size,
+            "Streaming copy using multipart upload"
+        );
+
+        let upload_id = self.create_multipart_upload(dest_key).await?;
+
+        let result: Result<()> = async {
+            let mut body = get_resp.body;
+            let mut buffer: Vec<u8> = Vec::with_capacity(chunk_size);
+            let mut completed_parts: Vec<(i32, String)> = Vec::new();
+            let mut part_number = 1i32;
+
+            while let Some(chunk_result) = body.next().await {
+                let bytes = chunk_result.with_context(|| {
+                    format!(
+                        "Streaming copy: error reading body of {}/{}",
+                        source_bucket, source_key
+                    )
+                })?;
+                buffer.extend_from_slice(&bytes);
+
+                // Upload full chunks as multipart parts
+                while buffer.len() >= chunk_size {
+                    let part_data: Vec<u8> = buffer.drain(..chunk_size).collect();
+                    let e_tag = self
+                        .upload_part(dest_key, &upload_id, part_number, part_data)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Streaming copy: upload_part {} failed for {}/{}",
+                                part_number, source_bucket, source_key
+                            )
+                        })?;
+                    completed_parts.push((part_number, e_tag));
+                    part_number += 1;
+                }
+            }
+
+            // Upload remaining bytes as the final part
+            if !buffer.is_empty() {
+                let e_tag = self
+                    .upload_part(dest_key, &upload_id, part_number, buffer)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Streaming copy: final upload_part failed for {}/{}",
+                            source_bucket, source_key
+                        )
+                    })?;
+                completed_parts.push((part_number, e_tag));
+            }
+
+            self.complete_multipart_upload(dest_key, &upload_id, completed_parts)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Streaming copy: complete_multipart_upload failed for dest {}",
+                        full_dest_key
+                    )
+                })
+        }
+        .await;
+
+        if let Err(e) = result {
+            let _ = self.abort_multipart_upload(dest_key, &upload_id).await;
+            return Err(e);
+        }
 
         debug!(
             source_bucket = %source_bucket,
@@ -1172,41 +1272,12 @@ impl S3Client {
         body: Vec<u8>,
         retry: RetryConfig,
     ) -> Result<()> {
-        let total_attempts = retry.max_retries + 1;
-
-        for attempt in 0..total_attempts {
+        let full_key = self.full_key(key);
+        retry_with_backoff(&retry, "PutObject", &full_key, || {
             let body_clone = body.clone();
-
-            match self.put_object(key, body_clone).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if attempt < total_attempts - 1 {
-                        let delay_ms = retry.base_delay_secs * 1000 * 2u64.pow(attempt);
-                        let actual_delay =
-                            crate::config::apply_jitter(delay_ms, retry.jitter_factor);
-                        warn!(
-                            key = %key,
-                            attempt = attempt + 1,
-                            max_retries = retry.max_retries,
-                            delay_ms = actual_delay,
-                            error = %e,
-                            "PutObject failed, retrying after backoff"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
-                    } else {
-                        return Err(e).with_context(|| {
-                            format!(
-                                "PutObject failed after {} attempts: {}",
-                                total_attempts,
-                                self.full_key(key)
-                            )
-                        });
-                    }
-                }
-            }
-        }
-
-        unreachable!("retry loop should have returned")
+            async move { self.put_object(key, body_clone).await }
+        })
+        .await
     }
 
     /// Upload a single part of a multipart upload with retry logic.
@@ -1221,47 +1292,16 @@ impl S3Client {
         body: Vec<u8>,
         retry: RetryConfig,
     ) -> Result<String> {
-        let total_attempts = retry.max_retries + 1;
-
-        for attempt in 0..total_attempts {
+        let context_msg = format!(
+            "UploadPart (part {}) {}",
+            part_number,
+            self.full_key(key)
+        );
+        retry_with_backoff(&retry, "UploadPart", &context_msg, || {
             let body_clone = body.clone();
-
-            match self
-                .upload_part(key, upload_id, part_number, body_clone)
-                .await
-            {
-                Ok(e_tag) => return Ok(e_tag),
-                Err(e) => {
-                    if attempt < total_attempts - 1 {
-                        let delay_ms = retry.base_delay_secs * 1000 * 2u64.pow(attempt);
-                        let actual_delay =
-                            crate::config::apply_jitter(delay_ms, retry.jitter_factor);
-                        warn!(
-                            key = %key,
-                            upload_id = %upload_id,
-                            part_number = part_number,
-                            attempt = attempt + 1,
-                            max_retries = retry.max_retries,
-                            delay_ms = actual_delay,
-                            error = %e,
-                            "UploadPart failed, retrying after backoff"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
-                    } else {
-                        return Err(e).with_context(|| {
-                            format!(
-                                "UploadPart (part {}) failed after {} attempts: {}",
-                                part_number,
-                                total_attempts,
-                                self.full_key(key)
-                            )
-                        });
-                    }
-                }
-            }
-        }
-
-        unreachable!("retry loop should have returned")
+            async move { self.upload_part(key, upload_id, part_number, body_clone).await }
+        })
+        .await
     }
 
     /// Copy with retry, backoff, and configurable jitter factor.
@@ -1316,6 +1356,56 @@ impl S3Client {
         // but the compiler needs it for exhaustiveness.
         unreachable!("retry loop should have returned")
     }
+}
+
+/// Generic retry helper with exponential backoff and jitter.
+///
+/// Executes the closure `f` up to `retry.max_retries + 1` times. On each
+/// transient failure, waits with exponential backoff (`base_delay * 2^attempt`)
+/// plus configurable jitter before the next attempt. On final failure, wraps
+/// the error with `op_name` and `context_msg` for diagnostics.
+///
+/// Used by `put_object_with_retry` and `upload_part_with_retry` to avoid
+/// duplicating the retry/backoff/jitter loop.
+async fn retry_with_backoff<F, Fut, T>(
+    retry: &RetryConfig,
+    op_name: &str,
+    context_msg: &str,
+    mut f: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let total_attempts = retry.max_retries + 1;
+    for attempt in 0..total_attempts {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if attempt < total_attempts - 1 {
+                    let delay_ms = (retry.base_delay_secs.saturating_mul(1000))
+                        .saturating_mul(2u64.saturating_pow(attempt));
+                    let actual_delay = crate::config::apply_jitter(delay_ms, retry.jitter_factor);
+                    warn!(
+                        attempt = attempt + 1,
+                        max_retries = retry.max_retries,
+                        delay_ms = actual_delay,
+                        error = %e,
+                        "{} failed, retrying after backoff", op_name
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
+                } else {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "{} failed after {} attempts: {}",
+                            op_name, total_attempts, context_msg
+                        )
+                    });
+                }
+            }
+        }
+    }
+    unreachable!("retry loop should have returned")
 }
 
 /// S3 minimum part size: 5 MiB (except the last part).
@@ -1450,19 +1540,44 @@ mod tests {
 
     #[test]
     fn test_copy_object_builds_correct_source() {
-        // Verify the CopySource format is "{bucket}/{key}"
+        // Verify the CopySource format is "{bucket}/{percent-encoded-key}"
         let client = mock_s3_fields("dest-bucket", "dest-prefix");
 
-        // The copy_source format used in copy_object is "{source_bucket}/{source_key}"
+        // ASCII-safe key: slashes preserved, no encoding needed
         let source_bucket = "source-bucket";
         let source_key = "path/to/object.bin";
-        let expected_source = format!("{}/{}", source_bucket, source_key);
-        assert_eq!(expected_source, "source-bucket/path/to/object.bin");
+        let copy_source = format!("{}/{}", source_bucket, percent_encode_s3_key(source_key));
+        assert_eq!(copy_source, "source-bucket/path/to/object.bin");
+
+        // Key with space and special chars: should be percent-encoded
+        let source_key_special = "path/to/my file (v2).bin";
+        let copy_source_special = format!(
+            "{}/{}",
+            source_bucket,
+            percent_encode_s3_key(source_key_special)
+        );
+        assert_eq!(
+            copy_source_special,
+            "source-bucket/path/to/my%20file%20%28v2%29.bin"
+        );
 
         // Verify dest key uses prefix
         let dest_key = "backup/objects/data.bin";
         let full_dest = client.full_key(dest_key);
         assert_eq!(full_dest, "dest-prefix/backup/objects/data.bin");
+    }
+
+    #[test]
+    fn test_percent_encode_s3_key() {
+        // Unreserved chars + slashes pass through unchanged
+        assert_eq!(percent_encode_s3_key("abc/def_123.~-"), "abc/def_123.~-");
+        // Space and parentheses are encoded
+        assert_eq!(percent_encode_s3_key("a b"), "a%20b");
+        assert_eq!(percent_encode_s3_key("a(b)"), "a%28b%29");
+        // Unicode bytes are encoded
+        assert_eq!(percent_encode_s3_key("ñ"), "%C3%B1");
+        // Empty string is fine
+        assert_eq!(percent_encode_s3_key(""), "");
     }
 
     #[tokio::test]

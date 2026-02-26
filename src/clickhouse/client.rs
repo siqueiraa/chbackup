@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -146,63 +147,105 @@ impl ChClient {
             "Building ClickHouse client"
         );
 
-        // Wire TLS configuration via environment variables.
+        // Wire TLS configuration via a custom native-tls connector.
         //
-        // The clickhouse-rs crate uses hyper-tls (native-tls backend) for HTTPS.
-        // Custom CA certificates and client certificates are configured through
-        // environment variables that native-tls / OpenSSL respects.
-        if config.secure {
-            // Custom CA certificate file
+        // std::env::set_var is NOT thread-safe in a multi-threaded async runtime
+        // (Rust 1.80+ flags this as unsound). Instead, we build a native_tls::TlsConnector
+        // with the desired options and pass it to clickhouse::Client::with_http_client().
+        // This approach is safe regardless of concurrent env reads by other threads.
+        let mut client = if config.secure
+            && (!config.tls_ca.is_empty() || config.skip_verify || !config.tls_cert.is_empty())
+        {
+            let mut tls_builder = native_tls::TlsConnector::builder();
+
+            // Custom CA certificate
             if !config.tls_ca.is_empty() {
                 let tls_ca_path = std::path::Path::new(&config.tls_ca);
                 if tls_ca_path.exists() {
-                    info!(
-                        tls_ca = %config.tls_ca,
-                        "Setting SSL_CERT_FILE for custom CA certificate"
-                    );
-                    std::env::set_var("SSL_CERT_FILE", &config.tls_ca);
+                    let ca_bytes = std::fs::read(tls_ca_path).with_context(|| {
+                        format!("Failed to read TLS CA file: {}", config.tls_ca)
+                    })?;
+                    let cert = native_tls::Certificate::from_pem(&ca_bytes).with_context(|| {
+                        format!("Failed to parse TLS CA certificate: {}", config.tls_ca)
+                    })?;
+                    tls_builder.add_root_certificate(cert);
+                    info!(tls_ca = %config.tls_ca, "Loaded custom CA certificate");
                 } else {
-                    warn!(
-                        tls_ca = %config.tls_ca,
-                        "Custom CA certificate file does not exist, skipping SSL_CERT_FILE"
-                    );
+                    warn!(tls_ca = %config.tls_ca, "Custom CA certificate file does not exist, skipping");
                 }
             }
 
-            // Client certificate authentication
-            // Note: native-tls/OpenSSL does not support client certs via env vars.
-            // Users must configure client certs at the OS/OpenSSL level.
-            if !config.tls_cert.is_empty() || !config.tls_key.is_empty() {
+            // Skip TLS verification (for testing / self-signed certs)
+            if config.skip_verify {
+                warn!("skip_verify=true: TLS certificate verification is disabled. Do not use in production.");
+                tls_builder.danger_accept_invalid_certs(true);
+            }
+
+            // Client certificate (tls_cert + tls_key as PEM files)
+            if !config.tls_cert.is_empty() && !config.tls_key.is_empty() {
+                let cert_path = std::path::Path::new(&config.tls_cert);
+                let key_path = std::path::Path::new(&config.tls_key);
+                if cert_path.exists() && key_path.exists() {
+                    let cert_bytes = std::fs::read(cert_path).with_context(|| {
+                        format!("Failed to read TLS client cert: {}", config.tls_cert)
+                    })?;
+                    let key_bytes = std::fs::read(key_path).with_context(|| {
+                        format!("Failed to read TLS client key: {}", config.tls_key)
+                    })?;
+                    match native_tls::Identity::from_pkcs8(&cert_bytes, &key_bytes) {
+                        Ok(identity) => {
+                            tls_builder.identity(identity);
+                            info!(tls_cert = %config.tls_cert, "Loaded client TLS certificate");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse client TLS certificate (tls_cert/tls_key), skipping");
+                        }
+                    }
+                } else {
+                    warn!(
+                        tls_cert = %config.tls_cert,
+                        tls_key = %config.tls_key,
+                        "Client TLS certificate files not found, skipping"
+                    );
+                }
+            } else if !config.tls_cert.is_empty() || !config.tls_key.is_empty() {
                 warn!(
                     tls_cert = %config.tls_cert,
                     tls_key = %config.tls_key,
-                    "Client certificate authentication (tls_cert/tls_key) is not directly \
-                     supported by the clickhouse-rs HTTP client. Configure client certificates \
-                     at the OS/OpenSSL level instead."
+                    "Both tls_cert and tls_key must be set for client certificate authentication"
                 );
             }
 
-            // Skip TLS verification
-            // Note: The native-tls backend does not support skip_verify via env vars.
-            // Users who need to skip verification should use a custom CA or set
-            // NODE_EXTRA_CA_CERTS / system trust store.
-            if config.skip_verify {
-                warn!(
-                    "skip_verify=true is not directly supported by the clickhouse-rs HTTP \
-                     client. TLS verification cannot be disabled programmatically. \
-                     Consider adding the server's CA to the system trust store."
-                );
-            }
-        }
+            let tls = tls_builder
+                .build()
+                .context("Failed to build native-tls TlsConnector")?;
 
-        let mut client = clickhouse::Client::default()
-            .with_url(&url)
-            .with_user(&config.username);
+            let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+            http.enforce_http(false);
+            let connector = hyper_tls::HttpsConnector::from((http, tls.into()));
+            let hyper_client = hyper_util::client::legacy::Client::builder(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .pool_idle_timeout(Duration::from_millis(2_500))
+            .build(connector);
+
+            clickhouse::Client::with_http_client(hyper_client)
+                .with_url(&url)
+                .with_user(&config.username)
+        } else {
+            clickhouse::Client::default()
+                .with_url(&url)
+                .with_user(&config.username)
+        };
 
         // Only set password if non-empty (avoid sending empty password header).
         if !config.password.is_empty() {
             client = client.with_password(&config.password);
         }
+
+        let timeout_secs = crate::config::parse_duration_secs(&config.timeout).unwrap_or(300);
+        client = client.with_option("max_execution_time", timeout_secs.to_string());
+        debug!(timeout_secs = timeout_secs, "Applied max_execution_time setting to ClickHouse client");
 
         if config.debug {
             info!("ClickHouse debug mode enabled: all queries will be logged at info level");
@@ -242,14 +285,21 @@ impl ChClient {
 
     // -- Query execution helpers --
 
+    /// Log a SQL statement at the appropriate level.
+    ///
+    /// Logs at `info` when `log_sql_queries` is true (or debug mode), otherwise `debug`.
+    fn log_sql(&self, sql: &str, description: &str) {
+        if self.log_sql_queries {
+            info!(sql = %sql, "{}", description);
+        } else {
+            debug!(sql = %sql, "{}", description);
+        }
+    }
+
     /// Log and execute a SQL statement. Logs at info or debug level based
     /// on the `log_sql_queries` setting.
     async fn log_and_execute(&self, sql: &str, description: &str) -> Result<()> {
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing {}", description);
-        } else {
-            debug!(sql = %sql, "Executing {}", description);
-        }
+        self.log_sql(sql, &format!("Executing {}", description));
         self.inner
             .query(sql)
             .execute()
@@ -262,19 +312,13 @@ impl ChClient {
 
     /// Execute ALTER TABLE FREEZE WITH NAME for the given table.
     pub async fn freeze_table(&self, db: &str, table: &str, freeze_name: &str) -> Result<()> {
-        let sql = format!(
-            "ALTER TABLE `{}`.`{}` FREEZE WITH NAME '{}'",
-            db, table, freeze_name
-        );
+        let sql = freeze_sql(db, table, freeze_name);
         self.log_and_execute(&sql, "FREEZE").await
     }
 
     /// Execute ALTER TABLE UNFREEZE WITH NAME for the given table.
     pub async fn unfreeze_table(&self, db: &str, table: &str, freeze_name: &str) -> Result<()> {
-        let sql = format!(
-            "ALTER TABLE `{}`.`{}` UNFREEZE WITH NAME '{}'",
-            db, table, freeze_name
-        );
+        let sql = unfreeze_sql(db, table, freeze_name);
         self.log_and_execute(&sql, "UNFREEZE").await
     }
 
@@ -287,11 +331,7 @@ impl ChClient {
                    FROM system.tables \
                    WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')";
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing list_tables");
-        } else {
-            debug!(sql = %sql, "Executing list_tables");
-        }
+        self.log_sql(sql, "Executing list_tables");
 
         let rows = self
             .inner
@@ -313,11 +353,7 @@ impl ChClient {
                    toString(uuid) as uuid, data_paths, total_bytes \
                    FROM system.tables";
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing list_all_tables");
-        } else {
-            debug!(sql = %sql, "Executing list_all_tables");
-        }
+        self.log_sql(sql, "Executing list_all_tables");
 
         let rows = self
             .inner
@@ -338,14 +374,11 @@ impl ChClient {
         let sql = format!(
             "SELECT create_table_query FROM system.tables \
              WHERE database = '{}' AND name = '{}'",
-            db, table
+            escape_sql_string(db),
+            escape_sql_string(table)
         );
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing get_table_ddl");
-        } else {
-            debug!(sql = %sql, "Executing get_table_ddl");
-        }
+        self.log_sql(&sql, "Executing get_table_ddl");
 
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct DdlRow {
@@ -362,6 +395,24 @@ impl ChClient {
         Ok(row.create_table_query)
     }
 
+    /// Get the DDL for a database using `SHOW CREATE DATABASE`.
+    ///
+    /// Returns the DDL string from ClickHouse, or an error if the query fails.
+    /// Callers should fall back to `CREATE DATABASE IF NOT EXISTS \`{db}\` ENGINE = Atomic`
+    /// on error for ClickHouse versions that don't support `SHOW CREATE DATABASE`.
+    pub async fn get_database_ddl(&self, database: &str) -> Result<String> {
+        let sql = format!("SHOW CREATE DATABASE {}", quote_identifier(database));
+
+        self.log_sql(&sql, "Executing get_database_ddl");
+
+        self.inner
+            .query(&sql)
+            .fetch_one::<ShowCreateRow>()
+            .await
+            .map(|row| row.statement)
+            .with_context(|| format!("Failed to get DDL for database: {database}"))
+    }
+
     // -- Mutations --
 
     /// Check for pending data mutations on the given tables.
@@ -375,10 +426,16 @@ impl ChClient {
             return Ok(Vec::new());
         }
 
-        // Build the IN clause for (database, table) pairs
+        // Build the IN clause for (database, table) pairs.
         let pairs: Vec<String> = targets
             .iter()
-            .map(|(db, table)| format!("('{}', '{}')", db, table))
+            .map(|(db, table)| {
+                format!(
+                    "('{}', '{}')",
+                    escape_sql_string(db),
+                    escape_sql_string(table)
+                )
+            })
             .collect();
         let in_clause = pairs.join(", ");
 
@@ -389,11 +446,7 @@ impl ChClient {
             in_clause
         );
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing check_pending_mutations");
-        } else {
-            debug!(sql = %sql, "Executing check_pending_mutations");
-        }
+        self.log_sql(&sql, "Executing check_pending_mutations");
 
         let rows = self
             .inner
@@ -409,7 +462,11 @@ impl ChClient {
 
     /// Execute SYSTEM SYNC REPLICA for the given table.
     pub async fn sync_replica(&self, db: &str, table: &str) -> Result<()> {
-        let sql = format!("SYSTEM SYNC REPLICA `{}`.`{}`", db, table);
+        let sql = format!(
+            "SYSTEM SYNC REPLICA {}.{}",
+            quote_identifier(db),
+            quote_identifier(table)
+        );
         self.log_and_execute(&sql, "SYNC REPLICA").await
     }
 
@@ -418,8 +475,10 @@ impl ChClient {
     /// Execute ALTER TABLE ATTACH PART for the given part name.
     pub async fn attach_part(&self, db: &str, table: &str, part_name: &str) -> Result<()> {
         let sql = format!(
-            "ALTER TABLE `{}`.`{}` ATTACH PART '{}'",
-            db, table, part_name
+            "ALTER TABLE {}.{} ATTACH PART '{}'",
+            quote_identifier(db),
+            quote_identifier(table),
+            escape_sql_string(part_name),
         );
         self.log_and_execute(&sql, "ATTACH PART").await
     }
@@ -448,11 +507,7 @@ impl ChClient {
         let sql =
             "SELECT name, path, type, ifNull(remote_path, '') as remote_path FROM system.disks";
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing get_disks");
-        } else {
-            debug!(sql = %sql, "Executing get_disks");
-        }
+        self.log_sql(sql, "Executing get_disks");
 
         let rows = self
             .inner
@@ -472,11 +527,7 @@ impl ChClient {
     pub async fn get_macros(&self) -> Result<HashMap<String, String>> {
         let sql = "SELECT macro AS macro_name, substitution FROM system.macros";
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing get_macros");
-        } else {
-            debug!(sql = %sql, "Executing get_macros");
-        }
+        self.log_sql(sql, "Executing get_macros");
 
         let rows = match self.inner.query(sql).fetch_all::<MacroRow>().await {
             Ok(rows) => rows,
@@ -550,7 +601,7 @@ impl ChClient {
 
         let sql = format!(
             "SELECT count() as cnt FROM system.databases WHERE name = '{}'",
-            db
+            escape_sql_string(db)
         );
 
         let row = self
@@ -573,7 +624,8 @@ impl ChClient {
         let sql = format!(
             "SELECT count() as cnt FROM system.tables \
              WHERE database = '{}' AND name = '{}'",
-            db, table
+            escape_sql_string(db),
+            escape_sql_string(table)
         );
 
         let row = self
@@ -612,14 +664,11 @@ impl ChClient {
         let sql = format!(
             "SELECT name, partition_id, active FROM system.parts \
              WHERE database = '{}' AND table = '{}' AND active = 1",
-            db, table
+            escape_sql_string(db),
+            escape_sql_string(table)
         );
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing query_system_parts");
-        } else {
-            debug!(sql = %sql, "Executing query_system_parts");
-        }
+        self.log_sql(&sql, "Executing query_system_parts");
 
         let rows = self
             .inner
@@ -645,20 +694,24 @@ impl ChClient {
         let mut sql = format!(
             "SELECT DISTINCT partition_id FROM system.parts \
              WHERE database = '{}' AND table = '{}' AND active = 1",
-            db, table
+            escape_sql_string(db),
+            escape_sql_string(table)
         );
 
         if !extra_where.is_empty() {
-            sql.push_str(&format!(" AND ({})", extra_where));
+            if extra_where.contains(';') {
+                warn!(
+                    extra_where = %extra_where,
+                    "freeze_by_part_where contains semicolons, skipping for safety"
+                );
+            } else {
+                sql.push_str(&format!(" AND ({})", extra_where));
+            }
         }
 
         sql.push_str(" ORDER BY partition_id");
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing query_distinct_partitions");
-        } else {
-            debug!(sql = %sql, "Executing query_distinct_partitions");
-        }
+        self.log_sql(&sql, "Executing query_distinct_partitions");
 
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct PartitionRow {
@@ -689,14 +742,11 @@ impl ChClient {
              parts_to_check, queue_size, inserts_in_queue, merges_in_queue \
              FROM system.replicas \
              WHERE database = '{}' AND table = '{}'",
-            db, table
+            escape_sql_string(db),
+            escape_sql_string(table)
         );
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing check_replica_sync");
-        } else {
-            debug!(sql = %sql, "Executing check_replica_sync");
-        }
+        self.log_sql(&sql, "Executing check_replica_sync");
 
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct ReplicaRow {
@@ -748,10 +798,16 @@ impl ChClient {
             return Ok(Vec::new());
         }
 
-        // Build the IN clause for (database, table) pairs
+        // Build the IN clause for (database, table) pairs.
         let pairs: Vec<String> = targets
             .iter()
-            .map(|(db, table)| format!("('{}', '{}')", db, table))
+            .map(|(db, table)| {
+                format!(
+                    "('{}', '{}')",
+                    escape_sql_string(db),
+                    escape_sql_string(table)
+                )
+            })
             .collect();
         let in_clause = pairs.join(", ");
 
@@ -765,11 +821,7 @@ impl ChClient {
             in_clause
         );
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing check_parts_columns");
-        } else {
-            debug!(sql = %sql, "Executing check_parts_columns");
-        }
+        self.log_sql(&sql, "Executing check_parts_columns");
 
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct PartsColumnsRow {
@@ -816,10 +868,16 @@ impl ChClient {
             return Ok(Vec::new());
         }
 
-        // Build the IN clause for (database, table) pairs
+        // Build the IN clause for (database, table) pairs.
         let pairs: Vec<String> = targets
             .iter()
-            .map(|(db, table)| format!("('{}', '{}')", db, table))
+            .map(|(db, table)| {
+                format!(
+                    "('{}', '{}')",
+                    escape_sql_string(db),
+                    escape_sql_string(table)
+                )
+            })
             .collect();
         let in_clause = pairs.join(", ");
 
@@ -831,11 +889,7 @@ impl ChClient {
             in_clause
         );
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing check_json_columns");
-        } else {
-            debug!(sql = %sql, "Executing check_json_columns");
-        }
+        self.log_sql(&sql, "Executing check_json_columns");
 
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct JsonColumnRow {
@@ -881,11 +935,7 @@ impl ChClient {
                    FROM system.tables \
                    WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')";
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing query_table_dependencies");
-        } else {
-            debug!(sql = %sql, "Executing query_table_dependencies");
-        }
+        self.log_sql(sql, "Executing query_table_dependencies");
 
         let rows = match self.inner.query(sql).fetch_all::<DependencyRow>().await {
             Ok(rows) => rows,
@@ -988,14 +1038,11 @@ impl ChClient {
 
         let sql = format!(
             "SELECT count() as cnt FROM system.zookeeper WHERE path = '{}/replicas' AND name = '{}'",
-            zk_path, replica_name
+            escape_sql_string(zk_path),
+            escape_sql_string(replica_name)
         );
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing check_zk_replica_exists");
-        } else {
-            debug!(sql = %sql, "Executing check_zk_replica_exists");
-        }
+        self.log_sql(&sql, "Executing check_zk_replica_exists");
 
         match self.inner.query(&sql).fetch_one::<CountRow>().await {
             Ok(row) => Ok(row.cnt > 0),
@@ -1024,17 +1071,23 @@ impl ChClient {
             engine: String,
         }
 
-        let sql = format!("SELECT engine FROM system.databases WHERE name = '{}'", db);
+        let sql = format!(
+            "SELECT engine FROM system.databases WHERE name = '{}'",
+            escape_sql_string(db)
+        );
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing query_database_engine");
-        } else {
-            debug!(sql = %sql, "Executing query_database_engine");
-        }
+        self.log_sql(&sql, "Executing query_database_engine");
 
         match self.inner.query(&sql).fetch_one::<EngineRow>().await {
             Ok(row) => Ok(row.engine),
-            Err(_) => Ok(String::new()),
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    database = %db,
+                    "Failed to query database engine, treating as non-existent"
+                );
+                Ok(String::new())
+            }
         }
     }
 
@@ -1045,8 +1098,14 @@ impl ChClient {
     /// The command is from `MutationInfo.command` (e.g., "DELETE WHERE user_id = 5").
     ///
     /// SQL: `ALTER TABLE \`db\`.\`table\` {command} SETTINGS mutations_sync=2`
+    ///
+    /// Returns `Ok(())` without executing if the command is not a recognized
+    /// mutation sub-command (DELETE, UPDATE, MATERIALIZE).
     pub async fn execute_mutation(&self, db: &str, table: &str, command: &str) -> Result<()> {
         let sql = execute_mutation_sql(db, table, command);
+        if sql.is_empty() {
+            return Ok(());
+        }
         self.log_and_execute(&sql, "MUTATION").await
     }
 
@@ -1077,11 +1136,10 @@ impl ChClient {
 
         let names_sql = format!("SELECT name FROM {}", system_table);
 
-        if self.log_sql_queries {
-            info!(sql = %names_sql, "Executing query_rbac_objects ({})", entity_type);
-        } else {
-            debug!(sql = %names_sql, "Executing query_rbac_objects ({})", entity_type);
-        }
+        self.log_sql(
+            &names_sql,
+            &format!("Executing query_rbac_objects ({})", entity_type),
+        );
 
         let names: Vec<NameRow> = match self.inner.query(&names_sql).fetch_all().await {
             Ok(rows) => rows,
@@ -1141,11 +1199,7 @@ impl ChClient {
     pub async fn query_named_collections(&self) -> Result<Vec<String>> {
         let names_sql = "SELECT name FROM system.named_collections";
 
-        if self.log_sql_queries {
-            info!(sql = %names_sql, "Executing query_named_collections");
-        } else {
-            debug!(sql = %names_sql, "Executing query_named_collections");
-        }
+        self.log_sql(names_sql, "Executing query_named_collections");
 
         let names: Vec<NameRow> = match self.inner.query(names_sql).fetch_all().await {
             Ok(rows) => rows,
@@ -1197,11 +1251,7 @@ impl ChClient {
     pub async fn query_user_defined_functions(&self) -> Result<Vec<String>> {
         let names_sql = "SELECT name FROM system.functions WHERE origin = 'SQLUserDefined'";
 
-        if self.log_sql_queries {
-            info!(sql = %names_sql, "Executing query_user_defined_functions");
-        } else {
-            debug!(sql = %names_sql, "Executing query_user_defined_functions");
-        }
+        self.log_sql(names_sql, "Executing query_user_defined_functions");
 
         let names: Vec<NameRow> = match self.inner.query(names_sql).fetch_all().await {
             Ok(rows) => rows,
@@ -1247,11 +1297,7 @@ impl ChClient {
     pub async fn query_disk_free_space(&self) -> Result<Vec<DiskSpaceRow>> {
         let sql = "SELECT name, path, free_space FROM system.disks";
 
-        if self.log_sql_queries {
-            info!(sql = %sql, "Executing query_disk_free_space");
-        } else {
-            debug!(sql = %sql, "Executing query_disk_free_space");
-        }
+        self.log_sql(sql, "Executing query_disk_free_space");
 
         let rows = self
             .inner
@@ -1262,6 +1308,14 @@ impl ChClient {
 
         Ok(rows)
     }
+}
+
+/// Escape a string value for use in SQL single-quoted literals.
+///
+/// Doubles any single-quote characters per the SQL standard, preventing
+/// SQL injection when interpolating user-controlled values into WHERE clauses.
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 /// Quote an identifier for use in ClickHouse SQL.
@@ -1304,24 +1358,31 @@ pub fn freeze_name(backup_name: &str, db: &str, table: &str) -> String {
 /// Generate the SQL string for a FREEZE command (for testing).
 pub fn freeze_sql(db: &str, table: &str, freeze_name: &str) -> String {
     format!(
-        "ALTER TABLE `{}`.`{}` FREEZE WITH NAME '{}'",
-        db, table, freeze_name
+        "ALTER TABLE {}.{} FREEZE WITH NAME '{}'",
+        quote_identifier(db),
+        quote_identifier(table),
+        escape_sql_string(freeze_name)
     )
 }
 
 /// Generate the SQL string for an UNFREEZE command (for testing).
 pub fn unfreeze_sql(db: &str, table: &str, freeze_name: &str) -> String {
     format!(
-        "ALTER TABLE `{}`.`{}` UNFREEZE WITH NAME '{}'",
-        db, table, freeze_name
+        "ALTER TABLE {}.{} UNFREEZE WITH NAME '{}'",
+        quote_identifier(db),
+        quote_identifier(table),
+        escape_sql_string(freeze_name)
     )
 }
 
 /// Generate the SQL string for a FREEZE PARTITION command (for testing).
 pub fn freeze_partition_sql(db: &str, table: &str, partition: &str, freeze_name: &str) -> String {
     format!(
-        "ALTER TABLE `{}`.`{}` FREEZE PARTITION '{}' WITH NAME '{}'",
-        db, table, partition, freeze_name
+        "ALTER TABLE {}.{} FREEZE PARTITION '{}' WITH NAME '{}'",
+        quote_identifier(db),
+        quote_identifier(table),
+        escape_sql_string(partition),
+        escape_sql_string(freeze_name)
     )
 }
 
@@ -1329,10 +1390,16 @@ pub fn freeze_partition_sql(db: &str, table: &str, partition: &str, freeze_name:
 pub fn drop_table_sql(db: &str, table: &str, on_cluster: Option<&str>) -> String {
     match on_cluster {
         Some(cluster) => format!(
-            "DROP TABLE IF EXISTS `{}`.`{}` ON CLUSTER '{}' SYNC",
-            db, table, cluster
+            "DROP TABLE IF EXISTS {}.{} ON CLUSTER '{}' SYNC",
+            quote_identifier(db),
+            quote_identifier(table),
+            escape_sql_string(cluster)
         ),
-        None => format!("DROP TABLE IF EXISTS `{}`.`{}` SYNC", db, table),
+        None => format!(
+            "DROP TABLE IF EXISTS {}.{} SYNC",
+            quote_identifier(db),
+            quote_identifier(table)
+        ),
     }
 }
 
@@ -1340,41 +1407,74 @@ pub fn drop_table_sql(db: &str, table: &str, on_cluster: Option<&str>) -> String
 pub fn drop_database_sql(db: &str, on_cluster: Option<&str>) -> String {
     match on_cluster {
         Some(cluster) => format!(
-            "DROP DATABASE IF EXISTS `{}` ON CLUSTER '{}' SYNC",
-            db, cluster
+            "DROP DATABASE IF EXISTS {} ON CLUSTER '{}' SYNC",
+            quote_identifier(db),
+            escape_sql_string(cluster)
         ),
-        None => format!("DROP DATABASE IF EXISTS `{}` SYNC", db),
+        None => format!("DROP DATABASE IF EXISTS {} SYNC", quote_identifier(db)),
     }
 }
 
 /// Generate the SQL for a DETACH TABLE SYNC command (for testing).
 pub fn detach_table_sync_sql(db: &str, table: &str) -> String {
-    format!("DETACH TABLE `{}`.`{}` SYNC", db, table)
+    format!(
+        "DETACH TABLE {}.{} SYNC",
+        quote_identifier(db),
+        quote_identifier(table)
+    )
 }
 
 /// Generate the SQL for an ATTACH TABLE command (for testing).
 pub fn attach_table_sql(db: &str, table: &str) -> String {
-    format!("ATTACH TABLE `{}`.`{}`", db, table)
+    format!(
+        "ATTACH TABLE {}.{}",
+        quote_identifier(db),
+        quote_identifier(table)
+    )
 }
 
 /// Generate the SQL for a SYSTEM RESTORE REPLICA command (for testing).
 pub fn system_restore_replica_sql(db: &str, table: &str) -> String {
-    format!("SYSTEM RESTORE REPLICA `{}`.`{}`", db, table)
+    format!(
+        "SYSTEM RESTORE REPLICA {}.{}",
+        quote_identifier(db),
+        quote_identifier(table)
+    )
 }
 
 /// Generate the SQL for a SYSTEM DROP REPLICA FROM ZKPATH command (for testing).
 pub fn drop_replica_from_zkpath_sql(replica_name: &str, zk_path: &str) -> String {
     format!(
         "SYSTEM DROP REPLICA '{}' FROM ZKPATH '{}'",
-        replica_name, zk_path
+        escape_sql_string(replica_name),
+        escape_sql_string(zk_path)
     )
 }
 
 /// Generate the SQL for a mutation execution command (for testing).
+///
+/// Validates that the command starts with a known ALTER TABLE sub-command
+/// (DELETE, UPDATE, MATERIALIZE) before interpolating it into the SQL.
+/// Returns an empty string for unrecognized commands.
 pub fn execute_mutation_sql(db: &str, table: &str, command: &str) -> String {
+    let cmd_trimmed = command.trim();
+    if cmd_trimmed.contains(';') {
+        warn!(command = %command, "Mutation command contains semicolons, skipping for safety");
+        return String::new();
+    }
+    let cmd_upper = cmd_trimmed.to_uppercase();
+    if !cmd_upper.starts_with("DELETE")
+        && !cmd_upper.starts_with("UPDATE")
+        && !cmd_upper.starts_with("MATERIALIZE")
+    {
+        warn!(command = %command, "Skipping unrecognized mutation command");
+        return String::new();
+    }
     format!(
-        "ALTER TABLE `{}`.`{}` {} SETTINGS mutations_sync=2",
-        db, table, command
+        "ALTER TABLE {}.{} {} SETTINGS mutations_sync=2",
+        quote_identifier(db),
+        quote_identifier(table),
+        cmd_trimmed
     )
 }
 
@@ -1382,6 +1482,7 @@ pub fn execute_mutation_sql(db: &str, table: &str, command: &str) -> String {
 ///
 /// Returns (backup_list_ddl, backup_actions_ddl) matching the design doc section 9.1.
 pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String) {
+    let port: u16 = api_port.parse().unwrap_or(7171);
     let list_ddl = format!(
         "CREATE TABLE IF NOT EXISTS system.backup_list (\
          name String, \
@@ -1396,7 +1497,7 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
          compressed_size UInt64, \
          required String\
          ) ENGINE = URL('http://{}:{}/api/v1/list', 'JSONEachRow')",
-        api_host, api_port
+        escape_sql_string(api_host), port
     );
 
     let actions_ddl = format!(
@@ -1407,7 +1508,7 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
          status String, \
          error String\
          ) ENGINE = URL('http://{}:{}/api/v1/actions', 'JSONEachRow')",
-        api_host, api_port
+        escape_sql_string(api_host), port
     );
 
     (list_ddl, actions_ddl)
@@ -1417,6 +1518,18 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
 mod tests {
     use super::*;
     use crate::config::ClickHouseConfig;
+
+    #[test]
+    fn test_escape_sql_string() {
+        assert_eq!(escape_sql_string("hello"), "hello");
+        assert_eq!(escape_sql_string("it's"), "it''s");
+        assert_eq!(escape_sql_string("a''b"), "a''''b");
+        assert_eq!(escape_sql_string(""), "");
+        assert_eq!(
+            escape_sql_string("O'Brien's data"),
+            "O''Brien''s data"
+        );
+    }
 
     #[test]
     fn test_ch_client_new_default_config() {
@@ -1476,6 +1589,33 @@ mod tests {
         assert_eq!(
             sql,
             "ALTER TABLE `default`.`trades` UNFREEZE WITH NAME 'chbackup_daily_default_trades'"
+        );
+    }
+
+    #[test]
+    fn test_quote_identifier() {
+        assert_eq!(quote_identifier("default"), "`default`");
+        assert_eq!(quote_identifier("my table"), "`my table`");
+        assert_eq!(quote_identifier("back`tick"), "`back``tick`");
+        assert_eq!(quote_identifier(""), "``");
+    }
+
+    #[test]
+    fn test_freeze_sql_with_backtick_in_name() {
+        // Identifiers containing backticks should be properly escaped
+        let sql = freeze_sql("my`db", "my`table", "test_freeze");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `my``db`.`my``table` FREEZE WITH NAME 'test_freeze'"
+        );
+    }
+
+    #[test]
+    fn test_drop_table_sql_with_backtick_in_name() {
+        let sql = drop_table_sql("my`db", "my`table", None);
+        assert_eq!(
+            sql,
+            "DROP TABLE IF EXISTS `my``db`.`my``table` SYNC"
         );
     }
 
@@ -1621,7 +1761,7 @@ mod tests {
 
     #[test]
     fn test_freeze_partition_sql_tuple_partition() {
-        // Partition IDs can be tuple-based
+        // Partition IDs can be tuple-based; single quotes inside are escaped
         let sql = freeze_partition_sql(
             "default",
             "events",
@@ -1630,7 +1770,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "ALTER TABLE `default`.`events` FREEZE PARTITION '(202401, 'us')' WITH NAME 'chbackup_test_default_events'"
+            "ALTER TABLE `default`.`events` FREEZE PARTITION '(202401, ''us'')' WITH NAME 'chbackup_test_default_events'"
         );
     }
 
@@ -1952,9 +2092,61 @@ mod tests {
             sql,
             "ALTER TABLE `logs`.`events` UPDATE status = 'archived' WHERE ts < '2024-01-01' SETTINGS mutations_sync=2"
         );
+    
+        // MATERIALIZE mutation
+        let sql = execute_mutation_sql("default", "trades", "MATERIALIZE COLUMN new_col");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`trades` MATERIALIZE COLUMN new_col SETTINGS mutations_sync=2"
+        );
     }
 
-    // -- Phase 4f: JSON/Object column detection tests --
+    #[test]
+    fn test_execute_mutation_sql_rejects_unrecognized_command() {
+        // Unrecognized commands return empty string
+        let sql = execute_mutation_sql("default", "trades", "DROP COLUMN bad");
+        assert_eq!(sql, "");
+
+        let sql = execute_mutation_sql("default", "trades", "SELECT 1");
+        assert_eq!(sql, "");
+
+        let sql = execute_mutation_sql("default", "trades", "");
+        assert_eq!(sql, "");
+    }
+
+    #[test]
+    fn test_execute_mutation_sql_case_insensitive() {
+        // Case-insensitive command prefix matching
+        let sql = execute_mutation_sql("default", "trades", "delete WHERE id = 1");
+        assert!(sql.contains("delete WHERE id = 1"));
+
+        let sql = execute_mutation_sql("default", "trades", "Update status = 'done' WHERE id = 1");
+        assert!(sql.contains("Update status = 'done' WHERE id = 1"));
+    }
+
+    #[test]
+    fn test_execute_mutation_sql_trims_whitespace() {
+        let sql = execute_mutation_sql("default", "trades", "  DELETE WHERE id = 1  ");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`trades` DELETE WHERE id = 1 SETTINGS mutations_sync=2"
+        );
+    }
+
+    #[test]
+    fn test_execute_mutation_sql_rejects_semicolons() {
+        let sql = execute_mutation_sql(
+            "default",
+            "trades",
+            "DELETE WHERE id = 1; DROP TABLE default.trades",
+        );
+        assert_eq!(sql, "");
+
+        let sql = execute_mutation_sql("default", "trades", "UPDATE x = 1 WHERE y; SELECT 1");
+        assert_eq!(sql, "");
+    }
+
+        // -- Phase 4f: JSON/Object column detection tests --
 
     #[test]
     fn test_json_column_row_struct() {

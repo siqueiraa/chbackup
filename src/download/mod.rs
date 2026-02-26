@@ -12,7 +12,7 @@
 
 pub mod stream;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backup::checksum::compute_crc64;
 use crate::backup::collect::per_disk_backup_dir;
-use crate::concurrency::effective_download_concurrency;
+use crate::concurrency::{effective_download_concurrency, effective_download_rate_limit};
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo};
 use crate::object_disk::is_s3_disk;
@@ -37,6 +37,20 @@ use crate::resume::{
 };
 use crate::storage::S3Client;
 
+/// Sanitize a relative path by keeping only `Normal` components.
+///
+/// Strips `ParentDir` (`..`), `RootDir` (`/`), `CurDir` (`.`), and `Prefix`
+/// components to prevent path traversal attacks via crafted S3 object keys.
+fn sanitize_relative_path(input: &str) -> PathBuf {
+    Path::new(input)
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(seg) => Some(seg),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Resolve the per-disk target backup directory for a download write path.
 ///
 /// During download we are CREATING directories, not reading existing ones,
@@ -46,7 +60,7 @@ use crate::storage::S3Client;
 /// `backup_dir` (for cross-host downloads where the original disk layout
 /// is not available).
 fn resolve_download_target_dir(
-    manifest_disks: &HashMap<String, String>,
+    manifest_disks: &BTreeMap<String, String>,
     disk_name: &str,
     backup_name: &str,
     backup_dir: &Path,
@@ -98,8 +112,10 @@ fn check_disk_space(backup_dir: &Path, required_bytes: u64) -> Result<()> {
     match nix::sys::statvfs::statvfs(&check_path) {
         Ok(stat) => {
             let block_size = stat.block_size();
-            let available_blocks = stat.blocks_available() as u64;
-            let available_bytes = block_size * available_blocks;
+            let available_blocks: u64 = stat.blocks_available().into();
+            // Use saturating_mul to prevent theoretical overflow on exotic
+            // filesystems with very large block_size * blocks_available.
+            let available_bytes = block_size.saturating_mul(available_blocks);
             // Apply 5% safety margin per design doc
             let safe_available = (available_bytes as f64 * 0.95) as u64;
 
@@ -149,7 +165,7 @@ fn find_existing_part(
     table_key: &str,
     part_name: &str,
     expected_crc: u64,
-    manifest_disks: &HashMap<String, String>,
+    manifest_disks: &BTreeMap<String, String>,
     disk_name: &str,
 ) -> Option<PathBuf> {
     use crate::backup::checksum::compute_crc64;
@@ -254,8 +270,8 @@ fn hardlink_existing_part(existing: &Path, target: &Path) -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             if let Err(e) = std::fs::hard_link(entry.path(), &dest) {
-                // EXDEV = cross-device link (error code 18 on Linux/macOS)
-                let is_exdev = e.raw_os_error() == Some(18);
+                let is_exdev =
+                    e.raw_os_error() == Some(nix::errno::Errno::EXDEV as i32);
                 if is_exdev {
                     std::fs::copy(entry.path(), &dest)?;
                 } else {
@@ -320,21 +336,100 @@ pub async fn download(
         "Downloaded manifest"
     );
 
-    // 2. Disk space pre-flight check
-    // Sum up compressed sizes from manifest to estimate required space
-    let total_compressed: u64 = manifest
-        .tables
-        .values()
-        .flat_map(|tm| tm.parts.values())
-        .flat_map(|parts| parts.iter())
-        .map(|p| p.size)
-        .sum();
+    // 2. Disk space pre-flight check (design §16.3).
+    // Group required space by disk so each physical filesystem is checked
+    // independently.  S3 disk parts don't consume local space (data stays
+    // in the backup bucket until restore), so they are skipped.
+    let mut space_by_disk: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    for table in manifest.tables.values() {
+        for (disk_name, parts) in &table.parts {
+            let disk_type = manifest
+                .disk_types
+                .get(disk_name)
+                .map(|s| s.as_str())
+                .unwrap_or("local");
+            if is_s3_disk(disk_type) {
+                continue;
+            }
+            let disk_total: u64 = parts.iter().map(|p| p.size).sum();
+            *space_by_disk.entry(disk_name.clone()).or_insert(0) += disk_total;
+        }
+    }
 
-    if total_compressed > 0 {
-        // Check the parent directory (backup_dir may not exist yet)
-        let check_parent = Path::new(data_path).join("backup");
-        std::fs::create_dir_all(&check_parent).ok();
-        check_disk_space(&check_parent, total_compressed)?;
+    // When hardlink dedup is enabled, subtract parts that will be satisfied
+    // by hardlinks from existing local backups (design §16.3: "required_space
+    // = sum(all parts) - sum(parts that match local CRC64)").
+    if hardlink_exists_files && !space_by_disk.is_empty() {
+        let data_path_for_scan = data_path.to_string();
+        let backup_name_for_scan = backup_name.to_string();
+        let manifest_for_scan = manifest.clone();
+        let savings: std::collections::HashMap<String, u64> =
+            tokio::task::spawn_blocking(move || {
+                let mut savings: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
+                for (table_key, table) in &manifest_for_scan.tables {
+                    for (disk_name, parts) in &table.parts {
+                        let disk_type = manifest_for_scan
+                            .disk_types
+                            .get(disk_name)
+                            .map(|s| s.as_str())
+                            .unwrap_or("local");
+                        if is_s3_disk(disk_type) {
+                            continue;
+                        }
+                        for part in parts {
+                            if part.checksum_crc64 == 0 {
+                                continue;
+                            }
+                            if find_existing_part(
+                                &data_path_for_scan,
+                                &backup_name_for_scan,
+                                table_key,
+                                &part.name,
+                                part.checksum_crc64,
+                                &manifest_for_scan.disks,
+                                disk_name,
+                            )
+                            .is_some()
+                            {
+                                *savings.entry(disk_name.clone()).or_insert(0) += part.size;
+                            }
+                        }
+                    }
+                }
+                savings
+            })
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "Hardlink dedup scan task panicked");
+                HashMap::new()
+            });
+
+        for (disk_name, saved) in savings {
+            if let Some(req) = space_by_disk.get_mut(&disk_name) {
+                *req = req.saturating_sub(saved);
+            }
+        }
+    }
+
+    // Check space per unique disk filesystem.
+    for (disk_name, required_bytes) in &space_by_disk {
+        if *required_bytes == 0 {
+            continue;
+        }
+        let disk_path = manifest
+            .disks
+            .get(disk_name)
+            .map(|s| s.as_str())
+            .unwrap_or(data_path);
+        let check_dir = if Path::new(disk_path).exists() {
+            Path::new(disk_path).join("backup")
+        } else {
+            Path::new(data_path).join("backup")
+        };
+        std::fs::create_dir_all(&check_dir).ok();
+        check_disk_space(&check_dir, *required_bytes)?;
     }
 
     // 2b. Create local backup directory
@@ -382,7 +477,7 @@ pub async fn download(
             completed_keys: HashSet::new(),
             backup_name: backup_name.to_string(),
             params_hash: current_params_hash.clone(),
-            disk_map: manifest.disks.clone(),
+            disk_map: manifest.disks.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         };
         save_state_graceful(&state_path, &disk_map_state);
     }
@@ -455,7 +550,7 @@ pub async fn download(
 
     // 4. Download parts in parallel with semaphore and rate limiter
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let rate_limiter = RateLimiter::new(config.backup.download_max_bytes_per_second);
+    let rate_limiter = RateLimiter::new(effective_download_rate_limit(config));
     let (effective_retries_count, effective_retry_delay_secs, effective_jitter) =
         crate::config::effective_retries(config);
     let retries_on_failure = effective_retries_count;
@@ -466,7 +561,7 @@ pub async fn download(
             completed_keys,
             backup_name: backup_name.to_string(),
             params_hash: current_params_hash,
-            disk_map: manifest.disks.clone(),
+            disk_map: manifest.disks.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         };
         Some(Arc::new(tokio::sync::Mutex::new((
             state,
@@ -499,9 +594,13 @@ pub async fn download(
                 .await
                 .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
 
-            if cancel_clone.is_cancelled() {
-                return Ok((item.table_key.clone(), 0u64));
-            }
+            // Pre-clone the table_key needed by the cancel arm before item is moved.
+            let cancel_table_key = item.table_key.clone();
+
+            tokio::select! {
+                biased;
+                _ = cancel_clone.cancelled() => Ok((cancel_table_key, 0u64)),
+                result = async move {
 
             debug!(
                 table = %item.table_key,
@@ -584,13 +683,7 @@ pub async fn download(
                     // Write metadata file to local shadow directory.
                     // Sanitize relative_name to prevent path traversal via
                     // crafted S3 keys containing ".." components.
-                    let safe_path: PathBuf = Path::new(relative_name)
-                        .components()
-                        .filter_map(|c| match c {
-                            std::path::Component::Normal(seg) => Some(seg),
-                            _ => None, // reject ParentDir (..), RootDir (/), CurDir (.), Prefix
-                        })
-                        .collect();
+                    let safe_path = sanitize_relative_path(relative_name);
                     if safe_path.as_os_str().is_empty() {
                         warn!(
                             relative_name = %relative_name,
@@ -708,7 +801,10 @@ pub async fn download(
 
                 for attempt in 0..max_attempts {
                     if attempt > 0 {
-                        let delay_ms = effective_retry_delay_secs * 1000;
+                        let delay_ms = effective_retry_delay_secs
+                            .saturating_mul(1000)
+                            .saturating_mul(2u64.saturating_pow(attempt))
+                            .min(300_000); // Cap at 5 minutes
                         let jittered_ms = crate::config::apply_jitter(delay_ms, effective_jitter);
                         info!(
                             table = %item.table_key,
@@ -789,6 +885,28 @@ pub async fn download(
                                 ));
                                 continue;
                             }
+                        } else {
+                            // checksums.txt missing after decompression but
+                            // manifest records a non-zero CRC -- treat as
+                            // corruption to trigger retry (design 16.1).
+                            warn!(
+                                table = %item.table_key,
+                                part = %part_name,
+                                expected_crc = expected_crc,
+                                "checksums.txt missing after decompression but CRC expected, treating as corruption"
+                            );
+
+                            let corrupt_dir = shadow_dir.join(&part_name);
+                            if corrupt_dir.exists() {
+                                let _ = std::fs::remove_dir_all(&corrupt_dir);
+                            }
+
+                            last_error = Some(anyhow::anyhow!(
+                                "checksums.txt missing for part {} but expected CRC {}",
+                                part_name,
+                                expected_crc
+                            ));
+                            continue;
                         }
                     }
 
@@ -817,6 +935,9 @@ pub async fn download(
                     anyhow::anyhow!("Download failed for part {} after retries", part_name)
                 }))
             }
+
+            } => result,
+            }
         });
 
         handles.push(handle);
@@ -829,6 +950,12 @@ pub async fn download(
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
+    // Guard: workers return Ok on cancel, so try_join_all succeeds even when killed.
+    // Prevent saving state and metadata when the operation was cancelled.
+    if cancel.is_cancelled() {
+        return Err(anyhow::anyhow!("download cancelled"));
+    }
+
     progress.finish();
 
     // 5. Tally totals
@@ -839,12 +966,30 @@ pub async fn download(
 
     // 5a. Download access/ directory (RBAC files) if present in manifest
     if manifest.rbac.is_some() {
-        download_simple_directory(s3, backup_name, &backup_dir, "access").await?;
+        download_simple_directory(
+            s3,
+            backup_name,
+            &backup_dir,
+            "access",
+            effective_retries_count,
+            effective_retry_delay_secs,
+            effective_jitter,
+        )
+        .await?;
         info!("Downloaded access/ directory from S3");
     }
 
     // 5b. Download configs/ directory (check if any configs/ keys exist in S3)
-    download_simple_directory(s3, backup_name, &backup_dir, "configs").await?;
+    download_simple_directory(
+        s3,
+        backup_name,
+        &backup_dir,
+        "configs",
+        effective_retries_count,
+        effective_retry_delay_secs,
+        effective_jitter,
+    )
+    .await?;
     if backup_dir.join("configs").exists() {
         info!("Downloaded configs/ directory from S3");
     }
@@ -901,6 +1046,9 @@ async fn download_simple_directory(
     backup_name: &str,
     local_dir: &Path,
     prefix: &str,
+    max_retries: u32,
+    retry_delay_secs: u64,
+    jitter_factor: f64,
 ) -> Result<()> {
     let s3_prefix = format!("{}/{}/", backup_name, prefix);
     let objects = s3
@@ -917,19 +1065,67 @@ async fn download_simple_directory(
     std::fs::create_dir_all(&target_dir)
         .with_context(|| format!("Failed to create {} directory", prefix))?;
 
+    let client_prefix = s3.prefix();
+    let client_prefix_slash = if client_prefix.is_empty() {
+        String::new()
+    } else if client_prefix.ends_with('/') {
+        client_prefix.to_string()
+    } else {
+        format!("{}/", client_prefix)
+    };
+
     for obj in &objects {
-        let data = s3
-            .get_object(&obj.key)
-            .await
-            .with_context(|| format!("Failed to download {}", obj.key))?;
-        // Extract relative path after the prefix
-        let rel_path = obj.key.strip_prefix(&s3_prefix).unwrap_or(&obj.key);
-        let file_path = target_dir.join(rel_path);
-        if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let relative_key = if !client_prefix_slash.is_empty() {
+            obj.key
+                .strip_prefix(&client_prefix_slash)
+                .unwrap_or(&obj.key)
+        } else {
+            &obj.key
+        };
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let total_attempts = max_retries + 1;
+        for attempt in 0..total_attempts {
+            if attempt > 0 {
+                let delay_ms = retry_delay_secs
+                    .saturating_mul(1000)
+                    .saturating_mul(2u64.saturating_pow(attempt))
+                    .min(300_000); // Cap at 5 minutes
+                let jittered_ms = crate::config::apply_jitter(delay_ms, jitter_factor);
+                warn!(
+                    key = %obj.key,
+                    attempt = attempt + 1,
+                    delay_ms = jittered_ms,
+                    "Retrying download of {} file after failure",
+                    prefix
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(jittered_ms)).await;
+            }
+            match s3.get_object(relative_key).await {
+                Ok(data) => {
+                    let full_s3_prefix = format!("{}{}", client_prefix_slash, s3_prefix);
+                    let rel_str = obj
+                        .key
+                        .strip_prefix(&full_s3_prefix)
+                        .unwrap_or(&obj.key);
+                    let safe_rel = sanitize_relative_path(rel_str);
+                    let file_path = target_dir.join(&safe_rel);
+                    if let Some(parent) = file_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&file_path, &data)
+                        .with_context(|| format!("Failed to write {}", file_path.display()))?;
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
         }
-        std::fs::write(&file_path, &data)
-            .with_context(|| format!("Failed to write {}", file_path.display()))?;
+        if let Some(e) = last_err {
+            return Err(e).with_context(|| format!("Failed to download {}", obj.key));
+        }
     }
 
     debug!(
@@ -950,14 +1146,8 @@ mod tests {
 
     #[test]
     fn test_download_work_item_construction() {
-        let part = PartInfo {
-            name: "202401_1_50_3".to_string(),
-            size: 134_217_728,
-            backup_key: "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string(),
-            source: "uploaded".to_string(),
-            checksum_crc64: 12345,
-            s3_objects: None,
-        };
+        let mut part = PartInfo::new("202401_1_50_3", 134_217_728, 12345);
+        part.backup_key = "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string();
 
         let work_item = DownloadWorkItem {
             table_key: "default.trades".to_string(),
@@ -983,18 +1173,14 @@ mod tests {
     #[test]
     fn test_download_s3_disk_work_item_detected() {
         // Verify that S3 disk parts are flagged correctly
-        let s3_part = PartInfo {
-            name: "202401_1_50_3".to_string(),
-            size: 134_217_728,
-            backup_key: "daily/data/default/trades/s3disk/202401_1_50_3/".to_string(),
-            source: "uploaded".to_string(),
-            checksum_crc64: 12345,
-            s3_objects: Some(vec![S3ObjectInfo {
+        let mut s3_part = PartInfo::new("202401_1_50_3", 134_217_728, 12345).with_s3_objects(vec![
+            S3ObjectInfo {
                 path: "store/abc/def/data.bin".to_string(),
                 size: 134_217_000,
                 backup_key: "daily/objects/store/abc/def/data.bin".to_string(),
-            }]),
-        };
+            },
+        ]);
+        s3_part.backup_key = "daily/data/default/trades/s3disk/202401_1_50_3/".to_string();
 
         let disk_types: HashMap<String, String> = HashMap::from([
             ("default".to_string(), "local".to_string()),
@@ -1025,14 +1211,9 @@ mod tests {
     #[test]
     fn test_download_local_parts_not_flagged_as_s3() {
         // Verify that local disk parts are NOT flagged as S3
-        let local_part = PartInfo {
-            name: "202401_1_50_3".to_string(),
-            size: 4096,
-            backup_key: "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string(),
-            source: "uploaded".to_string(),
-            checksum_crc64: 11111,
-            s3_objects: None,
-        };
+        let mut local_part = PartInfo::new("202401_1_50_3", 4096, 11111);
+        local_part.backup_key =
+            "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string();
 
         let disk_types: HashMap<String, String> =
             HashMap::from([("default".to_string(), "local".to_string())]);
@@ -1210,7 +1391,7 @@ mod tests {
             "default.trades",
             "202401_1_50_3",
             expected_crc,
-            &HashMap::new(),
+            &BTreeMap::new(),
             "default",
         );
         assert!(result.is_some());
@@ -1245,7 +1426,7 @@ mod tests {
             "default.trades",
             "202401_1_50_3",
             crc,
-            &HashMap::new(),
+            &BTreeMap::new(),
             "default",
         );
         assert!(result.is_none());
@@ -1265,7 +1446,7 @@ mod tests {
             "default.trades",
             "202401_1_50_3",
             12345,
-            &HashMap::new(),
+            &BTreeMap::new(),
             "default",
         );
         assert!(result.is_none());
@@ -1283,7 +1464,7 @@ mod tests {
             "default.trades",
             "202401_1_50_3",
             0,
-            &HashMap::new(),
+            &BTreeMap::new(),
             "default",
         );
         assert!(result.is_none());
@@ -1304,7 +1485,7 @@ mod tests {
         let backup_dir = data_path.join("backup").join("daily-2024");
         std::fs::create_dir_all(&backup_dir).unwrap();
 
-        let mut manifest_disks = HashMap::new();
+        let mut manifest_disks = BTreeMap::new();
         manifest_disks.insert(
             "default".to_string(),
             data_path.to_str().unwrap().to_string(),
@@ -1346,7 +1527,7 @@ mod tests {
         let backup_dir = dir.path().join("backup").join("daily-2024");
         std::fs::create_dir_all(&backup_dir).unwrap();
 
-        let mut manifest_disks = HashMap::new();
+        let mut manifest_disks = BTreeMap::new();
         manifest_disks.insert(
             "nvme_remote".to_string(),
             "/nonexistent/remote/nvme/path".to_string(),
@@ -1368,7 +1549,7 @@ mod tests {
         let backup_dir = dir.path().join("backup").join("daily-2024");
         std::fs::create_dir_all(&backup_dir).unwrap();
 
-        let manifest_disks = HashMap::new(); // empty
+        let manifest_disks = BTreeMap::new(); // empty
 
         let target =
             resolve_download_target_dir(&manifest_disks, "unknown_disk", "daily-2024", &backup_dir);
@@ -1467,7 +1648,7 @@ mod tests {
 
         let expected_crc = compute_crc64(&per_disk_part.join("checksums.txt")).unwrap();
 
-        let mut manifest_disks = HashMap::new();
+        let mut manifest_disks = BTreeMap::new();
         manifest_disks.insert("nvme1".to_string(), nvme_path.to_str().unwrap().to_string());
 
         // Should find the part at the per-disk location
@@ -1506,7 +1687,7 @@ mod tests {
 
         let expected_crc = compute_crc64(&source_part.join("checksums.txt")).unwrap();
 
-        let mut manifest_disks = HashMap::new();
+        let mut manifest_disks = BTreeMap::new();
         manifest_disks.insert(
             "default".to_string(),
             data_path.to_str().unwrap().to_string(),
@@ -1550,7 +1731,7 @@ mod tests {
 
         let expected_crc = compute_crc64(&legacy_part.join("checksums.txt")).unwrap();
 
-        let mut manifest_disks = HashMap::new();
+        let mut manifest_disks = BTreeMap::new();
         manifest_disks.insert("nvme1".to_string(), nvme_path.to_str().unwrap().to_string());
 
         // Should find the part at the default data_path location

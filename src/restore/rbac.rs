@@ -12,7 +12,7 @@ use crate::clickhouse::client::ChClient;
 use crate::config::Config;
 use crate::manifest::BackupManifest;
 
-use super::attach::detect_clickhouse_ownership;
+use super::attach::{chown_recursive, detect_clickhouse_ownership};
 use super::remap::add_on_cluster_clause;
 
 /// RBAC entry parsed from .jsonl files created during backup.
@@ -62,9 +62,7 @@ pub async fn restore_named_collections(
     info!(
         created = created,
         total = manifest.named_collections.len(),
-        "Named collection restore: {} created out of {}",
-        created,
-        manifest.named_collections.len()
+        "Named collection restore complete"
     );
     Ok(())
 }
@@ -215,9 +213,7 @@ pub async fn restore_rbac(
         created = created,
         skipped = skipped,
         total = entries.len(),
-        "RBAC restore: {} created, {} skipped",
-        created,
-        skipped
+        "RBAC restore complete"
     );
     Ok(())
 }
@@ -267,11 +263,33 @@ pub async fn restore_configs(config: &Config, backup_dir: &Path) -> Result<()> {
     info!(
         files = copied,
         config_dir = %config.clickhouse.config_dir,
-        "Config restore: {} files copied to {}",
-        copied,
-        config.clickhouse.config_dir
+        "Config restore complete"
     );
     Ok(())
+}
+
+/// Execute a shell command via `sh -c`, logging the outcome.
+///
+/// All failures are non-fatal (logged as warnings).
+async fn run_shell_command(cmd: &str, label: &str) {
+    tracing::info!(command = %cmd, "Executing restart command ({})", label);
+    match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .await
+    {
+        Ok(output) if !output.status.success() => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(command = %cmd, stderr = %stderr, "Restart command failed (non-fatal)");
+        }
+        Err(e) => {
+            tracing::warn!(command = %cmd, error = %e, "Failed to execute restart command (non-fatal)");
+        }
+        _ => {
+            tracing::info!(command = %cmd, "Restart command executed successfully");
+        }
+    }
 }
 
 /// Execute restart commands after RBAC or config restore.
@@ -294,33 +312,7 @@ pub async fn execute_restart_commands(ch: &ChClient, restart_command: &str) -> R
         }
 
         if let Some(exec_cmd) = cmd.strip_prefix("exec:") {
-            info!(command = %exec_cmd, "Executing restart command (exec)");
-            match tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(exec_cmd.trim())
-                .output()
-                .await
-            {
-                Ok(output) => {
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        warn!(
-                            command = %exec_cmd,
-                            stderr = %stderr,
-                            "Restart command failed (non-fatal)"
-                        );
-                    } else {
-                        info!(command = %exec_cmd, "Restart command executed successfully");
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        command = %exec_cmd,
-                        error = %e,
-                        "Failed to execute restart command (non-fatal)"
-                    );
-                }
-            }
+            run_shell_command(exec_cmd.trim(), "exec").await;
         } else if let Some(sql_cmd) = cmd.strip_prefix("sql:") {
             info!(sql = %sql_cmd, "Executing restart command (sql)");
             match ch.execute_ddl(sql_cmd.trim()).await {
@@ -336,32 +328,7 @@ pub async fn execute_restart_commands(ch: &ChClient, restart_command: &str) -> R
                 }
             }
         } else {
-            // Default to exec: if no prefix
-            info!(command = %cmd, "Executing restart command (exec, no prefix)");
-            match tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .output()
-                .await
-            {
-                Ok(output) => {
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        warn!(
-                            command = %cmd,
-                            stderr = %stderr,
-                            "Restart command failed (non-fatal)"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        command = %cmd,
-                        error = %e,
-                        "Failed to execute restart command (non-fatal)"
-                    );
-                }
-            }
+            run_shell_command(cmd, "exec, no prefix").await;
         }
     }
 
@@ -378,24 +345,10 @@ fn make_drop_ddl(entity_type: &str, name: &str) -> Option<String> {
         "quota" => "QUOTA",
         _ => return None,
     };
-    Some(format!("DROP {} IF EXISTS `{}`", keyword, name))
+    let escaped_name = name.replace('`', "``");
+    Some(format!("DROP {} IF EXISTS `{}`", keyword, escaped_name))
 }
 
-/// Recursively chown a directory to the given uid/gid.
-fn chown_recursive(dir: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
-    for entry in walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        nix::unistd::chown(
-            entry.path(),
-            uid.map(nix::unistd::Uid::from_raw),
-            gid.map(nix::unistd::Gid::from_raw),
-        )
-        .with_context(|| format!("Failed to chown {}", entry.path().display()))?;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -441,6 +394,15 @@ mod tests {
     fn test_make_drop_ddl_unknown() {
         let ddl = make_drop_ddl("unknown_type", "foo");
         assert_eq!(ddl, None);
+    }
+
+    #[test]
+    fn test_make_drop_ddl_backtick_escape() {
+        let ddl = make_drop_ddl("user", "user`name");
+        assert_eq!(
+            ddl,
+            Some("DROP USER IF EXISTS `user``name`".to_string())
+        );
     }
 
     #[test]

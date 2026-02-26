@@ -185,6 +185,7 @@ impl Metrics {
             "delete",
             "clean_broken_remote",
             "clean_broken_local",
+            "clean",
         ];
         for op in &operations {
             backup_duration_seconds.with_label_values(&[op]);

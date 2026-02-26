@@ -70,7 +70,7 @@ The `run_operation()` helper encapsulates:
 - Optional `ManifestCache` invalidation (when `invalidate_cache=true`)
 - Returns 200 immediately with action ID
 
-**Exclusion**: `post_actions` is intentionally excluded from the `run_operation()` helper because it returns `(StatusCode, Json<OperationStarted>)` (201 CREATED), which is incompatible with the helper's return type. `post_actions` retains its inline `try_start_op` + `tokio::spawn` + `tokio::select!` pattern.
+**Exclusion**: `post_actions` is intentionally excluded from the `run_operation()` helper because it returns `(StatusCode, Json<OperationStarted>)` (200 OK with action ID), which is incompatible with the helper's return type. `post_actions` retains its inline `try_start_op` + `tokio::spawn` + `tokio::select!` pattern.
 
 ### Kill Endpoint (routes.rs)
 `POST /api/v1/kill` -- Cancel running operation(s). Accepts optional `?id=N` query parameter via `KillParams { id: Option<u64> }`.
@@ -81,7 +81,7 @@ The `run_operation()` helper encapsulates:
 
 **CancellationToken wiring**: All 11 route handlers (10 via `run_operation()` + `post_actions`) wire `CancellationToken` into spawned tasks via `tokio::select!`. When the token is cancelled, the operation's future is DROPPED -- this aborts the task but does not run cleanup inside the function. Known limitation: in-progress FREEZE operations will leave shadow directories that can be cleaned via `chbackup clean`.
 
-**Auto-resume exclusion**: The 3 `_token` bindings in `auto_resume()` (state.rs) are intentionally discarded. Auto-resume operations are fire-and-forget restart recovery and must NOT be cancellable via kill.
+**Auto-resume cancellation**: Auto-resume operations (upload/download/restore) use the real `CancellationToken` from `try_start_op()` and wrap the operation in `tokio::select!`, so `/api/v1/kill` stops them like any other operation. They also acquire PID locks before running (design §2 — all mutating commands hold a PID lock).
 
 ### Backup Name Validation (state.rs)
 `validate_backup_name(name: &str) -> Result<(), &'static str>` prevents path traversal attacks via malicious backup names. Rejects names that are:
@@ -89,6 +89,8 @@ The `run_operation()` helper encapsulates:
 - Contain `..` (parent directory traversal)
 - Contain `/` or `\` (path separators)
 - Contain NUL bytes
+
+NOTE: `validate_backup_name` does NOT reject `"latest"` or `"previous"`. Those reserved shortcut names are allowed through validation so CLI commands like `upload latest` can be resolved after validation. The reserved-name check (which prevents creating a backup *named* "latest") lives only in `resolve_backup_name()` in `main.rs`, which is used exclusively for create/create_remote commands.
 
 Wired into all API entry points that accept backup names (called BEFORE `try_start_op` to avoid consuming a semaphore permit for invalid requests) and CLI entry points (`resolve_backup_name()` and `backup_name_required()` in `main.rs`). Returns 400 Bad Request with descriptive error message on validation failure.
 
@@ -101,7 +103,7 @@ Bounded `VecDeque<ActionEntry>` with configurable capacity (default 100). Tracks
 `ActionEntry` and `ActionStatus` derive `Serialize` for JSON API responses. `ActionStatus` uses `#[serde(rename_all = "snake_case")]` for JSON output.
 
 ### Basic Auth Middleware (auth.rs)
-Conditionally applied to the entire router when `config.api.username` AND `config.api.password` are both non-empty. Uses axum's `middleware::from_fn_with_state`. Decodes `Authorization: Basic <base64>` header via `base64::engine::general_purpose::STANDARD`. Returns 401 with `WWW-Authenticate: Basic` header on failure.
+Always applied unconditionally to the entire router via `middleware::from_fn_with_state`. The middleware reads live config on every request: when both `config.api.username` AND `config.api.password` are empty, requests pass through without authentication. This allows auth to be enabled at runtime via `/api/v1/restart` without rebuilding the router. Decodes `Authorization: Basic <base64>` header via `base64::engine::general_purpose::STANDARD`. Credential comparison uses constant-time `constant_time_eq()` to prevent timing attacks. Returns 401 with `WWW-Authenticate: Basic` header on failure.
 
 ### Compound Operations
 - `create_remote`: chains `backup::create()` then `upload::upload()` in a single spawned task; passes `rbac`, `configs`, `named_collections` flags to `create()` (Phase 4e)
@@ -202,7 +204,7 @@ NOT wired into the watch loop (it has its own retention logic) or auto-resume up
 - Returns `Vec<TablesResponseEntry>` with fields: `database`, `name`, `engine`, `uuid`, `data_paths`, `total_bytes`.
 
 ### Sync Function Handling
-Sync functions from `list` module (`delete_local`, `clean_broken_local`) are called via `tokio::task::spawn_blocking` to avoid blocking the async runtime.
+Sync functions from `list` module (`list_local`, `delete_local`, `clean_broken_local`) are called via `tokio::task::spawn_blocking` to avoid blocking the async runtime.
 
 ### WatchStartRequest (routes.rs)
 `WatchStartRequest` is an optional JSON body for `POST /api/v1/watch/start`. Derives `Debug`, `Deserialize`, `Default`. Fields:
@@ -246,7 +248,7 @@ A SIGQUIT signal handler is spawned in `start_server()` (Unix only, gated by `#[
 The download handler (`download_backup`) passes the `hardlink_exists_files` flag from `DownloadRequest` through to `download::download()`. Auto-resume in `state.rs` passes `false` for `hardlink_exists_files` (resume should not hardlink, it re-downloads).
 
 ### Public API
-- `build_router(state: AppState) -> Router` -- Assembles all routes with optional auth middleware
+- `build_router(state: AppState) -> Router` -- Assembles all routes with unconditional auth middleware
 - `start_server(config: Arc<Config>, ch: ChClient, s3: S3Client, watch: bool, config_path: PathBuf) -> Result<()>` -- Full server lifecycle: state creation, router build, optional watch loop spawn, integration tables, auto-resume, listen, graceful shutdown
 - `spawn_watch_from_state(state: &mut AppState, config_path: PathBuf, macros: HashMap<String, String>)` -- Spawn watch loop from API context (used by watch_start endpoint)
 - `AppState::new(config, ch, s3, config_path) -> Self` -- Create shared state with semaphore, optional metrics, and watch fields initialized to None/default

@@ -16,7 +16,9 @@ use tokio::sync::Mutex;
 use crate::clickhouse::ChClient;
 use crate::config::{parse_duration_secs, Config};
 use crate::list::{BackupSummary, ManifestCache};
+use crate::lock::PidLock;
 use crate::server::metrics::Metrics;
+use crate::server::state::{validate_backup_name, WatchStatus};
 use crate::storage::S3Client;
 
 // ---------------------------------------------------------------------------
@@ -110,10 +112,11 @@ pub fn classify_backup_type(template: &str, name: &str) -> Option<&'static str> 
     // If the preceding char is '}', it's the end of another macro -- no static delimiter.
     let start_delim: Option<char> = prefix.chars().last().filter(|c| *c != '}');
 
-    // Count the number of static characters before {type} in the template prefix.
-    // This gives us a minimum offset to start searching for the delimiter in the name.
-    // Static chars are those outside of {...} blocks.
-    let static_char_count_before = count_static_chars(prefix);
+    // Count the byte length of static characters before {type} in the template prefix.
+    // This gives us a minimum byte offset to start searching for the delimiter in the name.
+    // Static chars are those outside of {...} blocks. Using bytes (not char count) ensures
+    // correct indexing for templates with non-ASCII static characters.
+    let static_char_count_before = count_static_bytes(prefix);
 
     // Extract token from name using delimiters and the static prefix hint.
     let token_start = match start_delim {
@@ -130,6 +133,12 @@ pub fn classify_backup_type(template: &str, name: &str) -> Option<&'static str> 
             } else {
                 0
             };
+            // Verify search_start lands on a valid UTF-8 char boundary before slicing.
+            // If not (e.g., non-ASCII macro expansions shifted the offset mid-character),
+            // the name cannot match the template structure, so return None.
+            if !name.is_char_boundary(search_start) {
+                return None;
+            }
             // Find the delimiter at or after search_start
             name[search_start..]
                 .find(d)
@@ -146,7 +155,12 @@ pub fn classify_backup_type(template: &str, name: &str) -> Option<&'static str> 
         None => name.len(), // {type} is at the end of template
     };
 
-    if token_start > name.len() || token_end > name.len() || token_start > token_end {
+    if token_start > name.len()
+        || token_end > name.len()
+        || token_start > token_end
+        || !name.is_char_boundary(token_start)
+        || !name.is_char_boundary(token_end)
+    {
         return None;
     }
 
@@ -158,17 +172,19 @@ pub fn classify_backup_type(template: &str, name: &str) -> Option<&'static str> 
     }
 }
 
-/// Count the number of static (non-macro) characters in a template fragment.
+/// Count the byte length of static (non-macro) characters in a template fragment.
 ///
-/// Characters inside `{...}` blocks are not counted. Characters outside are counted.
-fn count_static_chars(s: &str) -> usize {
+/// Bytes inside `{...}` blocks are not counted. Bytes outside are counted.
+/// Returns a byte count (not char count) so the result can be used directly
+/// as a byte offset into a `str` slice.
+fn count_static_bytes(s: &str) -> usize {
     let mut count = 0;
     let mut in_macro = false;
     for ch in s.chars() {
         match ch {
             '{' => in_macro = true,
             '}' => in_macro = false,
-            _ if !in_macro => count += 1,
+            _ if !in_macro => count += ch.len_utf8(),
             _ => {}
         }
     }
@@ -333,6 +349,19 @@ pub enum WatchLoopExit {
     Stopped,
 }
 
+/// Map a `WatchState` to its human-readable API status string.
+fn watch_state_name(s: WatchState) -> &'static str {
+    match s {
+        WatchState::Idle => "idle",
+        WatchState::CreatingFull => "creating_full",
+        WatchState::CreatingIncr => "creating_incr",
+        WatchState::Uploading => "uploading",
+        WatchState::Cleaning => "cleaning",
+        WatchState::Sleeping => "sleeping",
+        WatchState::Error => "error",
+    }
+}
+
 /// All state needed to run the watch loop.
 pub struct WatchContext {
     pub config: Arc<Config>,
@@ -349,21 +378,25 @@ pub struct WatchContext {
     pub macros: HashMap<String, String>,
     /// Shared manifest cache for invalidation after retention_remote.
     pub manifest_cache: Option<Arc<Mutex<ManifestCache>>>,
+    /// Shared watch status for API queries (updated at each state transition).
+    pub watch_status: Arc<Mutex<WatchStatus>>,
 }
 
 impl WatchContext {
-    fn set_state(&mut self, new_state: WatchState) {
+    async fn set_state(&mut self, new_state: WatchState) {
         self.state = new_state;
         if let Some(m) = &self.metrics {
             m.watch_state.set(new_state as i64);
         }
+        self.watch_status.lock().await.state = watch_state_name(new_state).to_string();
     }
 
-    fn set_consecutive_errors(&mut self, count: u32) {
+    async fn set_consecutive_errors(&mut self, count: u32) {
         self.consecutive_errors = count;
         if let Some(m) = &self.metrics {
             m.watch_consecutive_errors.set(count as i64);
         }
+        self.watch_status.lock().await.consecutive_errors = count;
     }
 }
 
@@ -377,7 +410,7 @@ impl WatchContext {
 /// 5. Updates Prometheus metrics at each state transition
 pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
     info!("watch: starting watch loop");
-    ctx.set_state(WatchState::Idle);
+    ctx.set_state(WatchState::Idle).await;
 
     loop {
         // Check max consecutive errors
@@ -395,7 +428,7 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
         // Check shutdown
         if *ctx.shutdown_rx.borrow() {
             info!("watch: shutdown received");
-            ctx.set_state(WatchState::Idle);
+            ctx.set_state(WatchState::Idle).await;
             return WatchLoopExit::Shutdown;
         }
 
@@ -435,12 +468,14 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
         });
 
         // Step 1: Resume -- query remote backups and determine next action
-        ctx.set_state(WatchState::Idle);
+        ctx.set_state(WatchState::Idle).await;
         let remote_backups = match crate::list::list_remote(&ctx.s3).await {
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "watch: failed to list remote backups");
-                handle_error(&mut ctx, retry_interval).await;
+                if let Some(exit) = handle_error(&mut ctx, retry_interval).await {
+                    return exit;
+                }
                 continue;
             }
         };
@@ -460,12 +495,14 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
                 remaining,
                 backup_type: _,
             } => {
-                ctx.set_state(WatchState::Sleeping);
+                ctx.set_state(WatchState::Sleeping).await;
                 info!(
                     seconds = remaining.as_secs(),
                     "watch: cycle complete, sleeping"
                 );
+                ctx.watch_status.lock().await.next_backup_in = Some(remaining);
                 let exit = interruptible_sleep(&mut ctx, remaining).await;
+                ctx.watch_status.lock().await.next_backup_in = None;
                 if let Some(reason) = exit {
                     return reason;
                 }
@@ -498,10 +535,39 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             &ctx.macros,
         );
 
+        // Validate the resolved name before using it in filesystem/S3 operations.
+        // Catches templates that expand to unsafe paths (e.g. containing '/' or '..').
+        if let Err(e) = validate_backup_name(&backup_name) {
+            warn!(
+                backup_name = %backup_name,
+                template = %ctx.config.watch.name_template,
+                error = %e,
+                "watch: resolved backup name is invalid, skipping cycle"
+            );
+            if let Some(exit) = handle_error(&mut ctx, retry_interval).await {
+                return exit;
+            }
+            continue;
+        }
+
+        // Acquire per-backup PID lock before mutating operations (design §2).
+        // Enables orphan shadow-dir cleanup to detect in-progress watch backups.
+        let lock_path = std::path::PathBuf::from(format!("/tmp/chbackup.{backup_name}.pid"));
+        let _pid_lock = match PidLock::acquire(&lock_path, "watch") {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(error = %e, backup_name = %backup_name, "watch: failed to acquire backup lock");
+                if let Some(exit) = handle_error(&mut ctx, retry_interval).await {
+                    return exit;
+                }
+                continue;
+            }
+        };
+
         if backup_type == "full" {
-            ctx.set_state(WatchState::CreatingFull);
+            ctx.set_state(WatchState::CreatingFull).await;
         } else {
-            ctx.set_state(WatchState::CreatingIncr);
+            ctx.set_state(WatchState::CreatingIncr).await;
         }
         info!(
             backup_name = %backup_name,
@@ -510,33 +576,57 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             "watch: creating {} backup", backup_type
         );
 
+        // Wire CancellationToken to the shutdown signal so that SIGTERM during
+        // backup::create() cancels the operation instead of running to completion.
+        let create_cancel = tokio_util::sync::CancellationToken::new();
+        let create_cancel_for_shutdown = create_cancel.clone();
+        let mut create_shutdown_rx = ctx.shutdown_rx.clone();
+        let create_shutdown_guard = tokio::spawn(async move {
+            let _ = create_shutdown_rx.changed().await;
+            create_cancel_for_shutdown.cancel();
+        });
+
         let create_result = crate::backup::create(
             &ctx.config,
             &ctx.ch,
             &backup_name,
             tables_filter.as_deref(),
             false, // schema_only
-            diff_from.as_deref(),
+            None,  // diff_from: watch uses diff_from_remote in upload; local base may be deleted
             None,  // partitions
             false, // skip_check_parts_columns (let config.clickhouse.check_parts_columns control)
             false, // rbac (watch mode does not support RBAC backup)
             false, // configs (watch mode does not support config backup)
             false, // named_collections (watch mode does not support named collections backup)
             &ctx.config.backup.skip_projections,
+            create_cancel,
         )
         .await;
+        create_shutdown_guard.abort();
 
         if let Err(e) = create_result {
             warn!(error = %e, backup_name = %backup_name, "watch: create failed");
-            handle_error(&mut ctx, retry_interval).await;
+            if let Some(exit) = handle_error(&mut ctx, retry_interval).await {
+                return exit;
+            }
             continue;
         }
 
         // Step 4: Upload backup
-        ctx.set_state(WatchState::Uploading);
+        ctx.set_state(WatchState::Uploading).await;
         let backup_dir = PathBuf::from(&ctx.config.clickhouse.data_path)
             .join("backup")
             .join(&backup_name);
+
+        // Wire CancellationToken to the shutdown signal so that SIGTERM during
+        // upload::upload() cancels the operation instead of running to completion.
+        let upload_cancel = tokio_util::sync::CancellationToken::new();
+        let upload_cancel_for_shutdown = upload_cancel.clone();
+        let mut upload_shutdown_rx = ctx.shutdown_rx.clone();
+        let upload_shutdown_guard = tokio::spawn(async move {
+            let _ = upload_shutdown_rx.changed().await;
+            upload_cancel_for_shutdown.cancel();
+        });
 
         let upload_result = crate::upload::upload(
             &ctx.config,
@@ -546,24 +636,42 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             false, // delete_local handled separately below
             diff_from.as_deref(),
             ctx.config.general.use_resumable_state,
-            tokio_util::sync::CancellationToken::new(),
+            upload_cancel,
         )
         .await;
+        upload_shutdown_guard.abort();
 
         if let Err(e) = upload_result {
             warn!(error = %e, backup_name = %backup_name, "watch: upload failed");
-            handle_error(&mut ctx, retry_interval).await;
+            if let Some(exit) = handle_error(&mut ctx, retry_interval).await {
+                return exit;
+            }
             continue;
         }
         info!(backup_name = %backup_name, "watch: upload complete");
 
-        // Update last full/incremental timestamp metric
-        if let Some(m) = &ctx.metrics {
-            let ts = Utc::now().timestamp() as f64;
+        // Invalidate manifest cache after successful upload adds a new backup
+        if let Some(cache) = &ctx.manifest_cache {
+            cache.lock().await.invalidate();
+            info!("ManifestCache: invalidated after upload");
+        }
+
+        // Update last full/incremental timestamp metric and WatchStatus
+        {
+            let upload_ts = Utc::now();
+            if let Some(m) = &ctx.metrics {
+                let ts = upload_ts.timestamp() as f64;
+                if backup_type == "full" {
+                    m.watch_last_full_timestamp.set(ts);
+                } else {
+                    m.watch_last_incremental_timestamp.set(ts);
+                }
+            }
+            let mut ws = ctx.watch_status.lock().await;
             if backup_type == "full" {
-                m.watch_last_full_timestamp.set(ts);
+                ws.last_full = Some(upload_ts);
             } else {
-                m.watch_last_incremental_timestamp.set(ts);
+                ws.last_incr = Some(upload_ts);
             }
         }
 
@@ -583,7 +691,7 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
         }
 
         // Step 6: Retention (best-effort per design 10.7)
-        ctx.set_state(WatchState::Cleaning);
+        ctx.set_state(WatchState::Cleaning).await;
 
         let keep_local = crate::list::effective_retention_local(&ctx.config);
         if keep_local > 0 {
@@ -625,19 +733,21 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
         }
 
         // Success: reset error state
-        ctx.set_consecutive_errors(0);
+        ctx.set_consecutive_errors(0).await;
         if backup_type == "full" {
             ctx.force_next_full = false;
         }
         ctx.last_backup_name = Some(backup_name);
 
         // Step 7: Sleep for watch_interval
-        ctx.set_state(WatchState::Sleeping);
+        ctx.set_state(WatchState::Sleeping).await;
         info!(
             seconds = watch_interval.as_secs(),
             "watch: cycle complete, sleeping"
         );
+        ctx.watch_status.lock().await.next_backup_in = Some(watch_interval);
         let exit = interruptible_sleep(&mut ctx, watch_interval).await;
+        ctx.watch_status.lock().await.next_backup_in = None;
         if let Some(reason) = exit {
             return reason;
         }
@@ -646,18 +756,25 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
 
 /// Handle a watch cycle error: increment consecutive_errors, set force_next_full,
 /// update metrics, and sleep for retry_interval.
-async fn handle_error(ctx: &mut WatchContext, retry_interval: std::time::Duration) {
+///
+/// Returns `Some(WatchLoopExit)` if a shutdown/stop signal was received during
+/// the retry sleep, so the caller can exit the loop immediately instead of
+/// making another S3 list call before detecting the signal.
+async fn handle_error(
+    ctx: &mut WatchContext,
+    retry_interval: std::time::Duration,
+) -> Option<WatchLoopExit> {
     let new_count = ctx.consecutive_errors + 1;
-    ctx.set_consecutive_errors(new_count);
+    ctx.set_consecutive_errors(new_count).await;
     ctx.force_next_full = true;
-    ctx.set_state(WatchState::Error);
+    ctx.set_state(WatchState::Error).await;
     warn!(
         consecutive_errors = new_count,
         "watch: error, consecutive_errors={}", new_count
     );
 
-    // Sleep for retry_interval (interruptible)
-    let _ = interruptible_sleep(ctx, retry_interval).await;
+    // Sleep for retry_interval (interruptible) -- propagate exit signal
+    interruptible_sleep(ctx, retry_interval).await
 }
 
 /// Sleep for the given duration, but wake up early on shutdown, reload, or stop signals.
@@ -753,6 +870,10 @@ async fn apply_config_reload(ctx: &mut WatchContext) {
             return;
         }
     };
+
+    // Refresh macros from the new ClickHouse client so that name templates
+    // using {shard}, {replica}, etc. pick up any macro changes on the new server.
+    ctx.macros = new_ch.get_macros().await.unwrap_or_default();
 
     // Update all three atomically -- config last, only after both clients succeed
     ctx.ch = new_ch;

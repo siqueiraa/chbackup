@@ -8,7 +8,7 @@
 //! 3. Chown to ClickHouse uid/gid
 //! 4. ALTER TABLE ATTACH PART '{part_name}'
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -53,13 +53,13 @@ pub struct AttachParams<'a> {
     /// Shared resume state for tracking (optional).
     pub resume_state: Option<&'a Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>>,
     /// Disk name -> disk path mapping from manifest for per-disk path resolution.
-    pub manifest_disks: &'a HashMap<String, String>,
+    pub manifest_disks: &'a BTreeMap<String, String>,
     /// Original (pre-remap) database name for shadow path lookup.
     pub source_db: &'a str,
     /// Original (pre-remap) table name for shadow path lookup.
     pub source_table: &'a str,
     /// Parts grouped by disk name, for building part -> disk reverse map.
-    pub parts_by_disk: &'a HashMap<String, Vec<PartInfo>>,
+    pub parts_by_disk: &'a BTreeMap<String, Vec<PartInfo>>,
 }
 
 /// Owned parameters for attaching parts to a table.
@@ -88,17 +88,17 @@ pub struct OwnedAttachParams {
     /// S3 client for CopyObject during S3 disk part restore.
     pub s3_client: Option<S3Client>,
     /// Disk name -> disk type mapping for routing parts by disk type.
-    pub disk_type_map: HashMap<String, String>,
+    pub disk_type_map: BTreeMap<String, String>,
     /// Concurrency limit for S3 CopyObject operations during restore.
     pub object_disk_server_side_copy_concurrency: usize,
     /// Whether to allow streaming fallback for CopyObject failures.
     pub allow_object_disk_streaming: bool,
     /// Disk name -> remote_path for S3 disks (from DiskRow.remote_path).
-    pub disk_remote_paths: HashMap<String, String>,
+    pub disk_remote_paths: BTreeMap<String, String>,
     /// Table UUID for UUID-isolated S3 restore path derivation.
     pub table_uuid: Option<String>,
     /// Parts grouped by disk name, for S3 disk routing.
-    pub parts_by_disk: HashMap<String, Vec<PartInfo>>,
+    pub parts_by_disk: BTreeMap<String, Vec<PartInfo>>,
     /// Parts already attached (from resume state + system.parts). Parts in this
     /// set are skipped during ATTACH.
     pub already_attached: HashSet<String>,
@@ -109,7 +109,7 @@ pub struct OwnedAttachParams {
     pub jitter_factor: f64,
     /// Disk name -> disk path mapping from manifest. Used by
     /// resolve_shadow_part_path() to find per-disk backup directories.
-    pub manifest_disks: HashMap<String, String>,
+    pub manifest_disks: BTreeMap<String, String>,
     /// Original (pre-remap) database name for shadow path lookup.
     /// Shadow directories are created during backup using the source names,
     /// so lookups must always use source names even when remap is active.
@@ -139,8 +139,8 @@ pub fn uuid_s3_prefix(uuid: &str) -> String {
 /// Parameters for restoring S3 disk parts of a single table.
 struct S3RestoreParams<'a> {
     s3: &'a S3Client,
-    parts_by_disk: &'a HashMap<String, Vec<PartInfo>>,
-    disk_type_map: &'a HashMap<String, String>,
+    parts_by_disk: &'a BTreeMap<String, Vec<PartInfo>>,
+    disk_type_map: &'a BTreeMap<String, String>,
     table_uuid: &'a str,
     table_data_path: &'a Path,
     backup_dir: &'a Path,
@@ -152,7 +152,7 @@ struct S3RestoreParams<'a> {
     clickhouse_gid: Option<u32>,
     jitter_factor: f64,
     /// Disk name -> disk path from manifest for per-disk resolution.
-    manifest_disks: &'a HashMap<String, String>,
+    manifest_disks: &'a BTreeMap<String, String>,
     /// Original source database name for shadow path lookup.
     source_db: &'a str,
     /// Original source table name for shadow path lookup.
@@ -201,6 +201,14 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
 
     let semaphore = Arc::new(Semaphore::new(p.concurrency));
     let detached_dir = p.table_data_path.join("detached");
+
+    let url_src_db = encode_path_component(p.source_db);
+    let url_src_table = encode_path_component(p.source_table);
+    let backup_name = p
+        .backup_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
 
     for (disk_name, parts) in p.parts_by_disk {
         let disk_type = p
@@ -312,15 +320,6 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                 )
             })?;
 
-            // Read metadata files from the backup shadow directory
-            // Use source names for shadow path lookup (source == pre-remap names)
-            let url_src_db = encode_path_component(p.source_db);
-            let url_src_table = encode_path_component(p.source_table);
-            let backup_name = p
-                .backup_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
             let source_dir = resolve_shadow_part_path(
                 p.backup_dir,
                 p.manifest_disks,
@@ -433,31 +432,56 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
         });
 
     if has_s3_parts {
-        let s3 = params.s3_client.as_ref().expect("s3_client checked above");
-        let uuid = params
-            .table_uuid
-            .as_ref()
-            .expect("table_uuid checked above");
+        // On resume, check if ALL S3 disk parts are already attached.
+        // If so, skip the S3 restore entirely (avoids ListObjectsV2 per table).
+        let all_s3_attached = params
+            .parts_by_disk
+            .iter()
+            .filter(|(disk_name, _)| {
+                let disk_type = params
+                    .disk_type_map
+                    .get(disk_name.as_str())
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                is_s3_disk(disk_type)
+            })
+            .flat_map(|(_, parts)| parts.iter())
+            .filter(|p| p.s3_objects.is_some())
+            .all(|p| params.already_attached.contains(&p.name));
 
-        let s3_params = S3RestoreParams {
-            s3,
-            parts_by_disk: &params.parts_by_disk,
-            disk_type_map: &params.disk_type_map,
-            table_uuid: uuid,
-            table_data_path: &params.table_data_path,
-            backup_dir: &params.backup_dir,
-            db: &params.db,
-            table: &params.table,
-            concurrency: params.object_disk_server_side_copy_concurrency,
-            allow_streaming: params.allow_object_disk_streaming,
-            clickhouse_uid: params.clickhouse_uid,
-            clickhouse_gid: params.clickhouse_gid,
-            jitter_factor: params.jitter_factor,
-            manifest_disks: &params.manifest_disks,
-            source_db: &params.source_db,
-            source_table: &params.source_table,
-        };
-        restore_s3_disk_parts(&s3_params).await?;
+        if all_s3_attached && !params.already_attached.is_empty() {
+            debug!(
+                db = %params.db,
+                table = %params.table,
+                "All S3 disk parts already attached, skipping S3 restore"
+            );
+        } else {
+            let s3 = params.s3_client.as_ref().expect("s3_client checked above");
+            let uuid = params
+                .table_uuid
+                .as_ref()
+                .expect("table_uuid checked above");
+
+            let s3_params = S3RestoreParams {
+                s3,
+                parts_by_disk: &params.parts_by_disk,
+                disk_type_map: &params.disk_type_map,
+                table_uuid: uuid,
+                table_data_path: &params.table_data_path,
+                backup_dir: &params.backup_dir,
+                db: &params.db,
+                table: &params.table,
+                concurrency: params.object_disk_server_side_copy_concurrency,
+                allow_streaming: params.allow_object_disk_streaming,
+                clickhouse_uid: params.clickhouse_uid,
+                clickhouse_gid: params.clickhouse_gid,
+                jitter_factor: params.jitter_factor,
+                manifest_disks: &params.manifest_disks,
+                source_db: &params.source_db,
+                source_table: &params.source_table,
+            };
+            restore_s3_disk_parts(&s3_params).await?;
+        }
     }
 
     let attach_params = AttachParams {
@@ -524,8 +548,29 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
 
     let mut attached_count = 0u64;
 
-    let table_key = format!("{}.{}", db, table);
+    let resume_table_key = format!("{}.{}", params.source_db, params.source_table);
     let mut skipped_resume = 0u64;
+
+    // Hoist loop-invariant computations above the loop.
+    // URL-encode source db and table names for the backup shadow path.
+    // Use source_db/source_table (pre-remap names) since shadow dirs
+    // are created during backup using the original ClickHouse names.
+    let url_src_db = encode_path_component(params.source_db);
+    let url_src_table = encode_path_component(params.source_table);
+
+    let backup_name = params
+        .backup_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    // Build reverse map: part_name -> disk_name (O(n) instead of O(n^2) linear scan).
+    // Matches the pattern used in try_attach_table_mode().
+    let part_to_disk: std::collections::HashMap<&str, &str> = params
+        .parts_by_disk
+        .iter()
+        .flat_map(|(dn, parts)| parts.iter().map(move |p| (p.name.as_str(), dn.as_str())))
+        .collect();
 
     for part in &sorted_parts {
         // Resume: skip parts already attached
@@ -551,30 +596,7 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                 "S3 disk part already prepared in detached/, skipping hardlink"
             );
         } else {
-            // URL-encode source db and table names for the backup shadow path
-            // Use source_db/source_table (pre-remap names) since shadow dirs
-            // are created during backup using the original ClickHouse names.
-            let url_src_db = encode_path_component(params.source_db);
-            let url_src_table = encode_path_component(params.source_table);
-
-            let backup_name = params
-                .backup_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
-
-            // Build reverse map: part_name -> disk_name
-            let disk_name = params
-                .parts_by_disk
-                .iter()
-                .find_map(|(dn, parts)| {
-                    if parts.iter().any(|p| p.name == part.name) {
-                        Some(dn.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or("default");
+            let disk_name = part_to_disk.get(part.name.as_str()).copied().unwrap_or("default");
 
             // Resolve source directory using per-disk fallback chain
             let source_dir = resolve_shadow_part_path(
@@ -634,7 +656,7 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                     guard
                         .0
                         .attached_parts
-                        .entry(table_key.clone())
+                        .entry(resume_table_key.clone())
                         .or_default()
                         .push(part.name.clone());
                     let state_path = guard.1.clone();
@@ -647,8 +669,8 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                 if err_str.contains("DUPLICATE_DATA_PART")
                     || err_str.contains("PART_IS_TEMPORARILY_LOCKED")
                     || err_str.contains("NO_SUCH_DATA_PART")
-                    || err_str.contains("232")
-                    || err_str.contains("233")
+                    || err_str.contains("Code: 232")
+                    || err_str.contains("Code: 233")
                 {
                     warn!(
                         db = %db,
@@ -1026,16 +1048,16 @@ mod tests {
             clickhouse_gid: None,
             engine: "MergeTree".to_string(),
             s3_client: None,
-            disk_type_map: HashMap::from([("s3disk".to_string(), "s3".to_string())]),
+            disk_type_map: BTreeMap::from([("s3disk".to_string(), "s3".to_string())]),
             object_disk_server_side_copy_concurrency: 32,
             allow_object_disk_streaming: false,
-            disk_remote_paths: HashMap::new(),
+            disk_remote_paths: BTreeMap::new(),
             table_uuid: Some("5f3a7b2c-1234-5678-9abc-def012345678".to_string()),
-            parts_by_disk: HashMap::new(),
+            parts_by_disk: BTreeMap::new(),
             already_attached: HashSet::new(),
             resume_state: None,
             jitter_factor: 0.0,
-            manifest_disks: HashMap::new(),
+            manifest_disks: BTreeMap::new(),
             source_db: "default".to_string(),
             source_table: "trades".to_string(),
         };
@@ -1068,16 +1090,16 @@ mod tests {
             clickhouse_gid: None,
             engine: "MergeTree".to_string(),
             s3_client: None,
-            disk_type_map: HashMap::new(),
+            disk_type_map: BTreeMap::new(),
             object_disk_server_side_copy_concurrency: 32,
             allow_object_disk_streaming: false,
-            disk_remote_paths: HashMap::new(),
+            disk_remote_paths: BTreeMap::new(),
             table_uuid: None,
-            parts_by_disk: HashMap::new(),
+            parts_by_disk: BTreeMap::new(),
             already_attached: already.clone(),
             resume_state: None,
             jitter_factor: 0.0,
-            manifest_disks: HashMap::new(),
+            manifest_disks: BTreeMap::new(),
             source_db: "default".to_string(),
             source_table: "trades".to_string(),
         };
@@ -1138,7 +1160,7 @@ mod tests {
         std::fs::create_dir_all(&per_disk_part).unwrap();
         std::fs::write(per_disk_part.join("checksums.txt"), b"data").unwrap();
 
-        let manifest_disks = HashMap::from([(
+        let manifest_disks = BTreeMap::from([(
             "nvme1".to_string(),
             nvme1_path.to_string_lossy().to_string(),
         )]);
@@ -1177,7 +1199,7 @@ mod tests {
         let dest_part = backup_dir.join("shadow/staging/trades_copy/202401_1_50_3");
         assert!(!dest_part.exists());
 
-        let manifest_disks = HashMap::new();
+        let manifest_disks = BTreeMap::new();
 
         // Lookup with source names (prod.trades) should succeed
         let result = resolve_shadow_part_path(
@@ -1227,7 +1249,7 @@ mod tests {
         std::fs::write(legacy_part.join("checksums.txt"), b"data").unwrap();
 
         // manifest.disks has a disk entry but per-disk path doesn't exist
-        let manifest_disks = HashMap::from([(
+        let manifest_disks = BTreeMap::from([(
             "nvme1".to_string(),
             tmp.path()
                 .join("nvme1_does_not_exist")

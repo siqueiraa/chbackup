@@ -26,11 +26,11 @@ pub mod schema;
 pub mod sort;
 pub mod topo;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -191,7 +191,7 @@ pub async fn restore(
     };
 
     let replicated_databases = if on_cluster.is_some() {
-        detect_replicated_databases(ch, &manifest).await
+        detect_replicated_databases(ch, &manifest, remap_ref).await
     } else {
         HashSet::new()
     };
@@ -225,8 +225,7 @@ pub async fn restore(
     // Phase 2: CREATE data tables (not DDL-only objects)
     info!(
         count = phases.data_tables.len(),
-        "Phase 2: {} data tables",
-        phases.data_tables.len()
+        "Phase 2: data tables"
     );
     create_tables(
         ch,
@@ -247,8 +246,7 @@ pub async fn restore(
             let sorted_ddl = topological_sort(&manifest.tables, &phases.ddl_only_tables)?;
             info!(
                 count = sorted_ddl.len(),
-                "Phase 3: {} DDL-only objects",
-                sorted_ddl.len()
+                "Phase 3: DDL-only objects"
             );
             create_ddl_objects(
                 ch,
@@ -266,8 +264,7 @@ pub async fn restore(
         if !data_only && !phases.postponed_tables.is_empty() {
             info!(
                 count = phases.postponed_tables.len(),
-                "Phase 2b: {} postponed tables (schema-only)",
-                phases.postponed_tables.len()
+                "Phase 2b: postponed tables (schema-only)"
             );
             create_tables(
                 ch,
@@ -363,6 +360,8 @@ pub async fn restore(
             if data_only { "data" } else { "" },
             rename_as.unwrap_or(""),
             db_mapping_sorted.as_deref().unwrap_or(""),
+            partitions.unwrap_or(""),
+            if skip_empty_tables { "skip-empty" } else { "" },
         ])
     };
 
@@ -475,7 +474,7 @@ pub async fn restore(
     };
 
     // Build disk remote paths from live disks (for S3 CopyObject source)
-    let disk_remote_paths: HashMap<String, String> = if has_s3_disks {
+    let disk_remote_paths: BTreeMap<String, String> = if has_s3_disks {
         match ch.get_disks().await {
             Ok(disks) => disks
                 .into_iter()
@@ -484,11 +483,11 @@ pub async fn restore(
                 .collect(),
             Err(e) => {
                 warn!(error = %e, "Failed to get disk info for S3 restore");
-                HashMap::new()
+                BTreeMap::new()
             }
         }
     } else {
-        HashMap::new()
+        BTreeMap::new()
     };
 
     let object_disk_concurrency =
@@ -650,24 +649,15 @@ pub async fn restore(
     let mut attach_table_results: Vec<(String, u64)> = Vec::new();
 
     if restore_as_attach {
-        // Get macros for ZK path resolution (needed for DROP REPLICA in ATTACH TABLE mode)
-        let macros = ch.get_macros().await.unwrap_or_default();
-
         let mut normal_items: Vec<(String, OwnedAttachParams)> = Vec::new();
 
         for (table_key, params) in restore_items {
             if is_replicated_engine(&params.engine) {
                 // Try ATTACH TABLE mode for Replicated tables
-                let table_manifest = manifest.tables.get(&table_key);
-                let ddl = table_manifest.map_or("", |tm| tm.ddl.as_str());
-                let all_parts: Vec<_> = table_manifest
-                    .map(|tm| {
-                        tm.parts
-                            .values()
-                            .flat_map(|parts| parts.iter().cloned())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let ddl = manifest
+                    .tables
+                    .get(&table_key)
+                    .map_or("", |tm| tm.ddl.as_str());
 
                 let (src_db, src_table) =
                     table_key.split_once('.').unwrap_or(("default", &table_key));
@@ -681,7 +671,7 @@ pub async fn restore(
                     ddl,
                     &params.engine,
                     &macros,
-                    &all_parts,
+                    &params.parts,
                     &backup_dir,
                     &params.table_data_path,
                     ch_uid,
@@ -692,7 +682,7 @@ pub async fn restore(
                 .await
                 {
                     Ok(true) => {
-                        let count = all_parts.len() as u64;
+                        let count = params.parts.len() as u64;
                         attach_table_results.push((table_key, count));
                     }
                     Ok(false) => {
@@ -762,6 +752,13 @@ pub async fn restore(
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
+    // Check for cancellation before proceeding to post-attach phases.
+    // Parallel attach tasks check cancel_clone themselves, but after try_join_all we must
+    // recheck before executing mutations, postponed tables, DDL objects, RBAC, etc.
+    if cancel.is_cancelled() {
+        bail!("Restore cancelled");
+    }
+
     // Merge ATTACH TABLE mode results
     results.extend(attach_table_results);
 
@@ -782,8 +779,7 @@ pub async fn restore(
     if !data_only && !phases.postponed_tables.is_empty() {
         info!(
             count = phases.postponed_tables.len(),
-            "Phase 2b: {} postponed tables",
-            phases.postponed_tables.len()
+            "Phase 2b: postponed tables"
         );
         create_tables(
             ch,
@@ -804,8 +800,7 @@ pub async fn restore(
         let sorted_ddl = topological_sort(&manifest.tables, &phases.ddl_only_tables)?;
         info!(
             count = sorted_ddl.len(),
-            "Phase 3: {} DDL-only objects",
-            sorted_ddl.len()
+            "Phase 3: DDL-only objects"
         );
         create_ddl_objects(
             ch,
@@ -1012,8 +1007,8 @@ async fn try_attach_table_mode(
     table_data_path: &Path,
     ch_uid: Option<u32>,
     ch_gid: Option<u32>,
-    manifest_disks: &HashMap<String, String>,
-    parts_by_disk: &HashMap<String, Vec<crate::manifest::PartInfo>>,
+    manifest_disks: &BTreeMap<String, String>,
+    parts_by_disk: &BTreeMap<String, Vec<crate::manifest::PartInfo>>,
 ) -> Result<bool> {
     use crate::backup::collect::resolve_shadow_part_path;
 
@@ -1107,7 +1102,14 @@ async fn try_attach_table_mode(
                 part_name,
             ) {
                 Some(p) => p,
-                None => continue, // Part not found at any location
+                None => {
+                    tracing::warn!(
+                        part = %part_name,
+                        table = format!("{}.{}", src_db_clone, src_table_clone),
+                        "ATTACH TABLE mode: part source directory not found, skipping"
+                    );
+                    continue;
+                }
             };
 
             attach::hardlink_or_copy_dir(&part_src, &part_dst)?;
@@ -1350,47 +1352,20 @@ mod tests {
     #[test]
     fn test_mutation_reapply_empty() {
         use crate::manifest::{BackupManifest, DatabaseInfo, TableManifest};
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
-        let mut tables = HashMap::new();
+        let mut tables = BTreeMap::new();
         tables.insert(
             "default.trades".to_string(),
-            TableManifest {
-                ddl: "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id"
-                    .to_string(),
-                uuid: None,
-                engine: "MergeTree".to_string(),
-                total_bytes: 0,
-                parts: HashMap::new(),
-                pending_mutations: Vec::new(), // No mutations
-                metadata_only: false,
-                dependencies: Vec::new(),
-            },
+            TableManifest::test_new("MergeTree")
+                .with_ddl(
+                    "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id",
+                ),
         );
 
-        let manifest = BackupManifest {
-            manifest_version: 1,
-            name: "test".to_string(),
-            timestamp: chrono::Utc::now(),
-            clickhouse_version: String::new(),
-            chbackup_version: String::new(),
-            data_format: "lz4".to_string(),
-            compressed_size: 0,
-            metadata_size: 0,
-            disks: HashMap::new(),
-            disk_types: HashMap::new(),
-            disk_remote_paths: HashMap::new(),
-            tables,
-            databases: vec![DatabaseInfo {
-                name: "default".to_string(),
-                ddl: "CREATE DATABASE default ENGINE = Atomic".to_string(),
-            }],
-            functions: Vec::new(),
-            named_collections: Vec::new(),
-            rbac: None,
-            rbac_size: 0,
-            config_size: 0,
-        };
+        let manifest = BackupManifest::test_new("test")
+            .with_tables(tables)
+            .with_databases(vec![DatabaseInfo::test_new("default")]);
 
         // Verify table has no mutations -- reapply_pending_mutations would skip it
         let tm = manifest.tables.get("default.trades").unwrap();
@@ -1404,31 +1379,22 @@ mod tests {
     #[test]
     fn test_mutation_reapply_with_mutations() {
         use crate::manifest::{MutationInfo, TableManifest};
-        use std::collections::HashMap;
 
-        let tm = TableManifest {
-            ddl: "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id"
-                .to_string(),
-            uuid: None,
-            engine: "MergeTree".to_string(),
-            total_bytes: 0,
-            parts: HashMap::new(),
-            pending_mutations: vec![
-                MutationInfo {
-                    mutation_id: "0000000001".to_string(),
-                    command: "DELETE WHERE user_id = 5".to_string(),
-                    parts_to_do: vec!["202401_1_50_3".to_string()],
-                },
-                MutationInfo {
-                    mutation_id: "0000000002".to_string(),
-                    command: "UPDATE status = 'archived' WHERE created_at < '2024-01-01'"
-                        .to_string(),
-                    parts_to_do: vec!["202401_1_50_3".to_string(), "202402_1_10_1".to_string()],
-                },
-            ],
-            metadata_only: false,
-            dependencies: Vec::new(),
-        };
+        let mut tm = TableManifest::test_new("MergeTree").with_ddl(
+            "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id",
+        );
+        tm.pending_mutations = vec![
+            MutationInfo {
+                mutation_id: "0000000001".to_string(),
+                command: "DELETE WHERE user_id = 5".to_string(),
+                parts_to_do: vec!["202401_1_50_3".to_string()],
+            },
+            MutationInfo {
+                mutation_id: "0000000002".to_string(),
+                command: "UPDATE status = 'archived' WHERE created_at < '2024-01-01'".to_string(),
+                parts_to_do: vec!["202401_1_50_3".to_string(), "202402_1_10_1".to_string()],
+            },
+        ];
 
         // Verify mutations are present and correctly ordered
         assert_eq!(tm.pending_mutations.len(), 2);
@@ -1492,7 +1458,7 @@ mod tests {
         std::fs::write(per_disk_part.join("checksums.txt"), b"test").unwrap();
 
         // manifest_disks maps nvme1 to nvme_path
-        let manifest_disks: HashMap<String, String> = HashMap::from([
+        let manifest_disks: BTreeMap<String, String> = BTreeMap::from([
             (
                 "default".to_string(),
                 data_path.to_str().unwrap().to_string(),
@@ -1501,16 +1467,9 @@ mod tests {
         ]);
 
         // Build parts_by_disk
-        let parts_by_disk: HashMap<String, Vec<PartInfo>> = HashMap::from([(
+        let parts_by_disk: BTreeMap<String, Vec<PartInfo>> = BTreeMap::from([(
             "nvme1".to_string(),
-            vec![PartInfo {
-                name: part_name.to_string(),
-                size: 1024,
-                backup_key: String::new(),
-                source: "uploaded".to_string(),
-                checksum_crc64: 12345,
-                s3_objects: None,
-            }],
+            vec![PartInfo::new(part_name, 1024, 12345)],
         )]);
 
         // Build part_to_disk reverse map (same logic as try_attach_table_mode)
