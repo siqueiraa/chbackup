@@ -21,24 +21,39 @@ pub struct PartSortKey {
 impl PartSortKey {
     /// Parse a part name into a sort key.
     ///
-    /// Part name format: `{partition}_{min_block}_{max_block}_{level}`
-    /// Since the partition may contain underscores, we split from the right:
-    /// - Last segment = level
-    /// - Second-to-last = max_block
-    /// - Third-to-last = min_block
-    /// - Everything before that = partition
+    /// ClickHouse part names have two formats:
+    /// - 4-component: `{partition}_{min_block}_{max_block}_{level}`
+    /// - 5-component: `{partition}_{min_block}_{max_block}_{level}_{data_version}`
+    ///
+    /// The 5-component format appears after mutations or restores increment
+    /// the data version. We try 5-component first (all 4 trailing segments
+    /// must be numeric), then fall back to 4-component.
     pub fn from_part_name(name: &str) -> Option<Self> {
-        let segments: Vec<&str> = name.rsplitn(4, '_').collect();
-        // segments[0] = level, segments[1] = max_block, segments[2] = min_block, segments[3] = partition
-        if segments.len() < 4 {
-            return None;
+        // Try 5-component: {partition}_{min}_{max}_{level}_{data_version}
+        let seg5: Vec<&str> = name.rsplitn(5, '_').collect();
+        if seg5.len() == 5 {
+            if let (Ok(_), Ok(_), Ok(_), Ok(min_block)) = (
+                seg5[0].parse::<u64>(),
+                seg5[1].parse::<u64>(),
+                seg5[2].parse::<u64>(),
+                seg5[3].parse::<u64>(),
+            ) {
+                return Some(PartSortKey {
+                    partition: seg5[4].to_string(),
+                    min_block,
+                });
+            }
         }
 
-        let min_block = segments[2].parse::<u64>().ok()?;
-        let partition = segments[3].to_string();
+        // Fallback: 4-component {partition}_{min}_{max}_{level}
+        let seg4: Vec<&str> = name.rsplitn(4, '_').collect();
+        if seg4.len() < 4 {
+            return None;
+        }
+        let min_block = seg4[2].parse::<u64>().ok()?;
 
         Some(PartSortKey {
-            partition,
+            partition: seg4[3].to_string(),
             min_block,
         })
     }
@@ -103,10 +118,26 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_part_name_with_underscores_in_partition() {
-        // Partition "2024_01" (custom partitioning with underscore)
-        let key = PartSortKey::from_part_name("2024_01_1_50_3").unwrap();
-        assert_eq!(key.partition, "2024_01");
+    fn test_parse_part_name_5_component() {
+        // 5-component format: {partition}_{min}_{max}_{level}_{data_version}
+        let key = PartSortKey::from_part_name("202401_0_0_0_2").unwrap();
+        assert_eq!(key.partition, "202401");
+        assert_eq!(key.min_block, 0);
+
+        let key = PartSortKey::from_part_name("202401_1_1_0_8").unwrap();
+        assert_eq!(key.partition, "202401");
+        assert_eq!(key.min_block, 1);
+
+        let key = PartSortKey::from_part_name("202403_5_5_0_7").unwrap();
+        assert_eq!(key.partition, "202403");
+        assert_eq!(key.min_block, 5);
+    }
+
+    #[test]
+    fn test_parse_part_name_5_component_all_partition() {
+        // 5-component with "all" partition
+        let key = PartSortKey::from_part_name("all_1_1_0_3").unwrap();
+        assert_eq!(key.partition, "all");
         assert_eq!(key.min_block, 1);
     }
 
@@ -153,6 +184,23 @@ mod tests {
         assert_eq!(sorted[0].name, "202401_1_50_3");
         assert_eq!(sorted[1].name, "202401_50_100_1");
         assert_eq!(sorted[2].name, "202401_100_200_2");
+    }
+
+    #[test]
+    fn test_sort_parts_mixed_4_and_5_component() {
+        let parts = vec![
+            make_part("202402_1_1_0_3"),
+            make_part("202401_0_0_0"),
+            make_part("202401_1_1_0_8"),
+            make_part("202402_2_5_0"),
+        ];
+
+        let sorted = sort_parts_by_min_block(&parts);
+
+        assert_eq!(sorted[0].name, "202401_0_0_0");
+        assert_eq!(sorted[1].name, "202401_1_1_0_8");
+        assert_eq!(sorted[2].name, "202402_1_1_0_3");
+        assert_eq!(sorted[3].name, "202402_2_5_0");
     }
 
     #[test]
