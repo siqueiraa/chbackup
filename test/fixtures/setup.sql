@@ -59,3 +59,43 @@ INSERT INTO default.events VALUES
     ('2024-01-20', 2, 'purchase', '{"item": "widget"}'),
     ('2024-02-05', 3, 'click', '{"page": "/about"}'),
     ('2024-02-10', 4, 'signup', '{"source": "organic"}');
+
+-- S3-backed MergeTree with date partitioning (T11: S3 object disk backup/restore)
+CREATE TABLE IF NOT EXISTS default.s3_orders
+(
+    order_date Date,
+    order_id   UInt64,
+    customer   String,
+    amount     Float64,
+    status     String
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(order_date)
+ORDER BY (customer, order_id)
+SETTINGS storage_policy = 's3_policy';
+
+INSERT INTO default.s3_orders VALUES
+    ('2024-01-05', 1, 'alice', 99.50, 'completed'),
+    ('2024-01-15', 2, 'bob', 150.00, 'completed'),
+    ('2024-02-01', 3, 'carol', 75.25, 'pending'),
+    ('2024-02-20', 4, 'alice', 200.00, 'completed');
+
+-- S3-backed ReplicatedMergeTree (T11: replicated S3 disk backup/restore)
+CREATE TABLE IF NOT EXISTS default.s3_metrics
+(
+    metric_date Date,
+    metric_id   UInt64,
+    name        String,
+    value       Float64,
+    tags        String
+)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/default/s3_metrics', '{replica}')
+PARTITION BY toYYYYMM(metric_date)
+ORDER BY (name, metric_id)
+SETTINGS storage_policy = 's3_policy';
+
+INSERT INTO default.s3_metrics VALUES
+    ('2024-01-01', 1, 'cpu_usage', 45.2, '{"host":"srv1"}'),
+    ('2024-01-15', 2, 'mem_usage', 72.8, '{"host":"srv1"}'),
+    ('2024-02-01', 3, 'cpu_usage', 38.5, '{"host":"srv2"}'),
+    ('2024-02-15', 4, 'disk_io', 91.0, '{"host":"srv2"}');

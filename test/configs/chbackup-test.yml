@@ -18,7 +18,7 @@ general:
 
 clickhouse:
   host: localhost
-  port: 9000
+  port: 8123
   username: default
   password: ''
   data_path: /var/lib/clickhouse

@@ -38,3 +38,23 @@ SELECT
     arrayElement(['click', 'view', 'purchase', 'signup'], toUInt8(number % 4) + 1) AS event_type,
     concat('{"page":"/', toString(number % 100), '"}') AS payload
 FROM numbers(5000);
+
+-- default.s3_orders -- 3000 deterministic rows on S3 disk, across Jan-Mar 2024
+INSERT INTO default.s3_orders
+SELECT
+    toDate('2024-01-01') + toUInt32(number % 90) AS order_date,
+    number + 100 AS order_id,
+    arrayElement(['alice', 'bob', 'carol', 'dave'], toUInt8(number % 4) + 1) AS customer,
+    toFloat64(10 + (number % 500)) + toFloat64(number % 100) / 100.0 AS amount,
+    arrayElement(['completed', 'pending', 'cancelled'], toUInt8(number % 3) + 1) AS status
+FROM numbers(3000);
+
+-- default.s3_metrics -- 2000 deterministic rows on S3 disk, across Jan-Feb 2024
+INSERT INTO default.s3_metrics
+SELECT
+    toDate('2024-01-01') + toUInt32(number % 60) AS metric_date,
+    number + 100 AS metric_id,
+    arrayElement(['cpu_usage', 'mem_usage', 'disk_io', 'net_rx'], toUInt8(number % 4) + 1) AS name,
+    toFloat64(number % 100) + toFloat64(number % 10) / 10.0 AS value,
+    concat('{"host":"srv', toString(number % 5), '"}') AS tags
+FROM numbers(2000);

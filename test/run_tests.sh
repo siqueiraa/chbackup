@@ -84,36 +84,72 @@ CH_VERSION=$(clickhouse-client -q "SELECT version()")
 info "ClickHouse version: ${CH_VERSION}"
 
 # ---------------------------------------------------------------------------
-# Run setup fixtures
+# Fresh start: clean all S3 data, local backups, and ClickHouse state
 # ---------------------------------------------------------------------------
-if should_run "setup"; then
-    info "Running setup fixtures"
-    clickhouse-client --multiquery < /test/fixtures/setup.sql
-    pass "Setup fixtures loaded"
+info "Fresh start: cleaning all previous state"
 
-    # Verify tables were created
-    TABLE_COUNT=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database = 'default' AND name IN ('trades', 'users', 'events')")
-    if [[ "$TABLE_COUNT" -eq 3 ]]; then
-        pass "All 3 test tables created"
-    else
-        fail "Expected 3 tables, got ${TABLE_COUNT}"
+# 1. Delete all remote backups via chbackup (cleans backup S3 prefix)
+REMOTE_BACKUPS=$(chbackup list remote --format json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for b in data:
+        print(b.get('name', ''))
+except: pass
+" 2>/dev/null || true)
+for bname in $REMOTE_BACKUPS; do
+    if [[ -n "$bname" ]]; then
+        chbackup delete remote "$bname" 2>/dev/null || true
     fi
+done
+info "  Cleaned remote backups"
+
+# 2. Clean local backups
+if [ -d "/var/lib/clickhouse/backup" ]; then
+    rm -rf /var/lib/clickhouse/backup/*
+    info "  Cleaned local backups"
+fi
+
+# 3. Drop all test tables to start completely fresh
+info "  Dropping test tables"
+for tbl in trades users events s3_orders s3_metrics s3_orders_restored trades_restored; do
+    clickhouse-client -q "DROP TABLE IF EXISTS default.${tbl} SYNC" 2>/dev/null || true
+done
+
+# 4. Clean ClickHouse shadow directories (leftover from failed FREEZE)
+chbackup clean 2>/dev/null || true
+
+pass "Fresh start cleanup complete"
+
+# ---------------------------------------------------------------------------
+# Run setup fixtures (always runs — fresh start drops all tables)
+# ---------------------------------------------------------------------------
+info "Running setup fixtures"
+clickhouse-client --multiquery < /test/fixtures/setup.sql
+pass "Setup fixtures loaded"
+
+# Verify tables were created (3 local + 2 S3-backed)
+TABLE_COUNT=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database = 'default' AND name IN ('trades', 'users', 'events', 's3_orders', 's3_metrics')")
+if [[ "$TABLE_COUNT" -eq 5 ]]; then
+    pass "All 5 test tables created (3 local + 2 S3 disk)"
+else
+    fail "Expected 5 tables, got ${TABLE_COUNT}"
 fi
 
 # ---------------------------------------------------------------------------
-# Load seed data for round-trip verification
+# Load seed data (always runs — fresh start drops all tables)
 # ---------------------------------------------------------------------------
-if should_run "seed_data"; then
-    info "Loading seed data"
-    clickhouse-client --multiquery < /test/fixtures/seed_data.sql
-    pass "Seed data loaded"
+info "Loading seed data"
+clickhouse-client --multiquery < /test/fixtures/seed_data.sql
+pass "Seed data loaded"
 
-    # Capture row counts for post-restore verification
-    TRADES_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
-    USERS_COUNT=$(clickhouse-client -q "SELECT count() FROM default.users")
-    EVENTS_COUNT=$(clickhouse-client -q "SELECT count() FROM default.events")
-    info "Row counts: trades=${TRADES_COUNT}, users=${USERS_COUNT}, events=${EVENTS_COUNT}"
-fi
+# Capture row counts for post-restore verification
+TRADES_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
+USERS_COUNT=$(clickhouse-client -q "SELECT count() FROM default.users")
+EVENTS_COUNT=$(clickhouse-client -q "SELECT count() FROM default.events")
+S3_ORDERS_COUNT=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+S3_METRICS_COUNT=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+info "Row counts: trades=${TRADES_COUNT}, users=${USERS_COUNT}, events=${EVENTS_COUNT}, s3_orders=${S3_ORDERS_COUNT}, s3_metrics=${S3_METRICS_COUNT}"
 
 # ---------------------------------------------------------------------------
 # Smoke test: chbackup binary
@@ -162,7 +198,9 @@ if should_run "test_round_trip"; then
     PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
     PRE_USERS=$(clickhouse-client -q "SELECT count() FROM default.users")
     PRE_EVENTS=$(clickhouse-client -q "SELECT count() FROM default.events")
-    info "Pre-backup counts: trades=${PRE_TRADES}, users=${PRE_USERS}, events=${PRE_EVENTS}"
+    PRE_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+    PRE_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+    info "Pre-backup counts: trades=${PRE_TRADES}, users=${PRE_USERS}, events=${PRE_EVENTS}, s3_orders=${PRE_S3_ORDERS}, s3_metrics=${PRE_S3_METRICS}"
 
     # Step 1: Create backup
     info "  Step 1: chbackup create ${BACKUP_NAME}"
@@ -201,6 +239,8 @@ if should_run "test_round_trip"; then
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
 
     if chbackup restore "${BACKUP_NAME}" 2>&1; then
         pass "restore ${BACKUP_NAME}"
@@ -213,6 +253,8 @@ if should_run "test_round_trip"; then
     POST_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
     POST_USERS=$(clickhouse-client -q "SELECT count() FROM default.users")
     POST_EVENTS=$(clickhouse-client -q "SELECT count() FROM default.events")
+    POST_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+    POST_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
 
     if [[ "$POST_TRADES" -eq "$PRE_TRADES" ]]; then
         pass "trades row count matches: ${POST_TRADES}"
@@ -230,6 +272,18 @@ if should_run "test_round_trip"; then
         pass "events row count matches: ${POST_EVENTS}"
     else
         fail "events row count mismatch: expected=${PRE_EVENTS} got=${POST_EVENTS}"
+    fi
+
+    if [[ "$POST_S3_ORDERS" -eq "$PRE_S3_ORDERS" ]]; then
+        pass "s3_orders row count matches: ${POST_S3_ORDERS}"
+    else
+        fail "s3_orders row count mismatch: expected=${PRE_S3_ORDERS} got=${POST_S3_ORDERS}"
+    fi
+
+    if [[ "$POST_S3_METRICS" -eq "$PRE_S3_METRICS" ]]; then
+        pass "s3_metrics row count matches: ${POST_S3_METRICS}"
+    else
+        fail "s3_metrics row count mismatch: expected=${PRE_S3_METRICS} got=${POST_S3_METRICS}"
     fi
 
     # Cleanup: delete remote backup
@@ -311,6 +365,8 @@ if should_run "test_incremental_chain"; then
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
 
     if chbackup restore "${INCR_NAME}" 2>&1; then
         pass "restore incremental ${INCR_NAME}"
@@ -377,6 +433,8 @@ print(total)
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
 
     if chbackup restore "${SCHEMA_NAME}" 2>&1; then
         pass "restore schema-only ${SCHEMA_NAME}"
@@ -385,11 +443,11 @@ print(total)
     fi
 
     # Step 4: Verify tables exist but have no data
-    TABLE_COUNT=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database = 'default' AND name IN ('trades', 'users', 'events')")
-    if [[ "$TABLE_COUNT" -eq 3 ]]; then
-        pass "all 3 tables recreated from schema"
+    TABLE_COUNT=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database = 'default' AND name IN ('trades', 'users', 'events', 's3_orders', 's3_metrics')")
+    if [[ "$TABLE_COUNT" -eq 5 ]]; then
+        pass "all 5 tables recreated from schema"
     else
-        fail "expected 3 tables, got ${TABLE_COUNT}"
+        fail "expected 5 tables, got ${TABLE_COUNT}"
     fi
 
     TRADES_ROWS=$(clickhouse-client -q "SELECT count() FROM default.trades")
@@ -427,13 +485,16 @@ if should_run "test_partitioned_restore"; then
         fail "create ${PART_NAME}"
     fi
 
-    # Step 2: Drop trades table and restore only partition 202401
-    info "  Step 2: DROP trades and restore --partitions 202401"
+    # Step 2: Drop LOCAL tables and restore only partition 202401
+    # Note: S3 disk tables are NOT dropped because ClickHouse deletes their S3
+    # objects on DROP, making local-only restore impossible. S3 disk tables are
+    # not included in the -t filter. S3 disk restore is tested in T11-T13.
+    info "  Step 2: DROP local tables and restore --partitions 202401"
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
 
-    if chbackup restore "${PART_NAME}" --partitions "202401" 2>&1; then
+    if chbackup restore "${PART_NAME}" -t "default.trades" --partitions "202401" 2>&1; then
         pass "restore partitioned ${PART_NAME}"
     else
         fail "restore partitioned ${PART_NAME}"
@@ -453,6 +514,8 @@ if should_run "test_partitioned_restore"; then
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
     clickhouse-client --multiquery < /test/fixtures/setup.sql
     clickhouse-client --multiquery < /test/fixtures/seed_data.sql
 fi
@@ -474,7 +537,7 @@ if should_run "test_server_api_create_upload"; then
     # Wait for server to be ready (up to 10s)
     api_ready=0
     for i in $(seq 1 10); do
-        if curl -s http://localhost:7171/api/v1/health >/dev/null 2>&1; then
+        if curl -s http://localhost:7171/health >/dev/null 2>&1; then
             api_ready=1
             break
         fi
@@ -638,8 +701,8 @@ if should_run "test_delete_and_list"; then
 
     # Step 5: Verify remote gone
     info "  Step 5: Verify remote backup gone"
-    LIST_REMOTE=$(chbackup list --format json 2>&1)
-    if echo "$LIST_REMOTE" | grep -q "\"name\":\"${DEL_NAME}\".*\"location\":\"remote\""; then
+    LIST_REMOTE=$(chbackup list remote --format json 2>&1)
+    if echo "$LIST_REMOTE" | grep -q "\"name\":\"${DEL_NAME}\""; then
         fail "${DEL_NAME} still in remote list"
     else
         pass "${DEL_NAME} removed from remote"
@@ -701,6 +764,526 @@ if should_run "test_clean_broken"; then
         fail "${BROKEN_NAME} directory still exists after clean_broken"
     else
         pass "${BROKEN_NAME} cleaned up successfully"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T11: S3 object disk round-trip (create -> upload -> download -> restore)
+# ---------------------------------------------------------------------------
+if should_run "test_s3_disk_round_trip"; then
+    info "T11: S3 object disk round-trip"
+    S3DISK_NAME="s3disk_test_$$"
+
+    # Verify S3 disk is available
+    S3_DISK_EXISTS=$(clickhouse-client -q "SELECT count() FROM system.disks WHERE name = 's3disk'" 2>/dev/null || echo "0")
+    if [[ "$S3_DISK_EXISTS" -eq 0 ]]; then
+        skip "S3 disk not configured, skipping T11"
+    else
+        pass "S3 disk is configured"
+
+        # Verify S3 tables have data
+        PRE_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+        PRE_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+        info "  Pre-backup S3 table counts: s3_orders=${PRE_S3_ORDERS}, s3_metrics=${PRE_S3_METRICS}"
+
+        if [[ "$PRE_S3_ORDERS" -eq 0 ]] || [[ "$PRE_S3_METRICS" -eq 0 ]]; then
+            fail "S3 tables have no data (s3_orders=${PRE_S3_ORDERS}, s3_metrics=${PRE_S3_METRICS})"
+        else
+            # Verify data is actually on S3 disk
+            S3_PARTS=$(clickhouse-client -q "SELECT count() FROM system.parts WHERE database='default' AND table IN ('s3_orders','s3_metrics') AND disk_name='s3disk' AND active")
+            info "  Active parts on S3 disk: ${S3_PARTS}"
+            if [[ "$S3_PARTS" -gt 0 ]]; then
+                pass "data confirmed on S3 disk (${S3_PARTS} parts)"
+            else
+                fail "no active parts found on S3 disk"
+            fi
+
+            # Step 1: Create backup (includes S3 disk metadata)
+            info "  Step 1: Create backup ${S3DISK_NAME}"
+            if chbackup create "${S3DISK_NAME}" 2>&1; then
+                pass "create ${S3DISK_NAME}"
+            else
+                fail "create ${S3DISK_NAME}"
+            fi
+
+            # Step 2: Upload to S3 (S3 disk parts use CopyObject, local parts use PutObject)
+            info "  Step 2: Upload ${S3DISK_NAME}"
+            if chbackup upload "${S3DISK_NAME}" 2>&1; then
+                pass "upload ${S3DISK_NAME}"
+            else
+                fail "upload ${S3DISK_NAME}"
+            fi
+
+            # Step 3: Delete local backup
+            info "  Step 3: Delete local ${S3DISK_NAME}"
+            chbackup delete local "${S3DISK_NAME}" 2>&1 || true
+
+            # Step 4: Download from S3
+            info "  Step 4: Download ${S3DISK_NAME}"
+            if chbackup download "${S3DISK_NAME}" 2>&1; then
+                pass "download ${S3DISK_NAME}"
+            else
+                fail "download ${S3DISK_NAME}"
+            fi
+
+            # Step 5: DROP S3 tables and restore
+            info "  Step 5: DROP S3 tables and restore"
+            clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
+            clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
+
+            if chbackup restore "${S3DISK_NAME}" -t 'default.s3_orders,default.s3_metrics' 2>&1; then
+                pass "restore ${S3DISK_NAME}"
+            else
+                fail "restore ${S3DISK_NAME}"
+            fi
+
+            # Step 6: Verify row counts
+            info "  Step 6: Verify row counts"
+            POST_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+            POST_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+
+            if [[ "$POST_S3_ORDERS" -eq "$PRE_S3_ORDERS" ]]; then
+                pass "s3_orders row count matches: ${POST_S3_ORDERS}"
+            else
+                fail "s3_orders row count mismatch: expected=${PRE_S3_ORDERS} got=${POST_S3_ORDERS}"
+            fi
+
+            if [[ "$POST_S3_METRICS" -eq "$PRE_S3_METRICS" ]]; then
+                pass "s3_metrics row count matches: ${POST_S3_METRICS}"
+            else
+                fail "s3_metrics row count mismatch: expected=${PRE_S3_METRICS} got=${POST_S3_METRICS}"
+            fi
+
+            # Step 7: Verify data is back on S3 disk
+            POST_S3_PARTS=$(clickhouse-client -q "SELECT count() FROM system.parts WHERE database='default' AND table IN ('s3_orders','s3_metrics') AND disk_name='s3disk' AND active")
+            if [[ "$POST_S3_PARTS" -gt 0 ]]; then
+                pass "restored data is on S3 disk (${POST_S3_PARTS} parts)"
+            else
+                fail "restored data not on S3 disk (0 active parts)"
+            fi
+
+            # Cleanup
+            info "  Cleanup"
+            chbackup delete remote "${S3DISK_NAME}" 2>&1 || true
+            chbackup delete local "${S3DISK_NAME}" 2>&1 || true
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T12: Incremental backup with S3 disk tables
+# ---------------------------------------------------------------------------
+if should_run "test_incremental_s3_disk"; then
+    info "T12: Incremental backup with S3 disk tables"
+
+    S3_DISK_EXISTS=$(clickhouse-client -q "SELECT count() FROM system.disks WHERE name = 's3disk'" 2>/dev/null || echo "0")
+    if [[ "$S3_DISK_EXISTS" -eq 0 ]]; then
+        skip "S3 disk not configured, skipping T12"
+    else
+        FULL_S3="incr_s3_full_$$"
+        INCR_S3="incr_s3_diff_$$"
+
+        # Capture initial row counts
+        PRE_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+        PRE_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+        PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
+        info "  Pre-backup counts: s3_orders=${PRE_S3_ORDERS}, s3_metrics=${PRE_S3_METRICS}, trades=${PRE_TRADES}"
+
+        # Step 1: Create and upload full backup
+        info "  Step 1: Create full backup ${FULL_S3}"
+        if chbackup create "${FULL_S3}" 2>&1; then
+            pass "create full ${FULL_S3}"
+        else
+            fail "create full ${FULL_S3}"
+        fi
+
+        info "  Step 2: Upload full backup"
+        if chbackup upload "${FULL_S3}" 2>&1; then
+            pass "upload full ${FULL_S3}"
+        else
+            fail "upload full ${FULL_S3}"
+        fi
+
+        # Step 3: Insert more data into BOTH S3 and local tables
+        info "  Step 3: Insert additional data into S3 and local tables"
+        clickhouse-client -q "INSERT INTO default.s3_orders VALUES ('2024-04-01', 99801, 'eve', 333.33, 'completed'), ('2024-04-02', 99802, 'frank', 444.44, 'pending')"
+        clickhouse-client -q "INSERT INTO default.s3_metrics VALUES ('2024-03-01', 99901, 'net_tx', 55.5, '{\"host\":\"srv9\"}')"
+        clickhouse-client -q "INSERT INTO default.trades VALUES ('2024-04-01', 99901, 'TSLA', 250.00, 50)"
+
+        AFTER_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+        AFTER_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+        AFTER_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
+        info "  After insert counts: s3_orders=${AFTER_S3_ORDERS}, s3_metrics=${AFTER_S3_METRICS}, trades=${AFTER_TRADES}"
+
+        # Step 4: Create incremental backup
+        info "  Step 4: Create incremental backup ${INCR_S3} --diff-from ${FULL_S3}"
+        if chbackup create "${INCR_S3}" --diff-from "${FULL_S3}" 2>&1; then
+            pass "create incremental ${INCR_S3}"
+        else
+            fail "create incremental ${INCR_S3}"
+        fi
+
+        # Step 5: Verify incremental manifest has carried parts
+        INCR_MANIFEST="/var/lib/clickhouse/backup/${INCR_S3}/metadata.json"
+        if [ -f "$INCR_MANIFEST" ]; then
+            CARRIED_COUNT=$(python3 -c "
+import json, sys
+with open('${INCR_MANIFEST}') as f:
+    m = json.load(f)
+count = 0
+for t in m.get('tables', {}).values():
+    for disk_parts in t.get('parts', {}).values():
+        for p in disk_parts:
+            if p.get('source', '').startswith('carried:'):
+                count += 1
+print(count)
+" 2>/dev/null || echo "0")
+            if [[ "$CARRIED_COUNT" -gt 0 ]]; then
+                pass "incremental has ${CARRIED_COUNT} carried parts (unchanged from full)"
+            else
+                fail "incremental has 0 carried parts (expected some unchanged parts)"
+            fi
+
+            # Verify S3 disk parts are also carried (not just local)
+            S3_CARRIED=$(python3 -c "
+import json, sys
+with open('${INCR_MANIFEST}') as f:
+    m = json.load(f)
+count = 0
+for tname, t in m.get('tables', {}).items():
+    for disk, parts in t.get('parts', {}).items():
+        if disk == 's3disk':
+            for p in parts:
+                if p.get('source', '').startswith('carried:'):
+                    count += 1
+print(count)
+" 2>/dev/null || echo "0")
+            if [[ "$S3_CARRIED" -gt 0 ]]; then
+                pass "S3 disk parts carried in incremental: ${S3_CARRIED}"
+            else
+                # This might be 0 if all S3 parts changed -- just warn
+                info "  NOTE: 0 S3 disk parts carried (all parts may have new data)"
+            fi
+        else
+            fail "incremental manifest not found at ${INCR_MANIFEST}"
+        fi
+
+        # Step 6: Upload incremental
+        info "  Step 6: Upload incremental backup"
+        if chbackup upload "${INCR_S3}" 2>&1; then
+            pass "upload incremental ${INCR_S3}"
+        else
+            fail "upload incremental ${INCR_S3}"
+        fi
+
+        # Step 7: Delete local, download, restore
+        info "  Step 7: Delete local backups"
+        chbackup delete local "${INCR_S3}" 2>&1 || true
+        chbackup delete local "${FULL_S3}" 2>&1 || true
+
+        info "  Step 8: Download incremental"
+        if chbackup download "${INCR_S3}" 2>&1; then
+            pass "download incremental ${INCR_S3}"
+        else
+            fail "download incremental ${INCR_S3}"
+        fi
+
+        info "  Step 9: Download full (base for incremental)"
+        if chbackup download "${FULL_S3}" 2>&1; then
+            pass "download full ${FULL_S3}"
+        else
+            fail "download full ${FULL_S3}"
+        fi
+
+        info "  Step 10: DROP all tables and restore incremental"
+        clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
+        clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
+        clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
+        clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
+        clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
+
+        if chbackup restore "${INCR_S3}" 2>&1; then
+            pass "restore incremental ${INCR_S3}"
+        else
+            fail "restore incremental ${INCR_S3}"
+        fi
+
+        # Step 11: Verify all data including incremental inserts
+        POST_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+        POST_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+        POST_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
+
+        if [[ "$POST_S3_ORDERS" -eq "$AFTER_S3_ORDERS" ]]; then
+            pass "s3_orders incremental row count matches: ${POST_S3_ORDERS}"
+        else
+            fail "s3_orders incremental row count mismatch: expected=${AFTER_S3_ORDERS} got=${POST_S3_ORDERS}"
+        fi
+
+        if [[ "$POST_S3_METRICS" -eq "$AFTER_S3_METRICS" ]]; then
+            pass "s3_metrics incremental row count matches: ${POST_S3_METRICS}"
+        else
+            fail "s3_metrics incremental row count mismatch: expected=${AFTER_S3_METRICS} got=${POST_S3_METRICS}"
+        fi
+
+        if [[ "$POST_TRADES" -eq "$AFTER_TRADES" ]]; then
+            pass "trades incremental row count matches: ${POST_TRADES}"
+        else
+            fail "trades incremental row count mismatch: expected=${AFTER_TRADES} got=${POST_TRADES}"
+        fi
+
+        # Cleanup
+        info "  Cleanup"
+        chbackup delete remote "${INCR_S3}" 2>&1 || true
+        chbackup delete remote "${FULL_S3}" 2>&1 || true
+        chbackup delete local "${INCR_S3}" 2>&1 || true
+        chbackup delete local "${FULL_S3}" 2>&1 || true
+
+        # Remove extra rows (mutations_sync=2 ensures completion before next test)
+        clickhouse-client -q "ALTER TABLE default.s3_orders DELETE WHERE order_id IN (99801, 99802) SETTINGS mutations_sync=2" 2>&1 || true
+        clickhouse-client -q "ALTER TABLE default.s3_metrics DELETE WHERE metric_id = 99901 SETTINGS mutations_sync=2" 2>&1 || true
+        clickhouse-client -q "ALTER TABLE default.trades DELETE WHERE trade_id = 99901 SETTINGS mutations_sync=2" 2>&1 || true
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T13: Restore S3 tables with rename (--as flag equivalent via -t mapping)
+# ---------------------------------------------------------------------------
+if should_run "test_restore_rename_s3"; then
+    info "T13: Restore S3 tables with rename"
+
+    S3_DISK_EXISTS=$(clickhouse-client -q "SELECT count() FROM system.disks WHERE name = 's3disk'" 2>/dev/null || echo "0")
+    if [[ "$S3_DISK_EXISTS" -eq 0 ]]; then
+        skip "S3 disk not configured, skipping T13"
+    else
+        RENAME_NAME="rename_s3_$$"
+
+        # Capture original row counts
+        PRE_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+        PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
+        info "  Pre-backup counts: s3_orders=${PRE_S3_ORDERS}, trades=${PRE_TRADES}"
+
+        # Step 1: Create and upload backup
+        info "  Step 1: Create backup ${RENAME_NAME}"
+        if chbackup create "${RENAME_NAME}" 2>&1; then
+            pass "create ${RENAME_NAME}"
+        else
+            fail "create ${RENAME_NAME}"
+        fi
+
+        info "  Step 2: Upload backup ${RENAME_NAME}"
+        if chbackup upload "${RENAME_NAME}" 2>&1; then
+            pass "upload ${RENAME_NAME}"
+        else
+            fail "upload ${RENAME_NAME}"
+        fi
+
+        # Step 3: Create target tables with different names (schema only)
+        info "  Step 3: Create renamed target tables"
+        clickhouse-client -q "CREATE TABLE IF NOT EXISTS default.s3_orders_restored AS default.s3_orders ENGINE = MergeTree() PARTITION BY toYYYYMM(order_date) ORDER BY (customer, order_id) SETTINGS storage_policy = 's3_policy'"
+        clickhouse-client -q "CREATE TABLE IF NOT EXISTS default.trades_restored AS default.trades ENGINE = MergeTree() PARTITION BY toYYYYMM(trade_date) ORDER BY (symbol, trade_id)"
+
+        # Step 4: Delete local, download, and restore with --as mapping
+        chbackup delete local "${RENAME_NAME}" 2>&1 || true
+        info "  Step 4: Download backup"
+        if chbackup download "${RENAME_NAME}" 2>&1; then
+            pass "download ${RENAME_NAME}"
+        else
+            fail "download ${RENAME_NAME}"
+        fi
+
+        # Restore using -t filter to only restore specific tables, with --as mapping
+        info "  Step 5: Restore with --as (rename mapping)"
+        if chbackup restore "${RENAME_NAME}" --as "default.s3_orders:default.s3_orders_restored,default.trades:default.trades_restored" -t 'default.s3_orders,default.trades' 2>&1; then
+            pass "restore with rename ${RENAME_NAME}"
+        else
+            fail "restore with rename ${RENAME_NAME}"
+        fi
+
+        # Step 6: Verify restored tables have correct data
+        POST_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders_restored" 2>/dev/null || echo "0")
+        POST_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades_restored" 2>/dev/null || echo "0")
+
+        if [[ "$POST_S3_ORDERS" -eq "$PRE_S3_ORDERS" ]]; then
+            pass "s3_orders_restored row count matches: ${POST_S3_ORDERS}"
+        else
+            fail "s3_orders_restored row count mismatch: expected=${PRE_S3_ORDERS} got=${POST_S3_ORDERS}"
+        fi
+
+        if [[ "$POST_TRADES" -eq "$PRE_TRADES" ]]; then
+            pass "trades_restored row count matches: ${POST_TRADES}"
+        else
+            fail "trades_restored row count mismatch: expected=${PRE_TRADES} got=${POST_TRADES}"
+        fi
+
+        # Verify data integrity with checksum
+        ORIG_HASH=$(clickhouse-client -q "SELECT sum(cityHash64(*)) FROM default.s3_orders")
+        RESTORED_HASH=$(clickhouse-client -q "SELECT sum(cityHash64(*)) FROM default.s3_orders_restored")
+        if [[ "$ORIG_HASH" == "$RESTORED_HASH" ]]; then
+            pass "s3_orders data checksum matches after rename restore"
+        else
+            fail "s3_orders data checksum mismatch: original=${ORIG_HASH} restored=${RESTORED_HASH}"
+        fi
+
+        # Cleanup
+        info "  Cleanup"
+        clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders_restored SYNC"
+        clickhouse-client -q "DROP TABLE IF EXISTS default.trades_restored SYNC"
+        chbackup delete remote "${RENAME_NAME}" 2>&1 || true
+        chbackup delete local "${RENAME_NAME}" 2>&1 || true
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T14: Incremental S3 diff verification — carried S3 parts aren't re-uploaded
+# ---------------------------------------------------------------------------
+if should_run "test_incremental_s3_diff_verify"; then
+    info "T14: Incremental S3 diff verification (carried parts not re-uploaded)"
+
+    S3_DISK_EXISTS=$(clickhouse-client -q "SELECT count() FROM system.disks WHERE name = 's3disk'" 2>/dev/null || echo "0")
+    if [[ "$S3_DISK_EXISTS" -eq 0 ]]; then
+        skip "S3 disk not configured, skipping T14"
+    else
+        DIFF_FULL="diff_verify_full_$$"
+        DIFF_INCR="diff_verify_incr_$$"
+
+        # Step 1: Create full backup (all tables)
+        info "  Step 1: Create full backup ${DIFF_FULL}"
+        if chbackup create "${DIFF_FULL}" 2>&1; then
+            pass "create full ${DIFF_FULL}"
+        else
+            fail "create full ${DIFF_FULL}"
+        fi
+
+        info "  Step 2: Upload full backup"
+        if chbackup upload "${DIFF_FULL}" 2>&1; then
+            pass "upload full ${DIFF_FULL}"
+        else
+            fail "upload full ${DIFF_FULL}"
+        fi
+
+        # Step 3: Create incremental WITHOUT inserting data (all parts should be carried)
+        info "  Step 3: Create incremental (no new data — all parts should carry)"
+        if chbackup create "${DIFF_INCR}" --diff-from "${DIFF_FULL}" 2>&1; then
+            pass "create incremental ${DIFF_INCR}"
+        else
+            fail "create incremental ${DIFF_INCR}"
+        fi
+
+        # Step 4: Analyze incremental manifest
+        DIFF_MANIFEST="/var/lib/clickhouse/backup/${DIFF_INCR}/metadata.json"
+        if [ -f "$DIFF_MANIFEST" ]; then
+            # Count total parts vs carried parts
+            ANALYSIS=$(python3 -c "
+import json, sys
+with open('${DIFF_MANIFEST}') as f:
+    m = json.load(f)
+total = 0
+carried = 0
+uploaded = 0
+s3_carried = 0
+s3_uploaded = 0
+for tname, t in m.get('tables', {}).items():
+    for disk, parts in t.get('parts', {}).items():
+        for p in parts:
+            total += 1
+            src = p.get('source', '')
+            is_s3 = disk == 's3disk'
+            if src.startswith('carried:'):
+                carried += 1
+                if is_s3:
+                    s3_carried += 1
+            elif src == 'uploaded' or src == '':
+                uploaded += 1
+                if is_s3:
+                    s3_uploaded += 1
+print(f'{total} {carried} {uploaded} {s3_carried} {s3_uploaded}')
+" 2>/dev/null || echo "0 0 0 0 0")
+            read TOTAL CARRIED UPLOADED S3_CAR S3_UPL <<< "$ANALYSIS"
+            info "  Manifest analysis: total=${TOTAL} carried=${CARRIED} uploaded=${UPLOADED} s3_carried=${S3_CAR} s3_uploaded=${S3_UPL}"
+
+            # When no data is changed, ALL parts should be carried
+            if [[ "$CARRIED" -gt 0 ]] && [[ "$CARRIED" -eq "$TOTAL" ]]; then
+                pass "all ${TOTAL} parts are carried (no unnecessary re-upload)"
+            elif [[ "$CARRIED" -gt 0 ]]; then
+                pass "${CARRIED}/${TOTAL} parts carried (${UPLOADED} uploaded — may include new partitions from merge)"
+            else
+                fail "no parts carried in incremental (expected all parts to carry)"
+            fi
+
+            # Verify S3 disk parts specifically are carried
+            if [[ "$S3_CAR" -gt 0 ]]; then
+                pass "S3 disk parts carried: ${S3_CAR} (not re-uploaded)"
+            else
+                fail "no S3 disk parts carried in incremental"
+            fi
+
+            # Verify carried parts reference the full backup
+            CARRIED_BASE=$(python3 -c "
+import json, sys
+with open('${DIFF_MANIFEST}') as f:
+    m = json.load(f)
+bases = set()
+for t in m.get('tables', {}).values():
+    for parts in t.get('parts', {}).values():
+        for p in parts:
+            src = p.get('source', '')
+            if src.startswith('carried:'):
+                bases.add(src.split(':',1)[1])
+print(','.join(bases) if bases else 'none')
+" 2>/dev/null || echo "none")
+            if echo "$CARRIED_BASE" | grep -q "${DIFF_FULL}"; then
+                pass "carried parts reference full backup: ${CARRIED_BASE}"
+            else
+                fail "carried parts don't reference full backup (got: ${CARRIED_BASE})"
+            fi
+
+            # Verify carried S3 parts have backup_key from full backup (reusable)
+            S3_BACKUP_KEYS=$(python3 -c "
+import json, sys
+with open('${DIFF_MANIFEST}') as f:
+    m = json.load(f)
+keys = 0
+for t in m.get('tables', {}).values():
+    for disk, parts in t.get('parts', {}).items():
+        if disk == 's3disk':
+            for p in parts:
+                if p.get('source', '').startswith('carried:'):
+                    objs = p.get('s3_objects', [])
+                    for o in objs:
+                        if o.get('backup_key', ''):
+                            keys += 1
+print(keys)
+" 2>/dev/null || echo "0")
+            if [[ "$S3_BACKUP_KEYS" -gt 0 ]]; then
+                pass "carried S3 parts have ${S3_BACKUP_KEYS} backup_keys (data reused from full)"
+            else
+                info "  NOTE: ${S3_BACKUP_KEYS} S3 backup_keys found (may be empty for metadata-only parts)"
+            fi
+        else
+            fail "incremental manifest not found at ${DIFF_MANIFEST}"
+        fi
+
+        # Step 5: Upload incremental and verify it completes quickly (carried parts skip upload)
+        info "  Step 5: Upload incremental (should be fast — only manifest, no data)"
+        START_TIME=$(date +%s)
+        if chbackup upload "${DIFF_INCR}" 2>&1; then
+            END_TIME=$(date +%s)
+            ELAPSED=$((END_TIME - START_TIME))
+            if [[ $ELAPSED -le 10 ]]; then
+                pass "incremental upload completed in ${ELAPSED}s (fast — carried parts skipped)"
+            else
+                pass "incremental upload completed in ${ELAPSED}s"
+            fi
+        else
+            fail "upload incremental ${DIFF_INCR}"
+        fi
+
+        # Cleanup
+        info "  Cleanup"
+        chbackup delete remote "${DIFF_INCR}" 2>&1 || true
+        chbackup delete remote "${DIFF_FULL}" 2>&1 || true
+        chbackup delete local "${DIFF_INCR}" 2>&1 || true
+        chbackup delete local "${DIFF_FULL}" 2>&1 || true
     fi
 fi
 

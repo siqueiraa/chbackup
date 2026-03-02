@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     jq \
     netcat-openbsd \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy pre-built static chbackup binary
