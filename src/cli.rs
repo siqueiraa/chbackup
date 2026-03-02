@@ -128,7 +128,7 @@ pub enum Command {
         #[arg(short = 't', long = "tables")]
         tables: Option<String>,
 
-        /// Rename single table: -t db.src --as=db.dst
+        /// Table rename: -t db.src --as=db.dst or --as=src:dst,src2:dst2
         #[arg(long = "as", name = "rename")]
         rename_as: Option<String>,
 
@@ -226,7 +226,7 @@ pub enum Command {
         #[arg(short = 't', long = "tables")]
         tables: Option<String>,
 
-        /// Rename single table: -t db.src --as=db.dst
+        /// Table rename: -t db.src --as=db.dst or --as=src:dst,src2:dst2
         #[arg(long = "as", name = "rename")]
         rename_as: Option<String>,
 

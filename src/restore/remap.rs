@@ -11,9 +11,11 @@ use tracing::info;
 /// Parsed remap configuration from CLI flags.
 #[derive(Debug, Clone)]
 pub struct RemapConfig {
-    /// Single table rename: (src_db, src_table, dst_db, dst_table).
-    /// Only set when `--as` flag is used together with `-t src_db.src_table`.
-    pub rename_as: Option<(String, String, String, String)>,
+    /// Table-level rename mappings: Vec of (src_db, src_table, dst_db, dst_table).
+    /// Supports two formats:
+    /// - Legacy single: `-t db.src --as db.dst`
+    /// - Multi-table: `--as "db.src:db.dst,db2.src2:db2.dst2"`
+    pub rename_as: Vec<(String, String, String, String)>,
     /// Database-level mapping: src_db -> dst_db.
     pub database_mapping: HashMap<String, String>,
     /// ZK path template from config (e.g. "/clickhouse/tables/{shard}/{database}/{table}").
@@ -23,8 +25,10 @@ pub struct RemapConfig {
 impl RemapConfig {
     /// Build a RemapConfig from CLI flags.
     ///
-    /// - `rename_as_str`: value of `--as` flag, e.g. "dst_db.dst_table"
-    /// - `table_pattern`: value of `-t` flag, e.g. "src_db.src_table" (required when `--as` is used)
+    /// - `rename_as_str`: value of `--as` flag. Supports two formats:
+    ///   - Legacy single-table: `"dst_db.dst_table"` (requires `-t src_db.src_table`)
+    ///   - Multi-table mapping: `"src_db.src:dst_db.dst,src_db2.src2:dst_db2.dst2"`
+    /// - `table_pattern`: value of `-t` flag, e.g. "src_db.src_table" (required for legacy format)
     /// - `db_mapping_str`: value of `-m` flag, e.g. "prod:staging,logs:logs_copy"
     /// - `default_replica_path`: from config.clickhouse.default_replica_path
     ///
@@ -37,55 +41,60 @@ impl RemapConfig {
     ) -> Result<Option<Self>> {
         let rename_as = match rename_as_str {
             Some(as_str) => {
-                // --as requires -t (single table pattern)
-                let pattern = match table_pattern {
-                    Some(p) => p,
-                    None => {
-                        bail!("--as flag requires -t flag to specify the source table (e.g. -t src_db.src_table --as dst_db.dst_table)");
-                    }
-                };
+                if as_str.contains(':') {
+                    // Multi-table format: "src_db.src:dst_db.dst[,src_db2.src2:dst_db2.dst2]"
+                    parse_table_mapping(as_str)?
+                } else {
+                    // Legacy single-table format: -t db.src --as db.dst
+                    let pattern = match table_pattern {
+                        Some(p) => p,
+                        None => {
+                            bail!("--as flag requires -t flag to specify the source table (e.g. -t src_db.src_table --as dst_db.dst_table), or use multi-table format: --as 'src_db.src:dst_db.dst'");
+                        }
+                    };
 
-                // Parse source from -t pattern
-                let (src_db, src_table) = match pattern.split_once('.') {
-                    Some((db, tbl)) => (db.to_string(), tbl.to_string()),
-                    None => {
+                    // Parse source from -t pattern
+                    let (src_db, src_table) = match pattern.split_once('.') {
+                        Some((db, tbl)) => (db.to_string(), tbl.to_string()),
+                        None => {
+                            bail!(
+                                "--as flag requires -t pattern in db.table format, got '{}'",
+                                pattern
+                            );
+                        }
+                    };
+
+                    // Validate -t is a single table (no wildcards)
+                    if src_table.contains('*')
+                        || src_table.contains('?')
+                        || src_db.contains('*')
+                        || src_db.contains('?')
+                    {
                         bail!(
-                            "--as flag requires -t pattern in db.table format, got '{}'",
+                            "--as flag requires -t to specify a single table (no wildcards), got '{}'",
                             pattern
                         );
                     }
-                };
 
-                // Validate -t is a single table (no wildcards)
-                if src_table.contains('*')
-                    || src_table.contains('?')
-                    || src_db.contains('*')
-                    || src_db.contains('?')
-                {
-                    bail!(
-                        "--as flag requires -t to specify a single table (no wildcards), got '{}'",
-                        pattern
+                    // Parse destination from --as value
+                    let (dst_db, dst_table) = match as_str.split_once('.') {
+                        Some((db, tbl)) => (db.to_string(), tbl.to_string()),
+                        None => {
+                            bail!("--as value must be in db.table format, got '{}'", as_str);
+                        }
+                    };
+
+                    info!(
+                        src = %format!("{}.{}", src_db, src_table),
+                        dst = %format!("{}.{}", dst_db, dst_table),
+                        "Remap: {}.{} -> {}.{}",
+                        src_db, src_table, dst_db, dst_table
                     );
+
+                    vec![(src_db, src_table, dst_db, dst_table)]
                 }
-
-                // Parse destination from --as value
-                let (dst_db, dst_table) = match as_str.split_once('.') {
-                    Some((db, tbl)) => (db.to_string(), tbl.to_string()),
-                    None => {
-                        bail!("--as value must be in db.table format, got '{}'", as_str);
-                    }
-                };
-
-                info!(
-                    src = %format!("{}.{}", src_db, src_table),
-                    dst = %format!("{}.{}", dst_db, dst_table),
-                    "Remap: {}.{} -> {}.{}",
-                    src_db, src_table, dst_db, dst_table
-                );
-
-                Some((src_db, src_table, dst_db, dst_table))
             }
-            None => None,
+            None => Vec::new(),
         };
 
         let database_mapping = match db_mapping_str {
@@ -105,7 +114,7 @@ impl RemapConfig {
         };
 
         // If nothing is active, return None
-        if rename_as.is_none() && database_mapping.is_empty() {
+        if rename_as.is_empty() && database_mapping.is_empty() {
             return Ok(None);
         }
 
@@ -118,7 +127,7 @@ impl RemapConfig {
 
     /// Returns true if any remap is configured.
     pub fn is_active(&self) -> bool {
-        self.rename_as.is_some() || !self.database_mapping.is_empty()
+        !self.rename_as.is_empty() || !self.database_mapping.is_empty()
     }
 
     /// Given an original "db.table" key, return the destination (db, table).
@@ -130,7 +139,7 @@ impl RemapConfig {
             .unwrap_or(("default", original_key));
 
         // Check --as rename first (exact match on src_db.src_table)
-        if let Some((src_db, src_table, dst_db, dst_table)) = &self.rename_as {
+        for (src_db, src_table, dst_db, dst_table) in &self.rename_as {
             if orig_db == src_db && orig_table == src_table {
                 return (dst_db.clone(), dst_table.clone());
             }
@@ -144,6 +153,63 @@ impl RemapConfig {
         // No mapping -- passthrough
         (orig_db.to_string(), orig_table.to_string())
     }
+}
+
+/// Parse multi-table mapping from `--as` value.
+///
+/// Format: `"src_db.src_table:dst_db.dst_table[,src_db2.src2:dst_db2.dst2]"`
+///
+/// Returns Vec of (src_db, src_table, dst_db, dst_table) tuples.
+fn parse_table_mapping(s: &str) -> Result<Vec<(String, String, String, String)>> {
+    let mut mappings = Vec::new();
+    for pair in s.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (src, dst) = match pair.split_once(':') {
+            Some((s, d)) => (s.trim(), d.trim()),
+            None => {
+                bail!(
+                    "Invalid table mapping '{}': expected format 'src_db.src_table:dst_db.dst_table'",
+                    pair
+                );
+            }
+        };
+        let (src_db, src_table) = match src.split_once('.') {
+            Some((db, tbl)) => (db.to_string(), tbl.to_string()),
+            None => {
+                bail!(
+                    "Invalid table mapping source '{}': expected db.table format",
+                    src
+                );
+            }
+        };
+        let (dst_db, dst_table) = match dst.split_once('.') {
+            Some((db, tbl)) => (db.to_string(), tbl.to_string()),
+            None => {
+                bail!(
+                    "Invalid table mapping destination '{}': expected db.table format",
+                    dst
+                );
+            }
+        };
+
+        info!(
+            src = %format!("{}.{}", src_db, src_table),
+            dst = %format!("{}.{}", dst_db, dst_table),
+            "Remap: {}.{} -> {}.{}",
+            src_db, src_table, dst_db, dst_table
+        );
+
+        mappings.push((src_db, src_table, dst_db, dst_table));
+    }
+
+    if mappings.is_empty() {
+        bail!("--as value is empty or contains no valid mappings");
+    }
+
+    Ok(mappings)
 }
 
 /// Parse "-m prod:staging,logs:logs_copy" into HashMap.
@@ -828,12 +894,45 @@ mod tests {
         assert!(config.is_active());
         assert_eq!(
             config.rename_as,
-            Some((
+            vec![(
                 "src_db".to_string(),
                 "src_table".to_string(),
                 "dst_db".to_string(),
                 "dst_table".to_string()
-            ))
+            )]
+        );
+    }
+
+    #[test]
+    fn test_remap_config_new_multi_table_mapping() {
+        let result = RemapConfig::new(
+            Some("default.src1:default.dst1,prod.src2:staging.dst2"),
+            Some("default.src1,prod.src2"),
+            None,
+            "/clickhouse/tables/{shard}/{database}/{table}",
+        )
+        .unwrap();
+        assert!(result.is_some());
+        let config = result.unwrap();
+        assert!(config.is_active());
+        assert_eq!(config.rename_as.len(), 2);
+        assert_eq!(
+            config.rename_as[0],
+            (
+                "default".to_string(),
+                "src1".to_string(),
+                "default".to_string(),
+                "dst1".to_string()
+            )
+        );
+        assert_eq!(
+            config.rename_as[1],
+            (
+                "prod".to_string(),
+                "src2".to_string(),
+                "staging".to_string(),
+                "dst2".to_string()
+            )
         );
     }
 
@@ -898,12 +997,12 @@ mod tests {
     #[test]
     fn test_remap_table_key_with_rename_as() {
         let config = RemapConfig {
-            rename_as: Some((
+            rename_as: vec![(
                 "src_db".to_string(),
                 "src_table".to_string(),
                 "dst_db".to_string(),
                 "dst_table".to_string(),
-            )),
+            )],
             database_mapping: HashMap::new(),
             default_replica_path: String::new(),
         };
@@ -919,7 +1018,7 @@ mod tests {
         mapping.insert("prod".to_string(), "staging".to_string());
 
         let config = RemapConfig {
-            rename_as: None,
+            rename_as: Vec::new(),
             database_mapping: mapping,
             default_replica_path: String::new(),
         };
@@ -932,7 +1031,7 @@ mod tests {
     #[test]
     fn test_remap_table_key_no_mapping() {
         let config = RemapConfig {
-            rename_as: None,
+            rename_as: Vec::new(),
             database_mapping: HashMap::new(),
             default_replica_path: String::new(),
         };
@@ -948,7 +1047,7 @@ mod tests {
         mapping.insert("prod".to_string(), "staging".to_string());
 
         let config = RemapConfig {
-            rename_as: None,
+            rename_as: Vec::new(),
             database_mapping: mapping,
             default_replica_path: String::new(),
         };
@@ -964,12 +1063,12 @@ mod tests {
         mapping.insert("src_db".to_string(), "mapped_db".to_string());
 
         let config = RemapConfig {
-            rename_as: Some((
+            rename_as: vec![(
                 "src_db".to_string(),
                 "src_table".to_string(),
                 "dst_db".to_string(),
                 "dst_table".to_string(),
-            )),
+            )],
             database_mapping: mapping,
             default_replica_path: String::new(),
         };
@@ -1515,7 +1614,7 @@ mod tests {
         mapping.insert("prod".to_string(), "staging".to_string());
 
         let config = RemapConfig {
-            rename_as: None,
+            rename_as: Vec::new(),
             database_mapping: mapping,
             default_replica_path: String::new(),
         };
