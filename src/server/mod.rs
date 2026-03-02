@@ -54,17 +54,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/list", get(routes::list_backups))
         // Backup operation endpoints
         .route("/api/v1/create", post(routes::create_backup))
-        .route("/api/v1/upload/{name}", post(routes::upload_backup))
-        .route("/api/v1/download/{name}", post(routes::download_backup))
-        .route("/api/v1/restore/{name}", post(routes::restore_backup))
+        .route("/api/v1/upload/:name", post(routes::upload_backup))
+        .route("/api/v1/download/:name", post(routes::download_backup))
+        .route("/api/v1/restore/:name", post(routes::restore_backup))
         .route("/api/v1/create_remote", post(routes::create_remote))
         .route(
-            "/api/v1/restore_remote/{name}",
+            "/api/v1/restore_remote/:name",
             post(routes::restore_remote),
         )
         // Delete endpoints
         .route(
-            "/api/v1/delete/{location}/{name}",
+            "/api/v1/delete/:location/:name",
             delete(routes::delete_backup),
         )
         // Clean endpoints
