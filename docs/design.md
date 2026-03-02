@@ -1824,7 +1824,7 @@ POST /api/v1/clean/remote_broken
 POST /api/v1/clean/local_broken
 POST /api/v1/kill                 (cancel running operation)
 POST /api/v1/reload               (re-read config file, equivalent to SIGHUP)
-POST /api/v1/restart              (close connections, re-bind socket, reload config)
+POST /api/v1/restart              (reload config from disk, reconnect ClickHouse/S3 clients, ping-gated atomic swap; does not rebind the TCP socket)
 
 # Watch mode
 POST /api/v1/watch/start  { "watch_interval": "1h", "full_interval": "24h" }

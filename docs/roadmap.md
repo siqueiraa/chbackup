@@ -137,12 +137,14 @@ S3 GetObject body → lz4_decoder → tar_extract → files on disk
 
 ### Tests
 
-Integration test using the all-in-one Docker container from §1.4:
-- T1: Create → upload → download → restore round-trip with checksum verification
+Integration test using the all-in-one Docker container from §1.4.
+Tests marked **(impl)** are in `test/run_tests.sh`; unmarked are aspirational future work.
+
+- T1: Create → upload → download → restore round-trip with checksum verification **(impl: `test_round_trip`)**
 - T3: Restore Mode B (safe ATTACH, table doesn't exist)
 - T21: Empty backup handling (allow_empty_backups true/false)
 - T22: Table dropped during FREEZE (error code 60/81 — ignore_not_exists)
-- Basic CRC64 checksum computation
+- Basic CRC64 checksum computation (covered by `test_round_trip`)
 
 ### Definition of done
 
@@ -223,24 +225,28 @@ clickhouse-client -q "SELECT count() FROM default.trades"
 | Broken backup detection | §8.4 | Scan for missing/corrupt `metadata.json`. Show `[BROKEN]` in list. |
 | Parts column check | §3.3 | Single batch query across all target tables. |
 | Disk space pre-flight | §4 | `system.disks` free_space minus CRC64-matched hardlink savings. |
-| ClickHouse TLS | §12 | `secure`, `skip_verify`, `tls_key`, `tls_cert`, `tls_ca`. Many production clusters require TLS. |
+| ClickHouse TLS | §12 | `secure` and `tls_ca` are fully supported. `skip_verify` and mutual TLS (`tls_cert`/`tls_key`) parse and log but have no effect because the `clickhouse-rs` HTTP client does not expose a direct cert/key API; TLS env-var wiring (SSL_CERT_FILE etc.) is attempted but not guaranteed to work across all deployments. |
 | Partition-level backup | §3.4 | `--partitions` flag: use `ALTER TABLE FREEZE PARTITION 'X'` per partition instead of whole-table FREEZE. |
 | Disk filtering | §12 | `skip_disks: []` and `skip_disk_types: []` — exclude cache/temporary disks from backup. |
 
 ### Tests
 
-Expand integration test suite:
+Expand integration test suite.
+Tests marked **(impl)** are in `test/run_tests.sh`; unmarked are aspirational future work.
+
 - T2: Multi-table parallel create + upload + download + restore
 - T4: Restore Mode A (`--rm` DROP first)
-- T5: Diff-from with CRC64 mismatch detection
+- T5: Diff-from with CRC64 mismatch detection (incremental chain: **(impl: `test_incremental_chain`)**)
 - T7-T8: Partition and table filtering
 - T9: Replicated tables + actual ZK path handling
 - T11: Crash recovery — kill mid-freeze, verify scopeguard UNFREEZE
 - T13: Large parts → multipart upload
 - T14: Space check with hardlink dedup
-- T15: Cross-version compatibility (backup on 24.3, restore on 24.8)
+- T15: Cross-version compatibility (backup on 24.3, restore on 24.8) (CI matrix provides this implicitly)
 - T23: ClickHouse TLS connection (self-signed cert)
-- T25: Partition-level backup + restore (--partitions flag)
+- T25: Partition-level backup + restore (--partitions flag) **(impl: `test_partitioned_restore`)**
+
+Additional implemented tests not tied to a roadmap T-number: `test_schema_only` (schema-only backup/restore), `test_backup_name_validation` (reserved name rejection).
 
 ### Definition of done
 
@@ -288,7 +294,7 @@ chbackup restore -t default.s3_table --as=default.s3_table_copy s3_test
 | Integration tables | §9.1 | On startup, CREATE `system.backup_list` and `system.backup_actions` as URL engine tables pointing at the local API. Lets operators query backup status and trigger operations from `clickhouse-client`. DROP on shutdown. Config: `create_integration_tables: true` (default). |
 | API authentication | §9 | Basic auth via `api.username` / `api.password`. When set, all endpoints require Authorization header. 401 on failure. |
 | API TLS | §9 | `api.secure: true` with certificate/key files. Required for non-localhost deployments. |
-| POST /restart | §9 | Close connections, re-bind socket, reload config. |
+| POST /restart | §9 | Reload config from disk, reconnect ClickHouse/S3 clients with ping gate, atomic ArcSwap. Does NOT rebind the TCP socket (axum holds the listener; socket rebind requires process restart). |
 | Auto-resume on restart | §9 | `complete_resumable_after_restart: true`. On startup, scan for `*.state.json`, queue resume ops. |
 | Allow parallel ops | §9 | `allow_parallel: false` (default). When true, concurrent operations on different backup names allowed. |
 | Integration tables host | §9.1 | `integration_tables_host` — DNS name for URL engine tables (K8s service name). |
@@ -355,8 +361,10 @@ Use `prometheus` crate. Expose via `GET /metrics`.
 
 ### Tests
 
-- T6: Retention/GC with self-contained manifest chain preservation
-- T10: API server concurrency + PID lock
+Tests marked **(impl)** are in `test/run_tests.sh`; unmarked are aspirational future work.
+
+- T6: Retention/GC with self-contained manifest chain preservation (delete + clean_broken: **(impl: `test_delete_and_list`, `test_clean_broken`)**; GC chain preservation not covered)
+- T10: API server concurrency + PID lock (basic API: **(impl: `test_server_api_create_upload`)**; concurrency/lock not covered)
 - T16: Watch mode — full + incremental cycle
 - T17: Watch mode — resume after restart
 - T18: Watch mode — error recovery (error → full fallback)
@@ -464,11 +472,13 @@ kill -HUP $(pidof chbackup)
 
 ### Tests
 
+All Phase 4 tests are aspirational future work. None are currently in `test/run_tests.sh`.
+
 - T9: Replicated tables + ZK path conflict (4d)
 - T12: Streaming engine postponed activation (4c)
 - T19: RBAC backup + restore round-trip (4e)
 - T20: ON CLUSTER restore — DDL propagates to all cluster nodes (4d)
-- T25: Partition-level backup + restore with --partitions (2d)
+- T25: Partition-level backup + restore with --partitions (2d) (already **(impl: `test_partitioned_restore`)** from Phase 2)
 - T28: Replicated Database Engine — no ON CLUSTER, UUID regeneration (4d)
 
 ### Design sections consumed: §5.5-5.7, §6, §16.4
