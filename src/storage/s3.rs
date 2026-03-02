@@ -85,6 +85,33 @@ macro_rules! apply_s3_object_options {
     }};
 }
 
+/// Parse an S3 URI like `s3://bucket/prefix/` into (bucket, prefix).
+///
+/// Returns `(bucket, prefix)`. If the URI does not match `s3://` format,
+/// returns the whole string as the prefix with an empty bucket.
+pub fn parse_s3_uri(uri: &str) -> (String, String) {
+    let stripped = uri
+        .strip_prefix("s3://")
+        .or_else(|| uri.strip_prefix("S3://"));
+
+    match stripped {
+        Some(rest) => {
+            let rest = rest.trim_end_matches('/');
+            if let Some(slash_pos) = rest.find('/') {
+                let bucket = rest[..slash_pos].to_string();
+                let prefix = rest[slash_pos + 1..].to_string();
+                (bucket, prefix)
+            } else {
+                (rest.to_string(), String::new())
+            }
+        }
+        None => {
+            // Not an S3 URI -- treat as a plain path prefix
+            (String::new(), uri.trim_end_matches('/').to_string())
+        }
+    }
+}
+
 /// Metadata about an S3 object returned by list operations.
 #[derive(Debug, Clone)]
 pub struct S3Object {
@@ -322,6 +349,23 @@ impl S3Client {
         }
         let prefix = self.prefix.trim_end_matches('/');
         format!("{}/{}", prefix, relative_key)
+    }
+
+    /// Create a clone of this client targeting a different bucket and prefix.
+    ///
+    /// Reuses the same underlying AWS SDK client (connection pool, credentials)
+    /// but overrides bucket and prefix. Useful when restoring S3 disk parts
+    /// that live in a different bucket/prefix than the backup.
+    pub fn with_bucket_and_prefix(&self, bucket: &str, prefix: &str) -> Self {
+        S3Client {
+            inner: self.inner.clone(),
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            storage_class: self.storage_class.clone(),
+            sse: self.sse.clone(),
+            sse_kms_key_id: self.sse_kms_key_id.clone(),
+            acl: self.acl.clone(),
+        }
     }
 
     // -- PUT operations --

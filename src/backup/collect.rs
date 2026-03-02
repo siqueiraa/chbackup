@@ -330,6 +330,25 @@ pub fn collect_parts(
                             "Collected S3 disk part metadata"
                         );
 
+                        // Stage S3 disk metadata files to per-disk backup dir so they
+                        // survive UNFREEZE and are available for upload (CopyObject needs
+                        // the metadata files alongside the S3 object references).
+                        let disk_path_trimmed = disk_path.trim_end_matches('/');
+                        let per_disk_dir = per_disk_backup_dir(disk_path_trimmed, backup_name);
+                        if logged_disks.insert(format!("{}:s3meta", &disk_name)) {
+                            info!(
+                                disk = %disk_name,
+                                path = %per_disk_dir.display(),
+                                "staging S3 disk metadata to per-disk backup dir"
+                            );
+                        }
+                        let staging_dir = per_disk_dir
+                            .join("shadow")
+                            .join(encode_path_component(&db))
+                            .join(encode_path_component(&table))
+                            .join(&part_name);
+                        hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
+
                         let part_info =
                             PartInfo::new(part_name, part_size, crc64)
                                 .with_s3_objects(s3_objects);
@@ -386,7 +405,7 @@ pub fn collect_parts(
 
 /// Parse metadata files in an S3 disk part directory to extract S3 object references.
 ///
-/// Reads all non-checksums.txt files in the part directory as metadata files,
+/// Reads all files in the part directory as metadata files,
 /// parses them using the object disk metadata parser, and builds a list of
 /// S3ObjectInfo entries. Returns the list and the total size of all objects.
 fn collect_s3_part_metadata(part_dir: &Path) -> Result<(Vec<S3ObjectInfo>, u64)> {
@@ -408,11 +427,6 @@ fn collect_s3_part_metadata(part_dir: &Path) -> Result<(Vec<S3ObjectInfo>, u64)>
                 continue;
             }
         };
-
-        // Skip checksums.txt -- it's the checksum file, not a metadata file
-        if file_name == "checksums.txt" {
-            continue;
-        }
 
         // Try to parse this file as object disk metadata
         let content = std::fs::read_to_string(entry.path())

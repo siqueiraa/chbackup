@@ -33,6 +33,7 @@ use crate::clickhouse::client::{freeze_name, ChClient, ColumnInconsistency, Tabl
 use crate::concurrency::effective_max_connections;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, DatabaseInfo, TableManifest};
+use crate::object_disk;
 use crate::table_filter::{is_engine_excluded, is_excluded, TableFilter};
 
 use self::collect::collect_parts;
@@ -153,13 +154,55 @@ pub async fn create(
         .collect();
     let disk_type_map: BTreeMap<String, String> = disks
         .iter()
-        .map(|d| (d.name.clone(), d.disk_type.clone()))
+        .map(|d| {
+            // Normalize disk type: CH 24.8+ reports "ObjectStorage" with a separate
+            // object_storage_type field. Map "ObjectStorage" with object_storage_type="S3"
+            // to "s3" for downstream is_s3_disk() compatibility.
+            let effective_type =
+                if d.disk_type.eq_ignore_ascii_case("objectstorage") && !d.object_storage_type.is_empty() {
+                    d.object_storage_type.to_ascii_lowercase()
+                } else {
+                    d.disk_type.clone()
+                };
+            (d.name.clone(), effective_type)
+        })
         .collect();
-    let disk_remote_paths: BTreeMap<String, String> = disks
+    let mut disk_remote_paths: BTreeMap<String, String> = disks
         .iter()
         .filter(|d| !d.remote_path.is_empty())
         .map(|d| (d.name.clone(), d.remote_path.clone()))
         .collect();
+
+    // If any S3 disks lack remote_path (CH 24.8 doesn't expose it in system.disks),
+    // try to discover endpoints from ClickHouse config files.
+    let s3_disks_without_remote: Vec<&str> = disks
+        .iter()
+        .filter(|d| {
+            let effective_type = disk_type_map.get(&d.name).map(|s| s.as_str()).unwrap_or("");
+            object_disk::is_s3_disk(effective_type) && !disk_remote_paths.contains_key(&d.name)
+        })
+        .map(|d| d.name.as_str())
+        .collect();
+
+    if !s3_disks_without_remote.is_empty() {
+        info!(
+            disks = ?s3_disks_without_remote,
+            "S3 disks without remote_path, discovering from ClickHouse config"
+        );
+        let discovered = crate::clickhouse::client::discover_s3_disk_endpoints(
+            &config.clickhouse.config_dir,
+        );
+        for disk_name in &s3_disks_without_remote {
+            if let Some(uri) = discovered.get(*disk_name) {
+                disk_remote_paths.insert(disk_name.to_string(), uri.clone());
+            } else {
+                warn!(
+                    disk = %disk_name,
+                    "Could not discover S3 endpoint for disk; CopyObject may fail"
+                );
+            }
+        }
+    }
 
     // 3. List all user tables
     let all_tables = ch.list_tables().await?;

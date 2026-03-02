@@ -276,9 +276,11 @@ pub fn serialize_metadata(metadata: &ObjectDiskMetadata) -> String {
 /// Check if a disk type represents an S3 object disk.
 ///
 /// Per design doc section 16.2, S3 object disks have type "s3" or
-/// "object_storage".
+/// "object_storage". ClickHouse 24.8+ reports the type as "ObjectStorage"
+/// (capitalized), so comparison is case-insensitive.
 pub fn is_s3_disk(disk_type: &str) -> bool {
-    disk_type == "s3" || disk_type == "object_storage"
+    let lower = disk_type.to_ascii_lowercase();
+    lower == "s3" || lower == "object_storage" || lower == "objectstorage"
 }
 
 #[cfg(test)]
@@ -512,10 +514,12 @@ mod tests {
     fn test_is_s3_disk() {
         assert!(is_s3_disk("s3"));
         assert!(is_s3_disk("object_storage"));
+        assert!(is_s3_disk("S3")); // case-insensitive
+        assert!(is_s3_disk("ObjectStorage")); // CH 24.8+ format
+        assert!(is_s3_disk("OBJECT_STORAGE")); // uppercase variant
         assert!(!is_s3_disk("local"));
         assert!(!is_s3_disk("cache"));
         assert!(!is_s3_disk(""));
-        assert!(!is_s3_disk("S3")); // case-sensitive
     }
 
     #[test]

@@ -40,7 +40,7 @@ use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, UploadState,
 };
 use crate::storage::s3::{calculate_chunk_size, RetryConfig};
-use crate::storage::S3Client;
+use crate::storage::{parse_s3_uri, S3Client};
 
 /// Multipart upload threshold: parts with compressed data larger than 32 MiB
 /// use multipart upload instead of a single PutObject.
@@ -70,33 +70,6 @@ fn s3_key_for_part(
         part_name,
         stream::archive_extension(data_format)
     )
-}
-
-/// Parse an S3 URI like `s3://bucket/prefix/` into (bucket, prefix).
-///
-/// Returns `(bucket, prefix)`. If the URI does not match `s3://` format,
-/// returns the whole string as the prefix with an empty bucket.
-fn parse_s3_uri(uri: &str) -> (String, String) {
-    let stripped = uri
-        .strip_prefix("s3://")
-        .or_else(|| uri.strip_prefix("S3://"));
-
-    match stripped {
-        Some(rest) => {
-            let rest = rest.trim_end_matches('/');
-            if let Some(slash_pos) = rest.find('/') {
-                let bucket = rest[..slash_pos].to_string();
-                let prefix = rest[slash_pos + 1..].to_string();
-                (bucket, prefix)
-            } else {
-                (rest.to_string(), String::new())
-            }
-        }
-        None => {
-            // Not an S3 URI -- treat as a plain path prefix
-            (String::new(), uri.trim_end_matches('/').to_string())
-        }
-    }
 }
 
 /// A work item for the parallel local upload queue.

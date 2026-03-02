@@ -24,7 +24,7 @@ use crate::manifest::PartInfo;
 use crate::object_disk::{is_s3_disk, parse_metadata, rewrite_metadata};
 use crate::path_encoding::encode_path_component;
 use crate::resume::{save_state_graceful, RestoreState};
-use crate::storage::S3Client;
+use crate::storage::{parse_s3_uri, S3Client};
 
 use super::sort::{needs_sequential_attach, sort_parts_by_min_block};
 
@@ -157,15 +157,22 @@ struct S3RestoreParams<'a> {
     source_db: &'a str,
     /// Original source table name for shadow path lookup.
     source_table: &'a str,
+    /// Disk name -> remote_path S3 URI for data disks (from DiskRow.remote_path).
+    disk_remote_paths: &'a BTreeMap<String, String>,
 }
 
 /// Restore S3 disk parts for a single table.
 ///
 /// For each S3 disk part:
 /// 1. Same-name optimization: ListObjectsV2 to check existing objects
-/// 2. CopyObject non-matching objects to UUID-derived paths
+/// 2. CopyObject from backup bucket to data disk bucket/prefix
 /// 3. Rewrite metadata files to point to new UUID paths
 /// 4. Write rewritten metadata to detached/{part_name}/
+///
+/// Key insight: the backup S3Client has the backup prefix (e.g., `chbackup/prefix/`),
+/// but restored objects must go to the ClickHouse data disk's S3 prefix (e.g.,
+/// `clickhouse-disks/`). We create a data-disk-targeted S3Client per disk to
+/// handle the prefix difference correctly.
 async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
     let s3 = p.s3;
     let db = p.db;
@@ -174,28 +181,10 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
     let allow_streaming = p.allow_streaming;
     let jitter_factor = p.jitter_factor;
 
-    // Same-name optimization: list existing objects at the UUID prefix
-    // This is a single ListObjectsV2 per table, not per-object HeadObject
-    let existing_objects = s3.list_objects(&uuid_prefix).await.unwrap_or_else(|e| {
-        debug!(
-            error = %e,
-            prefix = %uuid_prefix,
-            "Failed to list existing S3 objects for same-name optimization, will copy all"
-        );
-        Vec::new()
-    });
-
-    // Build lookup map: relative_key -> size for same-name optimization
-    let existing_map: HashMap<String, i64> = existing_objects
-        .into_iter()
-        .map(|obj| (obj.key, obj.size))
-        .collect();
-
     info!(
         db = %db,
         table = %table,
         uuid = %p.table_uuid,
-        existing_objects = existing_map.len(),
         "Restoring S3 disk parts"
     );
 
@@ -210,6 +199,9 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
+    // Backup S3 bucket (where CopyObject source lives)
+    let backup_bucket = s3.bucket().to_string();
+
     for (disk_name, parts) in p.parts_by_disk {
         let disk_type = p
             .disk_type_map
@@ -219,6 +211,60 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
         if !is_s3_disk(disk_type) {
             continue;
         }
+
+        // Parse the data disk's S3 URI to get its bucket and prefix.
+        // This tells us WHERE to write the restored objects (data disk location,
+        // not backup location).
+        let disk_remote_path = match p.disk_remote_paths.get(disk_name) {
+            Some(path) => path.clone(),
+            None => {
+                warn!(
+                    disk = %disk_name,
+                    "No remote_path found for S3 disk, cannot restore S3 disk parts"
+                );
+                continue;
+            }
+        };
+
+        let (data_bucket, data_prefix) = parse_s3_uri(&disk_remote_path);
+        if data_bucket.is_empty() {
+            warn!(
+                disk = %disk_name,
+                remote_path = %disk_remote_path,
+                "Failed to parse S3 URI from disk remote_path, cannot restore S3 disk parts"
+            );
+            continue;
+        }
+
+        // Create an S3Client targeting the data disk's bucket/prefix for destination
+        // operations. Reuses the backup S3Client's connection pool and credentials.
+        let data_s3 = s3.with_bucket_and_prefix(&data_bucket, &data_prefix);
+
+        // Same-name optimization: list existing objects at the UUID prefix in the DATA disk
+        let existing_objects = data_s3
+            .list_objects(&uuid_prefix)
+            .await
+            .unwrap_or_else(|e| {
+                debug!(
+                    error = %e,
+                    prefix = %uuid_prefix,
+                    "Failed to list existing S3 objects for same-name optimization, will copy all"
+                );
+                Vec::new()
+            });
+
+        let existing_map: HashMap<String, i64> = existing_objects
+            .into_iter()
+            .map(|obj| (obj.key, obj.size))
+            .collect();
+
+        debug!(
+            disk = %disk_name,
+            data_bucket = %data_bucket,
+            data_prefix = %data_prefix,
+            existing_objects = existing_map.len(),
+            "S3 disk restore: data disk target resolved"
+        );
 
         for part in parts {
             let s3_objects = match &part.s3_objects {
@@ -234,7 +280,6 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                 "S3 disk parts: CopyObject to UUID-isolated paths"
             );
 
-            // Collect copy tasks for this part
             let mut copy_handles = Vec::new();
 
             for s3_obj in s3_objects {
@@ -247,11 +292,20 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                     continue;
                 }
 
-                // Destination key: store/{uuid_hex[0..3]}/{uuid_with_dashes}/{relative_path}
+                // Destination key relative to data disk prefix:
+                // store/{uuid_hex[0..3]}/{uuid_with_dashes}/{relative_path}
                 let dest_key = format!("{}/{}", uuid_prefix, s3_obj.path);
 
-                // Same-name optimization: check if object already exists with matching size
-                let full_dest_key = s3.full_key(&dest_key);
+                debug!(
+                    s3_obj_path = %s3_obj.path,
+                    s3_obj_backup_key = %s3_obj.backup_key,
+                    dest_key = %dest_key,
+                    uuid_prefix = %uuid_prefix,
+                    "S3 disk CopyObject path details"
+                );
+
+                // Same-name optimization: check data disk for existing object
+                let full_dest_key = data_s3.full_key(&dest_key);
                 if let Some(&existing_size) = existing_map.get(&full_dest_key) {
                     if existing_size as u64 == s3_obj.size {
                         info!(
@@ -263,18 +317,18 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                     }
                 }
 
-                // Source: the backup_key where the object was stored during upload
-                let source_bucket = s3.bucket().to_string();
+                // Source: backup_key is relative to the backup S3 prefix.
+                // copy_object() needs the ABSOLUTE source key in the source bucket,
+                // so we prepend the backup prefix via s3.full_key().
                 let source_key = if s3_obj.backup_key.is_empty() {
-                    // Fallback: use the original object path
                     s3_obj.path.clone()
                 } else {
-                    // Use the backup key (includes the backup prefix)
-                    s3_obj.backup_key.clone()
+                    s3.full_key(&s3_obj.backup_key)
                 };
 
                 let sem = semaphore.clone();
-                let s3_clone = s3.clone();
+                let data_s3_clone = data_s3.clone();
+                let backup_bucket_clone = backup_bucket.clone();
 
                 let handle = tokio::spawn(async move {
                     let _permit = sem
@@ -282,9 +336,11 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                         .await
                         .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
 
-                    s3_clone
+                    // Copy from backup bucket (absolute source key) to data disk
+                    // bucket (dest_key relative to data disk prefix).
+                    data_s3_clone
                         .copy_object_with_retry_jitter(
-                            &source_bucket,
+                            &backup_bucket_clone,
                             &source_key,
                             &dest_key,
                             allow_streaming,
@@ -320,7 +376,7 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                 )
             })?;
 
-            let source_dir = resolve_shadow_part_path(
+            let resolved = resolve_shadow_part_path(
                 p.backup_dir,
                 p.manifest_disks,
                 backup_name,
@@ -330,8 +386,21 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                 p.source_db,
                 p.source_table,
                 &part.name,
-            )
-            .unwrap_or_else(|| {
+            );
+
+            debug!(
+                part = %part.name,
+                backup_dir = %p.backup_dir.display(),
+                backup_name = %backup_name,
+                disk_name = %disk_name,
+                url_src_db = %url_src_db,
+                url_src_table = %url_src_table,
+                resolved_path = ?resolved,
+                manifest_disks = ?p.manifest_disks,
+                "resolve_shadow_part_path for S3 disk metadata rewrite"
+            );
+
+            let source_dir = resolved.unwrap_or_else(|| {
                 // Fallback: legacy hardcoded path for backward compat
                 p.backup_dir
                     .join("shadow")
@@ -340,12 +409,23 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                     .join(&part.name)
             });
 
+            debug!(
+                source_dir = %source_dir.display(),
+                exists = source_dir.exists(),
+                "S3 disk metadata source directory"
+            );
+
             if source_dir.exists() {
                 // Walk all files in the source part directory
                 for entry in WalkDir::new(&source_dir).min_depth(1) {
                     let entry = entry.with_context(|| {
                         format!("Failed to read entry under: {}", source_dir.display())
                     })?;
+
+                    // Skip FREEZE artifacts that ClickHouse cannot parse
+                    if entry.file_name().to_string_lossy() == "frozen_metadata.txt" {
+                        continue;
+                    }
 
                     let relative = entry
                         .path()
@@ -366,6 +446,13 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
                             // Try to parse as object disk metadata and rewrite paths
                             match parse_metadata(&text) {
                                 Ok(metadata) => {
+                                    debug!(
+                                        file = %relative.display(),
+                                        objects = metadata.objects.len(),
+                                        first_path = %metadata.objects.first().map(|o| o.relative_path.as_str()).unwrap_or(""),
+                                        uuid_prefix = %uuid_prefix,
+                                        "Rewriting S3 disk metadata file"
+                                    );
                                     let rewritten = rewrite_metadata(&metadata, &uuid_prefix);
                                     std::fs::write(&dest_path, &rewritten).with_context(|| {
                                         format!(
@@ -420,16 +507,40 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
 /// metadata rewrite) before delegating to the internal attach logic.
 pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
     // Handle S3 disk parts first (CopyObject + metadata rewrite)
-    let has_s3_parts = params.s3_client.is_some()
-        && params.table_uuid.is_some()
-        && params.parts_by_disk.iter().any(|(disk_name, parts)| {
-            let disk_type = params
-                .disk_type_map
-                .get(disk_name)
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            is_s3_disk(disk_type) && parts.iter().any(|p| p.s3_objects.is_some())
-        });
+    let has_s3_client = params.s3_client.is_some();
+    let has_table_uuid = params.table_uuid.is_some();
+    let has_s3_disk_parts = params.parts_by_disk.iter().any(|(disk_name, parts)| {
+        let disk_type = params
+            .disk_type_map
+            .get(disk_name)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let is_s3 = is_s3_disk(disk_type);
+        let has_objs = parts.iter().any(|p| p.s3_objects.is_some());
+        debug!(
+            db = %params.db,
+            table = %params.table,
+            disk_name = %disk_name,
+            disk_type = %disk_type,
+            is_s3_disk = is_s3,
+            has_s3_objects = has_objs,
+            parts_count = parts.len(),
+            "S3 disk check for restore"
+        );
+        is_s3 && has_objs
+    });
+    let has_s3_parts = has_s3_client && has_table_uuid && has_s3_disk_parts;
+
+    debug!(
+        db = %params.db,
+        table = %params.table,
+        has_s3_client = has_s3_client,
+        has_table_uuid = has_table_uuid,
+        has_s3_disk_parts = has_s3_disk_parts,
+        has_s3_parts = has_s3_parts,
+        table_uuid = ?params.table_uuid,
+        "S3 parts detection result"
+    );
 
     if has_s3_parts {
         // On resume, check if ALL S3 disk parts are already attached.
@@ -479,6 +590,7 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
                 manifest_disks: &params.manifest_disks,
                 source_db: &params.source_db,
                 source_table: &params.source_table,
+                disk_remote_paths: &params.disk_remote_paths,
             };
             restore_s3_disk_parts(&s3_params).await?;
         }

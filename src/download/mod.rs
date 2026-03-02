@@ -650,11 +650,14 @@ pub async fn download(
                 let mut total_metadata_bytes = 0u64;
 
                 for obj in &metadata_objects {
-                    // Extract filename relative to the part prefix
+                    // Extract filename relative to the part prefix.
+                    // obj.key is the full S3 key; strip the S3 prefix first,
+                    // then the separator slash, then the metadata key prefix.
                     let relative_name = obj
                         .key
                         .strip_prefix(s3.prefix())
                         .unwrap_or(&obj.key)
+                        .trim_start_matches('/')
                         .strip_prefix(metadata_prefix)
                         .unwrap_or(&obj.key)
                         .trim_start_matches('/');

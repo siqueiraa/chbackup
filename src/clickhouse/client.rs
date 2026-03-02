@@ -54,6 +54,10 @@ pub struct DiskRow {
     /// Remote path for S3 disks (S3 URI or path prefix). Empty for local disks.
     #[serde(default)]
     pub remote_path: String,
+    /// Object storage type (e.g. "S3", "HDFS"). Available in CH 24.8+.
+    /// Empty for local disks or older CH versions without this column.
+    #[serde(default)]
+    pub object_storage_type: String,
 }
 
 /// Row from `system.parts` query -- active parts for a table.
@@ -503,20 +507,48 @@ impl ChClient {
     }
 
     /// Get disk information from system.disks.
+    ///
+    /// Tries progressively simpler queries to handle different CH versions:
+    /// 1. Full query with `remote_path` + `object_storage_type` (newer CH)
+    /// 2. Query with `object_storage_type` but no `remote_path` (CH 24.8+)
+    /// 3. Minimal query without either column (oldest supported CH)
     pub async fn get_disks(&self) -> Result<Vec<DiskRow>> {
-        let sql =
-            "SELECT name, path, type, ifNull(remote_path, '') as remote_path FROM system.disks";
+        // Try full query first (newest CH with remote_path)
+        let sql_full = "SELECT name, path, type, \
+                         ifNull(remote_path, '') as remote_path, \
+                         ifNull(object_storage_type, '') as object_storage_type \
+                         FROM system.disks";
+        self.log_sql(sql_full, "Executing get_disks");
 
-        self.log_sql(sql, "Executing get_disks");
+        if let Ok(rows) = self.inner.query(sql_full).fetch_all::<DiskRow>().await {
+            return Ok(rows);
+        }
 
-        let rows = self
+        // Try with object_storage_type but without remote_path (CH 24.8+)
+        let sql_no_remote = "SELECT name, path, type, \
+                              '' as remote_path, \
+                              ifNull(object_storage_type, '') as object_storage_type \
+                              FROM system.disks";
+        debug!("remote_path column not available, trying query with object_storage_type only");
+
+        if let Ok(rows) = self
             .inner
-            .query(sql)
+            .query(sql_no_remote)
             .fetch_all::<DiskRow>()
             .await
-            .context("Failed to get disks from system.disks")?;
+        {
+            return Ok(rows);
+        }
 
-        Ok(rows)
+        // Minimal fallback (oldest CH versions)
+        let sql_minimal =
+            "SELECT name, path, type, '' as remote_path, '' as object_storage_type FROM system.disks";
+        debug!("object_storage_type column not available, using minimal query");
+        self.inner
+            .query(sql_minimal)
+            .fetch_all::<DiskRow>()
+            .await
+            .context("Failed to get disks from system.disks")
     }
 
     /// Get ClickHouse macros from system.macros.
@@ -1514,6 +1546,214 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
     (list_ddl, actions_ddl)
 }
 
+/// Discover S3 disk endpoints by reading ClickHouse config files.
+///
+/// Scans XML files in `config_dir` and `config_dir/config.d/` for
+/// `<storage_configuration>` blocks and extracts `<endpoint>` for each
+/// S3 disk. Returns a map from disk name to S3 endpoint URL.
+///
+/// This is needed for CH versions (like 24.8) that don't expose
+/// `remote_path` in `system.disks`. The endpoint URL format is
+/// `https://s3.region.amazonaws.com/bucket/prefix/` which can be
+/// converted to an S3 URI `s3://bucket/prefix/` for CopyObject.
+pub fn discover_s3_disk_endpoints(
+    config_dir: &str,
+) -> std::collections::BTreeMap<String, String> {
+    use std::path::Path;
+
+    let mut endpoints: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+
+    let config_path = Path::new(config_dir);
+    let mut xml_files: Vec<std::path::PathBuf> = Vec::new();
+
+    // Collect XML files from config_dir and config_dir/config.d/
+    for dir in &[config_path.to_path_buf(), config_path.join("config.d")] {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "xml") {
+                    xml_files.push(path);
+                }
+            }
+        }
+    }
+
+    for xml_file in &xml_files {
+        let content = match std::fs::read_to_string(xml_file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Look for <storage_configuration> sections with S3 disk definitions
+        if !content.contains("<storage_configuration>") {
+            continue;
+        }
+
+        // Simple XML parsing: find disk definitions within <disks>...</disks>
+        // Extract disk name and endpoint for S3 disks.
+        if let Some(disks_section) = extract_xml_section(&content, "disks") {
+            parse_s3_disks_from_xml(&disks_section, &mut endpoints);
+        }
+    }
+
+    if !endpoints.is_empty() {
+        info!(
+            count = endpoints.len(),
+            disks = ?endpoints.keys().collect::<Vec<_>>(),
+            "Discovered S3 disk endpoints from ClickHouse config"
+        );
+    }
+
+    endpoints
+}
+
+/// Extract content between `<tag>` and `</tag>` (first occurrence).
+fn extract_xml_section(content: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = content.find(&open)? + open.len();
+    let end = content[start..].find(&close)? + start;
+    Some(content[start..end].to_string())
+}
+
+/// Parse S3 disk definitions from a `<disks>` XML section.
+///
+/// Looks for child elements that contain `<type>s3</type>` or
+/// `<type>object_storage</type>` and extracts their `<endpoint>` value.
+fn parse_s3_disks_from_xml(
+    disks_xml: &str,
+    endpoints: &mut std::collections::BTreeMap<String, String>,
+) {
+    // Find disk elements: look for patterns like <diskname>...</diskname>
+    // We scan for XML tags at the top level of the disks section.
+    let mut pos = 0;
+    while pos < disks_xml.len() {
+        // Find next opening tag
+        let tag_start = match disks_xml[pos..].find('<') {
+            Some(i) => pos + i,
+            None => break,
+        };
+
+        // Skip comments and processing instructions
+        if disks_xml[tag_start..].starts_with("<!--") {
+            if let Some(end) = disks_xml[tag_start..].find("-->") {
+                pos = tag_start + end + 3;
+                continue;
+            }
+            break;
+        }
+
+        // Extract tag name
+        let tag_name_start = tag_start + 1;
+        let tag_name_end = match disks_xml[tag_name_start..].find(|c: char| c == '>' || c.is_whitespace()) {
+            Some(i) => tag_name_start + i,
+            None => break,
+        };
+
+        // Skip closing tags
+        if disks_xml[tag_name_start..].starts_with('/') {
+            pos = tag_name_end + 1;
+            continue;
+        }
+
+        let disk_name = &disks_xml[tag_name_start..tag_name_end];
+
+        // Find the closing tag for this disk
+        let close_tag = format!("</{}>", disk_name);
+        let disk_content_start = match disks_xml[tag_name_end..].find('>') {
+            Some(i) => tag_name_end + i + 1,
+            None => break,
+        };
+        let disk_content_end = match disks_xml[disk_content_start..].find(&close_tag) {
+            Some(i) => disk_content_start + i,
+            None => {
+                pos = disk_content_start;
+                continue;
+            }
+        };
+
+        let disk_content = &disks_xml[disk_content_start..disk_content_end];
+
+        // Check if this is an S3 disk
+        let is_s3 = extract_xml_section(disk_content, "type")
+            .is_some_and(|t| {
+                let trimmed = t.trim().to_ascii_lowercase();
+                trimmed == "s3" || trimmed == "object_storage"
+            });
+
+        if is_s3 {
+            if let Some(endpoint) = extract_xml_section(disk_content, "endpoint") {
+                let endpoint = endpoint.trim().to_string();
+                if !endpoint.is_empty() {
+                    // Convert HTTP endpoint URL to S3 URI
+                    let s3_uri = endpoint_url_to_s3_uri(&endpoint);
+                    endpoints.insert(disk_name.to_string(), s3_uri);
+                }
+            }
+        }
+
+        pos = disk_content_end + close_tag.len();
+    }
+}
+
+/// Convert a ClickHouse S3 endpoint URL to an S3 URI.
+///
+/// Input formats:
+/// - `https://s3.region.amazonaws.com/bucket/prefix/` -> `s3://bucket/prefix/`
+/// - `https://bucket.s3.region.amazonaws.com/prefix/` -> `s3://bucket/prefix/`
+/// - `https://storage.googleapis.com/bucket/prefix/`  -> `s3://bucket/prefix/`
+/// - Any URL with path-style: extract bucket from first path component
+///
+/// Falls back to returning the original URL if parsing fails.
+fn endpoint_url_to_s3_uri(endpoint: &str) -> String {
+    // Strip scheme
+    let without_scheme = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(endpoint);
+
+    // Split host and path
+    let (host, path) = match without_scheme.find('/') {
+        Some(i) => (&without_scheme[..i], &without_scheme[i + 1..]),
+        None => return endpoint.to_string(),
+    };
+
+    // Path-style: https://s3.region.amazonaws.com/bucket/prefix/
+    // The bucket is the first path component, rest is prefix
+    if host.starts_with("s3.") || host.contains(".amazonaws.com") && !host.split('.').next().is_some_and(|first| first != "s3" && first.len() > 3) {
+        // Path-style URL
+        let (bucket, prefix) = match path.find('/') {
+            Some(i) => (&path[..i], &path[i + 1..]),
+            None => (path.trim_end_matches('/'), ""),
+        };
+        if prefix.is_empty() {
+            return format!("s3://{}/", bucket);
+        }
+        return format!("s3://{}/{}", bucket, prefix);
+    }
+
+    // Virtual-hosted-style: https://bucket.s3.region.amazonaws.com/prefix/
+    let parts: Vec<&str> = host.splitn(2, ".s3").collect();
+    if parts.len() == 2 {
+        let bucket = parts[0];
+        if path.is_empty() {
+            return format!("s3://{}/", bucket);
+        }
+        return format!("s3://{}/{}", bucket, path);
+    }
+
+    // Generic: treat first path segment as bucket
+    let (bucket, prefix) = match path.find('/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (path.trim_end_matches('/'), ""),
+    };
+    if prefix.is_empty() {
+        format!("s3://{}/", bucket)
+    } else {
+        format!("s3://{}/{}", bucket, prefix)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1646,6 +1886,7 @@ mod tests {
             path: "/var/lib/clickhouse/disks/s3".to_string(),
             disk_type: "s3".to_string(),
             remote_path: "s3://data-bucket/ch-data/".to_string(),
+            object_storage_type: "S3".to_string(),
         };
         assert_eq!(disk.remote_path, "s3://data-bucket/ch-data/");
 
@@ -1655,18 +1896,20 @@ mod tests {
             path: "/var/lib/clickhouse".to_string(),
             disk_type: "local".to_string(),
             remote_path: String::new(),
+            object_storage_type: String::new(),
         };
         assert!(local_disk.remote_path.is_empty());
     }
 
     #[test]
     fn test_disk_row_remote_path_serde_default() {
-        // Verify that remote_path defaults to empty string when missing from JSON
-        // This simulates older ClickHouse versions that may not have the column
+        // Verify that remote_path and object_storage_type default to empty string
+        // when missing from JSON. Simulates older CH versions without these columns.
         let json = r#"{"name":"default","path":"/var/lib/clickhouse","type":"local"}"#;
         let disk: DiskRow = serde_json::from_str(json).unwrap();
         assert_eq!(disk.name, "default");
         assert!(disk.remote_path.is_empty());
+        assert!(disk.object_storage_type.is_empty());
     }
 
     #[test]
@@ -2189,5 +2432,77 @@ mod tests {
         assert!(sql.contains("LIKE '%JSON%'"));
         assert!(sql.contains("('default', 'events')"));
         assert!(sql.contains("('logs', 'raw')"));
+    }
+
+    #[test]
+    fn test_endpoint_url_to_s3_uri_path_style() {
+        // Standard AWS path-style URL
+        let uri = endpoint_url_to_s3_uri("https://s3.eu-west-1.amazonaws.com/my-bucket/prefix/");
+        assert_eq!(uri, "s3://my-bucket/prefix/");
+    }
+
+    #[test]
+    fn test_endpoint_url_to_s3_uri_path_style_no_prefix() {
+        let uri = endpoint_url_to_s3_uri("https://s3.us-east-1.amazonaws.com/my-bucket/");
+        assert_eq!(uri, "s3://my-bucket/");
+    }
+
+    #[test]
+    fn test_endpoint_url_to_s3_uri_virtual_hosted() {
+        let uri = endpoint_url_to_s3_uri("https://my-bucket.s3.eu-west-1.amazonaws.com/prefix/");
+        assert_eq!(uri, "s3://my-bucket/prefix/");
+    }
+
+    #[test]
+    fn test_endpoint_url_to_s3_uri_virtual_hosted_no_prefix() {
+        let uri = endpoint_url_to_s3_uri("https://my-bucket.s3.amazonaws.com/");
+        assert_eq!(uri, "s3://my-bucket/");
+    }
+
+    #[test]
+    fn test_extract_xml_section() {
+        let xml = "<root><name>test</name><value>42</value></root>";
+        assert_eq!(
+            extract_xml_section(xml, "name"),
+            Some("test".to_string())
+        );
+        assert_eq!(
+            extract_xml_section(xml, "value"),
+            Some("42".to_string())
+        );
+        assert_eq!(extract_xml_section(xml, "missing"), None);
+    }
+
+    #[test]
+    fn test_parse_s3_disks_from_xml() {
+        let xml = r#"
+            <s3disk>
+                <type>s3</type>
+                <endpoint>https://s3.eu-west-1.amazonaws.com/my-bucket/ch-data/</endpoint>
+                <access_key_id>AKIA...</access_key_id>
+            </s3disk>
+            <default>
+                <type>local</type>
+                <path>/var/lib/clickhouse/</path>
+            </default>
+            <s3cold>
+                <type>object_storage</type>
+                <endpoint>https://s3.us-west-2.amazonaws.com/cold-bucket/archive/</endpoint>
+            </s3cold>
+        "#;
+
+        let mut endpoints = std::collections::BTreeMap::new();
+        parse_s3_disks_from_xml(xml, &mut endpoints);
+
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints["s3disk"], "s3://my-bucket/ch-data/");
+        assert_eq!(endpoints["s3cold"], "s3://cold-bucket/archive/");
+        assert!(!endpoints.contains_key("default"));
+    }
+
+    #[test]
+    fn test_discover_s3_disk_endpoints_nonexistent_dir() {
+        let result = discover_s3_disk_endpoints("/nonexistent/path");
+        assert!(result.is_empty());
     }
 }
