@@ -1,0 +1,76 @@
+# docker-compose.minio.yml -- ClickHouse + chbackup with MinIO (no AWS needed)
+#
+# Quick start:
+#   docker compose -f docker-compose.minio.yml up -d
+#
+# No AWS credentials required. MinIO console at http://localhost:9001
+# (login: minioadmin / minioadmin)
+#
+# Run backup commands:
+#   docker compose -f docker-compose.minio.yml exec chbackup chbackup create my-backup
+#   docker compose -f docker-compose.minio.yml exec chbackup chbackup upload my-backup
+#   docker compose -f docker-compose.minio.yml exec chbackup chbackup list
+#
+# See docs/docker.md for a full walkthrough.
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ports:
+      - "8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: clickhouse-client -q "SELECT 1"
+      interval: 2s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: mc ready local
+      interval: 2s
+      retries: 10
+
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb --ignore-existing local/clickhouse-backups;
+      "
+
+  chbackup:
+    image: ghcr.io/user/chbackup:latest
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      S3_BUCKET: clickhouse-backups
+      S3_ENDPOINT: "http://minio:9000"
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_FORCE_PATH_STYLE: "true"
+      S3_DISABLE_SSL: "true"
+    entrypoint: ["sleep", "infinity"]
+
+volumes:
+  clickhouse-data:
+  minio-data:

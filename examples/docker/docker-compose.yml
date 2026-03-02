@@ -1,0 +1,44 @@
+# docker-compose.yml -- ClickHouse + chbackup with AWS S3
+#
+# Quick start:
+#   export S3_ACCESS_KEY=your-access-key
+#   export S3_SECRET_KEY=your-secret-key
+#   docker compose up -d
+#
+# Then run backup commands:
+#   docker compose exec chbackup chbackup create my-backup
+#   docker compose exec chbackup chbackup upload my-backup
+#   docker compose exec chbackup chbackup list
+#
+# See docs/docker.md for a full walkthrough.
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: clickhouse-client -q "SELECT 1"
+      interval: 2s
+      retries: 10
+
+  chbackup:
+    image: ghcr.io/user/chbackup:latest
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      S3_BUCKET: my-clickhouse-backups
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+    entrypoint: ["sleep", "infinity"]
+
+volumes:
+  clickhouse-data:

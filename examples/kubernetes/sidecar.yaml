@@ -37,7 +37,7 @@ spec:
         # Prometheus scraping for chbackup metrics
         prometheus.io/scrape: "true"
         prometheus.io/port: "7171"
-        prometheus.io/path: "/api/v1/metrics"
+        prometheus.io/path: "/metrics"
     spec:
       # Allow watch loop to finish current backup cycle on shutdown (design 11.5)
       terminationGracePeriodSeconds: 60
@@ -86,6 +86,9 @@ spec:
             - name: api
               containerPort: 7171
           env:
+            # API must listen on all interfaces (not just localhost)
+            - name: API_LISTEN
+              value: "0.0.0.0:7171"
             # S3 configuration
             - name: S3_BUCKET
               value: "my-clickhouse-backups"

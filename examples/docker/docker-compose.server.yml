@@ -1,0 +1,57 @@
+# docker-compose.server.yml -- ClickHouse + chbackup API server with watch mode
+#
+# Quick start:
+#   export S3_ACCESS_KEY=your-access-key
+#   export S3_SECRET_KEY=your-secret-key
+#   docker compose -f docker-compose.server.yml up -d
+#
+# API available at http://localhost:7171
+#
+# Example API calls:
+#   curl http://localhost:7171/health
+#   curl -X POST http://localhost:7171/api/v1/create
+#   curl http://localhost:7171/api/v1/list
+#   curl http://localhost:7171/api/v1/watch/status
+#   curl http://localhost:7171/metrics
+#
+# See docs/api.md for all endpoints.
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: clickhouse-client -q "SELECT 1"
+      interval: 2s
+      retries: 10
+
+  chbackup:
+    image: ghcr.io/user/chbackup:latest
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    command: ["server", "--watch"]
+    ports:
+      - "7171:7171"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      API_LISTEN: "0.0.0.0:7171"
+      S3_BUCKET: my-clickhouse-backups
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      WATCH_INTERVAL: "1h"
+      FULL_INTERVAL: "24h"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7171/health"]
+      interval: 10s
+      retries: 3
+
+volumes:
+  clickhouse-data:

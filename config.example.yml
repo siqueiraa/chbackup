@@ -42,6 +42,8 @@ general:
   retries_jitter: 30
   # Track progress in state files for --resume
   use_resumable_state: true
+  # TTL in seconds for remote backup manifest cache (server mode only)
+  remote_cache_ttl_secs: 300
 
 # -----------------------------------------------------------------------------
 # ClickHouse connection and behavior settings.
@@ -51,8 +53,8 @@ general:
 clickhouse:
   # ClickHouse hostname
   host: localhost
-  # ClickHouse native protocol port (HTTP port is typically 8123)
-  port: 9000
+  # ClickHouse HTTP protocol port
+  port: 8123
   # ClickHouse username
   username: default
   # ClickHouse password (env: CLICKHOUSE_PASSWORD)
@@ -114,6 +116,7 @@ clickhouse:
     - system.*
     - INFORMATION_SCHEMA.*
     - information_schema.*
+    - _temporary_and_external_tables.*
   # Engine names to exclude (e.g., Kafka, S3Queue)
   skip_table_engines: []
   # Disk names to exclude from backup
@@ -200,12 +203,14 @@ backup:
   download_max_bytes_per_second: 0
   # Retry count for upload/download failures
   retries_on_failure: 5
-  # Duration between retries
-  retries_duration: 10s
+  # Duration between retries (empty = use general.retries_pause)
+  retries_duration: ''
   # Randomize retry delay by +/- this fraction (e.g., 0.1 = 10%)
   retries_jitter: 0.1
   # Projection patterns to skip (e.g., db.table:proj_name)
   skip_projections: []
+  # Parts larger than this use streaming multipart upload (bytes, 0 = never)
+  streaming_upload_threshold: 268435456
 
 # -----------------------------------------------------------------------------
 # Retention policy (separate from general retention counters).
@@ -237,6 +242,8 @@ watch:
   retry_interval: 5m
   # Clean local backup after successful upload
   delete_local_after_upload: true
+  # Table filter pattern for watch backups (empty = all tables)
+  tables: ''
 
 # -----------------------------------------------------------------------------
 # API server settings (for Kubernetes integration).
