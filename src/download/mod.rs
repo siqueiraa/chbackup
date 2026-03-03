@@ -29,7 +29,7 @@ use crate::concurrency::{effective_download_concurrency, effective_download_rate
 use crate::config::Config;
 use crate::manifest::{BackupManifest, PartInfo};
 use crate::object_disk::is_s3_disk;
-use crate::path_encoding::encode_path_component;
+use crate::path_encoding::{encode_path_component, validate_disk_path};
 use crate::progress::ProgressTracker;
 use crate::rate_limiter::RateLimiter;
 use crate::resume::{
@@ -67,6 +67,14 @@ fn resolve_download_target_dir(
 ) -> PathBuf {
     match manifest_disks.get(disk_name) {
         Some(dp) if Path::new(dp.trim_end_matches('/')).exists() => {
+            if !validate_disk_path(dp) {
+                warn!(
+                    disk_path = %dp,
+                    disk_name = %disk_name,
+                    "Disk path failed validation, falling back to backup_dir"
+                );
+                return backup_dir.to_path_buf();
+            }
             per_disk_backup_dir(dp.trim_end_matches('/'), backup_name)
         }
         _ => backup_dir.to_path_buf(), // Disk not on this host -- fall back to default
@@ -193,13 +201,20 @@ fn find_existing_part(
     // Also search per-disk backup directories for the part's disk
     if let Some(disk_path) = manifest_disks.get(disk_name) {
         let dp = disk_path.trim_end_matches('/');
-        let per_disk_base = Path::new(dp).join("backup");
-        if per_disk_base.exists() {
-            let canonical =
-                std::fs::canonicalize(&per_disk_base).unwrap_or_else(|_| per_disk_base.clone());
-            if seen.insert(canonical) {
-                search_bases.push(per_disk_base);
+        if validate_disk_path(dp) {
+            let per_disk_base = Path::new(dp).join("backup");
+            if per_disk_base.exists() {
+                let canonical = std::fs::canonicalize(&per_disk_base)
+                    .unwrap_or_else(|_| per_disk_base.clone());
+                if seen.insert(canonical) {
+                    search_bases.push(per_disk_base);
+                }
             }
+        } else {
+            warn!(
+                "Disk path '{}' (disk: {}) failed validation in find_existing_part, skipping",
+                dp, disk_name
+            );
         }
     }
 
