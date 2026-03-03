@@ -211,8 +211,8 @@ test/
 │   ├── setup.sql                 # Creates test databases, tables (3 local + 2 S3 disk + 1 empty)
 │   ├── seed_data.sql             # Deterministic INSERT statements for checksum validation
 │   └── seed_large.sql            # Large data generator for multipart upload tests
-Dockerfile.local-test             # Multi-stage build (rust:alpine -> altinity/clickhouse-server)
-docker-compose.local.yml          # ZooKeeper + ClickHouse/chbackup test compose
+Dockerfile.test                   # Multi-stage build (rust:alpine -> altinity/clickhouse-server)
+docker-compose.test.yml           # ZooKeeper + ClickHouse/chbackup test compose
 ```
 
 **Fixture: setup.sql** — Creates every table type referenced by T1-T18.
@@ -823,41 +823,53 @@ log "Setup complete. Tables: $(clickhouse-client -q \
 
 #### 1.4.6 CI Integration (GitHub Actions)
 
+The CI pipeline has two jobs: `check` (fast feedback: fmt, clippy, tests, coverage) and `integration` (ClickHouse version matrix with real S3). The test Dockerfile (`Dockerfile.test`) builds from source using a multi-stage build — no pre-built binary is needed.
+
 ```yaml
-# .github/workflows/integration.yml
-name: Integration Tests
-on: [push, pull_request]
-env:
-  S3_BUCKET: ${{ secrets.TEST_S3_BUCKET }}
-  S3_ACCESS_KEY: ${{ secrets.TEST_S3_ACCESS_KEY }}
-  S3_SECRET_KEY: ${{ secrets.TEST_S3_SECRET_KEY }}
+# .github/workflows/ci.yml (simplified)
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 jobs:
-  test:
+  check:
+    name: Check (fmt + clippy + test)
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  integration:
+    name: Integration (CH ${{ matrix.ch_version }})
+    runs-on: ubuntu-latest
+    needs: check
     strategy:
       matrix:
-        ch_version: ["23.8", "24.3", "24.8", "25.1"]
+        ch_version:
+          - "23.8.16.40.altinitystable"
+          - "24.3.12.76.altinitystable"
+          - "24.8.13.51.altinitystable"
+          - "25.1.5.31.altinitystable"
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Build static binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
-
-      - name: Run integration tests
+      - name: Start test environment
         env:
           CH_VERSION: ${{ matrix.ch_version }}
           RUN_ID: ${{ github.run_id }}-${{ matrix.ch_version }}
-        run: |
-          docker compose -f docker-compose.test.yml up -d --build --wait
-          docker compose exec -T chbackup-test /test/run_tests.sh
-          docker compose down -v
+          S3_PATH: chbackup-test/${{ matrix.ch_version }}/${{ github.run_id }}
+        run: docker compose -f docker-compose.test.yml up -d --build --wait
+      - name: Run integration tests
+        run: docker compose -f docker-compose.test.yml exec -T chbackup-test /test/run_tests.sh
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
 ```
 
 S3 test isolation: each CI run uses `S3_PATH: chbackup-test/{ch_version}/{run_id}` — parallel matrix jobs write to different prefixes. Cleanup after each job via `chbackup delete remote`.

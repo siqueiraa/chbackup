@@ -48,6 +48,15 @@ RUN chmod +x /usr/local/bin/chbackup
 COPY test/configs/clickhouse-config.xml /etc/clickhouse-server/config.d/test.xml
 COPY test/configs/chbackup-test.yml /etc/chbackup/config.yml
 
+# Copy S3 disk config generator (runs before ClickHouse starts)
+COPY test/configs/generate-s3-disk-config.sh /usr/local/bin/generate-s3-disk-config.sh
+RUN chmod +x /usr/local/bin/generate-s3-disk-config.sh
+
+# Wrap entrypoint to generate S3 disk config before ClickHouse starts
+RUN printf '#!/bin/bash\n/usr/local/bin/generate-s3-disk-config.sh\nexec /entrypoint.sh "$@"\n' > /custom-entrypoint.sh \
+    && chmod +x /custom-entrypoint.sh
+ENTRYPOINT ["/custom-entrypoint.sh"]
+
 # Copy test fixtures and runner
 COPY test/fixtures/ /test/fixtures/
 COPY test/run_tests.sh /test/run_tests.sh

@@ -25,6 +25,8 @@ services:
   zookeeper:
     image: zookeeper:3.8
     restart: unless-stopped
+    environment:
+      ZOO_4LW_COMMANDS_WHITELIST: "ruok,srvr,stat"
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
       interval: 5s

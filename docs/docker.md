@@ -473,11 +473,8 @@ The Dockerfile uses a multi-stage build:
 For development with faster rebuild cycles:
 
 ```bash
-# Build the binary on your host
-cargo build --release --target x86_64-unknown-linux-musl
-
-# Copy into a minimal image
-docker build -f Dockerfile.local-test -t chbackup:dev .
+# Build from source (multi-stage, no pre-built binary needed)
+docker build -f Dockerfile.test -t chbackup:dev .
 ```
 
 ## Environment variables reference
