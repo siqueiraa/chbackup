@@ -223,6 +223,7 @@ pub async fn drop_tables(
         }
 
         if failed.is_empty() {
+            pending.clear();
             break;
         }
 
@@ -697,6 +698,7 @@ pub async fn create_ddl_objects(
         }
 
         if failed.is_empty() {
+            pending.clear();
             break;
         }
 
