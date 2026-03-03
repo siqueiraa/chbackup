@@ -1384,4 +1384,148 @@ mod tests {
         assert!(result.is_some(), "Should fall back to legacy path");
         assert_eq!(result.unwrap(), legacy_part);
     }
+
+    // ---- chown_recursive tests ----
+
+    #[test]
+    fn test_chown_recursive_both_none_is_noop() {
+        // When both uid and gid are None, should return Ok immediately
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), b"data").unwrap();
+        let result = chown_recursive(dir.path(), None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_chown_recursive_with_current_uid() {
+        // Non-root: chown to own uid/gid should succeed or silently skip
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("file.txt"), b"data").unwrap();
+
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(dir.path()).unwrap();
+        let uid = meta.uid();
+        let gid = meta.gid();
+
+        // Chown to same user should succeed
+        let result = chown_recursive(dir.path(), Some(uid), Some(gid));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_chown_recursive_eperm_is_silent() {
+        // Trying to chown to root (uid 0) as non-root should hit EPERM
+        // and return Ok (silently skipped)
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), b"data").unwrap();
+
+        // Only test if not already root
+        if nix::unistd::getuid().as_raw() != 0 {
+            let result = chown_recursive(dir.path(), Some(0), Some(0));
+            assert!(result.is_ok(), "EPERM should be handled gracefully");
+        }
+    }
+
+    // ---- detect_clickhouse_ownership with existing path ----
+
+    #[test]
+    fn test_detect_clickhouse_ownership_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = detect_clickhouse_ownership(dir.path());
+        assert!(result.is_ok());
+        let (uid, gid) = result.unwrap();
+        // Should return Some values for an existing directory
+        assert!(uid.is_some());
+        assert!(gid.is_some());
+    }
+
+    #[test]
+    fn test_detect_clickhouse_ownership_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test_file");
+        std::fs::write(&file, b"data").unwrap();
+        let result = detect_clickhouse_ownership(&file);
+        assert!(result.is_ok());
+        let (uid, gid) = result.unwrap();
+        assert!(uid.is_some());
+        assert!(gid.is_some());
+
+        // UID/GID should match our process UID/GID
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!(uid.unwrap(), meta.uid());
+        assert_eq!(gid.unwrap(), meta.gid());
+    }
+
+    // ---- hardlink_or_copy_dir edge cases ----
+
+    #[test]
+    fn test_hardlink_or_copy_dir_empty_src() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("empty_src");
+        let dst = dir.path().join("empty_dst");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let result = hardlink_or_copy_dir(&src, &dst);
+        assert!(result.is_ok());
+        assert!(dst.exists());
+    }
+
+    #[test]
+    fn test_hardlink_or_copy_dir_nonexistent_src() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("nonexistent");
+        let dst = dir.path().join("dst");
+
+        // WalkDir on nonexistent dir will fail
+        let result = hardlink_or_copy_dir(&src, &dst);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hardlink_or_copy_dir_multiple_subdirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("multi_src");
+        let dst = dir.path().join("multi_dst");
+
+        // Create multiple subdirs with files
+        for subdir in &["alpha", "beta", "gamma"] {
+            let sub = src.join(subdir);
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("data.bin"), format!("{} data", subdir).as_bytes()).unwrap();
+        }
+
+        hardlink_or_copy_dir(&src, &dst).unwrap();
+
+        for subdir in &["alpha", "beta", "gamma"] {
+            let content = std::fs::read_to_string(dst.join(subdir).join("data.bin")).unwrap();
+            assert_eq!(content, format!("{} data", subdir));
+        }
+    }
+
+    #[test]
+    fn test_hardlink_or_copy_dir_deeply_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("deep_src");
+        let dst = dir.path().join("deep_dst");
+
+        // Create deeply nested structure
+        let deep = src.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("leaf.txt"), b"deep content").unwrap();
+        std::fs::write(src.join("root.txt"), b"root content").unwrap();
+
+        hardlink_or_copy_dir(&src, &dst).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a/b/c/leaf.txt")).unwrap(),
+            "deep content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("root.txt")).unwrap(),
+            "root content"
+        );
+    }
 }

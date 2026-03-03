@@ -667,4 +667,436 @@ mod tests {
         assert!(!json.contains("\"pending_mutations\""));
         assert!(!json.contains("\"dependencies\""));
     }
+
+    // -----------------------------------------------------------------------
+    // PartInfo builder and field tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_part_info_new_defaults() {
+        let part = PartInfo::new("202401_1_50_3", 134_217_728, 12345);
+        assert_eq!(part.name, "202401_1_50_3");
+        assert_eq!(part.size, 134_217_728);
+        assert_eq!(part.checksum_crc64, 12345);
+        assert_eq!(part.source, "uploaded");
+        assert!(part.backup_key.is_empty());
+        assert!(part.s3_objects.is_none());
+        assert_eq!(part.backup_size, 0);
+    }
+
+    #[test]
+    fn test_part_info_with_s3_objects() {
+        let objects = vec![
+            S3ObjectInfo {
+                path: "store/abc/data.bin".to_string(),
+                size: 1000,
+                backup_key: "backup/objects/data.bin".to_string(),
+            },
+            S3ObjectInfo {
+                path: "store/abc/index.bin".to_string(),
+                size: 200,
+                backup_key: "backup/objects/index.bin".to_string(),
+            },
+        ];
+
+        let part = PartInfo::new("all_0_0_0", 1200, 99999).with_s3_objects(objects);
+        assert!(part.s3_objects.is_some());
+        let objs = part.s3_objects.unwrap();
+        assert_eq!(objs.len(), 2);
+        assert_eq!(objs[0].path, "store/abc/data.bin");
+        assert_eq!(objs[1].size, 200);
+    }
+
+    #[test]
+    fn test_part_info_backup_size_skip_serializing_when_zero() {
+        let part = PartInfo::new("all_0_0_0", 100, 0);
+        let json = serde_json::to_string(&part).unwrap();
+        // backup_size = 0 should be skipped via skip_serializing_if
+        assert!(
+            !json.contains("\"backup_size\""),
+            "backup_size=0 should not be serialized, got: {}",
+            json
+        );
+
+        // But non-zero should appear
+        let mut part2 = PartInfo::new("all_1_1_0", 100, 0);
+        part2.backup_size = 500;
+        let json2 = serde_json::to_string(&part2).unwrap();
+        assert!(
+            json2.contains("\"backup_size\":500"),
+            "Non-zero backup_size should be serialized, got: {}",
+            json2
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MutationInfo serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mutation_info_serialize_roundtrip() {
+        let mutation = MutationInfo {
+            mutation_id: "0000000042".to_string(),
+            command: "UPDATE x = 1 WHERE id = 5".to_string(),
+            parts_to_do: vec!["part_1".to_string(), "part_2".to_string()],
+        };
+
+        let json = serde_json::to_string_pretty(&mutation).unwrap();
+        let deser: MutationInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deser.mutation_id, "0000000042");
+        assert_eq!(deser.command, "UPDATE x = 1 WHERE id = 5");
+        assert_eq!(deser.parts_to_do.len(), 2);
+    }
+
+    #[test]
+    fn test_mutation_info_empty_parts_to_do_not_serialized() {
+        let mutation = MutationInfo {
+            mutation_id: "0000000001".to_string(),
+            command: "DELETE WHERE id = 1".to_string(),
+            parts_to_do: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&mutation).unwrap();
+        assert!(
+            !json.contains("\"parts_to_do\""),
+            "Empty parts_to_do should not be serialized"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Manifest with all optional fields populated
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manifest_all_optional_fields() {
+        let mut tables = BTreeMap::new();
+        let mut parts = BTreeMap::new();
+        parts.insert("default".to_string(), vec![{
+            let mut p = PartInfo::new("all_0_0_0", 500, 11111);
+            p.backup_key = "backup/data/part.tar.lz4".to_string();
+            p.backup_size = 300;
+            p
+        }]);
+        tables.insert(
+            "mydb.mytable".to_string(),
+            TableManifest::test_new("ReplicatedMergeTree")
+                .with_ddl("CREATE TABLE mydb.mytable (id UInt64) ENGINE = ReplicatedMergeTree ORDER BY id")
+                .with_uuid("12345678-abcd-efgh-ijkl-mnopqrstuvwx")
+                .with_total_bytes(500)
+                .with_parts(parts)
+                .with_dependencies(vec!["mydb.other".to_string()]),
+        );
+
+        let manifest = BackupManifest {
+            manifest_version: 2,
+            name: "full-backup".to_string(),
+            timestamp: chrono::Utc::now(),
+            clickhouse_version: "24.8.1.123".to_string(),
+            chbackup_version: "0.2.0".to_string(),
+            data_format: "zstd".to_string(),
+            compressed_size: 300,
+            metadata_size: 1024,
+            disks: BTreeMap::from([
+                ("default".to_string(), "/var/lib/clickhouse".to_string()),
+                ("s3disk".to_string(), "/mnt/s3".to_string()),
+            ]),
+            disk_types: BTreeMap::from([
+                ("default".to_string(), "local".to_string()),
+                ("s3disk".to_string(), "s3".to_string()),
+            ]),
+            disk_remote_paths: BTreeMap::from([
+                ("s3disk".to_string(), "s3://mybucket/data/".to_string()),
+            ]),
+            tables,
+            databases: vec![DatabaseInfo::test_new("mydb")],
+            functions: vec!["my_udf".to_string()],
+            named_collections: vec!["my_collection".to_string()],
+            rbac: Some(RbacInfo {
+                path: "backup/access/".to_string(),
+            }),
+            rbac_size: 2048,
+            config_size: 4096,
+        };
+
+        // Round-trip
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        let deser: BackupManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deser.manifest_version, 2);
+        assert_eq!(deser.data_format, "zstd");
+        assert_eq!(deser.functions, vec!["my_udf"]);
+        assert_eq!(deser.named_collections, vec!["my_collection"]);
+        assert!(deser.rbac.is_some());
+        assert_eq!(deser.rbac.unwrap().path, "backup/access/");
+        assert_eq!(deser.rbac_size, 2048);
+        assert_eq!(deser.config_size, 4096);
+        assert_eq!(deser.disks.len(), 2);
+        assert_eq!(deser.disk_types.len(), 2);
+        assert_eq!(deser.disk_remote_paths.len(), 1);
+        assert_eq!(deser.databases.len(), 1);
+        assert_eq!(deser.tables.len(), 1);
+
+        let table = deser.tables.get("mydb.mytable").unwrap();
+        assert_eq!(table.dependencies, vec!["mydb.other"]);
+        assert!(table.uuid.is_some());
+        assert_eq!(
+            table.uuid.as_ref().unwrap(),
+            "12345678-abcd-efgh-ijkl-mnopqrstuvwx"
+        );
+
+        let part = &table.parts["default"][0];
+        assert_eq!(part.backup_size, 300);
+        assert_eq!(part.checksum_crc64, 11111);
+    }
+
+    // -----------------------------------------------------------------------
+    // save_to_file creates nested directories
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_save_to_file_creates_nested_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep_path = dir
+            .path()
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("metadata.json");
+
+        assert!(!deep_path.exists());
+
+        let manifest = BackupManifest::test_new("nested-test");
+        manifest.save_to_file(&deep_path).unwrap();
+
+        assert!(deep_path.exists());
+        let loaded = BackupManifest::load_from_file(&deep_path).unwrap();
+        assert_eq!(loaded.name, "nested-test");
+    }
+
+    // -----------------------------------------------------------------------
+    // from_json_bytes error cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_from_json_bytes_invalid_json() {
+        let result = BackupManifest::from_json_bytes(b"not valid json");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to parse manifest"),
+            "Expected parse error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_from_json_bytes_empty() {
+        let result = BackupManifest::from_json_bytes(b"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_json_bytes_missing_required_field() {
+        // JSON object but missing required 'name' field
+        let result = BackupManifest::from_json_bytes(b"{}");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // load_from_file error case
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_from_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let result = BackupManifest::load_from_file(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to read manifest"));
+    }
+
+    #[test]
+    fn test_load_from_file_invalid_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, "not json").unwrap();
+        let result = BackupManifest::load_from_file(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to parse manifest"));
+    }
+
+    // -----------------------------------------------------------------------
+    // to_json_bytes produces valid JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_json_bytes_valid_json() {
+        let manifest = BackupManifest::test_new("bytes-test")
+            .with_compressed_size(1024)
+            .with_metadata_size(256);
+
+        let bytes = manifest.to_json_bytes().unwrap();
+        assert!(!bytes.is_empty());
+
+        // Should be valid JSON
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["name"], "bytes-test");
+        assert_eq!(parsed["compressed_size"], 1024);
+    }
+
+    // -----------------------------------------------------------------------
+    // S3ObjectInfo field tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_s3_object_info_serialization() {
+        let obj = S3ObjectInfo {
+            path: "store/abc/def/data.bin".to_string(),
+            size: 134_217_000,
+            backup_key: "backup/objects/data.bin".to_string(),
+        };
+
+        let json = serde_json::to_string(&obj).unwrap();
+        let deser: S3ObjectInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deser.path, "store/abc/def/data.bin");
+        assert_eq!(deser.size, 134_217_000);
+        assert_eq!(deser.backup_key, "backup/objects/data.bin");
+    }
+
+    // -----------------------------------------------------------------------
+    // DatabaseInfo tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_database_info_serialization() {
+        let db = DatabaseInfo {
+            name: "production".to_string(),
+            ddl: "CREATE DATABASE production ENGINE = Atomic".to_string(),
+        };
+
+        let json = serde_json::to_string(&db).unwrap();
+        let deser: DatabaseInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deser.name, "production");
+        assert_eq!(deser.ddl, "CREATE DATABASE production ENGINE = Atomic");
+    }
+
+    // -----------------------------------------------------------------------
+    // RbacInfo tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rbac_info_serialization() {
+        let rbac = RbacInfo {
+            path: "chbackup/daily/access/".to_string(),
+        };
+
+        let json = serde_json::to_string(&rbac).unwrap();
+        let deser: RbacInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deser.path, "chbackup/daily/access/");
+    }
+
+    // -----------------------------------------------------------------------
+    // TableManifest builder method tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_table_manifest_builder_methods() {
+        let table = TableManifest::test_new("MergeTree")
+            .with_ddl("CREATE TABLE t (x Int32) ENGINE = MergeTree ORDER BY x")
+            .with_uuid("aaaa-bbbb-cccc")
+            .with_total_bytes(123456)
+            .with_metadata_only(true)
+            .with_dependencies(vec!["dep1".to_string(), "dep2".to_string()]);
+
+        assert_eq!(
+            table.ddl,
+            "CREATE TABLE t (x Int32) ENGINE = MergeTree ORDER BY x"
+        );
+        assert_eq!(table.uuid.as_deref(), Some("aaaa-bbbb-cccc"));
+        assert_eq!(table.total_bytes, 123456);
+        assert!(table.metadata_only);
+        assert_eq!(table.dependencies, vec!["dep1", "dep2"]);
+        assert_eq!(table.engine, "MergeTree");
+    }
+
+    // -----------------------------------------------------------------------
+    // Manifest builder method tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manifest_builder_methods() {
+        use chrono::TimeZone;
+
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 30, 0).unwrap();
+        let manifest = BackupManifest::test_new("builder-test")
+            .with_timestamp(ts)
+            .with_compressed_size(5000)
+            .with_metadata_size(500)
+            .with_disks(BTreeMap::from([("d".to_string(), "/data".to_string())]))
+            .with_disk_types(BTreeMap::from([("d".to_string(), "local".to_string())]))
+            .with_disk_remote_paths(BTreeMap::from([
+                ("s3".to_string(), "s3://b/p".to_string()),
+            ]))
+            .with_databases(vec![DatabaseInfo::test_new("db1")])
+            .with_tables(BTreeMap::from([(
+                "db1.t1".to_string(),
+                TableManifest::test_new("Log"),
+            )]));
+
+        assert_eq!(manifest.name, "builder-test");
+        assert_eq!(manifest.timestamp, ts);
+        assert_eq!(manifest.compressed_size, 5000);
+        assert_eq!(manifest.metadata_size, 500);
+        assert_eq!(manifest.disks.len(), 1);
+        assert_eq!(manifest.disk_types.len(), 1);
+        assert_eq!(manifest.disk_remote_paths.len(), 1);
+        assert_eq!(manifest.databases.len(), 1);
+        assert_eq!(manifest.tables.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Manifest backward compatibility with Go-format JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manifest_go_compat_extra_fields_ignored() {
+        // Simulate a manifest from Go clickhouse-backup with extra fields
+        let json = r#"{
+            "name": "go-backup",
+            "timestamp": "2024-06-01T00:00:00Z",
+            "extra_unknown_field": "should be ignored",
+            "another_unknown": 42
+        }"#;
+
+        // Should deserialize successfully, ignoring unknown fields
+        // (serde default behavior with deny_unknown_fields absent)
+        let result = serde_json::from_str::<BackupManifest>(json);
+        assert!(result.is_ok(), "Should tolerate unknown fields");
+        assert_eq!(result.unwrap().name, "go-backup");
+    }
+
+    // -----------------------------------------------------------------------
+    // PartInfo source field variations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_part_info_carried_source() {
+        let json = r#"{
+            "name": "all_0_0_0",
+            "size": 500,
+            "source": "carried:base-2024-01-01",
+            "backup_key": "base/data/part.tar.lz4"
+        }"#;
+
+        let part: PartInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(part.source, "carried:base-2024-01-01");
+        assert_eq!(part.name, "all_0_0_0");
+        assert_eq!(part.backup_key, "base/data/part.tar.lz4");
+    }
 }

@@ -2216,4 +2216,629 @@ mod tests {
             err
         );
     }
+
+    // -----------------------------------------------------------------------
+    // effective_retries tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_effective_retries_backup_overrides() {
+        let mut config = Config::default();
+        config.general.retries_on_failure = 3;
+        config.general.retries_pause = "5s".to_string();
+        config.general.retries_jitter = 30;
+
+        config.backup.retries_on_failure = 10;
+        config.backup.retries_duration = "20s".to_string();
+        config.backup.retries_jitter = 0.5;
+
+        let (retries, delay, jitter) = effective_retries(&config);
+
+        // backup.* overrides general.* when non-zero
+        assert_eq!(retries, 10);
+        assert_eq!(delay, 20);
+        assert!((jitter - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_effective_retries_general_fallback() {
+        let mut config = Config::default();
+        config.general.retries_on_failure = 5;
+        config.general.retries_pause = "10s".to_string();
+        config.general.retries_jitter = 50;
+
+        // backup.* all zero/empty => fallback to general.*
+        config.backup.retries_on_failure = 0;
+        config.backup.retries_duration = String::new();
+        config.backup.retries_jitter = 0.0;
+
+        let (retries, delay, jitter) = effective_retries(&config);
+
+        assert_eq!(retries, 5);
+        assert_eq!(delay, 10);
+        assert!((jitter - 0.5).abs() < f64::EPSILON); // 50/100 = 0.5
+    }
+
+    #[test]
+    fn test_effective_retries_default_config() {
+        let config = Config::default();
+        let (retries, delay, jitter) = effective_retries(&config);
+
+        // Default: backup.retries_on_failure=5 (overrides general=3 since non-zero),
+        // backup.retries_duration="" (empty => falls back to general.retries_pause="5s"),
+        // backup.retries_jitter=0.1 (overrides general.retries_jitter=30% since > 0.0)
+        assert_eq!(retries, 5);
+        assert_eq!(delay, 5);
+        assert!((jitter - 0.1).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_jitter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_jitter_zero_factor() {
+        // jitter_factor = 0 means no jitter
+        assert_eq!(apply_jitter(1000, 0.0), 1000);
+    }
+
+    #[test]
+    fn test_apply_jitter_zero_base() {
+        // base_delay = 0 means no jitter regardless of factor
+        assert_eq!(apply_jitter(0, 0.5), 0);
+    }
+
+    #[test]
+    fn test_apply_jitter_negative_factor() {
+        // Negative jitter factor treated as no jitter
+        assert_eq!(apply_jitter(1000, -0.5), 1000);
+    }
+
+    #[test]
+    fn test_apply_jitter_positive_bounded() {
+        // With positive jitter, result should be >= base and <= base * (1 + factor)
+        let base = 1000;
+        let factor = 0.3;
+
+        // Run multiple times to check bounds
+        for _ in 0..20 {
+            let result = apply_jitter(base, factor);
+            assert!(
+                result >= base,
+                "Jittered value {} should be >= base {}",
+                result,
+                base
+            );
+            assert!(
+                result <= (base as f64 * (1.0 + factor)) as u64 + 1,
+                "Jittered value {} should be <= {} (base * (1+factor))",
+                result,
+                (base as f64 * (1.0 + factor)) as u64
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // default_yaml tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_yaml_roundtrip() {
+        let yaml = Config::default_yaml().unwrap();
+        assert!(!yaml.is_empty());
+
+        // Should be valid YAML that deserializes back to a Config
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+
+        // Verify some key defaults survived the roundtrip
+        assert_eq!(config.clickhouse.port, 8123);
+        assert_eq!(config.general.log_level, "info");
+        assert_eq!(config.general.log_format, "text");
+    }
+
+    #[test]
+    fn test_default_yaml_contains_sections() {
+        let yaml = Config::default_yaml().unwrap();
+        // Should contain all 7 sections
+        assert!(yaml.contains("general:"), "YAML should have general section");
+        assert!(
+            yaml.contains("clickhouse:"),
+            "YAML should have clickhouse section"
+        );
+        assert!(yaml.contains("s3:"), "YAML should have s3 section");
+        assert!(yaml.contains("backup:"), "YAML should have backup section");
+        assert!(
+            yaml.contains("retention:"),
+            "YAML should have retention section"
+        );
+        assert!(yaml.contains("watch:"), "YAML should have watch section");
+        assert!(yaml.contains("api:"), "YAML should have api section");
+    }
+
+    // -----------------------------------------------------------------------
+    // Config::validate concurrency validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_upload_concurrency_zero() {
+        let mut config = Config::default();
+        config.general.upload_concurrency = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("general.upload_concurrency must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_download_concurrency_zero() {
+        let mut config = Config::default();
+        config.general.download_concurrency = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("general.download_concurrency must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_max_connections_zero() {
+        let mut config = Config::default();
+        config.clickhouse.max_connections = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("clickhouse.max_connections must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_s3_concurrency_zero() {
+        let mut config = Config::default();
+        config.s3.concurrency = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("s3.concurrency must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_object_disk_copy_concurrency_zero() {
+        let mut config = Config::default();
+        config.backup.object_disk_copy_concurrency = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("backup.object_disk_copy_concurrency must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_object_disk_server_side_copy_zero() {
+        let mut config = Config::default();
+        config.general.object_disk_server_side_copy_concurrency = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("general.object_disk_server_side_copy_concurrency must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_s3_max_parts_count_zero() {
+        let mut config = Config::default();
+        config.s3.max_parts_count = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("s3.max_parts_count must be > 0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Config::validate log level and format tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_invalid_log_level() {
+        let mut config = Config::default();
+        config.general.log_level = "verbose".to_string();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid general.log_level"));
+    }
+
+    #[test]
+    fn test_validate_valid_log_levels() {
+        for level in &["debug", "info", "warning", "warn", "error", "trace"] {
+            let mut config = Config::default();
+            config.general.log_level = level.to_string();
+            assert!(
+                config.validate().is_ok(),
+                "Log level '{}' should be valid",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_invalid_log_format() {
+        let mut config = Config::default();
+        config.general.log_format = "xml".to_string();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid general.log_format"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Config::validate compression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_invalid_compression() {
+        let mut config = Config::default();
+        config.backup.compression = "brotli".to_string();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid backup.compression"));
+    }
+
+    #[test]
+    fn test_validate_valid_compressions() {
+        for comp in &["lz4", "zstd", "gzip", "none"] {
+            let mut config = Config::default();
+            config.backup.compression = comp.to_string();
+            assert!(
+                config.validate().is_ok(),
+                "Compression '{}' should be valid",
+                comp
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_zstd_compression_level_too_high() {
+        let mut config = Config::default();
+        config.backup.compression = "zstd".to_string();
+        config.backup.compression_level = 23;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("zstd compression_level must be 0-22"));
+    }
+
+    #[test]
+    fn test_validate_gzip_compression_level_too_high() {
+        let mut config = Config::default();
+        config.backup.compression = "gzip".to_string();
+        config.backup.compression_level = 10;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("gzip compression_level must be 0-9"));
+    }
+
+    #[test]
+    fn test_validate_zstd_max_level_ok() {
+        let mut config = Config::default();
+        config.backup.compression = "zstd".to_string();
+        config.backup.compression_level = 22;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_gzip_max_level_ok() {
+        let mut config = Config::default();
+        config.backup.compression = "gzip".to_string();
+        config.backup.compression_level = 9;
+        assert!(config.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Config::validate rbac_resolve_conflicts tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_invalid_rbac_resolve_conflicts() {
+        let mut config = Config::default();
+        config.clickhouse.rbac_resolve_conflicts = "merge".to_string();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid clickhouse.rbac_resolve_conflicts"));
+    }
+
+    #[test]
+    fn test_validate_valid_rbac_resolve_conflicts() {
+        for mode in &["recreate", "ignore", "fail"] {
+            let mut config = Config::default();
+            config.clickhouse.rbac_resolve_conflicts = mode.to_string();
+            assert!(
+                config.validate().is_ok(),
+                "rbac_resolve_conflicts '{}' should be valid",
+                mode
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Config serde roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_serde_roundtrip() {
+        let config = Config::default();
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let deser: Config = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(deser.clickhouse.port, config.clickhouse.port);
+        assert_eq!(deser.general.log_level, config.general.log_level);
+        assert_eq!(deser.s3.region, config.s3.region);
+        assert_eq!(deser.backup.compression, config.backup.compression);
+    }
+
+    #[test]
+    fn test_config_from_minimal_yaml() {
+        // An almost empty YAML should produce a valid config with all defaults
+        let yaml = "general:\n  log_level: debug\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.general.log_level, "debug");
+        // All other fields should have defaults
+        assert_eq!(config.clickhouse.port, 8123);
+        assert_eq!(config.general.upload_concurrency, 4);
+    }
+
+    #[test]
+    fn test_config_empty_yaml() {
+        // Empty YAML should produce default config
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.clickhouse.host, "localhost");
+        assert_eq!(config.general.log_format, "text");
+    }
+
+    // -----------------------------------------------------------------------
+    // Config::load from file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_load_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yml");
+        let yaml = r#"
+general:
+  log_level: debug
+clickhouse:
+  host: myhost
+  port: 9000
+s3:
+  bucket: my-bucket
+  region: eu-west-1
+"#;
+        std::fs::write(&config_path, yaml).unwrap();
+
+        let config = Config::load(&config_path, &[]).unwrap();
+        // Only assert on fields not affected by env overlay from parallel tests.
+        // Env overlay tests set CHBACKUP_UPLOAD_CONCURRENCY etc., which can
+        // race with this test since cargo test runs in parallel.
+        assert_eq!(config.clickhouse.host, "myhost");
+        assert_eq!(config.clickhouse.port, 9000);
+        assert_eq!(config.s3.bucket, "my-bucket");
+        assert_eq!(config.s3.region, "eu-west-1");
+    }
+
+    #[test]
+    fn test_config_load_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("nonexistent.yml");
+
+        // Loading a nonexistent config file should use defaults
+        let config = Config::load(&config_path, &[]).unwrap();
+        assert_eq!(config.clickhouse.host, "localhost");
+    }
+
+    #[test]
+    fn test_config_load_with_cli_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yml");
+        let yaml = "general:\n  log_level: info\n";
+        std::fs::write(&config_path, yaml).unwrap();
+
+        let config = Config::load(
+            &config_path,
+            &[
+                "s3.bucket=test-bucket".to_string(),
+                "clickhouse.host=testhost".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.s3.bucket, "test-bucket");
+        assert_eq!(config.clickhouse.host, "testhost");
+        assert_eq!(config.general.log_level, "info"); // from YAML
+    }
+
+    // -----------------------------------------------------------------------
+    // backup upload/download concurrency = 0 is valid sentinel
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_backup_concurrency_zero_valid() {
+        let mut config = Config::default();
+        // backup.upload_concurrency=0 and backup.download_concurrency=0
+        // are valid sentinels meaning "use general default"
+        config.backup.upload_concurrency = 0;
+        config.backup.download_concurrency = 0;
+        assert!(
+            config.validate().is_ok(),
+            "backup concurrency=0 should be valid"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // env_key_to_dot_notation full coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_env_key_to_dot_notation_s3_keys() {
+        assert_eq!(
+            env_key_to_dot_notation("S3_REGION"),
+            Some("s3.region")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("S3_ENDPOINT"),
+            Some("s3.endpoint")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("S3_PREFIX"),
+            Some("s3.prefix")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("S3_ACCESS_KEY"),
+            Some("s3.access_key")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("S3_SECRET_KEY"),
+            Some("s3.secret_key")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("S3_ASSUME_ROLE_ARN"),
+            Some("s3.assume_role_arn")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("S3_FORCE_PATH_STYLE"),
+            Some("s3.force_path_style")
+        );
+    }
+
+    #[test]
+    fn test_env_key_to_dot_notation_clickhouse_keys() {
+        assert_eq!(
+            env_key_to_dot_notation("CLICKHOUSE_PORT"),
+            Some("clickhouse.port")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("CLICKHOUSE_USERNAME"),
+            Some("clickhouse.username")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("CLICKHOUSE_DATA_PATH"),
+            Some("clickhouse.data_path")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("CLICKHOUSE_SKIP_DISKS"),
+            Some("clickhouse.skip_disks")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("CLICKHOUSE_SKIP_DISK_TYPES"),
+            Some("clickhouse.skip_disk_types")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("CLICKHOUSE_SKIP_TABLE_ENGINES"),
+            Some("clickhouse.skip_table_engines")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("CLICKHOUSE_SKIP_TABLES"),
+            Some("clickhouse.skip_tables")
+        );
+    }
+
+    #[test]
+    fn test_env_key_to_dot_notation_backup_keys() {
+        assert_eq!(
+            env_key_to_dot_notation("CHBACKUP_BACKUP_SKIP_PROJECTIONS"),
+            Some("backup.skip_projections")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD"),
+            Some("backup.streaming_upload_threshold")
+        );
+    }
+
+    #[test]
+    fn test_env_key_to_dot_notation_watch_keys() {
+        assert_eq!(
+            env_key_to_dot_notation("FULL_INTERVAL"),
+            Some("watch.full_interval")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("WATCH_ENABLED"),
+            Some("watch.enabled")
+        );
+    }
+
+    #[test]
+    fn test_env_key_to_dot_notation_api_keys() {
+        assert_eq!(
+            env_key_to_dot_notation("API_LISTEN"),
+            Some("api.listen")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("API_CREATE_INTEGRATION_TABLES"),
+            Some("api.create_integration_tables")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Config default values detailed checks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_all_section_defaults() {
+        let config = Config::default();
+
+        // General section defaults
+        assert_eq!(config.general.log_level, "info");
+        assert_eq!(config.general.log_format, "text");
+        assert!(!config.general.disable_progress_bar);
+        assert_eq!(config.general.backups_to_keep_local, 0);
+        assert!(config.general.use_resumable_state);
+        assert_eq!(config.general.retries_on_failure, 3);
+        assert_eq!(config.general.retries_pause, "5s");
+        assert_eq!(config.general.retries_jitter, 30);
+
+        // Retention section defaults
+        assert_eq!(config.retention.backups_to_keep_local, 0);
+        assert_eq!(config.retention.backups_to_keep_remote, 0);
+
+        // ClickHouse section defaults
+        assert_eq!(config.clickhouse.host, "localhost");
+        assert_eq!(config.clickhouse.port, 8123);
+        assert_eq!(config.clickhouse.username, "default");
+        assert!(config.clickhouse.password.is_empty());
+        assert!(!config.clickhouse.secure);
+        assert!(config.clickhouse.sync_replicated_tables);
+        assert!(config.clickhouse.check_replicas_before_attach);
+        assert!(!config.clickhouse.check_parts_columns);
+        assert!(config.clickhouse.log_sql_queries);
+
+        // Backup section defaults
+        assert_eq!(config.backup.compression, "lz4");
+
+        // API section defaults
+        assert!(config.api.username.is_empty());
+        assert!(config.api.password.is_empty());
+    }
 }

@@ -3155,4 +3155,767 @@ mod tests {
         config.retention.backups_to_keep_remote = 0;
         assert_eq!(effective_retention_remote(&config), 3);
     }
+
+    // -----------------------------------------------------------------------
+    // summary_from_manifest tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_summary_from_manifest_basic() {
+        let manifest = BackupManifest::test_new("test-summary")
+            .with_compressed_size(2048)
+            .with_metadata_size(512);
+        let summary = summary_from_manifest(&manifest);
+
+        assert_eq!(summary.name, "test-summary");
+        assert!(!summary.is_broken);
+        assert!(summary.timestamp.is_some());
+        assert_eq!(summary.compressed_size, 2048);
+        assert_eq!(summary.metadata_size, 512);
+        assert_eq!(summary.table_count, 0);
+        assert_eq!(summary.size, 0);
+        assert_eq!(summary.object_disk_size, 0);
+        assert!(summary.required.is_empty());
+        assert!(summary.broken_reason.is_none());
+    }
+
+    #[test]
+    fn test_summary_from_manifest_with_s3_objects() {
+        use crate::manifest::{PartInfo, S3ObjectInfo, TableManifest};
+
+        let mut parts = BTreeMap::new();
+        parts.insert(
+            "s3disk".to_string(),
+            vec![PartInfo::new("all_0_0_0", 1000, 123).with_s3_objects(vec![
+                S3ObjectInfo {
+                    path: "store/abc/data.bin".to_string(),
+                    size: 800,
+                    backup_key: "backup/objects/data.bin".to_string(),
+                },
+                S3ObjectInfo {
+                    path: "store/abc/idx.bin".to_string(),
+                    size: 200,
+                    backup_key: "backup/objects/idx.bin".to_string(),
+                },
+            ])],
+        );
+
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "db.table".to_string(),
+            TableManifest::test_new("MergeTree")
+                .with_total_bytes(5000)
+                .with_parts(parts),
+        );
+
+        let manifest = BackupManifest::test_new("s3-summary")
+            .with_tables(tables)
+            .with_compressed_size(3000);
+
+        let summary = summary_from_manifest(&manifest);
+        assert_eq!(summary.object_disk_size, 1000); // 800 + 200
+        assert_eq!(summary.size, 5000);
+        assert_eq!(summary.table_count, 1);
+    }
+
+    #[test]
+    fn test_summary_from_manifest_incremental() {
+        use crate::manifest::{PartInfo, TableManifest};
+
+        let mut parts = BTreeMap::new();
+        parts.insert("default".to_string(), vec![{
+            let mut p = PartInfo::new("all_0_0_0", 100, 0);
+            p.source = "carried:base-full-backup".to_string();
+            p
+        }]);
+
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "db.table".to_string(),
+            TableManifest::test_new("MergeTree")
+                .with_total_bytes(100)
+                .with_parts(parts),
+        );
+
+        let manifest = BackupManifest::test_new("incr-summary").with_tables(tables);
+        let summary = summary_from_manifest(&manifest);
+        assert_eq!(summary.required, "base-full-backup");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_list_output with broken backup in Default format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_list_output_default_broken() {
+        let summaries = vec![BackupSummary {
+            name: "broken-backup".to_string(),
+            timestamp: None,
+            size: 0,
+            compressed_size: 0,
+            table_count: 0,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken: true,
+            broken_reason: Some("metadata.json not found".to_string()),
+        }];
+
+        let output = format_list_output(&summaries, &ListFormat::Default).unwrap();
+        assert!(
+            output.contains("[BROKEN: metadata.json not found]"),
+            "Default format should show BROKEN reason, got: {}",
+            output
+        );
+        assert!(output.contains("broken-backup"));
+    }
+
+    #[test]
+    fn test_format_list_output_default_broken_no_reason() {
+        let summaries = vec![BackupSummary {
+            name: "broken-no-reason".to_string(),
+            timestamp: None,
+            size: 0,
+            compressed_size: 0,
+            table_count: 0,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken: true,
+            broken_reason: None,
+        }];
+
+        let output = format_list_output(&summaries, &ListFormat::Default).unwrap();
+        assert!(
+            output.contains("[BROKEN]"),
+            "Default format should show [BROKEN] when no reason, got: {}",
+            output
+        );
+        // Should NOT show "[BROKEN: ]"
+        assert!(!output.contains("[BROKEN: ]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_delimited with special characters (RFC 4180 quoting)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_delimited_csv_with_special_chars() {
+        let summaries = vec![BackupSummary {
+            name: "backup,with,commas".to_string(),
+            timestamp: None,
+            size: 100,
+            compressed_size: 50,
+            table_count: 1,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken: true,
+            broken_reason: Some("has \"quotes\" and,comma".to_string()),
+        }];
+
+        let output = format_delimited(&summaries, ',');
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // Name with commas should be quoted
+        assert!(
+            lines[1].starts_with("\"backup,with,commas\""),
+            "Name with commas should be quoted, got: {}",
+            lines[1]
+        );
+        // Broken reason with quotes and comma should be double-quoted
+        assert!(
+            lines[1].contains("\"has \"\"quotes\"\" and,comma\""),
+            "Broken reason should have escaped quotes, got: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn test_format_delimited_tsv_no_comma_quoting() {
+        let summaries = vec![BackupSummary {
+            name: "backup,with,commas".to_string(),
+            timestamp: None,
+            size: 100,
+            compressed_size: 50,
+            table_count: 1,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken: false,
+            broken_reason: None,
+        }];
+
+        let output = format_delimited(&summaries, '\t');
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // Commas in name should NOT be quoted with tab delimiter
+        assert!(
+            lines[1].starts_with("backup,with,commas\t"),
+            "Commas in name should not be quoted with tab delimiter, got: {}",
+            lines[1]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // retention_local edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_retention_local_exact_keep_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        let base_ts = chrono::Utc::now();
+
+        // Create exactly 3 backups
+        for i in 0..3 {
+            let ts = base_ts - chrono::Duration::days(2 - i);
+            create_backup_with_timestamp(&backup_base, &format!("backup-{}", i), ts);
+        }
+
+        // Keep 3 => should delete nothing since count == keep
+        let deleted = retention_local(dir.path().to_str().unwrap(), 3).unwrap();
+        assert_eq!(deleted, 0, "Should not delete when count == keep");
+
+        // All 3 should still exist
+        for i in 0..3 {
+            assert!(backup_base.join(format!("backup-{}", i)).exists());
+        }
+    }
+
+    #[test]
+    fn test_retention_local_fewer_than_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        let base_ts = chrono::Utc::now();
+        create_backup_with_timestamp(&backup_base, "only-one", base_ts);
+
+        // Keep 5 but only 1 exists
+        let deleted = retention_local(dir.path().to_str().unwrap(), 5).unwrap();
+        assert_eq!(deleted, 0, "Should not delete when count < keep");
+        assert!(backup_base.join("only-one").exists());
+    }
+
+    #[test]
+    fn test_retention_local_no_backup_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // No backup directory exists at all
+        let deleted = retention_local(dir.path().to_str().unwrap(), 2).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_keys_from_manifest edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_collect_keys_skips_empty_backup_key() {
+        use crate::manifest::{PartInfo, TableManifest};
+
+        let mut parts = BTreeMap::new();
+        parts.insert(
+            "default".to_string(),
+            vec![
+                // Part with empty backup_key (should be skipped)
+                PartInfo::new("all_0_0_0", 100, 0),
+                // Part with a real backup_key
+                {
+                    let mut p = PartInfo::new("all_1_1_0", 200, 0);
+                    p.backup_key = "backup/data/part.tar.lz4".to_string();
+                    p
+                },
+            ],
+        );
+
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "db.table".to_string(),
+            TableManifest::test_new("MergeTree")
+                .with_total_bytes(300)
+                .with_parts(parts),
+        );
+
+        let manifest = BackupManifest::test_new("test").with_tables(tables);
+        let keys = collect_keys_from_manifest(&manifest);
+
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains("backup/data/part.tar.lz4"));
+        // Empty string should not be in the set
+        assert!(!keys.contains(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // list_local sorting verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_local_sorted_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        // Create backups in non-alphabetical order
+        for name in &["zebra", "alpha", "middle"] {
+            let backup_dir = backup_base.join(name);
+            std::fs::create_dir_all(&backup_dir).unwrap();
+            let manifest = BackupManifest::test_new(*name);
+            manifest
+                .save_to_file(&backup_dir.join("metadata.json"))
+                .unwrap();
+        }
+
+        let summaries = list_local(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(summaries.len(), 3);
+        // Should be sorted alphabetically by name
+        assert_eq!(summaries[0].name, "alpha");
+        assert_eq!(summaries[1].name, "middle");
+        assert_eq!(summaries[2].name, "zebra");
+    }
+
+    // -----------------------------------------------------------------------
+    // list_local ignores non-directory entries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_local_ignores_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        // Create a regular file (not a directory) in the backup base
+        std::fs::write(backup_base.join("not-a-dir.txt"), "hello").unwrap();
+
+        // Create one valid backup
+        let backup_dir = backup_base.join("real-backup");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let manifest = BackupManifest::test_new("real-backup");
+        manifest
+            .save_to_file(&backup_dir.join("metadata.json"))
+            .unwrap();
+
+        let summaries = list_local(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "real-backup");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_backup_name_from_prefix edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_backup_name_empty_prefix() {
+        assert_eq!(extract_backup_name_from_prefix("/", ""), "");
+    }
+
+    #[test]
+    fn test_extract_backup_name_nested_prefix() {
+        assert_eq!(
+            extract_backup_name_from_prefix("prefix/my-backup/", "prefix"),
+            "my-backup"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_size additional boundary values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_size_boundary_values() {
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1025), "1.00 KB");
+        // Just below MB threshold
+        assert_eq!(format_size(1_048_575), "1024.00 KB");
+        // Exactly 1.5 GB
+        assert_eq!(format_size(1_610_612_736), "1.50 GB");
+        // Large TB value
+        assert_eq!(format_size(5_497_558_138_880), "5.00 TB");
+    }
+
+    // -----------------------------------------------------------------------
+    // ManifestCache set_ttl test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manifest_cache_set_ttl() {
+        let mut cache = ManifestCache::new(Duration::from_secs(300));
+
+        let summaries = vec![BackupSummary {
+            name: "ttl-test".to_string(),
+            timestamp: None,
+            size: 0,
+            compressed_size: 0,
+            table_count: 0,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken: false,
+            broken_reason: None,
+        }];
+        cache.set(summaries);
+
+        // Should be cached with TTL=300s
+        assert!(cache.get().is_some());
+
+        // Change TTL to 0 (immediate expiry)
+        cache.set_ttl(Duration::from_millis(0));
+        std::thread::sleep(Duration::from_millis(1));
+
+        // Now get() should return None (expired with new TTL)
+        assert!(
+            cache.get().is_none(),
+            "Cache should expire after TTL change to 0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ManifestCache repeated set overwrites
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manifest_cache_overwrite() {
+        let mut cache = ManifestCache::new(Duration::from_secs(300));
+
+        let summaries_v1 = vec![BackupSummary {
+            name: "v1".to_string(),
+            timestamp: None,
+            size: 0,
+            compressed_size: 0,
+            table_count: 0,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken: false,
+            broken_reason: None,
+        }];
+
+        let summaries_v2 = vec![
+            BackupSummary {
+                name: "v2-a".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "v2-b".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+        ];
+
+        cache.set(summaries_v1);
+        assert_eq!(cache.get().unwrap().len(), 1);
+
+        cache.set(summaries_v2);
+        assert_eq!(cache.get().unwrap().len(), 2);
+        assert_eq!(cache.get().unwrap()[0].name, "v2-a");
+    }
+
+    // -----------------------------------------------------------------------
+    // total_uncompressed_size tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_total_uncompressed_size_multi_table() {
+        use crate::manifest::TableManifest;
+
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "db.t1".to_string(),
+            TableManifest::test_new("MergeTree").with_total_bytes(1000),
+        );
+        tables.insert(
+            "db.t2".to_string(),
+            TableManifest::test_new("MergeTree").with_total_bytes(2000),
+        );
+        tables.insert(
+            "db.t3".to_string(),
+            TableManifest::test_new("MergeTree").with_total_bytes(3000),
+        );
+
+        let manifest = BackupManifest::test_new("multi-table").with_tables(tables);
+        assert_eq!(total_uncompressed_size(&manifest), 6000);
+    }
+
+    #[test]
+    fn test_total_uncompressed_size_empty() {
+        let manifest = BackupManifest::test_new("empty");
+        assert_eq!(total_uncompressed_size(&manifest), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_s3_prefix edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_s3_prefix_with_trailing_slash() {
+        assert_eq!(
+            strip_s3_prefix("prefix/key.json", "prefix/"),
+            "key.json"
+        );
+    }
+
+    #[test]
+    fn test_strip_s3_prefix_no_match() {
+        assert_eq!(
+            strip_s3_prefix("other/key.json", "myprefix"),
+            "other/key.json"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // clean_broken_local with no broken backups
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_clean_broken_local_none_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_base = dir.path().join("backup");
+        std::fs::create_dir_all(&backup_base).unwrap();
+
+        // Create only valid backups
+        let valid_dir = backup_base.join("valid-1");
+        std::fs::create_dir_all(&valid_dir).unwrap();
+        let manifest = BackupManifest::test_new("valid-1");
+        manifest
+            .save_to_file(&valid_dir.join("metadata.json"))
+            .unwrap();
+
+        let count = clean_broken_local(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(count, 0, "No broken backups to clean");
+        assert!(valid_dir.exists(), "Valid backup should remain");
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_object_disk_size with no s3_objects
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_object_disk_size_no_s3_parts() {
+        use crate::manifest::{PartInfo, TableManifest};
+
+        let mut parts = BTreeMap::new();
+        parts.insert(
+            "default".to_string(),
+            vec![
+                PartInfo::new("all_0_0_0", 1000, 0),
+                PartInfo::new("all_1_1_0", 2000, 0),
+            ],
+        );
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "db.t".to_string(),
+            TableManifest::test_new("MergeTree")
+                .with_total_bytes(3000)
+                .with_parts(parts),
+        );
+
+        let manifest = BackupManifest::test_new("no-s3").with_tables(tables);
+        assert_eq!(compute_object_disk_size(&manifest), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Location enum coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_location_enum_equality() {
+        assert_eq!(Location::Local, Location::Local);
+        assert_eq!(Location::Remote, Location::Remote);
+        assert_ne!(Location::Local, Location::Remote);
+    }
+
+    // -----------------------------------------------------------------------
+    // ListFormat enum coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_format_enum_equality() {
+        assert_eq!(ListFormat::Default, ListFormat::Default);
+        assert_eq!(ListFormat::Json, ListFormat::Json);
+        assert_eq!(ListFormat::Yaml, ListFormat::Yaml);
+        assert_eq!(ListFormat::Csv, ListFormat::Csv);
+        assert_eq!(ListFormat::Tsv, ListFormat::Tsv);
+        assert_ne!(ListFormat::Json, ListFormat::Yaml);
+    }
+
+    // -----------------------------------------------------------------------
+    // BackupSummary serde with all fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backup_summary_serde_all_fields() {
+        use chrono::TimeZone;
+
+        let summary = BackupSummary {
+            name: "full-test".to_string(),
+            timestamp: Some(chrono::Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap()),
+            size: 99999,
+            compressed_size: 55555,
+            table_count: 10,
+            metadata_size: 1024,
+            rbac_size: 512,
+            config_size: 256,
+            object_disk_size: 8000,
+            required: "base-backup-name".to_string(),
+            is_broken: false,
+            broken_reason: None,
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let deser: BackupSummary = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deser.name, "full-test");
+        assert_eq!(deser.size, 99999);
+        assert_eq!(deser.compressed_size, 55555);
+        assert_eq!(deser.table_count, 10);
+        assert_eq!(deser.metadata_size, 1024);
+        assert_eq!(deser.rbac_size, 512);
+        assert_eq!(deser.config_size, 256);
+        assert_eq!(deser.object_disk_size, 8000);
+        assert_eq!(deser.required, "base-backup-name");
+        assert!(!deser.is_broken);
+        assert!(deser.broken_reason.is_none());
+    }
+
+    #[test]
+    fn test_backup_summary_serde_broken_with_reason() {
+        let summary = BackupSummary {
+            name: "broken-test".to_string(),
+            timestamp: None,
+            size: 0,
+            compressed_size: 0,
+            table_count: 0,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken: true,
+            broken_reason: Some("corrupt metadata".to_string()),
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let deser: BackupSummary = serde_json::from_str(&json).unwrap();
+
+        assert!(deser.is_broken);
+        assert_eq!(deser.broken_reason, Some("corrupt metadata".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_list_output with multiple backups
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_list_output_json_multiple() {
+        use chrono::TimeZone;
+
+        let summaries = vec![
+            BackupSummary {
+                name: "backup-1".to_string(),
+                timestamp: Some(chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap()),
+                size: 1000,
+                compressed_size: 500,
+                table_count: 2,
+                metadata_size: 128,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "backup-2".to_string(),
+                timestamp: Some(chrono::Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap()),
+                size: 2000,
+                compressed_size: 1000,
+                table_count: 5,
+                metadata_size: 256,
+                rbac_size: 64,
+                config_size: 32,
+                object_disk_size: 512,
+                required: "backup-1".to_string(),
+                is_broken: false,
+                broken_reason: None,
+            },
+        ];
+
+        let output = format_list_output(&summaries, &ListFormat::Json).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["name"], "backup-1");
+        assert_eq!(parsed[1]["name"], "backup-2");
+        assert_eq!(parsed[1]["required"], "backup-1");
+        assert_eq!(parsed[1]["object_disk_size"], 512);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_delimited column count matches header
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_delimited_column_count_matches() {
+        use chrono::TimeZone;
+
+        let summaries = vec![BackupSummary {
+            name: "col-test".to_string(),
+            timestamp: Some(chrono::Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap()),
+            size: 100,
+            compressed_size: 50,
+            table_count: 1,
+            metadata_size: 10,
+            rbac_size: 5,
+            config_size: 3,
+            object_disk_size: 20,
+            required: "base".to_string(),
+            is_broken: false,
+            broken_reason: None,
+        }];
+
+        let csv_output = format_delimited(&summaries, ',');
+        let lines: Vec<&str> = csv_output.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let header_cols = lines[0].split(',').count();
+        let data_cols = lines[1].split(',').count();
+        assert_eq!(
+            header_cols, data_cols,
+            "Header and data columns should match: header={}, data={}",
+            header_cols, data_cols
+        );
+        assert_eq!(header_cols, 12, "Should have 12 columns");
+    }
 }

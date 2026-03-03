@@ -415,4 +415,170 @@ mod tests {
         let state: RestoreState = serde_json::from_str(json).unwrap();
         assert_eq!(state.params_hash, "");
     }
+
+    #[test]
+    fn test_restore_params_path() {
+        // Covers lines 101-102: restore_params_path builds the expected path
+        let dir = std::path::Path::new("/tmp/backup/daily-2024-01-15");
+        let result = restore_params_path(dir);
+        assert_eq!(result, dir.join("restore.params.json"));
+    }
+
+    #[test]
+    fn test_save_state_graceful_logs_warning_on_failure() {
+        // Covers lines 155-158: save_state_graceful failure path (non-fatal warning)
+        let state = UploadState {
+            completed_keys: HashSet::from(["key1".to_string()]),
+            backup_name: "test".to_string(),
+            params_hash: "hash".to_string(),
+        };
+
+        // Use a path under a non-existent read-only directory to trigger write failure.
+        // Writing to /dev/null/subdir/file.json will fail because /dev/null is not a directory.
+        let path = std::path::Path::new("/dev/null/subdir/state.json");
+
+        // Should NOT panic -- gracefully degrades with a warning
+        save_state_graceful(path, &state);
+
+        // No file should exist (the write failed)
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_load_state_file_invalid_json() {
+        // Covers the JSON parse error path in load_state_file (line 142-143)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.state.json");
+        std::fs::write(&path, "not valid json {{{").unwrap();
+
+        let result: anyhow::Result<Option<UploadState>> = load_state_file(&path);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Failed to parse state file"),
+            "Error should mention parse failure: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_delete_state_file_permission_error() {
+        // Covers lines 199-200: delete_state_file non-NotFound error path
+        // Create a file inside a read-only directory so deletion fails with permission error
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("readonly_dir");
+        std::fs::create_dir(&subdir).unwrap();
+        let path = subdir.join("state.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        // Make the directory read-only so remove_file fails with permission denied
+        let mut perms = std::fs::metadata(&subdir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            perms.set_readonly(true);
+        }
+        std::fs::set_permissions(&subdir, perms.clone()).unwrap();
+
+        // delete_state_file should not panic; it logs a warning for non-NotFound errors
+        delete_state_file(&path);
+
+        // The file should still exist because deletion failed
+        assert!(path.exists());
+
+        // Restore permissions so tempdir cleanup works
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            perms.set_readonly(false);
+        }
+        std::fs::set_permissions(&subdir, perms).unwrap();
+    }
+
+    #[test]
+    fn test_save_state_file_directory_creation_error() {
+        // Covers the directory creation error path in save_state_file (lines 117-118)
+        let state = UploadState {
+            completed_keys: HashSet::new(),
+            backup_name: "test".to_string(),
+            params_hash: "hash".to_string(),
+        };
+
+        // Path under /dev/null triggers directory creation failure
+        let path = std::path::Path::new("/dev/null/nested/dir/state.json");
+        let result = save_state_file(path, &state);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Failed to create state directory"),
+            "Error should mention directory creation: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_download_state_with_disk_map() {
+        // Verify disk_map roundtrips correctly
+        let mut disk_map = HashMap::new();
+        disk_map.insert("default".to_string(), "/var/lib/clickhouse".to_string());
+        disk_map.insert("nvme2".to_string(), "/mnt/nvme2/clickhouse".to_string());
+
+        let state = DownloadState {
+            completed_keys: HashSet::from(["key1".to_string()]),
+            backup_name: "backup-1".to_string(),
+            params_hash: "hash".to_string(),
+            disk_map,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dl.state.json");
+
+        save_state_file(&path, &state).unwrap();
+        let loaded: DownloadState = load_state_file(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.disk_map.len(), 2);
+        assert_eq!(
+            loaded.disk_map.get("default").unwrap(),
+            "/var/lib/clickhouse"
+        );
+        assert_eq!(
+            loaded.disk_map.get("nvme2").unwrap(),
+            "/mnt/nvme2/clickhouse"
+        );
+    }
+
+    #[test]
+    fn test_restore_params_roundtrip() {
+        // Verify RestoreParams serialization roundtrip
+        let params = RestoreParams {
+            backup_name: "daily-2024-01-15".to_string(),
+            tables: Some("default.*".to_string()),
+            schema_only: false,
+            data_only: true,
+            rm: false,
+            rename_as: Some("old:new".to_string()),
+            database_mapping: HashMap::from([("src_db".to_string(), "dst_db".to_string())]),
+            rbac: true,
+            configs: false,
+            named_collections: true,
+            partitions: Some("202401".to_string()),
+            skip_empty_tables: true,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = restore_params_path(dir.path());
+
+        save_state_file(&path, &params).unwrap();
+        let loaded: RestoreParams = load_state_file(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.backup_name, "daily-2024-01-15");
+        assert_eq!(loaded.tables, Some("default.*".to_string()));
+        assert!(loaded.data_only);
+        assert!(loaded.rbac);
+        assert!(loaded.named_collections);
+        assert_eq!(loaded.partitions, Some("202401".to_string()));
+        assert!(loaded.skip_empty_tables);
+        assert_eq!(
+            loaded.database_mapping.get("src_db").unwrap(),
+            "dst_db"
+        );
+    }
 }

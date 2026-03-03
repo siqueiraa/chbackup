@@ -230,4 +230,181 @@ mod tests {
         assert!(json.contains("\"command\":\"create\""));
         assert!(json.contains("\"running\""));
     }
+
+    // -----------------------------------------------------------------------
+    // ActionStatus::Display tests -- covers lines 21-30 (~8 lines)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_action_status_display_running() {
+        let status = ActionStatus::Running;
+        assert_eq!(format!("{}", status), "running");
+    }
+
+    #[test]
+    fn test_action_status_display_completed() {
+        let status = ActionStatus::Completed;
+        assert_eq!(format!("{}", status), "completed");
+    }
+
+    #[test]
+    fn test_action_status_display_failed() {
+        let status = ActionStatus::Failed("timeout".to_string());
+        assert_eq!(format!("{}", status), "failed: timeout");
+    }
+
+    #[test]
+    fn test_action_status_display_killed() {
+        let status = ActionStatus::Killed;
+        assert_eq!(format!("{}", status), "killed");
+    }
+
+    // -----------------------------------------------------------------------
+    // ActionLog: finish/fail does NOT override Killed status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_action_log_finish_does_not_override_killed() {
+        let mut log = ActionLog::new(10);
+        let id = log.start("create".to_string());
+
+        // Kill the action first
+        log.kill(id);
+        assert!(matches!(log.entries()[0].status, ActionStatus::Killed));
+
+        // Now try to finish it -- should be a no-op
+        log.finish(id);
+        assert!(
+            matches!(log.entries()[0].status, ActionStatus::Killed),
+            "finish() must not override Killed status"
+        );
+    }
+
+    #[test]
+    fn test_action_log_fail_does_not_override_killed() {
+        let mut log = ActionLog::new(10);
+        let id = log.start("upload".to_string());
+
+        // Kill the action first
+        log.kill(id);
+
+        // Now try to fail it -- should be a no-op
+        log.fail(id, "should not appear".to_string());
+        assert!(
+            matches!(log.entries()[0].status, ActionStatus::Killed),
+            "fail() must not override Killed status"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ActionLog edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_action_log_kill_nonexistent_id() {
+        let mut log = ActionLog::new(10);
+        let id = log.start("create".to_string());
+
+        // Killing a non-existent ID should be a no-op
+        log.kill(id + 999);
+
+        // Original entry should still be Running
+        assert!(matches!(log.entries()[0].status, ActionStatus::Running));
+    }
+
+    #[test]
+    fn test_action_log_finish_nonexistent_id() {
+        let mut log = ActionLog::new(10);
+        let _id = log.start("create".to_string());
+
+        // Finishing a non-existent ID should be a no-op
+        log.finish(999);
+
+        // Original entry should still be Running
+        assert!(matches!(log.entries()[0].status, ActionStatus::Running));
+    }
+
+    #[test]
+    fn test_action_log_fail_nonexistent_id() {
+        let mut log = ActionLog::new(10);
+        let _id = log.start("create".to_string());
+
+        // Failing a non-existent ID should be a no-op
+        log.fail(999, "error".to_string());
+
+        // Original entry should still be Running
+        assert!(matches!(log.entries()[0].status, ActionStatus::Running));
+    }
+
+    #[test]
+    fn test_action_log_entries_order() {
+        let mut log = ActionLog::new(10);
+        let id1 = log.start("create".to_string());
+        let id2 = log.start("upload".to_string());
+        let id3 = log.start("download".to_string());
+
+        let entries = log.entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].id, id1);
+        assert_eq!(entries[0].command, "create");
+        assert_eq!(entries[1].id, id2);
+        assert_eq!(entries[1].command, "upload");
+        assert_eq!(entries[2].id, id3);
+        assert_eq!(entries[2].command, "download");
+    }
+
+    #[test]
+    fn test_action_log_monotonic_ids() {
+        let mut log = ActionLog::new(10);
+        let id1 = log.start("op1".to_string());
+        let id2 = log.start("op2".to_string());
+        let id3 = log.start("op3".to_string());
+
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+    }
+
+    #[test]
+    fn test_action_log_capacity_one() {
+        let mut log = ActionLog::new(1);
+        let _id1 = log.start("first".to_string());
+        assert_eq!(log.entries().len(), 1);
+
+        let id2 = log.start("second".to_string());
+        assert_eq!(log.entries().len(), 1);
+        assert_eq!(log.entries()[0].id, id2);
+        assert_eq!(log.entries()[0].command, "second");
+    }
+
+    #[test]
+    fn test_action_log_running_returns_first_running() {
+        let mut log = ActionLog::new(10);
+        let id1 = log.start("op1".to_string());
+        let _id2 = log.start("op2".to_string());
+
+        // running() returns the FIRST running entry
+        let running = log.running().unwrap();
+        assert_eq!(running.id, id1);
+    }
+
+    #[test]
+    fn test_action_status_serialization() {
+        // Running
+        let json = serde_json::to_string(&ActionStatus::Running).unwrap();
+        assert_eq!(json, "\"running\"");
+
+        // Completed
+        let json = serde_json::to_string(&ActionStatus::Completed).unwrap();
+        assert_eq!(json, "\"completed\"");
+
+        // Killed
+        let json = serde_json::to_string(&ActionStatus::Killed).unwrap();
+        assert_eq!(json, "\"killed\"");
+
+        // Failed (tagged enum)
+        let json = serde_json::to_string(&ActionStatus::Failed("oops".to_string())).unwrap();
+        assert!(json.contains("failed"));
+        assert!(json.contains("oops"));
+    }
 }

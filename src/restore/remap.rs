@@ -1736,4 +1736,473 @@ mod tests {
         assert_eq!(path, "/clickhouse/tables/01/default/t");
         assert_eq!(replica, "r1");
     }
+
+    // -----------------------------------------------------------------------
+    // parse_table_mapping tests (covers lines 163-213)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_table_mapping_valid_single() {
+        // Covers lines 199-200 (info! log on success) and normal path
+        let result = parse_table_mapping("db1.t1:db2.t2").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0],
+            (
+                "db1".to_string(),
+                "t1".to_string(),
+                "db2".to_string(),
+                "t2".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_table_mapping_multi() {
+        let result = parse_table_mapping("db1.t1:db2.t2,db3.t3:db4.t4").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0],
+            (
+                "db1".to_string(),
+                "t1".to_string(),
+                "db2".to_string(),
+                "t2".to_string()
+            )
+        );
+        assert_eq!(
+            result[1],
+            (
+                "db3".to_string(),
+                "t3".to_string(),
+                "db4".to_string(),
+                "t4".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_table_mapping_no_colon() {
+        // Covers line 173: bail! for mapping without colon separator
+        let result = parse_table_mapping("db1.t1");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Invalid table mapping"),
+            "Error should mention invalid mapping: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_table_mapping_src_no_dot() {
+        // Covers line 182: bail! for source without dot
+        let result = parse_table_mapping("db1:db2.t2");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Invalid table mapping source"),
+            "Error should mention source format: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_table_mapping_dst_no_dot() {
+        // Covers line 191: bail! for destination without dot
+        let result = parse_table_mapping("db1.t1:db2");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Invalid table mapping destination"),
+            "Error should mention destination format: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_table_mapping_empty() {
+        // Covers line 209: bail! for empty mapping string
+        let result = parse_table_mapping("");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty or contains no valid mappings"),
+            "Error should mention empty: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_table_mapping_trailing_comma() {
+        // Covers line 168: continue for empty segment
+        let result = parse_table_mapping("db1.t1:db2.t2,").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0],
+            (
+                "db1".to_string(),
+                "t1".to_string(),
+                "db2".to_string(),
+                "t2".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_table_mapping_leading_comma() {
+        // Also covers line 168: continue for empty segment at start
+        let result = parse_table_mapping(",db1.t1:db2.t2").unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_table_mapping_only_commas() {
+        // All segments are empty, should hit line 209
+        let result = parse_table_mapping(",,,");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_database_mapping empty segment test (covers line 229)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_database_mapping_with_empty_segments() {
+        // Covers line 229: continue for empty segment between commas
+        let result = parse_database_mapping("db1:db2,,db3:db4").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("db1").unwrap(), "db2");
+        assert_eq!(result.get("db3").unwrap(), "db4");
+    }
+
+    // -----------------------------------------------------------------------
+    // RemapConfig::new legacy format edge cases (covers lines 60, 88-89)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_remap_config_new_as_table_pattern_no_dot() {
+        // Covers line 60: bail! for -t pattern without dot in legacy format
+        let result = RemapConfig::new(
+            Some("dst_db.dst_table"),
+            Some("nodot"),
+            None,
+            "/clickhouse/tables/{shard}/{database}/{table}",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("db.table format"),
+            "Error should mention format: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_remap_config_new_legacy_logs_remap() {
+        // Covers lines 88-89: info! log in legacy --as format
+        // The test verifies the function succeeds (the info! is executed)
+        let result = RemapConfig::new(
+            Some("newdb.newtable"),
+            Some("olddb.oldtable"),
+            None,
+            "/clickhouse/tables/{shard}/{database}/{table}",
+        )
+        .unwrap();
+        assert!(result.is_some());
+        let config = result.unwrap();
+        assert_eq!(config.rename_as.len(), 1);
+        assert_eq!(
+            config.rename_as[0],
+            (
+                "olddb".to_string(),
+                "oldtable".to_string(),
+                "newdb".to_string(),
+                "newtable".to_string()
+            )
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rewrite_create_table_ddl edge cases (covers lines 268-269)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_ddl_logs_info() {
+        // Covers lines 268-269: info! log at start of rewrite_create_table_ddl
+        let ddl = "CREATE TABLE `db`.`t` (col Int32) ENGINE = MergeTree ORDER BY col";
+        let result = rewrite_create_table_ddl(ddl, "db", "t", "newdb", "newt", "");
+        assert!(result.contains("`newdb`.`newt`"));
+        assert!(!result.contains("`db`.`t`"));
+    }
+
+    // -----------------------------------------------------------------------
+    // rewrite_create_table_ddl UUID removal edge case (covers line 594)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_ddl_uuid_no_closing_quote() {
+        // Covers line 594: remove_uuid_clause when UUID ' has no closing quote
+        // (malformed DDL edge case)
+        let ddl = "CREATE TABLE db.t UUID 'abc-def-no-close (col Int32) ENGINE = MergeTree";
+        let result = remove_uuid_clause(ddl);
+        // Since there's no closing quote, the UUID clause can't be removed
+        assert_eq!(result, ddl);
+    }
+
+    // -----------------------------------------------------------------------
+    // rewrite_create_table_ddl Replicated ZK path edge cases (covers lines 631, 638, 644)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_replicated_zk_path_no_paren() {
+        // Covers line 631: Replicated found but no opening paren
+        let ddl = "CREATE TABLE db.t (col Int32) ENGINE = ReplicatedMergeTree ORDER BY col";
+        let result = rewrite_replicated_zk_path(ddl, "newdb", "newt", "/zk/{database}/{table}");
+        assert_eq!(result, ddl, "Should return unchanged when no paren after Replicated");
+    }
+
+    #[test]
+    fn test_rewrite_replicated_zk_path_no_quote_inside_parens() {
+        // Covers line 638: Replicated( found but no single quote inside
+        let ddl = "CREATE TABLE db.t (col Int32) ENGINE = ReplicatedMergeTree() ORDER BY col";
+        let result = rewrite_replicated_zk_path(ddl, "newdb", "newt", "/zk/{database}/{table}");
+        assert_eq!(result, ddl, "Should return unchanged when no quotes in parens");
+    }
+
+    #[test]
+    fn test_rewrite_replicated_zk_path_unclosed_quote() {
+        // Covers line 644: opening quote found but no closing quote
+        let ddl = "CREATE TABLE db.t (col Int32) ENGINE = ReplicatedMergeTree('/zk/path";
+        let result = rewrite_replicated_zk_path(ddl, "newdb", "newt", "/zk/{database}/{table}");
+        assert_eq!(result, ddl, "Should return unchanged when quote is unclosed");
+    }
+
+    #[test]
+    fn test_rewrite_ddl_replicated_zk_path_with_remap() {
+        // Full DDL rewrite exercising the ZK path rewrite path through rewrite_create_table_ddl
+        let ddl = "CREATE TABLE `db`.`t` (col Int32) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/db/t', '{replica}') ORDER BY col";
+        let result = rewrite_create_table_ddl(
+            ddl,
+            "db",
+            "t",
+            "newdb",
+            "newt",
+            "/clickhouse/tables/{shard}/{database}/{table}",
+        );
+        assert!(
+            result.contains("/clickhouse/tables/{shard}/newdb/newt"),
+            "ZK path should be rewritten: {}",
+            result
+        );
+        assert!(
+            !result.contains("/clickhouse/tables/{shard}/db/t"),
+            "Old ZK path should not be present: {}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rewrite_create_table_ddl Distributed engine edge cases (covers lines 681, 693, 701)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_distributed_engine_no_paren() {
+        // Covers line 681: Distributed found but no paren
+        // (handled via find_distributed_engine returning None)
+        let ddl = "CREATE TABLE db.t (col Int32) ENGINE = MergeTree ORDER BY col";
+        let result =
+            rewrite_distributed_engine(ddl, "db", "t", "newdb", "newt");
+        assert_eq!(result, ddl);
+    }
+
+    #[test]
+    fn test_rewrite_distributed_engine_no_closing_paren() {
+        // Covers line 693: find_matching_paren returns None
+        let ddl = "CREATE TABLE db.t (col Int32) ENGINE = Distributed('cluster', 'db', 't'";
+        let result =
+            rewrite_distributed_engine(ddl, "db", "t", "newdb", "newt");
+        assert_eq!(result, ddl, "Should return unchanged when no closing paren");
+    }
+
+    #[test]
+    fn test_rewrite_distributed_engine_too_few_args() {
+        // Covers line 701: fewer than 3 args
+        let ddl =
+            "CREATE TABLE db.t (col Int32) ENGINE = Distributed('cluster', 'db')";
+        let result =
+            rewrite_distributed_engine(ddl, "db", "t", "newdb", "newt");
+        assert_eq!(result, ddl, "Should return unchanged when fewer than 3 args");
+    }
+
+    #[test]
+    fn test_rewrite_ddl_distributed_full_rewrite() {
+        // Full DDL rewrite exercising Distributed engine rewrite through rewrite_create_table_ddl
+        let ddl = "CREATE TABLE `db`.`t_dist` (col Int32) ENGINE = Distributed('cluster', 'db', 't', rand())";
+        let result = rewrite_create_table_ddl(ddl, "db", "t", "newdb", "newt", "");
+        // Note: table name `t_dist` stays as `t_dist` because rewrite_table_name
+        // only rewrites the exact match `db`.`t` -> `newdb`.`newt`
+        // But the Distributed engine args should be updated
+        assert!(
+            result.contains("'newdb'"),
+            "Distributed db arg should be updated: {}",
+            result
+        );
+        assert!(
+            result.contains("'newt'"),
+            "Distributed table arg should be updated: {}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rewrite_create_database_ddl no match (covers line 327)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_database_ddl_no_match() {
+        // Covers line 327: DDL doesn't match any CREATE DATABASE pattern
+        let ddl = "SELECT 1";
+        let result = rewrite_create_database_ddl(ddl, "db", "newdb");
+        assert_eq!(result, "SELECT 1");
+    }
+
+    #[test]
+    fn test_rewrite_database_ddl_db_name_not_in_ddl() {
+        // Source db name doesn't appear anywhere in the DDL
+        let ddl = "CREATE DATABASE other_db ENGINE = Atomic";
+        let result = rewrite_create_database_ddl(ddl, "db", "newdb");
+        // Neither backtick nor unquoted pattern matches, so falls through to line 327
+        assert_eq!(result, ddl);
+    }
+
+    // -----------------------------------------------------------------------
+    // add_on_cluster_clause fallback (covers line 456)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_on_cluster_no_match() {
+        // Covers line 456: DDL doesn't match any known prefix
+        let ddl = "SELECT 1 FROM table";
+        let result = add_on_cluster_clause(ddl, "mycluster");
+        assert_eq!(result, "SELECT 1 FROM table");
+    }
+
+    #[test]
+    fn test_add_on_cluster_alter_table() {
+        // ALTER TABLE is not in the supported prefixes, should fall through
+        let ddl = "ALTER TABLE db.t ADD COLUMN x UInt64";
+        let result = add_on_cluster_clause(ddl, "mycluster");
+        assert_eq!(result, ddl, "ALTER TABLE should not get ON CLUSTER injected");
+    }
+
+    // -----------------------------------------------------------------------
+    // skip_object_name edge cases (covers lines 471, 491)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_on_cluster_with_backtick_db_table() {
+        // Exercises skip_object_name with backtick-quoted `db`.`table` (covers line 471+)
+        let ddl = "CREATE TABLE `my_db`.`my_table` (id UInt64) ENGINE = MergeTree ORDER BY id";
+        let result = add_on_cluster_clause(ddl, "c1");
+        assert_eq!(
+            result,
+            "CREATE TABLE `my_db`.`my_table` ON CLUSTER 'c1' (id UInt64) ENGINE = MergeTree ORDER BY id"
+        );
+    }
+
+    #[test]
+    fn test_skip_object_name_empty() {
+        // Covers line 471: pos >= bytes.len() immediately
+        let result = skip_object_name("");
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_skip_object_name_starts_with_space() {
+        // Covers line 491: first char is not identifier char or backtick
+        let result = skip_object_name(" db.table");
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_skip_object_name_backtick_dot_backtick() {
+        // Tests `db`.`table` pattern
+        let result = skip_object_name("`my_db`.`my_table` rest");
+        assert_eq!(result, 18); // len of `my_db`.`my_table`
+    }
+
+    #[test]
+    fn test_skip_object_name_unquoted() {
+        let result = skip_object_name("db.table rest");
+        assert_eq!(result, 8); // "db.table"
+    }
+
+    // -----------------------------------------------------------------------
+    // rewrite_distributed_cluster edge cases (covers lines 521, 532, 538)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_distributed_cluster_no_paren() {
+        // Covers line 521: Distributed found but no opening paren
+        // Actually this is covered by find_distributed_engine returning None
+        // because it checks for '(' after "Distributed"
+        // Let's test with Distributed appearing but not as engine
+        let ddl = "CREATE TABLE t ENGINE = MergeTree ORDER BY col COMMENT 'uses Distributed approach'";
+        let result = rewrite_distributed_cluster(ddl, "new_cluster");
+        assert_eq!(result, ddl);
+    }
+
+    #[test]
+    fn test_distributed_cluster_no_quotes_in_args() {
+        // Covers line 532: Distributed( found but no single quotes
+        let ddl = "CREATE TABLE t ENGINE = Distributed(cluster, db, t)";
+        let result = rewrite_distributed_cluster(ddl, "new_cluster");
+        assert_eq!(result, ddl, "Should return unchanged when no quoted cluster");
+    }
+
+    #[test]
+    fn test_distributed_cluster_unclosed_quote() {
+        // Covers line 538: opening quote found but no closing quote
+        let ddl = "CREATE TABLE t ENGINE = Distributed('cluster_no_close";
+        let result = rewrite_distributed_cluster(ddl, "new_cluster");
+        assert_eq!(
+            result, ddl,
+            "Should return unchanged when cluster quote is unclosed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // find_distributed_engine miss (covers lines 764, 766)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_distributed_engine_not_followed_by_paren() {
+        // Covers lines 764, 766: "Distributed" appears but next non-whitespace is not '('
+        let result = find_distributed_engine(
+            "CREATE TABLE t ENGINE = MergeTree COMMENT 'Distributed data'"
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_distributed_engine_with_paren() {
+        let result = find_distributed_engine(
+            "CREATE TABLE t ENGINE = Distributed('cluster', 'db', 't')"
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_find_distributed_engine_not_present() {
+        let result = find_distributed_engine("CREATE TABLE t ENGINE = MergeTree ORDER BY id");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_distributed_engine_with_spaces_before_paren() {
+        // "Distributed  (" should still work
+        let result = find_distributed_engine("ENGINE = Distributed  ('c', 'db', 't')");
+        assert!(result.is_some());
+    }
 }

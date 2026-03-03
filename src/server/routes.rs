@@ -2499,4 +2499,301 @@ mod tests {
         assert_eq!(response.object_disk_size, 768);
         assert_eq!(response.required, "base-backup");
     }
+
+    // -----------------------------------------------------------------------
+    // paginate() tests -- covers ~34 lines (47-81)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_paginate_empty_vec() {
+        let items: Vec<i32> = vec![];
+        let (header, result) = paginate(items, None, None, "test");
+        assert!(result.is_empty());
+        assert_eq!(header[0].1.to_str().unwrap(), "0");
+    }
+
+    #[test]
+    fn test_paginate_no_offset_no_limit() {
+        let items = vec![1, 2, 3, 4, 5];
+        let (header, result) = paginate(items, None, None, "test");
+        assert_eq!(result, vec![1, 2, 3, 4, 5]);
+        assert_eq!(header[0].1.to_str().unwrap(), "5");
+    }
+
+    #[test]
+    fn test_paginate_offset_only() {
+        let items = vec![10, 20, 30, 40, 50];
+        let (header, result) = paginate(items, Some(2), None, "test");
+        assert_eq!(result, vec![30, 40, 50]);
+        // X-Total-Count reflects original count
+        assert_eq!(header[0].1.to_str().unwrap(), "5");
+    }
+
+    #[test]
+    fn test_paginate_limit_only() {
+        let items = vec![10, 20, 30, 40, 50];
+        let (header, result) = paginate(items, None, Some(3), "test");
+        assert_eq!(result, vec![10, 20, 30]);
+        assert_eq!(header[0].1.to_str().unwrap(), "5");
+    }
+
+    #[test]
+    fn test_paginate_offset_and_limit() {
+        let items = vec![10, 20, 30, 40, 50];
+        let (header, result) = paginate(items, Some(1), Some(2), "test");
+        assert_eq!(result, vec![20, 30]);
+        assert_eq!(header[0].1.to_str().unwrap(), "5");
+    }
+
+    #[test]
+    fn test_paginate_offset_beyond_length() {
+        let items = vec![1, 2, 3];
+        let (header, result) = paginate(items, Some(10), None, "test");
+        assert!(result.is_empty());
+        assert_eq!(header[0].1.to_str().unwrap(), "3");
+    }
+
+    #[test]
+    fn test_paginate_large_limit() {
+        let items = vec![1, 2, 3];
+        let (header, result) = paginate(items, None, Some(100), "test");
+        assert_eq!(result, vec![1, 2, 3]);
+        assert_eq!(header[0].1.to_str().unwrap(), "3");
+    }
+
+    #[test]
+    fn test_paginate_zero_offset_zero_limit() {
+        let items = vec![1, 2, 3, 4];
+        let (header, result) = paginate(items, Some(0), Some(0), "test");
+        assert!(result.is_empty());
+        assert_eq!(header[0].1.to_str().unwrap(), "4");
+    }
+
+    #[test]
+    fn test_paginate_header_name_is_x_total_count() {
+        let items = vec![1, 2];
+        let (header, _) = paginate(items, None, None, "test");
+        assert_eq!(header[0].0.as_str(), "x-total-count");
+    }
+
+    // -----------------------------------------------------------------------
+    // validation_error() tests -- covers ~8 lines (37-45)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validation_error_returns_bad_request() {
+        let (status, Json(body)) = validation_error("bad/../name", "must not contain '..'");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("invalid backup name"));
+        assert!(body.error.contains("must not contain '..'"));
+    }
+
+    #[test]
+    fn test_validation_error_includes_reason() {
+        let (status, Json(body)) = validation_error("", "backup name must not be empty");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("backup name must not be empty"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_duration() additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_duration_zero() {
+        assert_eq!(format_duration(std::time::Duration::ZERO), "0s");
+    }
+
+    #[test]
+    fn test_format_duration_one_second() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(1)), "1s");
+    }
+
+    #[test]
+    fn test_format_duration_59_seconds() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn test_format_duration_exactly_60_seconds() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(60)), "1m");
+    }
+
+    #[test]
+    fn test_format_duration_hours_minutes_seconds() {
+        // 1h1m1s = 3661s. format_duration only shows h+m, ignoring leftover seconds
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(3661)),
+            "1h1m"
+        );
+    }
+
+    #[test]
+    fn test_format_duration_very_large() {
+        // 100 hours
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(360_000)),
+            "100h"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // summary_to_list_response() additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_summary_to_list_response_with_timestamp() {
+        use chrono::TimeZone;
+        let ts = chrono::Utc.with_ymd_and_hms(2025, 3, 1, 12, 0, 0).unwrap();
+        let summary = list::BackupSummary {
+            name: "ts-backup".to_string(),
+            timestamp: Some(ts),
+            size: 100,
+            compressed_size: 50,
+            table_count: 1,
+            metadata_size: 10,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken: false,
+            broken_reason: None,
+        };
+        let resp = summary_to_list_response(summary, "remote");
+        assert_eq!(resp.name, "ts-backup");
+        assert_eq!(resp.location, "remote");
+        assert!(resp.created.contains("2025"));
+        assert_eq!(resp.data_size, resp.size); // data_size == size
+        assert_eq!(resp.compressed_size, 50);
+    }
+
+    #[test]
+    fn test_summary_to_list_response_no_timestamp() {
+        let summary = list::BackupSummary {
+            name: "no-ts".to_string(),
+            timestamp: None,
+            size: 0,
+            compressed_size: 0,
+            table_count: 0,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken: false,
+            broken_reason: None,
+        };
+        let resp = summary_to_list_response(summary, "local");
+        assert_eq!(resp.created, ""); // None maps to empty string
+    }
+
+    // -----------------------------------------------------------------------
+    // Request deserialization tests (DownloadRequest, CreateRemoteRequest, KillParams)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_download_request_deserialization() {
+        let json = r#"{"hardlink_exists_files": true, "resume": false}"#;
+        let req: DownloadRequest =
+            serde_json::from_str(json).expect("Should parse DownloadRequest");
+        assert_eq!(req.hardlink_exists_files, Some(true));
+        assert_eq!(req.resume, Some(false));
+
+        let json_empty = r#"{}"#;
+        let req_empty: DownloadRequest =
+            serde_json::from_str(json_empty).expect("Should parse empty DownloadRequest");
+        assert!(req_empty.hardlink_exists_files.is_none());
+        assert!(req_empty.resume.is_none());
+    }
+
+    #[test]
+    fn test_create_remote_request_deserialization() {
+        let json = r#"{
+            "tables": "default.*",
+            "diff_from_remote": "prev-remote",
+            "backup_name": "remote-backup",
+            "delete_source": true,
+            "skip_check_parts_columns": false,
+            "rbac": true,
+            "configs": false,
+            "named_collections": true,
+            "skip_projections": ["proj1", "proj2"]
+        }"#;
+        let req: CreateRemoteRequest =
+            serde_json::from_str(json).expect("Should parse CreateRemoteRequest");
+        assert_eq!(req.tables.as_deref(), Some("default.*"));
+        assert_eq!(req.diff_from_remote.as_deref(), Some("prev-remote"));
+        assert_eq!(req.backup_name.as_deref(), Some("remote-backup"));
+        assert_eq!(req.delete_source, Some(true));
+        assert_eq!(req.skip_check_parts_columns, Some(false));
+        assert_eq!(req.rbac, Some(true));
+        assert_eq!(req.configs, Some(false));
+        assert_eq!(req.named_collections, Some(true));
+        assert_eq!(
+            req.skip_projections.as_deref(),
+            Some(&["proj1".to_string(), "proj2".to_string()][..])
+        );
+
+        let json_empty = r#"{}"#;
+        let req_empty: CreateRemoteRequest =
+            serde_json::from_str(json_empty).expect("Should parse empty CreateRemoteRequest");
+        assert!(req_empty.tables.is_none());
+        assert!(req_empty.diff_from_remote.is_none());
+        assert!(req_empty.skip_projections.is_none());
+    }
+
+    #[test]
+    fn test_kill_params_deserialization() {
+        let json = r#"{"id": 42}"#;
+        let params: KillParams = serde_json::from_str(json).expect("Should parse KillParams");
+        assert_eq!(params.id, Some(42));
+
+        let json_empty = r#"{}"#;
+        let params_empty: KillParams =
+            serde_json::from_str(json_empty).expect("Should parse empty KillParams");
+        assert!(params_empty.id.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // RestoreRemoteRequest with rm and RBAC fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_restore_remote_request_all_fields() {
+        let json = r#"{
+            "tables": "db.*",
+            "schema": true,
+            "data_only": false,
+            "rename_as": "staging.tbl",
+            "database_mapping": "prod:dev",
+            "rm": true,
+            "rbac": true,
+            "configs": true,
+            "named_collections": false
+        }"#;
+        let req: RestoreRemoteRequest = serde_json::from_str(json)
+            .expect("Should parse RestoreRemoteRequest with all fields");
+        assert_eq!(req.rm, Some(true));
+        assert_eq!(req.rbac, Some(true));
+        assert_eq!(req.configs, Some(true));
+        assert_eq!(req.named_collections, Some(false));
+    }
+
+    // -----------------------------------------------------------------------
+    // RestoreRequest RBAC fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_restore_request_rbac_fields() {
+        let json = r#"{
+            "rbac": true,
+            "configs": false,
+            "named_collections": true
+        }"#;
+        let req: RestoreRequest =
+            serde_json::from_str(json).expect("Should parse RestoreRequest with RBAC fields");
+        assert_eq!(req.rbac, Some(true));
+        assert_eq!(req.configs, Some(false));
+        assert_eq!(req.named_collections, Some(true));
+    }
 }

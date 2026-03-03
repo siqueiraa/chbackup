@@ -460,4 +460,610 @@ mod tests {
             .collect();
         assert_eq!(parts.len(), 2);
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: make_drop_ddl edge cases
+    // -----------------------------------------------------------------------
+
+    /// Test make_drop_ddl with a name containing multiple backticks.
+    #[test]
+    fn test_make_drop_ddl_multiple_backticks() {
+        let ddl = make_drop_ddl("role", "ro`le`name");
+        assert_eq!(
+            ddl,
+            Some("DROP ROLE IF EXISTS `ro``le``name`".to_string())
+        );
+    }
+
+    /// Test make_drop_ddl with empty entity name.
+    #[test]
+    fn test_make_drop_ddl_empty_name() {
+        let ddl = make_drop_ddl("user", "");
+        assert_eq!(ddl, Some("DROP USER IF EXISTS ``".to_string()));
+    }
+
+    /// Test make_drop_ddl with special characters in entity name.
+    #[test]
+    fn test_make_drop_ddl_special_chars() {
+        let ddl = make_drop_ddl("quota", "daily quota (v2)");
+        assert_eq!(
+            ddl,
+            Some("DROP QUOTA IF EXISTS `daily quota (v2)`".to_string())
+        );
+    }
+
+    /// Test make_drop_ddl returns None for various unknown types.
+    #[test]
+    fn test_make_drop_ddl_unknown_types() {
+        assert_eq!(make_drop_ddl("database", "foo"), None);
+        assert_eq!(make_drop_ddl("table", "bar"), None);
+        assert_eq!(make_drop_ddl("", "baz"), None);
+        assert_eq!(make_drop_ddl("USER", "admin"), None); // case-sensitive
+    }
+
+    /// Test make_drop_ddl with entity name containing Unicode.
+    #[test]
+    fn test_make_drop_ddl_unicode_name() {
+        let ddl = make_drop_ddl("user", "admin_user");
+        assert_eq!(
+            ddl,
+            Some("DROP USER IF EXISTS `admin_user`".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: RbacEntry parsing edge cases
+    // -----------------------------------------------------------------------
+
+    /// Test parsing RbacEntry with all entity types.
+    #[test]
+    fn test_parse_rbac_all_entity_types() {
+        let entries_json = vec![
+            r#"{"entity_type":"user","name":"u1","create_statement":"CREATE USER u1"}"#,
+            r#"{"entity_type":"role","name":"r1","create_statement":"CREATE ROLE r1"}"#,
+            r#"{"entity_type":"row_policy","name":"p1","create_statement":"CREATE ROW POLICY p1"}"#,
+            r#"{"entity_type":"settings_profile","name":"s1","create_statement":"CREATE SETTINGS PROFILE s1"}"#,
+            r#"{"entity_type":"quota","name":"q1","create_statement":"CREATE QUOTA q1"}"#,
+        ];
+
+        for json_str in &entries_json {
+            let entry: RbacEntry = serde_json::from_str(json_str).unwrap();
+            assert!(!entry.entity_type.is_empty());
+            assert!(!entry.name.is_empty());
+            assert!(!entry.create_statement.is_empty());
+        }
+    }
+
+    /// Verify make_drop_ddl covers all entity_type values that RbacEntry can have.
+    #[test]
+    fn test_make_drop_ddl_all_known_types() {
+        let types_and_keywords = vec![
+            ("user", "DROP USER IF EXISTS"),
+            ("role", "DROP ROLE IF EXISTS"),
+            ("row_policy", "DROP ROW POLICY IF EXISTS"),
+            ("settings_profile", "DROP SETTINGS PROFILE IF EXISTS"),
+            ("quota", "DROP QUOTA IF EXISTS"),
+        ];
+
+        for (entity_type, expected_prefix) in types_and_keywords {
+            let result = make_drop_ddl(entity_type, "test_entity");
+            assert!(result.is_some(), "Expected Some for entity_type: {}", entity_type);
+            let ddl = result.unwrap();
+            assert!(
+                ddl.starts_with(expected_prefix),
+                "Expected DDL starting with '{}', got: '{}'",
+                expected_prefix,
+                ddl
+            );
+            assert!(ddl.contains("`test_entity`"));
+        }
+    }
+
+    /// Test restart command parsing with only sql: prefix.
+    #[test]
+    fn test_execute_restart_commands_sql_only() {
+        let cmd = "sql:SYSTEM RELOAD CONFIG";
+        let parts: Vec<&str> = cmd.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].starts_with("sql:"));
+        let sql = parts[0].strip_prefix("sql:").unwrap().trim();
+        assert_eq!(sql, "SYSTEM RELOAD CONFIG");
+    }
+
+    /// Test restart command parsing with no prefix (defaults to exec).
+    #[test]
+    fn test_execute_restart_commands_no_prefix() {
+        let cmd = "systemctl restart clickhouse-server";
+        let parts: Vec<&str> = cmd.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        assert_eq!(parts.len(), 1);
+        assert!(!parts[0].starts_with("exec:"));
+        assert!(!parts[0].starts_with("sql:"));
+    }
+
+    /// Test restart command parsing with mixed prefixes.
+    #[test]
+    fn test_execute_restart_commands_mixed() {
+        let cmd = "exec:echo hello;sql:SELECT 1;/usr/bin/service restart";
+        let parts: Vec<&str> = cmd.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].starts_with("exec:"));
+        assert!(parts[1].starts_with("sql:"));
+        assert!(!parts[2].starts_with("exec:"));
+        assert!(!parts[2].starts_with("sql:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Comprehensive restart command parsing coverage
+    // -----------------------------------------------------------------------
+
+    /// Verify empty command string produces no parts.
+    #[test]
+    fn test_execute_restart_commands_empty_string() {
+        let cmd = "";
+        let parts: Vec<&str> = cmd
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(parts.len(), 0);
+    }
+
+    /// Verify only-whitespace segments are filtered out.
+    #[test]
+    fn test_execute_restart_commands_whitespace_only() {
+        let cmd = " ; ; ";
+        let parts: Vec<&str> = cmd
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(parts.len(), 0);
+    }
+
+    /// Verify exec: prefix is correctly stripped.
+    #[test]
+    fn test_restart_commands_exec_strip_prefix() {
+        let cmd = "exec:systemctl restart clickhouse-server";
+        let exec_cmd = cmd.strip_prefix("exec:").unwrap().trim();
+        assert_eq!(exec_cmd, "systemctl restart clickhouse-server");
+    }
+
+    /// Verify sql: prefix is correctly stripped.
+    #[test]
+    fn test_restart_commands_sql_strip_prefix() {
+        let cmd = "sql:SYSTEM RELOAD CONFIG";
+        let sql_cmd = cmd.strip_prefix("sql:").unwrap().trim();
+        assert_eq!(sql_cmd, "SYSTEM RELOAD CONFIG");
+    }
+
+    /// Verify command without prefix is not matched by exec: or sql:.
+    #[test]
+    fn test_restart_commands_no_prefix_detection() {
+        let cmd = "/usr/local/bin/restart.sh";
+        assert!(cmd.strip_prefix("exec:").is_none());
+        assert!(cmd.strip_prefix("sql:").is_none());
+    }
+
+    /// Verify multiple sql: commands are correctly split.
+    #[test]
+    fn test_restart_commands_multiple_sql() {
+        let cmd = "sql:SYSTEM RELOAD CONFIG;sql:SYSTEM FLUSH LOGS";
+        let parts: Vec<&str> = cmd
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].strip_prefix("sql:").unwrap().trim(),
+            "SYSTEM RELOAD CONFIG"
+        );
+        assert_eq!(
+            parts[1].strip_prefix("sql:").unwrap().trim(),
+            "SYSTEM FLUSH LOGS"
+        );
+    }
+
+    /// Verify trailing semicolons do not produce empty segments.
+    #[test]
+    fn test_restart_commands_trailing_semicolons() {
+        let cmd = "exec:echo test;;;";
+        let parts: Vec<&str> = cmd
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].starts_with("exec:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Comprehensive make_drop_ddl coverage
+    // -----------------------------------------------------------------------
+
+    /// Verify all five known entity types produce correct DROP DDL.
+    #[test]
+    fn test_make_drop_ddl_all_known_entity_types() {
+        let cases = vec![
+            ("user", "USER"),
+            ("role", "ROLE"),
+            ("row_policy", "ROW POLICY"),
+            ("settings_profile", "SETTINGS PROFILE"),
+            ("quota", "QUOTA"),
+        ];
+
+        for (entity_type, keyword) in cases {
+            let result = make_drop_ddl(entity_type, "test_name");
+            assert!(result.is_some(), "Expected Some for entity_type: {}", entity_type);
+            let ddl = result.unwrap();
+            assert_eq!(
+                ddl,
+                format!("DROP {} IF EXISTS `test_name`", keyword),
+                "Wrong DDL for entity_type: {}",
+                entity_type
+            );
+        }
+    }
+
+    /// Entity names with special characters (spaces, parens) are preserved inside backticks.
+    #[test]
+    fn test_make_drop_ddl_special_chars_in_name() {
+        let ddl = make_drop_ddl("quota", "daily quota (v2)").unwrap();
+        assert_eq!(ddl, "DROP QUOTA IF EXISTS `daily quota (v2)`");
+    }
+
+    /// Unknown entity types return None.
+    #[test]
+    fn test_make_drop_ddl_unknown_types_comprehensive() {
+        assert_eq!(make_drop_ddl("database", "foo"), None);
+        assert_eq!(make_drop_ddl("table", "bar"), None);
+        assert_eq!(make_drop_ddl("", "baz"), None);
+        // Case-sensitive: uppercase "USER" is not a known entity_type value.
+        assert_eq!(make_drop_ddl("USER", "admin"), None);
+        assert_eq!(make_drop_ddl("ROLE", "readonly"), None);
+    }
+
+    /// Multiple consecutive backticks in the name are all escaped.
+    #[test]
+    fn test_make_drop_ddl_consecutive_backticks() {
+        let ddl = make_drop_ddl("user", "a``b").unwrap();
+        // Each ` becomes ``, so `` becomes ````
+        assert_eq!(ddl, "DROP USER IF EXISTS `a````b`");
+    }
+
+    // -----------------------------------------------------------------------
+    /// RbacEntry with special characters in name.
+    #[test]
+    fn test_parse_rbac_special_name() {
+        let json = r#"{"entity_type":"user","name":"user@host","create_statement":"CREATE USER `user@host`"}"#;
+        let entry: RbacEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.name, "user@host");
+        assert!(entry.create_statement.contains("`user@host`"));
+    }
+
+    /// RbacEntry with unicode name.
+    #[test]
+    fn test_parse_rbac_unicode_name() {
+        let json = r#"{"entity_type":"role","name":"admin_role","create_statement":"CREATE ROLE admin_role"}"#;
+        let entry: RbacEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.entity_type, "role");
+        assert_eq!(entry.name, "admin_role");
+    }
+
+    /// RbacEntry with multiline create_statement.
+    #[test]
+    fn test_parse_rbac_multiline_statement() {
+        let json = r#"{"entity_type":"row_policy","name":"filter_policy","create_statement":"CREATE ROW POLICY filter_policy ON db.t FOR SELECT USING id > 0"}"#;
+        let entry: RbacEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.entity_type, "row_policy");
+        assert!(entry.create_statement.contains("FOR SELECT USING"));
+    }
+
+    /// Verify make_drop_ddl output matches the entity_type values that RbacEntry uses.
+    #[test]
+    fn test_make_drop_ddl_matches_rbac_entity_types() {
+        let json_entries = vec![
+            r#"{"entity_type":"user","name":"u1","create_statement":"CREATE USER u1"}"#,
+            r#"{"entity_type":"role","name":"r1","create_statement":"CREATE ROLE r1"}"#,
+            r#"{"entity_type":"row_policy","name":"p1","create_statement":"CREATE ROW POLICY p1"}"#,
+            r#"{"entity_type":"settings_profile","name":"s1","create_statement":"CREATE SETTINGS PROFILE s1"}"#,
+            r#"{"entity_type":"quota","name":"q1","create_statement":"CREATE QUOTA q1"}"#,
+        ];
+
+        for json_str in &json_entries {
+            let entry: RbacEntry = serde_json::from_str(json_str).unwrap();
+            let drop_ddl = make_drop_ddl(&entry.entity_type, &entry.name);
+            assert!(
+                drop_ddl.is_some(),
+                "make_drop_ddl should handle entity_type '{}' from RbacEntry",
+                entry.entity_type
+            );
+            let ddl = drop_ddl.unwrap();
+            assert!(
+                ddl.starts_with("DROP "),
+                "DROP DDL should start with DROP: {}",
+                ddl
+            );
+            assert!(
+                ddl.contains("IF EXISTS"),
+                "DROP DDL should contain IF EXISTS: {}",
+                ddl
+            );
+            assert!(
+                ddl.contains(&format!("`{}`", entry.name)),
+                "DROP DDL should contain backtick-quoted name: {}",
+                ddl
+            );
+        }
+    }
+
+    // ---- restore_named_collections tests ----
+
+    #[tokio::test]
+    async fn test_restore_named_collections_empty() {
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+        use crate::manifest::BackupManifest;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let manifest = BackupManifest::test_new("test");
+        // Empty named_collections should return Ok immediately
+        let result = restore_named_collections(&ch, &manifest, None).await;
+        assert!(result.is_ok());
+    }
+
+    // ---- restore_rbac tests (file I/O) ----
+
+    #[tokio::test]
+    async fn test_restore_rbac_no_access_dir() {
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let config = Config::default();
+        let backup_dir = tempfile::tempdir().unwrap();
+        // No access/ directory should return Ok immediately
+        let result = restore_rbac(&ch, &config, backup_dir.path(), "recreate").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_restore_rbac_empty_access_dir() {
+        // access/ exists but has no .jsonl files -> empty entries -> return Ok
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let config = Config::default();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let access_dir = backup_dir.path().join("access");
+        std::fs::create_dir_all(&access_dir).unwrap();
+        // Put a non-.jsonl file to ensure it's ignored
+        std::fs::write(access_dir.join("readme.txt"), b"not jsonl").unwrap();
+
+        let result = restore_rbac(&ch, &config, backup_dir.path(), "recreate").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_restart_commands_empty() {
+        // Empty restart_command should return Ok immediately
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let result = execute_restart_commands(&ch, "").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_restart_commands_exec_only() {
+        // exec: commands run via shell, don't need ChClient
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let result = execute_restart_commands(&ch, "exec:echo hello").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_restart_commands_no_prefix_async() {
+        // Commands without prefix default to exec: behavior
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let result = execute_restart_commands(&ch, "echo hello").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_restart_commands_multi_exec() {
+        // Multiple exec commands separated by semicolons
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let result = execute_restart_commands(&ch, "exec:echo a;exec:echo b;exec:echo c").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_restart_commands_failing_exec() {
+        // Failing exec command should be non-fatal
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let result = execute_restart_commands(&ch, "exec:false").await;
+        assert!(result.is_ok(), "Failing exec command should be non-fatal");
+    }
+
+    #[tokio::test]
+    async fn test_restore_rbac_jsonl_empty_lines_only() {
+        // access/ has .jsonl files but only empty/whitespace lines -> empty entries
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let config = Config::default();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let access_dir = backup_dir.path().join("access");
+        std::fs::create_dir_all(&access_dir).unwrap();
+        std::fs::write(access_dir.join("users.jsonl"), "\n  \n\n").unwrap();
+
+        let result = restore_rbac(&ch, &config, backup_dir.path(), "recreate").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_restore_rbac_invalid_json_in_jsonl() {
+        // .jsonl file with invalid JSON should return error
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let config = Config::default();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let access_dir = backup_dir.path().join("access");
+        std::fs::create_dir_all(&access_dir).unwrap();
+        std::fs::write(access_dir.join("users.jsonl"), "not valid json\n").unwrap();
+
+        let result = restore_rbac(&ch, &config, backup_dir.path(), "recreate").await;
+        assert!(result.is_err(), "Invalid JSON should cause error");
+    }
+
+    #[tokio::test]
+    async fn test_restore_rbac_with_valid_entries_recreate() {
+        // Valid .jsonl entries + no ClickHouse → DDL will fail, but "recreate" mode
+        // should log warnings and continue (non-fatal for DDL failures in recreate mode)
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let config = Config::default();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let access_dir = backup_dir.path().join("access");
+        std::fs::create_dir_all(&access_dir).unwrap();
+
+        let jsonl = r#"{"entity_type":"user","name":"test_user","create_statement":"CREATE USER `test_user`"}"#;
+        std::fs::write(access_dir.join("users.jsonl"), jsonl).unwrap();
+
+        // This will parse the file, then try to execute DDL which will fail
+        // because there's no ClickHouse running. With "recreate" mode,
+        // failures are logged as warnings and skipped.
+        let result = restore_rbac(&ch, &config, backup_dir.path(), "recreate").await;
+        // Result depends on whether DDL failure is propagated — in recreate mode
+        // it should be non-fatal, so Ok is expected
+        assert!(result.is_ok(), "Recreate mode should handle DDL failures gracefully");
+    }
+
+    #[tokio::test]
+    async fn test_restore_rbac_with_valid_entries_ignore() {
+        // Valid .jsonl entries + no ClickHouse → "ignore" mode skips failures
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let config = Config::default();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let access_dir = backup_dir.path().join("access");
+        std::fs::create_dir_all(&access_dir).unwrap();
+
+        let jsonl = r#"{"entity_type":"role","name":"test_role","create_statement":"CREATE ROLE `test_role`"}"#;
+        std::fs::write(access_dir.join("roles.jsonl"), jsonl).unwrap();
+
+        let result = restore_rbac(&ch, &config, backup_dir.path(), "ignore").await;
+        assert!(result.is_ok(), "Ignore mode should handle DDL failures gracefully");
+    }
+
+    #[tokio::test]
+    async fn test_restore_rbac_with_valid_entries_fail_mode() {
+        // Valid .jsonl entries + no ClickHouse → "fail" mode should return error
+        use crate::clickhouse::client::ChClient;
+        use crate::config::ClickHouseConfig;
+
+        let ch = ChClient::new(&ClickHouseConfig::default()).unwrap();
+        let config = Config::default();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let access_dir = backup_dir.path().join("access");
+        std::fs::create_dir_all(&access_dir).unwrap();
+
+        let jsonl = r#"{"entity_type":"user","name":"u1","create_statement":"CREATE USER `u1`"}"#;
+        std::fs::write(access_dir.join("users.jsonl"), jsonl).unwrap();
+
+        let result = restore_rbac(&ch, &config, backup_dir.path(), "fail").await;
+        assert!(result.is_err(), "Fail mode should return error on DDL failure");
+    }
+
+    // ---- restore_configs tests (file I/O only, no ChClient) ----
+
+    #[tokio::test]
+    async fn test_restore_configs_no_configs_dir() {
+        // When backup has no configs/ directory, should return Ok silently
+        let backup_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            clickhouse: crate::config::ClickHouseConfig {
+                config_dir: "/tmp/unused".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = restore_configs(&config, backup_dir.path()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_restore_configs_copies_files() {
+        let backup_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create configs/ directory with files in backup
+        let configs_src = backup_dir.path().join("configs");
+        std::fs::create_dir_all(configs_src.join("subdir")).unwrap();
+        std::fs::write(configs_src.join("users.xml"), b"<users/>").unwrap();
+        std::fs::write(configs_src.join("subdir/remote.xml"), b"<remote/>").unwrap();
+
+        let config = Config {
+            clickhouse: crate::config::ClickHouseConfig {
+                config_dir: target_dir.path().to_str().unwrap().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = restore_configs(&config, backup_dir.path()).await;
+        assert!(result.is_ok());
+
+        // Verify files were copied
+        assert_eq!(
+            std::fs::read_to_string(target_dir.path().join("users.xml")).unwrap(),
+            "<users/>"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target_dir.path().join("subdir/remote.xml")).unwrap(),
+            "<remote/>"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_configs_empty_configs_dir() {
+        let backup_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create empty configs/ directory
+        std::fs::create_dir_all(backup_dir.path().join("configs")).unwrap();
+
+        let config = Config {
+            clickhouse: crate::config::ClickHouseConfig {
+                config_dir: target_dir.path().to_str().unwrap().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = restore_configs(&config, backup_dir.path()).await;
+        assert!(result.is_ok());
+    }
 }

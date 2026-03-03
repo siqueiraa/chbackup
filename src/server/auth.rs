@@ -182,6 +182,20 @@ mod tests {
     }
 
     #[test]
+    fn test_unauthorized_response_has_www_authenticate_header() {
+        let response = unauthorized_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let headers = response.headers();
+        let www_auth = headers
+            .get(header::WWW_AUTHENTICATE)
+            .expect("Should have WWW-Authenticate header");
+        assert_eq!(
+            www_auth.to_str().unwrap(),
+            "Basic realm=\"chbackup\""
+        );
+    }
+
+    #[test]
     fn test_constant_time_eq_equal() {
         assert!(constant_time_eq(b"hello", b"hello"));
         assert!(constant_time_eq(b"", b""));

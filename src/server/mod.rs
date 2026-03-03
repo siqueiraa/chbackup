@@ -461,6 +461,609 @@ fn parse_integration_host_port(config: &Config) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{self, Request, StatusCode};
+    use tower::ServiceExt; // for oneshot()
+
+    /// Build a test AppState with dummy clients (won't connect to anything).
+    ///
+    /// `ChClient::new()` just builds a clickhouse client struct pointing at localhost.
+    /// `S3Client::new()` builds the AWS SDK config. Neither actually connects until
+    /// a query is made, so they are safe for testing routes that don't touch backends.
+    async fn test_app_state() -> AppState {
+        let config = Arc::new(Config::default());
+        let ch = crate::clickhouse::ChClient::new(&config.clickhouse)
+            .expect("ChClient::new should succeed with default config");
+        let s3 = crate::storage::S3Client::new(&config.s3)
+            .await
+            .expect("S3Client::new should succeed with default config");
+        let config_path = std::path::PathBuf::from("/tmp/test-config.yml");
+        AppState::new(config, ch, s3, config_path)
+    }
+
+    /// Build a test router with dummy state.
+    async fn test_router() -> axum::Router {
+        let state = test_app_state().await;
+        build_router(state)
+    }
+
+    /// Build a test AppState with auth credentials configured.
+    async fn test_app_state_with_auth(username: &str, password: &str) -> AppState {
+        let mut config = Config::default();
+        config.api.username = username.to_string();
+        config.api.password = password.to_string();
+        let config = Arc::new(config);
+        let ch = crate::clickhouse::ChClient::new(&config.clickhouse)
+            .expect("ChClient::new should succeed");
+        let s3 = crate::storage::S3Client::new(&config.s3)
+            .await
+            .expect("S3Client::new should succeed");
+        let config_path = std::path::PathBuf::from("/tmp/test-config.yml");
+        AppState::new(config, ch, s3, config_path)
+    }
+
+    /// Helper to read the response body as bytes.
+    async fn body_bytes(body: Body) -> Vec<u8> {
+        use http_body_util::BodyExt;
+        let collected = body.collect().await.expect("body collect should succeed");
+        collected.to_bytes().to_vec()
+    }
+
+    /// Helper to read the response body as a serde_json::Value.
+    async fn body_json(body: Body) -> serde_json::Value {
+        let bytes = body_bytes(body).await;
+        serde_json::from_slice(&bytes).expect("response body should be valid JSON")
+    }
+
+    // -----------------------------------------------------------------------
+    // Axum integration tests using tower::ServiceExt::oneshot
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_route_health_returns_ok_json() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_route_actions_empty() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/actions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        // Should be an empty array since no operations have been started
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_route_status_idle() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["status"], "idle");
+        assert!(json["command"].is_null());
+        assert!(json["start"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_route_watch_status_default() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/watch/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["state"], "inactive");
+        assert_eq!(json["active"], false);
+        assert_eq!(json["consecutive_errors"], 0);
+        assert!(json["last_full"].is_null());
+        assert!(json["last_incr"].is_null());
+        assert!(json["next_in"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_route_kill_no_running_returns_404() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/kill")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // No operations running, kill should return 404
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_route_kill_with_id_no_running_returns_404() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/kill?id=999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_route_metrics_enabled_by_default() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Default config has enable_metrics=true
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body_bytes(resp.into_body()).await;
+        let text = String::from_utf8(bytes).expect("metrics should be UTF-8");
+        assert!(
+            text.contains("# HELP chbackup_"),
+            "Should contain prometheus HELP lines"
+        );
+        assert!(
+            text.contains("chbackup_in_progress"),
+            "Should contain in_progress gauge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_metrics_disabled() {
+        let mut config = Config::default();
+        config.api.enable_metrics = false;
+        let config = Arc::new(config);
+        let ch = crate::clickhouse::ChClient::new(&config.clickhouse).unwrap();
+        let s3 = crate::storage::S3Client::new(&config.s3).await.unwrap();
+        let state = AppState::new(
+            config,
+            ch,
+            s3,
+            std::path::PathBuf::from("/tmp/test-config.yml"),
+        );
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let bytes = body_bytes(resp.into_body()).await;
+        let text = String::from_utf8(bytes).expect("body should be UTF-8");
+        assert_eq!(text, "metrics disabled");
+    }
+
+    #[tokio::test]
+    async fn test_route_create_invalid_name_path_traversal() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"backup_name":"bad/../name"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp.into_body()).await;
+        assert!(
+            json["error"].as_str().unwrap().contains("invalid backup name"),
+            "Error should mention invalid backup name"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_create_invalid_name_slash() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"backup_name":"path/slash"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_route_create_invalid_name_empty() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"backup_name":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_route_create_reserved_name_latest() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"backup_name":"latest"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // "latest" should be rejected by reject_reserved_backup_name in create
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp.into_body()).await;
+        let err = json["error"].as_str().unwrap();
+        assert!(
+            err.contains("latest") || err.contains("reserved"),
+            "Error should mention reserved name: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_post_actions_empty_body() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/actions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"[]"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Empty command list should return 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_route_post_actions_unknown_command() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/actions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"[{"command":"nonexistent_cmd"}]"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Unknown command should return 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp.into_body()).await;
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown command"));
+    }
+
+    #[tokio::test]
+    async fn test_route_delete_invalid_location() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::DELETE)
+                    .uri("/api/v1/delete/invalid_location/my-backup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_route_watch_stop_not_active() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/watch/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Watch is not active so stop should return 404
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_route_version_endpoint() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        // version should be the cargo package version
+        assert!(json["version"].is_string());
+        assert!(!json["version"].as_str().unwrap().is_empty());
+        // clickhouse_version will be "unknown" since we have no real CH
+        assert!(json["clickhouse_version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_route_clean_remote_broken_starts_operation() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/clean/remote_broken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // This should start an async operation (200 with action ID),
+        // even though the S3 call will fail in the background.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert!(json["id"].is_number());
+        assert_eq!(json["status"], "started");
+    }
+
+    #[tokio::test]
+    async fn test_route_upload_invalid_name() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/api/v1/upload/bad%2F..%2Fname")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Path traversal in upload name should return 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth middleware integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_auth_no_config_passes_through() {
+        // Default config has empty username/password -- auth should pass through
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_configured_no_header_returns_401() {
+        let state = test_app_state_with_auth("admin", "secret123").await;
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Should include WWW-Authenticate header
+        assert!(resp.headers().contains_key("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_configured_correct_credentials_passes() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let state = test_app_state_with_auth("admin", "secret123").await;
+        let app = build_router(state);
+        let creds = STANDARD.encode("admin:secret123");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("authorization", format!("Basic {creds}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_auth_configured_wrong_credentials_returns_401() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let state = test_app_state_with_auth("admin", "secret123").await;
+        let app = build_router(state);
+        let creds = STANDARD.encode("admin:wrongpassword");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("authorization", format!("Basic {creds}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_configured_wrong_username_returns_401() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let state = test_app_state_with_auth("admin", "secret123").await;
+        let app = build_router(state);
+        let creds = STANDARD.encode("wronguser:secret123");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("authorization", format!("Basic {creds}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_non_basic_scheme_returns_401() {
+        let state = test_app_state_with_auth("admin", "secret123").await;
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("authorization", "Bearer some-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_invalid_base64_returns_401() {
+        let state = test_app_state_with_auth("admin", "secret123").await;
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("authorization", "Basic not-valid-base64!!!")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_route_nonexistent_returns_404() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_route_wrong_method_returns_405() {
+        let app = test_router().await;
+        // /health only supports GET, try POST
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // axum returns 405 Method Not Allowed for wrong method on existing route
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Original unit tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_parse_integration_host_port_defaults() {
@@ -478,5 +1081,34 @@ mod tests {
         let (host, port) = parse_integration_host_port(&config);
         assert_eq!(host, "backup-server");
         assert_eq!(port, "8080");
+    }
+
+    #[test]
+    fn test_parse_integration_host_port_ipv4() {
+        let mut config = Config::default();
+        config.api.listen = "127.0.0.1:9090".to_string();
+        let (host, port) = parse_integration_host_port(&config);
+        assert_eq!(host, "localhost"); // default when integration_tables_host is empty
+        assert_eq!(port, "9090");
+    }
+
+    #[test]
+    fn test_parse_integration_host_port_no_colon() {
+        // Edge case: if listen has no colon, rsplit(':').next() returns the whole string
+        let mut config = Config::default();
+        config.api.listen = "badformat".to_string();
+        let (host, port) = parse_integration_host_port(&config);
+        assert_eq!(host, "localhost");
+        assert_eq!(port, "badformat"); // entire string when no colon
+    }
+
+    #[test]
+    fn test_parse_integration_host_port_empty_host_config() {
+        let mut config = Config::default();
+        config.api.integration_tables_host = String::new();
+        config.api.listen = "0.0.0.0:7171".to_string();
+        let (host, port) = parse_integration_host_port(&config);
+        assert_eq!(host, "localhost");
+        assert_eq!(port, "7171");
     }
 }

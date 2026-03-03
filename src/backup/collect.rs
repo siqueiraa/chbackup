@@ -1242,4 +1242,142 @@ mod tests {
 
         assert_eq!(result, None);
     }
+
+    #[test]
+    fn test_build_uuid_map_skips_null_uuid() {
+        // build_uuid_map should skip null UUIDs (all zeros)
+        let tables = vec![TableRow {
+            database: "default".to_string(),
+            name: "log_table".to_string(),
+            engine: "Log".to_string(),
+            create_table_query: "CREATE TABLE ...".to_string(),
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            data_paths: vec!["/var/lib/clickhouse/data/default/log_table/".to_string()],
+            total_bytes: Some(100),
+        }];
+
+        let map = build_uuid_map(&tables);
+        // The null UUID should NOT be in the map
+        assert!(
+            !map.contains_key("00000000-0000-0000-0000-000000000000"),
+            "Null UUID should not be inserted into uuid_map"
+        );
+        // But data_paths-derived UUID (last path component) should be present
+        assert!(map.contains_key("log_table"));
+    }
+
+    #[test]
+    fn test_build_uuid_map_multiple_data_paths() {
+        // Verify build_uuid_map handles tables with multiple data_paths
+        let tables = vec![TableRow {
+            database: "default".to_string(),
+            name: "trades".to_string(),
+            engine: "MergeTree".to_string(),
+            create_table_query: "CREATE TABLE ...".to_string(),
+            uuid: "abcdef12-3456-7890-abcd-ef1234567890".to_string(),
+            data_paths: vec![
+                "/var/lib/clickhouse/store/abc/abcdef12-3456-7890-abcd-ef1234567890/".to_string(),
+                "/mnt/nvme2/store/abc/abcdef12-3456-7890-abcd-ef1234567890/".to_string(),
+            ],
+            total_bytes: Some(1000),
+        }];
+
+        let map = build_uuid_map(&tables);
+        // Both data_paths should have entries for the UUID directory name
+        assert!(map.contains_key("abcdef12-3456-7890-abcd-ef1234567890"));
+        let entry = map.get("abcdef12-3456-7890-abcd-ef1234567890").unwrap();
+        assert_eq!(entry.0, "default");
+        assert_eq!(entry.1, "trades");
+    }
+
+    #[test]
+    fn test_build_uuid_map_empty_uuid() {
+        // Tables with empty uuid should not insert empty key
+        let tables = vec![TableRow {
+            database: "default".to_string(),
+            name: "log_table".to_string(),
+            engine: "Log".to_string(),
+            create_table_query: "CREATE TABLE ...".to_string(),
+            uuid: "".to_string(),
+            data_paths: vec!["/var/lib/clickhouse/data/default/log_table/".to_string()],
+            total_bytes: Some(100),
+        }];
+
+        let map = build_uuid_map(&tables);
+        assert!(!map.contains_key(""));
+    }
+
+    #[test]
+    fn test_should_skip_projection_no_match() {
+        // No patterns match -> should not skip
+        assert!(!should_skip_projection("my_agg", &["other_*".to_string()]));
+    }
+
+    #[test]
+    fn test_should_skip_projection_star_matches_all() {
+        // Special pattern "*" matches everything
+        assert!(should_skip_projection("any_projection", &["*".to_string()]));
+    }
+
+    #[test]
+    fn test_should_skip_projection_glob_match() {
+        // Glob pattern "my_*" should match "my_agg"
+        assert!(should_skip_projection("my_agg", &["my_*".to_string()]));
+    }
+
+    #[test]
+    fn test_should_skip_projection_no_patterns() {
+        // Empty pattern list -> never skip
+        assert!(!should_skip_projection("anything", &[]));
+    }
+
+    #[test]
+    fn test_dir_size_nonexistent_dir() {
+        // dir_size on a nonexistent path should error
+        let path = std::path::Path::new("/tmp/nonexistent_dir_chbackup_test_12345");
+        let result = dir_size(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_per_disk_backup_dir_trailing_slash() {
+        // Verify trailing slashes in disk_path are handled
+        let result = per_disk_backup_dir("/mnt/disk1/", "backup-1");
+        assert_eq!(result, PathBuf::from("/mnt/disk1/backup/backup-1"));
+    }
+
+    #[test]
+    fn test_collect_s3_part_metadata_local_dir() {
+        // When a part directory has no parseable metadata files, s3_objects
+        // should be empty (all files fail to parse and are silently skipped)
+        let tmp = tempfile::tempdir().unwrap();
+        let part_dir = tmp.path().join("part_1_1_0");
+        std::fs::create_dir_all(&part_dir).unwrap();
+        std::fs::write(part_dir.join("data.bin"), b"not metadata").unwrap();
+        std::fs::write(part_dir.join("checksums.txt"), b"checksum data").unwrap();
+
+        let (objects, total_size) = collect_s3_part_metadata(&part_dir).unwrap();
+        assert!(objects.is_empty());
+        assert_eq!(total_size, 0);
+    }
+
+    #[test]
+    fn test_collect_s3_part_metadata_with_valid_metadata() {
+        // Test that collect_s3_part_metadata correctly parses metadata files
+        let tmp = tempfile::tempdir().unwrap();
+        let part_dir = tmp.path().join("part_1_1_0");
+        std::fs::create_dir_all(&part_dir).unwrap();
+
+        // Write a valid metadata file
+        let metadata = "2\n1\t500\n500\tstore/abc/data.bin\n0\n";
+        std::fs::write(part_dir.join("data.bin"), metadata).unwrap();
+        // checksums.txt is not a metadata file -- will fail to parse and be skipped
+        std::fs::write(part_dir.join("checksums.txt"), b"checksum data").unwrap();
+
+        let (objects, total_size) = collect_s3_part_metadata(&part_dir).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].path, "store/abc/data.bin");
+        assert_eq!(objects[0].size, 500);
+        assert_eq!(total_size, 500);
+    }
 }

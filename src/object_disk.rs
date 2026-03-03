@@ -580,4 +580,157 @@ mod tests {
         // Should not have double slash
         assert_eq!(lines[2], "500\tstore/new/store/abc/data.bin");
     }
+
+    #[test]
+    fn test_parse_file_too_short_one_line() {
+        // Covers lines 76, 78: file with only version line (< 3 lines)
+        let content = "2\n";
+        let result = parse_metadata(content);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("too short"),
+            "Expected 'too short' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_file_too_short_two_lines() {
+        // Covers lines 76, 78: file with version and header but no object lines
+        // "2\n1\t500\n" has only 2 lines, which is < 3, so it triggers the "too short" check
+        let content = "2\n1\t500\n";
+        let result = parse_metadata(content);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("too short"),
+            "Expected 'too short' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_header_missing_tab() {
+        // Covers line 85: header line without tab separator
+        let content = "2\n1 500\n500\tdata.bin\n0\n";
+        let result = parse_metadata(content);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Invalid metadata header"),
+            "Expected 'Invalid metadata header' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_truncated_objects_section() {
+        // Covers lines 101: object_count says 3 but only 1 object line present
+        let content = "2\n3\t1500\n500\tstore/abc/data.bin\n";
+        let result = parse_metadata(content);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("truncated"),
+            "Expected 'truncated' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_invalid_object_line_no_tab() {
+        // Covers line 109: object line without tab separator
+        let content = "2\n1\t500\n500 store/abc/data.bin\n0\n";
+        let result = parse_metadata(content);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Invalid object line"),
+            "Expected 'Invalid object line' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_v1_missing_ref_count() {
+        // Covers line 138: ref_count line missing, defaults to 0
+        // v1 metadata with exactly 3 lines (version + header + 1 object, no ref_count line)
+        let content = "1\n1\t100\n100\ts3://bucket/data.bin";
+        let meta = parse_metadata(content).unwrap();
+        assert_eq!(meta.version, 1);
+        assert_eq!(meta.ref_count, 0);
+        assert_eq!(meta.objects.len(), 1);
+    }
+
+    #[test]
+    fn test_rewrite_metadata_v4_no_inline_data() {
+        // Covers line 226: rewrite_metadata for v4 with inline_data = None
+        let meta = ObjectDiskMetadata {
+            version: 4,
+            objects: vec![ObjectRef {
+                relative_path: "store/abc/data.bin".to_string(),
+                size: 500,
+            }],
+            total_size: 500,
+            ref_count: 1,
+            read_only: false,
+            inline_data: None,
+        };
+        let rewritten = rewrite_metadata(&meta, "store/new");
+        let lines: Vec<&str> = rewritten.lines().collect();
+        assert_eq!(lines[0], "4"); // version
+        assert_eq!(lines[1], "1\t500"); // object count + total size
+        assert_eq!(lines[2], "500\tstore/new/store/abc/data.bin"); // object
+        assert_eq!(lines[3], "0"); // ref_count = 0
+        assert_eq!(lines[4], "0"); // read_only = false
+        // Line 5 should be empty (inline_data = None produces empty line)
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[5], "");
+    }
+
+    #[test]
+    fn test_serialize_metadata_v4_no_inline_data() {
+        // Covers line 269: serialize_metadata for v4 with inline_data = None
+        let meta = ObjectDiskMetadata {
+            version: 4,
+            objects: vec![ObjectRef {
+                relative_path: "store/abc/data.bin".to_string(),
+                size: 500,
+            }],
+            total_size: 500,
+            ref_count: 2,
+            read_only: false,
+            inline_data: None,
+        };
+        let serialized = serialize_metadata(&meta);
+        let lines: Vec<&str> = serialized.lines().collect();
+        assert_eq!(lines[0], "4"); // version
+        assert_eq!(lines[1], "1\t500"); // header
+        assert_eq!(lines[2], "500\tstore/abc/data.bin"); // object
+        assert_eq!(lines[3], "2"); // ref_count
+        assert_eq!(lines[4], "0"); // read_only
+        // Line 5 should be empty (inline_data = None produces empty line)
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[5], "");
+    }
+
+    #[test]
+    fn test_serialize_metadata_v3_read_only_true() {
+        // Covers line 260: serialize_metadata with read_only=true for v3
+        let meta = ObjectDiskMetadata {
+            version: 3,
+            objects: vec![ObjectRef {
+                relative_path: "store/abc/data.bin".to_string(),
+                size: 500,
+            }],
+            total_size: 500,
+            ref_count: 1,
+            read_only: true,
+            inline_data: None,
+        };
+        let serialized = serialize_metadata(&meta);
+        let lines: Vec<&str> = serialized.lines().collect();
+        assert_eq!(lines[4], "1"); // read_only = true
+    }
 }

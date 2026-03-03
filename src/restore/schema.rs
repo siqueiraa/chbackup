@@ -1079,4 +1079,211 @@ mod tests {
         let resolved_path = resolve_zk_macros(&path_template, &macros);
         assert_eq!(resolved_path, "/clickhouse/tables/abc-123-def");
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: ensure_if_not_exists_table edge cases
+    // -----------------------------------------------------------------------
+
+    /// Test ensure_if_not_exists_table returns DDL unchanged when it has no
+    /// recognized CREATE keyword (the fallback path at the end of the function).
+    #[test]
+    fn test_ensure_if_not_exists_table_unrecognized_ddl() {
+        // DDL that doesn't match any known CREATE pattern
+        let ddl = "ALTER TABLE default.trades ADD COLUMN x UInt64";
+        let result = ensure_if_not_exists_table(ddl);
+        assert_eq!(result, ddl, "Unrecognized DDL should pass through unchanged");
+    }
+
+    /// Test ensure_if_not_exists_table when DDL already has IF NOT EXISTS
+    /// for a TABLE statement.
+    #[test]
+    fn test_ensure_if_not_exists_table_already_present() {
+        let ddl = "CREATE TABLE IF NOT EXISTS default.t (id UInt64) ENGINE = MergeTree ORDER BY id";
+        let result = ensure_if_not_exists_table(ddl);
+        assert_eq!(result, ddl, "Should return DDL unchanged when IF NOT EXISTS already present");
+    }
+
+    /// Test ensure_if_not_exists_table when DDL already has IF NOT EXISTS
+    /// for a MATERIALIZED VIEW statement.
+    #[test]
+    fn test_ensure_if_not_exists_mv_already_present() {
+        let ddl = "CREATE MATERIALIZED VIEW IF NOT EXISTS default.mv TO default.t AS SELECT 1";
+        let result = ensure_if_not_exists_table(ddl);
+        assert_eq!(result, ddl);
+    }
+
+    /// Test ensure_if_not_exists_table when DDL already has IF NOT EXISTS
+    /// for a DICTIONARY statement.
+    #[test]
+    fn test_ensure_if_not_exists_dict_already_present() {
+        let ddl = "CREATE DICTIONARY IF NOT EXISTS default.d (id UInt64) PRIMARY KEY id";
+        let result = ensure_if_not_exists_table(ddl);
+        assert_eq!(result, ddl);
+    }
+
+    /// Test ensure_if_not_exists_database with DDL that doesn't contain
+    /// the CREATE DATABASE keyword at all.
+    #[test]
+    fn test_ensure_if_not_exists_database_unrecognized() {
+        let ddl = "DROP DATABASE foo";
+        let result = ensure_if_not_exists_database(ddl);
+        // replacen with 0 occurrences returns the string unchanged
+        assert_eq!(result, ddl);
+    }
+
+    /// Verify that ensure_if_not_exists_table correctly handles CREATE TABLE
+    /// with leading whitespace/comments (common in ClickHouse DDL dumps).
+    #[test]
+    fn test_ensure_if_not_exists_table_preserves_content() {
+        let ddl = "CREATE TABLE default.t (id UInt64, name String) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 8192";
+        let result = ensure_if_not_exists_table(ddl);
+        assert!(result.starts_with("CREATE TABLE IF NOT EXISTS"));
+        assert!(result.contains("SETTINGS index_granularity = 8192"));
+    }
+
+    /// Test ensure_if_not_exists_table for CREATE VIEW with complex query.
+    #[test]
+    fn test_ensure_if_not_exists_view_complex_query() {
+        let ddl = "CREATE VIEW default.complex_view AS SELECT a, b, count() FROM default.t GROUP BY a, b HAVING count() > 10";
+        let result = ensure_if_not_exists_table(ddl);
+        assert!(result.starts_with("CREATE VIEW IF NOT EXISTS"));
+        assert!(result.contains("HAVING count() > 10"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: is_replicated_engine edge cases
+    // -----------------------------------------------------------------------
+
+    /// Test is_replicated_engine with empty string.
+    #[test]
+    fn test_is_replicated_engine_empty() {
+        assert!(!is_replicated_engine(""));
+    }
+
+    /// Test is_replicated_engine with just the prefix "Replicated" alone.
+    #[test]
+    fn test_is_replicated_engine_prefix_only() {
+        assert!(is_replicated_engine("Replicated"));
+    }
+
+    /// Test is_replicated_engine with case mismatch.
+    #[test]
+    fn test_is_replicated_engine_case_sensitive() {
+        assert!(!is_replicated_engine("replicatedMergeTree"));
+        assert!(!is_replicated_engine("REPLICATEDMERGETREE"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: SYSTEM_DATABASES boundary checks
+    // -----------------------------------------------------------------------
+
+    /// Verify system database names are case-sensitive.
+    #[test]
+    fn test_system_databases_case_sensitive() {
+        assert!(SYSTEM_DATABASES.contains(&"system"));
+        assert!(!SYSTEM_DATABASES.contains(&"System"));
+        assert!(!SYSTEM_DATABASES.contains(&"SYSTEM"));
+        assert!(SYSTEM_DATABASES.contains(&"INFORMATION_SCHEMA"));
+        assert!(!SYSTEM_DATABASES.contains(&"Information_Schema"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Comprehensive is_replicated_engine coverage
+    // -----------------------------------------------------------------------
+
+    /// All standard Replicated*MergeTree variants must return true.
+    #[test]
+    fn test_is_replicated_mergetree() {
+        assert!(is_replicated_engine("ReplicatedMergeTree"));
+        assert!(is_replicated_engine("ReplicatedReplacingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedSummingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedAggregatingMergeTree"));
+        assert!(is_replicated_engine("ReplicatedCollapsingMergeTree"));
+        assert!(is_replicated_engine(
+            "ReplicatedVersionedCollapsingMergeTree"
+        ));
+    }
+
+    /// Non-replicated engines must return false.
+    #[test]
+    fn test_is_not_replicated() {
+        assert!(!is_replicated_engine("MergeTree"));
+        assert!(!is_replicated_engine("Memory"));
+        assert!(!is_replicated_engine("Distributed"));
+        assert!(!is_replicated_engine("Log"));
+        assert!(!is_replicated_engine(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Comprehensive ensure_if_not_exists_database coverage
+    // -----------------------------------------------------------------------
+
+    /// Plain CREATE DATABASE without IF NOT EXISTS should get it inserted.
+    #[test]
+    fn test_ensure_if_not_exists_db_plain() {
+        let ddl = "CREATE DATABASE mydb";
+        let result = ensure_if_not_exists_database(ddl);
+        assert_eq!(result, "CREATE DATABASE IF NOT EXISTS mydb");
+    }
+
+    /// When IF NOT EXISTS is already present, the DDL should be returned unchanged.
+    #[test]
+    fn test_ensure_if_not_exists_db_already_present_v2() {
+        let ddl = "CREATE DATABASE IF NOT EXISTS mydb";
+        let result = ensure_if_not_exists_database(ddl);
+        assert_eq!(result, ddl);
+    }
+
+    /// Backtick-quoted database names should be preserved.
+    #[test]
+    fn test_ensure_if_not_exists_db_backtick() {
+        let ddl = "CREATE DATABASE `mydb`";
+        let result = ensure_if_not_exists_database(ddl);
+        assert_eq!(result, "CREATE DATABASE IF NOT EXISTS `mydb`");
+    }
+
+    // -----------------------------------------------------------------------
+    // Comprehensive ensure_if_not_exists_table coverage
+    // -----------------------------------------------------------------------
+
+    /// Plain CREATE TABLE gets IF NOT EXISTS inserted.
+    #[test]
+    fn test_ensure_if_not_exists_table_plain() {
+        let ddl = "CREATE TABLE db.t (col Int32) ENGINE = MergeTree ORDER BY col";
+        let result = ensure_if_not_exists_table(ddl);
+        assert!(result.contains("IF NOT EXISTS"));
+    }
+
+    /// CREATE TABLE already containing IF NOT EXISTS is returned unchanged.
+    #[test]
+    fn test_ensure_if_not_exists_table_already_present_v2() {
+        let ddl =
+            "CREATE TABLE IF NOT EXISTS db.t (col Int32) ENGINE = MergeTree ORDER BY col";
+        let result = ensure_if_not_exists_table(ddl);
+        assert_eq!(result, ddl);
+    }
+
+    /// CREATE MATERIALIZED VIEW gets IF NOT EXISTS inserted.
+    #[test]
+    fn test_ensure_if_not_exists_materialized_view_v2() {
+        let ddl = "CREATE MATERIALIZED VIEW db.mv (col Int32) ENGINE = MergeTree ORDER BY col AS SELECT * FROM db.t";
+        let result = ensure_if_not_exists_table(ddl);
+        assert!(result.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS"));
+    }
+
+    /// CREATE VIEW gets IF NOT EXISTS inserted.
+    #[test]
+    fn test_ensure_if_not_exists_view_v2() {
+        let ddl = "CREATE VIEW db.v AS SELECT 1";
+        let result = ensure_if_not_exists_table(ddl);
+        assert!(result.contains("CREATE VIEW IF NOT EXISTS"));
+    }
+
+    /// CREATE DICTIONARY gets IF NOT EXISTS inserted.
+    #[test]
+    fn test_ensure_if_not_exists_dictionary_v2() {
+        let ddl = "CREATE DICTIONARY db.d (col Int32) PRIMARY KEY col SOURCE(CLICKHOUSE(HOST 'localhost'))";
+        let result = ensure_if_not_exists_table(ddl);
+        assert!(result.contains("CREATE DICTIONARY IF NOT EXISTS"));
+    }
 }

@@ -1526,4 +1526,153 @@ mod tests {
         assert!(validate_backup_name("backup@host").is_ok());
         assert!(validate_backup_name("backup#1").is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // semaphore_permits() tests -- covers lines 23-29 (~6 lines)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_semaphore_permits_sequential() {
+        assert_eq!(semaphore_permits(false), 1);
+    }
+
+    #[test]
+    fn test_semaphore_permits_parallel() {
+        assert_eq!(semaphore_permits(true), Semaphore::MAX_PERMITS);
+    }
+
+    // -----------------------------------------------------------------------
+    // reject_reserved_backup_name() additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_reserved_backup_name_similar_names() {
+        // Names that are similar to but NOT exactly "latest" or "previous" should pass
+        assert!(reject_reserved_backup_name("latest-2").is_ok());
+        assert!(reject_reserved_backup_name("my-latest").is_ok());
+        assert!(reject_reserved_backup_name("previous-backup").is_ok());
+        assert!(reject_reserved_backup_name("LATEST").is_ok()); // Case-sensitive
+        assert!(reject_reserved_backup_name("PREVIOUS").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // scan_resumable_state_files() additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_resumable_skips_invalid_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup");
+
+        // Create a directory with a path-traversal name -- should be skipped
+        let bad_dir = backup_dir.join("..hidden");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("upload.state.json"), "{}").unwrap();
+
+        // Create a valid directory -- should be found
+        let good_dir = backup_dir.join("valid-backup");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(good_dir.join("restore.state.json"), "{}").unwrap();
+
+        let ops = scan_resumable_state_files(dir.path().to_str().unwrap());
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].backup_name, "valid-backup");
+        assert_eq!(ops[0].op_type, "restore");
+    }
+
+    #[test]
+    fn test_scan_resumable_multiple_ops_same_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup");
+
+        // A single backup dir with all three state files
+        let bk = backup_dir.join("multi-state");
+        std::fs::create_dir_all(&bk).unwrap();
+        std::fs::write(bk.join("upload.state.json"), "{}").unwrap();
+        std::fs::write(bk.join("download.state.json"), "{}").unwrap();
+        std::fs::write(bk.join("restore.state.json"), "{}").unwrap();
+
+        let ops = scan_resumable_state_files(dir.path().to_str().unwrap());
+        assert_eq!(ops.len(), 3);
+
+        // All should reference the same backup
+        for op in &ops {
+            assert_eq!(op.backup_name, "multi-state");
+        }
+
+        // All three op types should be present
+        let types: std::collections::HashSet<_> = ops.iter().map(|o| o.op_type.as_str()).collect();
+        assert!(types.contains("upload"));
+        assert!(types.contains("download"));
+        assert!(types.contains("restore"));
+    }
+
+    #[test]
+    fn test_scan_resumable_empty_backup_dir_no_state_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup");
+
+        // Create backup directories without any state files
+        std::fs::create_dir_all(backup_dir.join("backup-a")).unwrap();
+        std::fs::create_dir_all(backup_dir.join("backup-b")).unwrap();
+
+        let ops = scan_resumable_state_files(dir.path().to_str().unwrap());
+        assert!(ops.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // WatchStatus tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_watch_status_default_values() {
+        let ws = WatchStatus::default();
+        assert!(!ws.active);
+        assert_eq!(ws.state, "inactive");
+        assert!(ws.last_full.is_none());
+        assert!(ws.last_incr.is_none());
+        assert_eq!(ws.consecutive_errors, 0);
+        assert!(ws.next_backup_in.is_none());
+    }
+
+    #[test]
+    fn test_watch_status_clone() {
+        let ws = WatchStatus {
+            active: true,
+            state: "creating_full".to_string(),
+            consecutive_errors: 3,
+            ..Default::default()
+        };
+
+        let cloned = ws.clone();
+        assert!(cloned.active);
+        assert_eq!(cloned.state, "creating_full");
+        assert_eq!(cloned.consecutive_errors, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // ResumableOp tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resumable_op_clone() {
+        let op = ResumableOp {
+            backup_name: "my-backup".to_string(),
+            op_type: "upload".to_string(),
+        };
+        let cloned = op.clone();
+        assert_eq!(cloned.backup_name, "my-backup");
+        assert_eq!(cloned.op_type, "upload");
+    }
+
+    #[test]
+    fn test_resumable_op_debug() {
+        let op = ResumableOp {
+            backup_name: "test".to_string(),
+            op_type: "download".to_string(),
+        };
+        let debug_str = format!("{:?}", op);
+        assert!(debug_str.contains("test"));
+        assert!(debug_str.contains("download"));
+    }
 }
