@@ -23,7 +23,7 @@ use crate::manifest::BackupManifest;
 use crate::table_filter::TableFilter;
 
 use super::actions::ActionStatus;
-use super::metrics::Metrics;
+use super::metrics::{Metrics, OperationLabels};
 use super::state::{reject_reserved_backup_name, run_operation, validate_backup_name, AppState};
 
 // ---------------------------------------------------------------------------
@@ -684,10 +684,11 @@ pub async fn post_actions(
                 match result {
                     Ok(()) => {
                         if let Some(m) = &state_clone.metrics {
+                            let labels = OperationLabels::new(op);
                             m.backup_duration_seconds
-                                .with_label_values(&[op])
+                                .get_or_create(&labels)
                                 .observe(duration);
-                            m.successful_operations_total.with_label_values(&[op]).inc();
+                            m.successful_operations_total.get_or_create(&labels).inc();
                         }
                         info!(command = %command, "Action completed from POST /api/v1/actions");
                         // Invalidate manifest cache for operations that mutate remote state
@@ -698,10 +699,11 @@ pub async fn post_actions(
                     }
                     Err(e) => {
                         if let Some(m) = &state_clone.metrics {
+                            let labels = OperationLabels::new(op);
                             m.backup_duration_seconds
-                                .with_label_values(&[op])
+                                .get_or_create(&labels)
                                 .observe(duration);
-                            m.errors_total.with_label_values(&[op]).inc();
+                            m.errors_total.get_or_create(&labels).inc();
                         }
                         warn!(command = %command, error = %e, "Action failed from POST /api/v1/actions");
                         state_clone.fail_op(id, e.to_string()).await;
@@ -1941,7 +1943,9 @@ async fn refresh_backup_counts(state: &AppState, metrics: &Metrics) {
     let config = state.config.load();
     let data_path = config.clickhouse.data_path.clone();
     match tokio::task::spawn_blocking(move || crate::list::list_local(&data_path)).await {
-        Ok(Ok(summaries)) => metrics.number_backups_local.set(summaries.len() as i64),
+        Ok(Ok(summaries)) => {
+            metrics.number_backups_local.set(summaries.len() as i64);
+        }
         Ok(Err(e)) => warn!(error = %e, "Failed to refresh local backup count for metrics"),
         Err(e) => warn!(error = %e, "spawn_blocking failed for list_local in metrics"),
     }
@@ -1949,7 +1953,9 @@ async fn refresh_backup_counts(state: &AppState, metrics: &Metrics) {
     // Refresh remote backup count (async, using cache to avoid redundant S3 calls)
     let s3 = state.s3.load();
     match crate::list::list_remote_cached(&s3, &state.manifest_cache).await {
-        Ok(summaries) => metrics.number_backups_remote.set(summaries.len() as i64),
+        Ok(summaries) => {
+            metrics.number_backups_remote.set(summaries.len() as i64);
+        }
         Err(e) => warn!(error = %e, "Failed to refresh remote backup count for metrics"),
     }
 
@@ -2411,7 +2417,7 @@ mod tests {
     fn test_metrics_handler_returns_prometheus_text() {
         // Verify that Metrics::encode() produces valid prometheus text format
         // that the handler returns on the success path.
-        let metrics = super::Metrics::new().expect("Metrics::new() should succeed");
+        let metrics = super::Metrics::new();
         let text = metrics.encode().expect("encode() should succeed");
 
         // Handler returns (StatusCode::OK, text) when metrics is Some

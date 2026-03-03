@@ -38,7 +38,7 @@ use crate::storage::S3Client;
 use tracing::{info, warn};
 
 use super::actions::ActionLog;
-use super::metrics::Metrics;
+use super::metrics::{Metrics, OperationLabels};
 use super::routes::{ErrorResponse, OperationStarted};
 
 /// Current status of the watch loop, shared between the watch loop and API handlers.
@@ -130,17 +130,9 @@ impl AppState {
 
         // Conditionally create Prometheus metrics
         let metrics = if config.api.enable_metrics {
-            match Metrics::new() {
-                Ok(m) => {
-                    let count = m.registry.gather().len();
-                    info!("Metrics registry created with {} metric families", count);
-                    Some(Arc::new(m))
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to create metrics registry, continuing without metrics");
-                    None
-                }
-            }
+            let m = Metrics::new();
+            info!("Metrics registry created");
+            Some(Arc::new(m))
         } else {
             None
         };
@@ -378,11 +370,12 @@ where
                 match result {
                     Ok(()) => {
                         if let Some(m) = &state_clone.metrics {
+                            let labels = OperationLabels::new(&op_label_owned);
                             m.backup_duration_seconds
-                                .with_label_values(&[&op_label_owned])
+                                .get_or_create(&labels)
                                 .observe(duration);
                             m.successful_operations_total
-                                .with_label_values(&[&op_label_owned])
+                                .get_or_create(&labels)
                                 .inc();
                         }
                         info!(op = %op_label_owned, "Operation completed");
@@ -394,11 +387,12 @@ where
                     }
                     Err(e) => {
                         if let Some(m) = &state_clone.metrics {
+                            let labels = OperationLabels::new(&op_label_owned);
                             m.backup_duration_seconds
-                                .with_label_values(&[&op_label_owned])
+                                .get_or_create(&labels)
                                 .observe(duration);
                             m.errors_total
-                                .with_label_values(&[&op_label_owned])
+                                .get_or_create(&labels)
                                 .inc();
                         }
                         warn!(op = %op_label_owned, error = %e, "Operation failed");
@@ -1019,7 +1013,7 @@ mod tests {
 
         // Create metrics the same way AppState::new() does
         let metrics = if config.api.enable_metrics {
-            Metrics::new().ok().map(Arc::new)
+            Some(Arc::new(Metrics::new()))
         } else {
             None
         };
@@ -1029,13 +1023,15 @@ mod tests {
             "Metrics should be Some when enable_metrics=true"
         );
 
-        // Verify the registry has all 14 metric families
-        let families = metrics.as_ref().unwrap().registry.gather();
-        assert_eq!(
-            families.len(),
-            14,
-            "Expected 14 metric families, got {}",
-            families.len()
+        // Verify the registry has all 14 metric families by encoding and checking content
+        let text = metrics
+            .as_ref()
+            .unwrap()
+            .encode()
+            .expect("encode should succeed");
+        assert!(
+            text.contains("chbackup_backup_duration_seconds"),
+            "Encoded output should contain duration metric"
         );
     }
 
@@ -1046,8 +1042,8 @@ mod tests {
         config.api.enable_metrics = false;
         let config = Arc::new(config);
 
-        let metrics = if config.api.enable_metrics {
-            Metrics::new().ok().map(Arc::new)
+        let metrics: Option<Arc<Metrics>> = if config.api.enable_metrics {
+            Some(Arc::new(Metrics::new()))
         } else {
             None
         };

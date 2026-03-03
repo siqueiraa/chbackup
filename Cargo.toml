@@ -77,7 +77,7 @@ base64 = "0.22"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 
 # Prometheus metrics (Phase 3b)
-prometheus = "0.13"
+prometheus-client = "0.23"
 
 # Progress bar
 indicatif = "0.17"
