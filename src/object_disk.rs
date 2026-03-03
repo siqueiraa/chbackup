@@ -23,7 +23,12 @@
 //! {inline_data}     <- only if version >= 4
 //! ```
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
+use tracing::{info, warn};
+
+use crate::clickhouse::client::DiskRow;
 
 /// Parsed representation of a ClickHouse object disk metadata file.
 #[derive(Debug, Clone, PartialEq)]
@@ -281,6 +286,59 @@ pub fn serialize_metadata(metadata: &ObjectDiskMetadata) -> String {
 pub fn is_s3_disk(disk_type: &str) -> bool {
     let lower = disk_type.to_ascii_lowercase();
     lower == "s3" || lower == "object_storage" || lower == "objectstorage"
+}
+
+/// Normalize disk type for CH 24.8+ where ObjectStorage replaced "s3".
+///
+/// CH 24.8+ reports disk type as "ObjectStorage" with a separate
+/// `object_storage_type` field (e.g. "S3"). This function maps that
+/// combination back to the lowercase storage type for downstream
+/// `is_s3_disk()` compatibility.
+pub fn normalize_disk_type(disk_type: &str, object_storage_type: &str) -> String {
+    if disk_type.eq_ignore_ascii_case("objectstorage") && !object_storage_type.is_empty() {
+        object_storage_type.to_ascii_lowercase()
+    } else {
+        disk_type.to_lowercase()
+    }
+}
+
+/// Build disk remote paths with S3 endpoint discovery fallback for CH 24.8+.
+///
+/// Collects `remote_path` from disks that have it, then discovers endpoints
+/// from ClickHouse config files for any S3 disks that lack `remote_path`
+/// (common in CH 24.8 where `system.disks` doesn't expose it).
+pub fn build_disk_remote_paths(disks: &[DiskRow], config_dir: &str) -> BTreeMap<String, String> {
+    let mut paths: BTreeMap<String, String> = disks
+        .iter()
+        .filter(|d| !d.remote_path.is_empty())
+        .map(|d| (d.name.clone(), d.remote_path.clone()))
+        .collect();
+
+    let s3_without: Vec<&str> = disks
+        .iter()
+        .filter(|d| {
+            let eff = normalize_disk_type(&d.disk_type, &d.object_storage_type);
+            is_s3_disk(&eff) && !paths.contains_key(&d.name)
+        })
+        .map(|d| d.name.as_str())
+        .collect();
+
+    if !s3_without.is_empty() {
+        info!(
+            disks = ?s3_without,
+            "S3 disks without remote_path, discovering from ClickHouse config"
+        );
+        let discovered = crate::clickhouse::client::discover_s3_disk_endpoints(config_dir);
+        for name in &s3_without {
+            if let Some(uri) = discovered.get(*name) {
+                paths.insert(name.to_string(), uri.clone());
+            } else {
+                warn!(disk = %name, "Could not discover S3 endpoint for disk");
+            }
+        }
+    }
+
+    paths
 }
 
 #[cfg(test)]
@@ -732,5 +790,31 @@ mod tests {
         let serialized = serialize_metadata(&meta);
         let lines: Vec<&str> = serialized.lines().collect();
         assert_eq!(lines[4], "1"); // read_only = true
+    }
+
+    #[test]
+    fn test_normalize_disk_type_objectstorage_s3() {
+        assert_eq!(normalize_disk_type("ObjectStorage", "S3"), "s3");
+    }
+
+    #[test]
+    fn test_normalize_disk_type_objectstorage_hdfs() {
+        assert_eq!(normalize_disk_type("ObjectStorage", "HDFS"), "hdfs");
+    }
+
+    #[test]
+    fn test_normalize_disk_type_objectstorage_empty() {
+        // Empty object_storage_type means we can't normalize, keep as-is (lowercased)
+        assert_eq!(normalize_disk_type("ObjectStorage", ""), "objectstorage");
+    }
+
+    #[test]
+    fn test_normalize_disk_type_local() {
+        assert_eq!(normalize_disk_type("local", ""), "local");
+    }
+
+    #[test]
+    fn test_normalize_disk_type_s3_passthrough() {
+        assert_eq!(normalize_disk_type("s3", ""), "s3");
     }
 }

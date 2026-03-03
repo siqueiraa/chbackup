@@ -39,6 +39,7 @@ services:
       dockerfile: Dockerfile.test
       args:
         CH_VERSION: ${CH_VERSION:-25.3.8.10041.altinitystable}
+        COVERAGE: ${COVERAGE:-false}
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -59,8 +60,15 @@ services:
       # Test runner settings
       TEST_FILTER: ${TEST_FILTER:-}
       RUN_ID: ${RUN_ID:-local}
+      # Coverage: instrumented binary writes profraw here (harmless when COVERAGE=false)
+      LLVM_PROFILE_FILE: /coverage/integ/integ-%p-%m.profraw
+    volumes:
+      - coverage-vol:/coverage
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client -q 'SELECT 1'"]
       interval: 5s
       timeout: 3s
       retries: 30
+
+volumes:
+  coverage-vol:

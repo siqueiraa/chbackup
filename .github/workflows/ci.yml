@@ -58,23 +58,17 @@ jobs:
       - name: cargo test
         run: cargo test
 
-      - name: Coverage check
+      - name: Install coverage tools
         run: |
-          cargo install cargo-tarpaulin --locked || true
-          cargo tarpaulin --out json --output-file tarpaulin-report.json \
-            --skip-clean --timeout 300 2>/dev/null || true
-          COVERAGE=$(python3 -c "
-          import json
-          d=json.load(open('tarpaulin-report.json'))
-          pct = d.get('coverage', d.get('coverage_percentage', 0))
-          print(f'{pct:.1f}')
-          " 2>/dev/null || echo "0")
-          echo "Coverage: ${COVERAGE}%"
-          python3 -c "
-          import json; d=json.load(open('tarpaulin-report.json'))
-          pct = d.get('coverage', d.get('coverage_percentage', 0))
-          assert pct >= 35, f'Coverage {pct:.1f}% < 35%'
-          "
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked || true
+
+      - name: Unit test coverage gate
+        run: |
+          cargo llvm-cov test --all --all-features --summary-only 2>&1 | tee cov-summary.txt
+          LINE_PCT=$(grep 'TOTAL' cov-summary.txt | awk '{print $10}' | tr -d '%')
+          echo "Unit coverage: ${LINE_PCT}%"
+          python3 -c "assert float('${LINE_PCT}') >= 35, f'Coverage ${LINE_PCT}% < 35%'"
 
   # ---------------------------------------------------------------------------
   # Job 2: Integration tests with ClickHouse version matrix
@@ -110,12 +104,13 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Start test environment
+      - name: Start test environment (with coverage)
         if: steps.s3-check.outputs.skip != 'true'
         env:
           CH_VERSION: ${{ matrix.ch_version }}
           RUN_ID: ${{ github.run_id }}-${{ matrix.ch_version }}
           S3_PATH: chbackup-test/${{ matrix.ch_version }}/${{ github.run_id }}
+          COVERAGE: "true"
         run: |
           docker compose -f docker-compose.test.yml up -d --build --wait
 
@@ -127,6 +122,32 @@ jobs:
           S3_PATH: chbackup-test/${{ matrix.ch_version }}/${{ github.run_id }}
         run: |
           docker compose -f docker-compose.test.yml exec -T chbackup-test /test/run_tests.sh
+
+      - name: Generate merged coverage report
+        if: steps.s3-check.outputs.skip != 'true' && matrix.ch_version == '24.8.13.51.altinitystable'
+        env:
+          CH_VERSION: ${{ matrix.ch_version }}
+          RUN_ID: ${{ github.run_id }}-${{ matrix.ch_version }}
+          S3_PATH: chbackup-test/${{ matrix.ch_version }}/${{ github.run_id }}
+        run: |
+          # Extract integration profraw from the running container
+          mkdir -p integ-profraw
+          docker compose -f docker-compose.test.yml cp \
+            chbackup-test:/coverage/integ/. integ-profraw/ 2>/dev/null || true
+
+          # Run merge+report inside a builder-stage container
+          docker build --target builder --build-arg COVERAGE=true \
+            -f Dockerfile.test -t chbackup-cov-reporter .
+
+          docker run --rm \
+            -v $(pwd)/integ-profraw:/integ-profraw:ro \
+            chbackup-cov-reporter \
+            sh -c '
+              PROFRAW_DIR=$(find /build/target -name "*.profraw" -exec dirname {} \; | sort -u | head -1)
+              if [ -z "$PROFRAW_DIR" ]; then echo "No unit profraw found"; exit 0; fi
+              find /integ-profraw -name "*.profraw" -exec cp {} "$PROFRAW_DIR/" \; 2>/dev/null || true
+              cargo llvm-cov report --release --summary-only 2>&1 || true
+            '
 
       - name: Tear down test environment
         if: always() && steps.s3-check.outputs.skip != 'true'

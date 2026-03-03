@@ -181,7 +181,7 @@ async fn run() -> Result<()> {
                 .join(&name);
 
             let effective_resume = resume && config.general.use_resumable_state;
-            upload::upload(
+            let _stats = upload::upload(
                 &config,
                 &s3,
                 &name,
@@ -323,7 +323,7 @@ async fn run() -> Result<()> {
                 .join(&name);
 
             let effective_resume = resume && config.general.use_resumable_state;
-            upload::upload(
+            let _stats = upload::upload(
                 &config,
                 &s3,
                 &name,

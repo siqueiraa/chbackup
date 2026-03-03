@@ -491,49 +491,7 @@ pub async fn restore(
     let disk_remote_paths: BTreeMap<String, String> = if has_s3_disks {
         match ch.get_disks().await {
             Ok(disks) => {
-                let mut paths: BTreeMap<String, String> = disks
-                    .iter()
-                    .filter(|d| !d.remote_path.is_empty())
-                    .map(|d| (d.name.clone(), d.remote_path.clone()))
-                    .collect();
-
-                // If any S3 disks lack remote_path (CH 24.8), discover from config
-                let s3_disks_without_remote: Vec<String> = disks
-                    .iter()
-                    .filter(|d| {
-                        let effective_type = if d.disk_type.eq_ignore_ascii_case("objectstorage")
-                            && !d.object_storage_type.is_empty()
-                        {
-                            d.object_storage_type.to_ascii_lowercase()
-                        } else {
-                            d.disk_type.clone()
-                        };
-                        is_s3_disk(&effective_type) && !paths.contains_key(&d.name)
-                    })
-                    .map(|d| d.name.clone())
-                    .collect();
-
-                if !s3_disks_without_remote.is_empty() {
-                    info!(
-                        disks = ?s3_disks_without_remote,
-                        "S3 disks without remote_path, discovering from ClickHouse config"
-                    );
-                    let discovered = crate::clickhouse::client::discover_s3_disk_endpoints(
-                        &config.clickhouse.config_dir,
-                    );
-                    for disk_name in &s3_disks_without_remote {
-                        if let Some(uri) = discovered.get(disk_name) {
-                            paths.insert(disk_name.clone(), uri.clone());
-                        } else {
-                            warn!(
-                                disk = %disk_name,
-                                "Could not discover S3 endpoint for disk; S3 restore may fail"
-                            );
-                        }
-                    }
-                }
-
-                paths
+                crate::object_disk::build_disk_remote_paths(&disks, &config.clickhouse.config_dir)
             }
             Err(e) => {
                 warn!(error = %e, "Failed to get disk info for S3 restore");

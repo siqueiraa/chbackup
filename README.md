@@ -58,6 +58,7 @@ docker pull ghcr.io/user/chbackup:latest
 **Build from source** (requires Rust 1.82+):
 
 ```bash
+rustup target add x86_64-unknown-linux-musl  # one-time setup
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 

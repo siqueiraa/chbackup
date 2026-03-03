@@ -3,4 +3,6 @@
 /coverage/
 tarpaulin-report.json
 cobertura.xml
+*.profraw
+*.profdata
 .env

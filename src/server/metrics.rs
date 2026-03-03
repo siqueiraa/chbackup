@@ -97,9 +97,9 @@ impl Metrics {
         // Per-operation duration histogram
         let backup_duration_seconds =
             Family::<OperationLabels, Histogram>::new_with_constructor(|| {
-                Histogram::new(
-                    [1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0],
-                )
+                Histogram::new([
+                    1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+                ])
             });
         registry.register(
             "chbackup_backup_duration_seconds",

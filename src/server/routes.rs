@@ -397,6 +397,7 @@ pub async fn post_actions(
                 })?;
 
             let state_clone = state.clone();
+            let metrics_clone = state.metrics.clone();
             let command = request.command.clone();
             let parts_owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
             let cancel_for_ops = token.clone();
@@ -475,7 +476,11 @@ pub async fn post_actions(
                         )
                         .await;
 
-                        if upload_result.is_ok() {
+                        if let Ok(ref stats) = upload_result {
+                            if let Some(m) = &metrics_clone {
+                                m.parts_uploaded_total.inc_by(stats.uploaded_count);
+                                m.parts_skipped_incremental_total.inc_by(stats.carried_count);
+                            }
                             // Apply retention after successful upload (design doc 3.6 step 7)
                             list::apply_retention_after_upload(
                                 &config,
@@ -485,7 +490,7 @@ pub async fn post_actions(
                             )
                             .await;
                         }
-                        upload_result
+                        upload_result.map(|_| ())
                     }
                     "download" => {
                         let effective_resume = config.general.use_resumable_state;
@@ -558,7 +563,12 @@ pub async fn post_actions(
                                 )
                                 .await;
 
-                                if upload_result.is_ok() {
+                                if let Ok(ref stats) = upload_result {
+                                    if let Some(m) = &metrics_clone {
+                                        m.parts_uploaded_total.inc_by(stats.uploaded_count);
+                                        m.parts_skipped_incremental_total
+                                            .inc_by(stats.carried_count);
+                                    }
                                     // Apply retention after successful upload (design doc 3.6 step 7)
                                     list::apply_retention_after_upload(
                                         &config,
@@ -568,7 +578,7 @@ pub async fn post_actions(
                                     )
                                     .await;
                                 }
-                                upload_result
+                                upload_result.map(|_| ())
                             }
                             Err(e) => Err(e),
                         }
@@ -913,6 +923,7 @@ pub async fn upload_backup(
 
     validate_backup_name(&name).map_err(|e| validation_error(&name, e))?;
 
+    let metrics_clone = state.metrics.clone();
     let cache_clone = state.manifest_cache.clone();
     run_operation(
         &state,
@@ -926,7 +937,7 @@ pub async fn upload_backup(
                 .join("backup")
                 .join(&name);
             let effective_resume = req.resume.unwrap_or(config.general.use_resumable_state);
-            crate::upload::upload(
+            let stats = crate::upload::upload(
                 &config,
                 &s3,
                 &name,
@@ -937,6 +948,12 @@ pub async fn upload_backup(
                 cancel,
             )
             .await?;
+
+            if let Some(m) = &metrics_clone {
+                m.parts_uploaded_total.inc_by(stats.uploaded_count);
+                m.parts_skipped_incremental_total
+                    .inc_by(stats.carried_count);
+            }
 
             // Apply retention after successful upload (design doc 3.6 step 7)
             list::apply_retention_after_upload(&config, &s3, Some(&name), Some(&cache_clone)).await;
@@ -1139,7 +1156,7 @@ pub async fn create_remote(
                 .join(&backup_name);
 
             let effective_resume = config.general.use_resumable_state;
-            crate::upload::upload(
+            let stats = crate::upload::upload(
                 &config,
                 &s3,
                 &backup_name,
@@ -1164,6 +1181,9 @@ pub async fn create_remote(
                 m.backup_last_success_timestamp
                     .set(Utc::now().timestamp() as f64);
                 m.backup_size_bytes.set(manifest.compressed_size as f64);
+                m.parts_uploaded_total.inc_by(stats.uploaded_count);
+                m.parts_skipped_incremental_total
+                    .inc_by(stats.carried_count);
             }
             Ok(())
         },

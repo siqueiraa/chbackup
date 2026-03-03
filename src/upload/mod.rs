@@ -42,6 +42,15 @@ use crate::resume::{
 use crate::storage::s3::{calculate_chunk_size, RetryConfig};
 use crate::storage::{parse_s3_uri, S3Client};
 
+/// Statistics from an upload operation, used for Prometheus metrics.
+#[derive(Debug, Default)]
+pub struct UploadStats {
+    /// Number of parts actually uploaded to S3.
+    pub uploaded_count: u64,
+    /// Number of parts carried from base backup (incremental skip).
+    pub carried_count: u64,
+}
+
 /// Multipart upload threshold: parts with compressed data larger than 32 MiB
 /// use multipart upload instead of a single PutObject.
 const MULTIPART_THRESHOLD: u64 = 32 * 1024 * 1024;
@@ -142,7 +151,7 @@ pub async fn upload(
     diff_from_remote: Option<&str>,
     resume: bool,
     cancel: CancellationToken,
-) -> Result<()> {
+) -> Result<UploadStats> {
     info!(
         backup_name = %backup_name,
         backup_dir = %backup_dir.display(),
@@ -239,6 +248,7 @@ pub async fn upload(
     let mut local_work_items: Vec<UploadWorkItem> = Vec::new();
     let mut s3_disk_work_items: Vec<S3DiskUploadWorkItem> = Vec::new();
     let mut table_count = 0u64;
+    let mut carried_count = 0u64;
 
     let table_keys: Vec<String> = manifest.tables.keys().cloned().collect();
 
@@ -275,6 +285,7 @@ pub async fn upload(
                         source = %part.source,
                         "Skipping carried part (already on S3)"
                     );
+                    carried_count += 1;
                     continue;
                 }
 
@@ -1043,7 +1054,11 @@ pub async fn upload(
         .with_context(|| format!("Failed to delete local backup '{}'", backup_name))?;
     }
 
-    Ok(())
+    let uploaded_count = (total_local_parts + total_s3_disk_parts) as u64;
+    Ok(UploadStats {
+        uploaded_count,
+        carried_count,
+    })
 }
 
 /// Upload metadata files from a local part directory to S3.

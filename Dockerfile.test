@@ -7,15 +7,27 @@
 # Used by docker-compose.test.yml. No pre-built binary required.
 # =============================================================================
 
-# Global ARG must be before first FROM for multi-stage availability
+# Global ARGs must be before first FROM for multi-stage availability
 ARG CH_VERSION=25.3.8.10041.altinitystable
+ARG COVERAGE=false
 
 # --- Stage 1: Build static binary from source ---
 FROM rust:1.93-alpine AS builder
+ARG COVERAGE
 
 RUN apk add --no-cache musl-dev perl make cmake g++ linux-headers openssl-dev openssl-libs-static pkgconfig
 
+# Install cargo-llvm-cov for coverage instrumented builds
+RUN if [ "$COVERAGE" = "true" ]; then \
+      rustup component add llvm-tools-preview && \
+      cargo install cargo-llvm-cov --locked; \
+    fi
+
 WORKDIR /build
+
+# Keep instrumented objects alongside the release binary so the same
+# target dir is used regardless of COVERAGE flag.
+ENV CARGO_LLVM_COV_TARGET_DIR=/build/target
 
 # Cache dependencies: copy manifests first, do a dummy build
 COPY Cargo.toml Cargo.lock ./
@@ -23,9 +35,18 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
     && cargo build --release 2>/dev/null || true \
     && rm -rf src target/release/chbackup target/release/deps/chbackup-* target/release/deps/libchbackup-*
 
-# Copy real source and build
+# Copy real source and build (conditionally with coverage instrumentation)
 COPY src/ src/
-RUN cargo build --release
+RUN if [ "$COVERAGE" = "true" ]; then \
+      cargo llvm-cov build --release; \
+    else \
+      cargo build --release; \
+    fi
+
+# Run unit tests with coverage (fail the build on test failure)
+RUN if [ "$COVERAGE" = "true" ]; then \
+      cargo llvm-cov test --release --no-report; \
+    fi
 
 # --- Stage 2: Test runtime ---
 ARG CH_VERSION
