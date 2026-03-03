@@ -1,16 +1,30 @@
 # =============================================================================
 # Dockerfile.test — All-in-one integration test container
 # =============================================================================
-# Altinity ClickHouse server + pre-built chbackup static binary.
-# Used by docker-compose.test.yml for integration tests against real S3.
+# Builds chbackup from source (static musl binary), then sets up Altinity
+# ClickHouse server for integration testing against real S3.
 #
-# Build context expects:
-#   target/x86_64-unknown-linux-musl/release/chbackup  (static binary)
-#   test/configs/                                       (config overlays)
-#   test/fixtures/                                      (SQL fixtures)
-#   test/run_tests.sh                                   (test entrypoint)
+# Used by docker-compose.test.yml. No pre-built binary required.
 # =============================================================================
 
+# --- Stage 1: Build static binary from source ---
+FROM rust:1.93-alpine AS builder
+
+RUN apk add --no-cache musl-dev perl make cmake g++ linux-headers openssl-dev openssl-libs-static pkgconfig
+
+WORKDIR /build
+
+# Cache dependencies: copy manifests first, do a dummy build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
+    && cargo build --release 2>/dev/null || true \
+    && rm -rf src target/release/chbackup target/release/deps/chbackup-* target/release/deps/libchbackup-*
+
+# Copy real source and build
+COPY src/ src/
+RUN cargo build --release
+
+# --- Stage 2: Test runtime ---
 ARG CH_VERSION=25.3.8.10041.altinitystable
 FROM altinity/clickhouse-server:${CH_VERSION}
 
@@ -23,8 +37,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy pre-built static chbackup binary
-COPY target/x86_64-unknown-linux-musl/release/chbackup /usr/local/bin/chbackup
+# Copy built binary from builder stage
+COPY --from=builder /build/target/release/chbackup /usr/local/bin/chbackup
 RUN chmod +x /usr/local/bin/chbackup
 
 # Copy test configs

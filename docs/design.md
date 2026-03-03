@@ -172,10 +172,7 @@ services:
 #### 1.4.3 Test Execution
 
 ```bash
-# Build chbackup first (static binary for test image)
-cargo build --release --target x86_64-unknown-linux-musl
-
-# Run full test suite against default CH version
+# Run full test suite (builds from source automatically)
 export S3_BUCKET=my-test-bucket S3_ACCESS_KEY=xxx S3_SECRET_KEY=xxx
 docker compose -f docker-compose.test.yml up -d --build
 docker compose exec chbackup-test /test/run_tests.sh
