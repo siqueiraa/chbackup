@@ -3509,15 +3509,15 @@ if should_run "test_print_config_with_overrides"; then
 fi
 
 # ---------------------------------------------------------------------------
-# T61: Resume restore
+# T61: Resume restore (deterministic interruption via state file polling)
 # ---------------------------------------------------------------------------
 if should_run "test_resume_restore"; then
     info "T61: Resume restore"
     RESUME_RST_NAME="resume_rst_$$"
 
-    # Step 1: Insert bulk data, create backup
+    # Step 1: Insert bulk data (500k rows for larger restore window), create backup
     info "  Step 1: Create backup with bulk data"
-    clickhouse-client -q "INSERT INTO default.trades SELECT toDate('2024-04-01') + (number % 30), 300000 + number, 'BULK_RST', 100.0 + number * 0.01, 10 FROM numbers(100000)"
+    clickhouse-client -q "INSERT INTO default.trades SELECT toDate('2024-04-01') + (number % 30), 300000 + number, 'BULK_RST', 100.0 + number * 0.01, 10 FROM numbers(500000)"
     BULK_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
     info "  Trades count: ${BULK_COUNT}"
     chbackup create "${RESUME_RST_NAME}" -t 'default.trades' 2>&1 || true
@@ -3526,31 +3526,37 @@ if should_run "test_resume_restore"; then
     info "  Step 2: Drop trades"
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
 
-    # Step 3: Start restore with --resume, kill after 2s
-    info "  Step 3: Start restore, interrupt after 2s"
+    # Step 3: Start restore with --resume, interrupt deterministically via state file polling
+    info "  Step 3: Start restore, interrupt when state file appears"
+    LOCAL_BACKUP_DIR="/var/lib/clickhouse/backup"
+    STATE_FILE="${LOCAL_BACKUP_DIR}/${RESUME_RST_NAME}/restore.state.json"
     set +e
     chbackup restore --rm --resume "${RESUME_RST_NAME}" -t 'default.trades' &
     RST_PID=$!
-    sleep 2
-    kill $RST_PID 2>/dev/null
+    INTERRUPTED=false
+    for i in $(seq 1 30); do
+        if [[ -f "$STATE_FILE" ]] && [[ -s "$STATE_FILE" ]]; then
+            kill $RST_PID 2>/dev/null
+            INTERRUPTED=true
+            break
+        fi
+        sleep 0.2
+    done
+    if ! $INTERRUPTED; then
+        info "  NOTE: restore completed before interruption (covered by T61b)"
+    fi
     wait $RST_PID 2>/dev/null
     set -e
 
     info "  Step 4: Resume restore"
     run_cmd "resume restore completed" chbackup restore --resume "${RESUME_RST_NAME}" -t 'default.trades'
 
-    # Step 5: Verify row count
+    # Step 5: Verify exact row count (strict match required)
     POST_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades" 2>/dev/null || echo "0")
     if [[ "$POST_COUNT" -eq "$BULK_COUNT" ]]; then
         pass "restore row count matches: ${POST_COUNT}"
     else
-        # Partial success is acceptable — resume may have completed on first attempt
-        info "  NOTE: row count ${POST_COUNT} vs expected ${BULK_COUNT} (partial restore acceptable)"
-        if [[ "$POST_COUNT" -gt 0 ]]; then
-            pass "restore produced data (${POST_COUNT} rows)"
-        else
-            fail "restore produced 0 rows"
-        fi
+        fail "restore row count mismatch: got ${POST_COUNT}, expected ${BULK_COUNT}"
     fi
 
     # Cleanup: re-seed original data
@@ -3560,9 +3566,59 @@ if should_run "test_resume_restore"; then
 fi
 
 # ---------------------------------------------------------------------------
+# T61b: Restore resume idempotency (no-op after completed restore)
+# ---------------------------------------------------------------------------
+if should_run "test_resume_restore_idempotency"; then
+    info "T61b: Restore resume idempotency"
+    IDEMP_NAME="idemp_rst_$$"
+
+    # Step 1: Insert data, create backup
+    info "  Step 1: Create backup with test data"
+    clickhouse-client -q "INSERT INTO default.trades SELECT toDate('2024-05-01') + (number % 30), 400000 + number, 'IDEMP', 200.0 + number * 0.01, 10 FROM numbers(10000)"
+    PRE_INSERT_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    info "  Trades count before backup: ${PRE_INSERT_COUNT}"
+    chbackup create "${IDEMP_NAME}" -t 'default.trades' 2>&1 || true
+
+    # Step 2: Drop table, restore normally
+    info "  Step 2: Drop and restore"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
+    run_cmd "initial restore" chbackup restore --rm "${IDEMP_NAME}" -t 'default.trades'
+
+    PRE_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    info "  Row count after initial restore: ${PRE_COUNT}"
+
+    # Step 3: Force merges to change active part names
+    info "  Step 3: Force merges (OPTIMIZE TABLE FINAL)"
+    clickhouse-client -q "OPTIMIZE TABLE default.trades FINAL"
+    sleep 1
+
+    # Verify active part names changed (confirms merge happened)
+    PARTS_AFTER_MERGE=$(RUST_LOG=error clickhouse-client -q "SELECT count() FROM system.parts WHERE database='default' AND table='trades' AND active=1")
+    info "  Active parts after merge: ${PARTS_AFTER_MERGE}"
+
+    # Step 4: Run restore --resume on the same backup (should be a no-op)
+    info "  Step 4: Resume restore (should be no-op)"
+    run_cmd "idempotent resume restore" chbackup restore --resume "${IDEMP_NAME}" -t 'default.trades'
+
+    # Step 5: Assert row count unchanged (exact match)
+    POST_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    info "  Row count after resume: ${POST_COUNT}"
+    if [[ "$POST_COUNT" -eq "$PRE_COUNT" ]]; then
+        pass "resume idempotency: row count unchanged (${POST_COUNT})"
+    else
+        fail "resume idempotency: row count changed from ${PRE_COUNT} to ${POST_COUNT}"
+    fi
+
+    # Cleanup
+    info "  Cleanup: re-seed data"
+    reseed_data
+    chbackup delete local "${IDEMP_NAME}" 2>&1 || true
+fi
+
+# ---------------------------------------------------------------------------
 # T62: Clean --name (targeted shadow cleanup)
 # ---------------------------------------------------------------------------
-if should_run "test_clean_targeted"; then
+if should_run "test_clean_name"; then
     info "T62: Clean --name (targeted shadow cleanup)"
     SHADOW_DIR="/var/lib/clickhouse/shadow"
 

@@ -43,7 +43,7 @@ use crate::concurrency::{
 use crate::config::Config;
 use crate::manifest::BackupManifest;
 use crate::object_disk::is_s3_disk;
-use crate::resume::{compute_params_hash, delete_state_file, load_state_file, RestoreState};
+use crate::resume::{compute_params_hash, load_state_file, save_state_file, RestoreState};
 use crate::storage::S3Client;
 use crate::table_filter::TableFilter;
 
@@ -396,6 +396,7 @@ pub async fn restore(
         // Query system.parts for authoritative view of already-attached parts
         // When remap is active, query using the *destination* db/table names
         // Only query data tables (DDL-only objects have no parts)
+        let mut tables_with_active_parts: HashSet<String> = HashSet::new();
         for table_key in &phases.data_tables {
             let (orig_db, orig_table) = table_key.split_once('.').unwrap_or(("default", table_key));
             let (query_db, query_table) = match remap_ref {
@@ -408,6 +409,7 @@ pub async fn restore(
             match ch.query_system_parts(&query_db, &query_table).await {
                 Ok(parts) => {
                     if !parts.is_empty() {
+                        tables_with_active_parts.insert(table_key.clone());
                         let part_names: HashSet<String> =
                             parts.into_iter().map(|p| p.name).collect();
                         info!(
@@ -427,9 +429,27 @@ pub async fn restore(
                         error = %e,
                         "Failed to query system.parts, relying on state file only"
                     );
+                    // On query failure, assume table might have parts (don't discard state)
+                    tables_with_active_parts.insert(table_key.clone());
                 }
             }
         }
+
+        // Cross-check: if system.parts shows 0 active parts for a table,
+        // discard state file entries for that table. The table may have been
+        // dropped and recreated since the state file was written.
+        already_attached.retain(|table_key, parts| {
+            if tables_with_active_parts.contains(table_key) || parts.is_empty() {
+                true
+            } else {
+                info!(
+                    table = %table_key,
+                    stale_parts = parts.len(),
+                    "Discarding stale state file entries (table has no active parts)"
+                );
+                false
+            }
+        });
 
         if !already_attached.is_empty() {
             let total: usize = already_attached.values().map(|s| s.len()).sum();
@@ -528,6 +548,10 @@ pub async fn restore(
         effective_object_disk_server_side_copy_concurrency(config) as usize;
     let allow_streaming = config.s3.allow_object_disk_streaming;
     let (_, _, jitter_factor) = crate::config::effective_retries(config);
+
+    // Global ATTACH semaphore: bounds total concurrent ATTACH PART operations
+    // across all tables. Individual parts acquire a permit before executing ATTACH.
+    let attach_semaphore = Arc::new(Semaphore::new(effective_max_connections(config) as usize));
 
     // Build shared resume state tracker (for parallel tasks to update)
     let resume_state: Option<Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>> = if resume {
@@ -640,6 +664,7 @@ pub async fn restore(
                 table_uuid,
                 parts_by_disk: table_manifest.parts.clone(),
                 already_attached: table_already_attached,
+                attach_semaphore: Some(attach_semaphore.clone()),
                 resume_state: resume_state.clone(),
                 jitter_factor,
                 manifest_disks: manifest.disks.clone(),
@@ -649,11 +674,15 @@ pub async fn restore(
         ));
     }
 
-    // 5a-2. check_replicas_before_attach: warn about out-of-sync replicas
+    // 5a-2. check_replicas_before_attach: poll replication sync with timeout
     if config.clickhouse.check_replicas_before_attach {
+        let timeout = config.clickhouse.check_replicas_before_attach_timeout;
         for (table_key, params) in &restore_items {
             if is_replicated_engine(&params.engine) {
-                match ch.check_replica_sync(&params.db, &params.table).await {
+                match ch
+                    .check_replica_sync_with_timeout(&params.db, &params.table, timeout)
+                    .await
+                {
                     Ok(true) => {
                         debug!(table = %table_key, "Replica is in sync");
                     }
@@ -662,7 +691,8 @@ pub async fn restore(
                             table = %table_key,
                             db = %params.db,
                             table_name = %params.table,
-                            "Replica is NOT in sync -- replication queue is non-empty. \
+                            timeout_secs = timeout,
+                            "Replica is NOT in sync after polling timeout. \
                              Proceeding with restore anyway (non-fatal)."
                         );
                     }
@@ -768,21 +798,15 @@ pub async fn restore(
         );
     }
 
-    // 6. Parallel table restore with semaphore
-    let semaphore = Arc::new(Semaphore::new(max_conn));
-
+    // 6. Parallel table restore
+    // All table tasks spawn freely; individual ATTACH PART operations are
+    // bounded by the global attach_semaphore passed into each OwnedAttachParams.
     let mut handles = Vec::with_capacity(table_count);
 
     for (table_key, params) in restore_items {
-        let sem = semaphore.clone();
         let cancel_clone = cancel.clone();
 
         let handle = tokio::spawn(async move {
-            let _permit = sem
-                .acquire()
-                .await
-                .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
-
             if cancel_clone.is_cancelled() {
                 return Ok((table_key, 0u64));
             }
@@ -906,10 +930,36 @@ pub async fn restore(
         "Restore complete"
     );
 
-    // Delete resume state file on successful completion
+    // Save completion state with all manifest part names, so a subsequent
+    // --resume is a no-op. ClickHouse reassigns block numbers on ATTACH PART,
+    // so after merges, active part names differ from manifest names. Persisting
+    // the manifest names in the state file allows name-based matching on resume.
+    {
+        let completion_state = RestoreState {
+            attached_parts: phases
+                .data_tables
+                .iter()
+                .filter_map(|key| {
+                    manifest.tables.get(key).map(|tm| {
+                        let parts: Vec<String> = tm
+                            .parts
+                            .values()
+                            .flat_map(|parts| parts.iter().map(|p| p.name.clone()))
+                            .collect();
+                        (key.clone(), parts)
+                    })
+                })
+                .collect(),
+            backup_name: backup_name.to_string(),
+            params_hash: current_params_hash.clone(),
+        };
+        if let Err(e) = save_state_file(&state_path, &completion_state) {
+            warn!(error = %e, "Failed to save completion state (non-fatal)");
+        }
+    }
+
+    // Delete the params sidecar if one was written during this resume run.
     if resume {
-        delete_state_file(&state_path);
-        // Also delete the params sidecar written at the start of this resume run.
         let params_path = crate::resume::restore_params_path(&backup_dir);
         let _ = std::fs::remove_file(&params_path); // non-fatal
     }

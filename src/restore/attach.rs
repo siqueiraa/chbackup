@@ -102,6 +102,10 @@ pub struct OwnedAttachParams {
     /// Parts already attached (from resume state + system.parts). Parts in this
     /// set are skipped during ATTACH.
     pub already_attached: HashSet<String>,
+    /// Global semaphore for ATTACH PART concurrency across all tables.
+    /// When set, each individual ATTACH PART acquires a permit.
+    /// When None (e.g., ATTACH TABLE mode), falls back to sequential behavior.
+    pub attach_semaphore: Option<Arc<Semaphore>>,
     /// Shared resume state for tracking attached parts across parallel tasks.
     /// When set, each successful ATTACH is recorded and persisted.
     pub resume_state: Option<Arc<tokio::sync::Mutex<(RestoreState, PathBuf)>>>,
@@ -613,17 +617,26 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
         parts_by_disk: &params.parts_by_disk,
     };
 
-    attach_parts_inner(&attach_params, &params.engine).await
+    attach_parts_inner(
+        &attach_params,
+        &params.engine,
+        params.attach_semaphore.as_ref(),
+    )
+    .await
 }
 
 /// Internal attach implementation with engine-aware routing.
 ///
 /// When `needs_sequential_attach(engine)` returns true (Replacing, Collapsing,
 /// Versioned engines), parts are attached strictly in sorted order.
-/// For plain MergeTree engines, parts are also attached sequentially within
-/// the table (Phase 2a keeps per-table ATTACH sequential; parallelism is
-/// across tables, not within a single table).
-async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u64> {
+/// For non-dedup engines (MergeTree, SummingMergeTree, AggregatingMergeTree,
+/// ReplicatedMergeTree), parts are attached in parallel when a global
+/// `attach_semaphore` is provided.
+async fn attach_parts_inner(
+    params: &AttachParams<'_>,
+    engine: &str,
+    attach_semaphore: Option<&Arc<Semaphore>>,
+) -> Result<u64> {
     let db = params.db;
     let table = params.table;
 
@@ -645,6 +658,13 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
             engine = %engine,
             "Using sequential attach (engine requires ordered attachment)"
         );
+    } else if attach_semaphore.is_some() {
+        debug!(
+            db = %db,
+            table = %table,
+            engine = %engine,
+            "Using parallel in-table attach"
+        );
     }
 
     // Sort parts by (partition, min_block) for correct attach order
@@ -658,15 +678,9 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
         )
     })?;
 
-    let mut attached_count = 0u64;
-
     let resume_table_key = format!("{}.{}", params.source_db, params.source_table);
-    let mut skipped_resume = 0u64;
 
     // Hoist loop-invariant computations above the loop.
-    // URL-encode source db and table names for the backup shadow path.
-    // Use source_db/source_table (pre-remap names) since shadow dirs
-    // are created during backup using the original ClickHouse names.
     let url_src_db = encode_path_component(params.source_db);
     let url_src_table = encode_path_component(params.source_table);
 
@@ -677,15 +691,16 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
         .unwrap_or("unknown");
 
     // Build reverse map: part_name -> disk_name (O(n) instead of O(n^2) linear scan).
-    // Matches the pattern used in try_attach_table_mode().
     let part_to_disk: std::collections::HashMap<&str, &str> = params
         .parts_by_disk
         .iter()
         .flat_map(|(dn, parts)| parts.iter().map(move |p| (p.name.as_str(), dn.as_str())))
         .collect();
 
+    // Filter out parts that should be skipped (resume name match)
+    let mut skipped_resume = 0u64;
+    let mut work_parts: Vec<&PartInfo> = Vec::new();
     for part in &sorted_parts {
-        // Resume: skip parts already attached
         if params.already_attached.contains(&part.name) {
             skipped_resume += 1;
             debug!(
@@ -697,10 +712,15 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
             continue;
         }
 
-        // Destination: {table_data_path}/detached/{part_name}/
+        work_parts.push(part);
+    }
+
+    // Prepare each part: hardlink/copy to detached/
+    // This is done sequentially because it's filesystem I/O (not network)
+    // and benefits from sequential disk access patterns.
+    for part in &work_parts {
         let dest_dir = detached_dir.join(&part.name);
 
-        // S3 disk parts: detached/ was already populated by restore_s3_disk_parts
         let is_s3_part = part.s3_objects.is_some();
         if is_s3_part && dest_dir.exists() {
             debug!(
@@ -713,7 +733,6 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                 .copied()
                 .unwrap_or("default");
 
-            // Resolve source directory using per-disk fallback chain
             let source_dir = resolve_shadow_part_path(
                 params.backup_dir,
                 params.manifest_disks,
@@ -728,7 +747,6 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
 
             match source_dir {
                 Some(dir) => {
-                    // Hardlink or copy all files from source to dest
                     hardlink_or_copy_dir(&dir, &dest_dir).with_context(|| {
                         format!(
                             "Failed to hardlink/copy part {} from {} to {}",
@@ -737,8 +755,6 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                             dest_dir.display()
                         )
                     })?;
-
-                    // Chown to ClickHouse uid/gid
                     chown_recursive(&dest_dir, params.clickhouse_uid, params.clickhouse_gid)?;
                 }
                 None => {
@@ -748,60 +764,132 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                         source_table = %params.source_table,
                         "Part source directory not found, skipping"
                     );
-                    continue;
-                }
-            }
-        }
-
-        // ATTACH PART
-        debug!(
-            db = %db,
-            table = %table,
-            part = %part.name,
-            "Attaching part"
-        );
-
-        match params.ch.attach_part(db, table, &part.name).await {
-            Ok(()) => {
-                attached_count += 1;
-
-                // Save resume state after each successful ATTACH
-                if let Some(state_mutex) = &params.resume_state {
-                    let mut guard = state_mutex.lock().await;
-                    guard
-                        .0
-                        .attached_parts
-                        .entry(resume_table_key.clone())
-                        .or_default()
-                        .push(part.name.clone());
-                    let state_path = guard.1.clone();
-                    save_state_graceful(&state_path, &guard.0);
-                }
-            }
-            Err(e) => {
-                let err_str = format!("{:#}", e);
-                // ClickHouse errors 232/233: overlapping block range or part already exists
-                if err_str.contains("DUPLICATE_DATA_PART")
-                    || err_str.contains("PART_IS_TEMPORARILY_LOCKED")
-                    || err_str.contains("NO_SUCH_DATA_PART")
-                    || err_str.contains("Code: 232")
-                    || err_str.contains("Code: 233")
-                {
-                    warn!(
-                        db = %db,
-                        table = %table,
-                        part = %part.name,
-                        error = %err_str,
-                        "Part already exists or overlaps, skipping"
-                    );
-                } else {
-                    return Err(e).with_context(|| {
-                        format!("Failed to ATTACH PART '{}' to {}.{}", part.name, db, table)
-                    });
                 }
             }
         }
     }
+
+    // ATTACH PART phase: sequential for dedup engines, parallel otherwise
+    let attached_count = if let (false, Some(global_sem)) = (sequential, attach_semaphore) {
+        // Parallel ATTACH for non-dedup engines.
+        // Each part's ATTACH is spawned as a tokio task with a semaphore permit.
+        let sem = global_sem.clone();
+        let ch_clone = params.ch.clone();
+        let db_owned = db.to_string();
+        let table_owned = table.to_string();
+        let resume_key_owned = resume_table_key.clone();
+        let resume_state_clone = params.resume_state.cloned();
+
+        let mut handles = Vec::with_capacity(work_parts.len());
+        for part in &work_parts {
+            let sem = sem.clone();
+            let ch = ch_clone.clone();
+            let db = db_owned.clone();
+            let table = table_owned.clone();
+            let part_name = part.name.clone();
+            let resume_key = resume_key_owned.clone();
+            let resume_state = resume_state_clone.clone();
+
+            handles.push(tokio::spawn(async move {
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Semaphore closed"))?;
+
+                debug!(db = %db, table = %table, part = %part_name, "Attaching part (parallel)");
+
+                match ch.attach_part(&db, &table, &part_name).await {
+                    Ok(()) => {
+                        if let Some(state_mutex) = &resume_state {
+                            let mut guard = state_mutex.lock().await;
+                            guard
+                                .0
+                                .attached_parts
+                                .entry(resume_key.clone())
+                                .or_default()
+                                .push(part_name.clone());
+                            let state_path = guard.1.clone();
+                            save_state_graceful(&state_path, &guard.0);
+                        }
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        if is_attach_warning(&e) {
+                            warn!(
+                                db = %db, table = %table, part = %part_name,
+                                error = %format!("{:#}", e),
+                                "Part already exists or overlaps, skipping"
+                            );
+                            Ok(false)
+                        } else {
+                            Err(e).with_context(|| {
+                                format!("Failed to ATTACH PART '{}' to {}.{}", part_name, db, table)
+                            })
+                        }
+                    }
+                }
+            }));
+        }
+
+        let results = try_join_all(handles)
+            .await
+            .context("ATTACH task panicked")?;
+        let mut count = 0u64;
+        for result in results {
+            if result? {
+                count += 1;
+            }
+        }
+        count
+    } else {
+        // Sequential ATTACH: one part at a time (for dedup engines or no semaphore)
+        let mut count = 0u64;
+        for part in &work_parts {
+            // Acquire global permit if semaphore is provided
+            let _permit = if let Some(sem) = attach_semaphore {
+                Some(
+                    sem.acquire()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Semaphore closed"))?,
+                )
+            } else {
+                None
+            };
+
+            debug!(db = %db, table = %table, part = %part.name, "Attaching part");
+
+            match params.ch.attach_part(db, table, &part.name).await {
+                Ok(()) => {
+                    count += 1;
+                    if let Some(state_mutex) = &params.resume_state {
+                        let mut guard = state_mutex.lock().await;
+                        guard
+                            .0
+                            .attached_parts
+                            .entry(resume_table_key.clone())
+                            .or_default()
+                            .push(part.name.clone());
+                        let state_path = guard.1.clone();
+                        save_state_graceful(&state_path, &guard.0);
+                    }
+                }
+                Err(e) => {
+                    if is_attach_warning(&e) {
+                        warn!(
+                            db = %db, table = %table, part = %part.name,
+                            error = %format!("{:#}", e),
+                            "Part already exists or overlaps, skipping"
+                        );
+                    } else {
+                        return Err(e).with_context(|| {
+                            format!("Failed to ATTACH PART '{}' to {}.{}", part.name, db, table)
+                        });
+                    }
+                }
+            }
+        }
+        count
+    };
 
     if skipped_resume > 0 {
         info!(
@@ -821,6 +909,16 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
     );
 
     Ok(attached_count)
+}
+
+/// Check if an ATTACH PART error is a non-fatal warning (232/233 overlap/duplicate).
+fn is_attach_warning(e: &anyhow::Error) -> bool {
+    let err_str = format!("{:#}", e);
+    err_str.contains("DUPLICATE_DATA_PART")
+        || err_str.contains("PART_IS_TEMPORARILY_LOCKED")
+        || err_str.contains("NO_SUCH_DATA_PART")
+        || err_str.contains("Code: 232")
+        || err_str.contains("Code: 233")
 }
 
 /// Hardlink all files from source directory to destination directory.
@@ -1164,6 +1262,7 @@ mod tests {
             table_uuid: Some("5f3a7b2c-1234-5678-9abc-def012345678".to_string()),
             parts_by_disk: BTreeMap::new(),
             already_attached: HashSet::new(),
+            attach_semaphore: None,
             resume_state: None,
             jitter_factor: 0.0,
             manifest_disks: BTreeMap::new(),
@@ -1206,6 +1305,7 @@ mod tests {
             table_uuid: None,
             parts_by_disk: BTreeMap::new(),
             already_attached: already.clone(),
+            attach_semaphore: None,
             resume_state: None,
             jitter_factor: 0.0,
             manifest_disks: BTreeMap::new(),

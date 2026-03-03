@@ -148,6 +148,10 @@ pub struct ClickHouseConfig {
     #[serde(default = "default_true")]
     pub check_replicas_before_attach: bool,
 
+    /// timeout in seconds for replication sync polling (0 = single check)
+    #[serde(default = "default_check_replicas_timeout")]
+    pub check_replicas_before_attach_timeout: u64,
+
     /// validate column type consistency before backup
     #[serde(default)]
     pub check_parts_columns: bool,
@@ -535,6 +539,7 @@ impl Default for ClickHouseConfig {
             tls_ca: String::new(),
             sync_replicated_tables: true,
             check_replicas_before_attach: true,
+            check_replicas_before_attach_timeout: default_check_replicas_timeout(),
             check_parts_columns: false,
             mutation_wait_timeout: default_mutation_wait_timeout(),
             restore_as_attach: false,
@@ -726,6 +731,10 @@ fn default_data_path() -> String {
 
 fn default_config_dir() -> String {
     "/etc/clickhouse-server".to_string()
+}
+
+fn default_check_replicas_timeout() -> u64 {
+    30
 }
 
 fn default_mutation_wait_timeout() -> String {
@@ -1010,6 +1019,16 @@ impl Config {
             } else {
                 warn!(
                     "CLICKHOUSE_SYNC_REPLICATED_TABLES='{}' is not a valid bool, ignoring",
+                    v
+                );
+            }
+        }
+        if let Ok(v) = std::env::var("CLICKHOUSE_CHECK_REPLICAS_BEFORE_ATTACH_TIMEOUT") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.clickhouse.check_replicas_before_attach_timeout = n;
+            } else {
+                warn!(
+                    "CLICKHOUSE_CHECK_REPLICAS_BEFORE_ATTACH_TIMEOUT='{}' is not a valid u64, ignoring",
                     v
                 );
             }
@@ -1353,6 +1372,10 @@ impl Config {
             "clickhouse.check_replicas_before_attach" => {
                 self.clickhouse.check_replicas_before_attach =
                     value.parse().context("Invalid bool")?
+            }
+            "clickhouse.check_replicas_before_attach_timeout" => {
+                self.clickhouse.check_replicas_before_attach_timeout =
+                    value.parse().context("Invalid u64")?
             }
             "clickhouse.check_parts_columns" => {
                 self.clickhouse.check_parts_columns = value.parse().context("Invalid bool")?
@@ -1714,6 +1737,9 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CLICKHOUSE_TLS_CERT" => Some("clickhouse.tls_cert"),
         "CLICKHOUSE_TLS_CA" => Some("clickhouse.tls_ca"),
         "CLICKHOUSE_SYNC_REPLICATED_TABLES" => Some("clickhouse.sync_replicated_tables"),
+        "CLICKHOUSE_CHECK_REPLICAS_BEFORE_ATTACH_TIMEOUT" => {
+            Some("clickhouse.check_replicas_before_attach_timeout")
+        }
         "CLICKHOUSE_MAX_CONNECTIONS" => Some("clickhouse.max_connections"),
         "CLICKHOUSE_TIMEOUT" => Some("clickhouse.timeout"),
         "CLICKHOUSE_CONFIG_DIR" => Some("clickhouse.config_dir"),

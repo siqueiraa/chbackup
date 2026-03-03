@@ -16,6 +16,8 @@ pub struct PartSortKey {
     pub partition: String,
     /// Minimum block number.
     pub min_block: u64,
+    /// Maximum block number.
+    pub max_block: u64,
 }
 
 impl PartSortKey {
@@ -32,7 +34,7 @@ impl PartSortKey {
         // Try 5-component: {partition}_{min}_{max}_{level}_{data_version}
         let seg5: Vec<&str> = name.rsplitn(5, '_').collect();
         if seg5.len() == 5 {
-            if let (Ok(_), Ok(_), Ok(_), Ok(min_block)) = (
+            if let (Ok(_), Ok(_), Ok(max_block), Ok(min_block)) = (
                 seg5[0].parse::<u64>(),
                 seg5[1].parse::<u64>(),
                 seg5[2].parse::<u64>(),
@@ -41,6 +43,7 @@ impl PartSortKey {
                 return Some(PartSortKey {
                     partition: seg5[4].to_string(),
                     min_block,
+                    max_block,
                 });
             }
         }
@@ -51,10 +54,12 @@ impl PartSortKey {
             return None;
         }
         let min_block = seg4[2].parse::<u64>().ok()?;
+        let max_block = seg4[1].parse::<u64>().ok()?;
 
         Some(PartSortKey {
             partition: seg4[3].to_string(),
             min_block,
+            max_block,
         })
     }
 }
@@ -108,6 +113,7 @@ mod tests {
         let key = PartSortKey::from_part_name("202401_1_50_3").unwrap();
         assert_eq!(key.partition, "202401");
         assert_eq!(key.min_block, 1);
+        assert_eq!(key.max_block, 50);
     }
 
     #[test]
@@ -115,6 +121,7 @@ mod tests {
         let key = PartSortKey::from_part_name("all_0_0_0").unwrap();
         assert_eq!(key.partition, "all");
         assert_eq!(key.min_block, 0);
+        assert_eq!(key.max_block, 0);
     }
 
     #[test]
@@ -123,14 +130,17 @@ mod tests {
         let key = PartSortKey::from_part_name("202401_0_0_0_2").unwrap();
         assert_eq!(key.partition, "202401");
         assert_eq!(key.min_block, 0);
+        assert_eq!(key.max_block, 0);
 
         let key = PartSortKey::from_part_name("202401_1_1_0_8").unwrap();
         assert_eq!(key.partition, "202401");
         assert_eq!(key.min_block, 1);
+        assert_eq!(key.max_block, 1);
 
         let key = PartSortKey::from_part_name("202403_5_5_0_7").unwrap();
         assert_eq!(key.partition, "202403");
         assert_eq!(key.min_block, 5);
+        assert_eq!(key.max_block, 5);
     }
 
     #[test]
@@ -139,6 +149,7 @@ mod tests {
         let key = PartSortKey::from_part_name("all_1_1_0_3").unwrap();
         assert_eq!(key.partition, "all");
         assert_eq!(key.min_block, 1);
+        assert_eq!(key.max_block, 1);
     }
 
     #[test]
@@ -231,6 +242,7 @@ mod tests {
         let key = PartSortKey::from_part_name("20230101_1_1_0").unwrap();
         assert_eq!(key.partition, "20230101");
         assert_eq!(key.min_block, 1);
+        assert_eq!(key.max_block, 1);
     }
 
     #[test]
@@ -238,6 +250,7 @@ mod tests {
         let key = PartSortKey::from_part_name("20230101_1_1_0_7").unwrap();
         assert_eq!(key.partition, "20230101");
         assert_eq!(key.min_block, 1);
+        assert_eq!(key.max_block, 1);
     }
 
     #[test]
@@ -252,6 +265,25 @@ mod tests {
         // all 4 trailing are numeric, so partition = "tuple_val", min_block = 1
         assert_eq!(key.partition, "tuple_val");
         assert_eq!(key.min_block, 1);
+        assert_eq!(key.max_block, 2);
+    }
+
+    #[test]
+    fn test_part_sort_key_max_block() {
+        // 4-component: verify max_block parsed correctly
+        let key = PartSortKey::from_part_name("202401_1_50_3").unwrap();
+        assert_eq!(key.min_block, 1);
+        assert_eq!(key.max_block, 50);
+
+        // 5-component: verify max_block parsed correctly
+        let key = PartSortKey::from_part_name("202401_1_100_4_2").unwrap();
+        assert_eq!(key.min_block, 1);
+        assert_eq!(key.max_block, 100);
+
+        // Merged part with wide range
+        let key = PartSortKey::from_part_name("202401_1_1000_5").unwrap();
+        assert_eq!(key.min_block, 1);
+        assert_eq!(key.max_block, 1000);
     }
 
     #[test]

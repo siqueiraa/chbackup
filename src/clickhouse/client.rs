@@ -66,6 +66,9 @@ pub struct PartRow {
     pub name: String,
     pub partition_id: String,
     pub active: u8,
+    pub min_block_number: u64,
+    pub max_block_number: u64,
+    pub rows: u64,
 }
 
 /// Column type inconsistency detected by `check_parts_columns`.
@@ -691,8 +694,8 @@ impl ChClient {
     /// Returns all active parts (active=1) for the given database and table.
     pub async fn query_system_parts(&self, db: &str, table: &str) -> Result<Vec<PartRow>> {
         let sql = format!(
-            "SELECT name, partition_id, active FROM system.parts \
-             WHERE database = '{}' AND table = '{}' AND active = 1",
+            "SELECT name, partition_id, active, min_block_number, max_block_number, rows \
+             FROM system.parts WHERE database = '{}' AND table = '{}' AND active = 1",
             escape_sql_string(db),
             escape_sql_string(table)
         );
@@ -810,6 +813,30 @@ impl ChClient {
             && row.merges_in_queue == 0;
 
         Ok(is_synced)
+    }
+
+    /// Check if a Replicated table is in sync, polling until timeout.
+    ///
+    /// Retries every 2 seconds up to `timeout_secs`. Returns `Ok(true)` if
+    /// the table becomes synced within the timeout, `Ok(false)` if not.
+    pub async fn check_replica_sync_with_timeout(
+        &self,
+        db: &str,
+        table: &str,
+        timeout_secs: u64,
+    ) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            match self.check_replica_sync(db, table).await? {
+                true => return Ok(true),
+                false => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
     }
 
     // -- Parts column consistency check --
@@ -2017,16 +2044,19 @@ mod tests {
 
     #[test]
     fn test_query_parts_sql() {
-        // Verify the SQL query string for system.parts
+        // Verify the SQL query string for system.parts includes block numbers and rows
         let db = "default";
         let table = "trades";
         let expected_sql = format!(
-            "SELECT name, partition_id, active FROM system.parts \
-             WHERE database = '{}' AND table = '{}' AND active = 1",
+            "SELECT name, partition_id, active, min_block_number, max_block_number, rows \
+             FROM system.parts WHERE database = '{}' AND table = '{}' AND active = 1",
             db, table
         );
         assert!(expected_sql.contains("system.parts"));
         assert!(expected_sql.contains("active = 1"));
+        assert!(expected_sql.contains("min_block_number"));
+        assert!(expected_sql.contains("max_block_number"));
+        assert!(expected_sql.contains(", rows"));
         assert!(expected_sql.contains("default"));
         assert!(expected_sql.contains("trades"));
     }
@@ -2075,10 +2105,16 @@ mod tests {
             name: "202401_1_50_3".to_string(),
             partition_id: "202401".to_string(),
             active: 1,
+            min_block_number: 1,
+            max_block_number: 50,
+            rows: 1000,
         };
         assert_eq!(part.name, "202401_1_50_3");
         assert_eq!(part.partition_id, "202401");
         assert_eq!(part.active, 1);
+        assert_eq!(part.min_block_number, 1);
+        assert_eq!(part.max_block_number, 50);
+        assert_eq!(part.rows, 1000);
     }
 
     #[test]
