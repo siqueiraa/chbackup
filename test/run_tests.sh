@@ -45,6 +45,96 @@ should_run() {
 }
 
 # ---------------------------------------------------------------------------
+# DRY Helpers (used across all tests)
+# ---------------------------------------------------------------------------
+
+# run_cmd <label> <cmd...>
+# Runs a command and records pass/fail with the given label.
+# Returns 0 on success, 1 on failure.
+run_cmd() {
+    local label="$1"; shift
+    if "$@" 2>&1; then
+        pass "$label"
+        return 0
+    else
+        fail "$label"
+        return 1
+    fi
+}
+
+# drop_all_tables — drops the 5 standard test tables (3 local + 2 S3)
+drop_all_tables() {
+    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
+}
+
+# capture_row_counts — captures PRE_TRADES/PRE_USERS/PRE_EVENTS/PRE_S3_ORDERS/PRE_S3_METRICS
+# These variables are set in the CALLER's scope (no subshell).
+capture_row_counts() {
+    PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    PRE_USERS=$(clickhouse-client -q "SELECT count() FROM default.users")
+    PRE_EVENTS=$(clickhouse-client -q "SELECT count() FROM default.events")
+    PRE_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+    PRE_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+    info "Pre-backup counts: trades=${PRE_TRADES}, users=${PRE_USERS}, events=${PRE_EVENTS}, s3_orders=${PRE_S3_ORDERS}, s3_metrics=${PRE_S3_METRICS}"
+}
+
+# verify_row_counts — compares POST row counts against PRE_* variables for all 5 tables
+# Expects PRE_TRADES, PRE_USERS, PRE_EVENTS, PRE_S3_ORDERS, PRE_S3_METRICS to be set.
+verify_row_counts() {
+    local POST_TRADES POST_USERS POST_EVENTS POST_S3_ORDERS POST_S3_METRICS
+    POST_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    POST_USERS=$(clickhouse-client -q "SELECT count() FROM default.users")
+    POST_EVENTS=$(clickhouse-client -q "SELECT count() FROM default.events")
+    POST_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+    POST_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+
+    if [[ "$POST_TRADES" -eq "$PRE_TRADES" ]]; then
+        pass "trades row count matches: ${POST_TRADES}"
+    else
+        fail "trades row count mismatch: expected=${PRE_TRADES} got=${POST_TRADES}"
+    fi
+    if [[ "$POST_USERS" -eq "$PRE_USERS" ]]; then
+        pass "users row count matches: ${POST_USERS}"
+    else
+        fail "users row count mismatch: expected=${PRE_USERS} got=${POST_USERS}"
+    fi
+    if [[ "$POST_EVENTS" -eq "$PRE_EVENTS" ]]; then
+        pass "events row count matches: ${POST_EVENTS}"
+    else
+        fail "events row count mismatch: expected=${PRE_EVENTS} got=${POST_EVENTS}"
+    fi
+    if [[ "$POST_S3_ORDERS" -eq "$PRE_S3_ORDERS" ]]; then
+        pass "s3_orders row count matches: ${POST_S3_ORDERS}"
+    else
+        fail "s3_orders row count mismatch: expected=${PRE_S3_ORDERS} got=${POST_S3_ORDERS}"
+    fi
+    if [[ "$POST_S3_METRICS" -eq "$PRE_S3_METRICS" ]]; then
+        pass "s3_metrics row count matches: ${POST_S3_METRICS}"
+    else
+        fail "s3_metrics row count mismatch: expected=${PRE_S3_METRICS} got=${POST_S3_METRICS}"
+    fi
+}
+
+# cleanup_backup <name> [<name2> ...] — deletes remote + local backups
+cleanup_backup() {
+    for name in "$@"; do
+        chbackup delete remote "$name" 2>&1 || true
+        chbackup delete local "$name" 2>&1 || true
+    done
+}
+
+# reseed_data — drops all test tables and re-runs setup + seed SQL
+reseed_data() {
+    drop_all_tables
+    clickhouse-client --multiquery < /test/fixtures/setup.sql
+    clickhouse-client --multiquery < /test/fixtures/seed_data.sql
+}
+
+# ---------------------------------------------------------------------------
 # Validate required env vars
 # ---------------------------------------------------------------------------
 info "Validating environment"
@@ -112,7 +202,8 @@ fi
 
 # 3. Drop all test tables to start completely fresh
 info "  Dropping test tables"
-for tbl in trades users events s3_orders s3_metrics s3_orders_restored trades_restored empty_table proj_test; do
+drop_all_tables
+for tbl in s3_orders_restored trades_restored empty_table proj_test; do
     clickhouse-client -q "DROP TABLE IF EXISTS default.${tbl} SYNC" 2>/dev/null || true
 done
 
@@ -156,35 +247,17 @@ info "Row counts: trades=${TRADES_COUNT}, users=${USERS_COUNT}, events=${EVENTS_
 # ---------------------------------------------------------------------------
 if should_run "smoke_binary"; then
     info "Smoke test: chbackup --help"
-    if chbackup --help >/dev/null 2>&1; then
-        pass "chbackup --help"
-    else
-        fail "chbackup --help"
-    fi
+    run_cmd "chbackup --help" chbackup --help
 fi
 
-# ---------------------------------------------------------------------------
-# Smoke test: chbackup print-config
-# ---------------------------------------------------------------------------
 if should_run "smoke_config"; then
     info "Smoke test: chbackup print-config"
-    if chbackup print-config >/dev/null 2>&1; then
-        pass "chbackup print-config"
-    else
-        fail "chbackup print-config"
-    fi
+    run_cmd "chbackup print-config" chbackup print-config
 fi
 
-# ---------------------------------------------------------------------------
-# Smoke test: chbackup list (requires CH + S3 connectivity)
-# ---------------------------------------------------------------------------
 if should_run "smoke_list"; then
     info "Smoke test: chbackup list"
-    if chbackup list 2>&1; then
-        pass "chbackup list"
-    else
-        fail "chbackup list"
-    fi
+    run_cmd "chbackup list" chbackup list
 fi
 
 # ---------------------------------------------------------------------------
@@ -194,102 +267,30 @@ if should_run "test_round_trip"; then
     info "Round-trip test: create -> upload -> delete local -> download -> restore"
     BACKUP_NAME="roundtrip_test_$$"
 
-    # Capture pre-backup row counts
-    PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
-    PRE_USERS=$(clickhouse-client -q "SELECT count() FROM default.users")
-    PRE_EVENTS=$(clickhouse-client -q "SELECT count() FROM default.events")
-    PRE_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
-    PRE_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
-    info "Pre-backup counts: trades=${PRE_TRADES}, users=${PRE_USERS}, events=${PRE_EVENTS}, s3_orders=${PRE_S3_ORDERS}, s3_metrics=${PRE_S3_METRICS}"
+    capture_row_counts
 
-    # Step 1: Create backup
     info "  Step 1: chbackup create ${BACKUP_NAME}"
-    if chbackup create "${BACKUP_NAME}" 2>&1; then
-        pass "create ${BACKUP_NAME}"
-    else
-        fail "create ${BACKUP_NAME}"
-    fi
+    run_cmd "create ${BACKUP_NAME}" chbackup create "${BACKUP_NAME}"
 
-    # Step 2: Upload to S3
     info "  Step 2: chbackup upload ${BACKUP_NAME}"
-    if chbackup upload "${BACKUP_NAME}" 2>&1; then
-        pass "upload ${BACKUP_NAME}"
-    else
-        fail "upload ${BACKUP_NAME}"
-    fi
+    run_cmd "upload ${BACKUP_NAME}" chbackup upload "${BACKUP_NAME}"
 
-    # Step 3: Delete local backup
     info "  Step 3: chbackup delete local ${BACKUP_NAME}"
-    if chbackup delete local "${BACKUP_NAME}" 2>&1; then
-        pass "delete local ${BACKUP_NAME}"
-    else
-        fail "delete local ${BACKUP_NAME}"
-    fi
+    run_cmd "delete local ${BACKUP_NAME}" chbackup delete local "${BACKUP_NAME}"
 
-    # Step 4: Download from S3
     info "  Step 4: chbackup download ${BACKUP_NAME}"
-    if chbackup download "${BACKUP_NAME}" 2>&1; then
-        pass "download ${BACKUP_NAME}"
-    else
-        fail "download ${BACKUP_NAME}"
-    fi
+    run_cmd "download ${BACKUP_NAME}" chbackup download "${BACKUP_NAME}"
 
-    # Step 5: DROP tables and restore
     info "  Step 5: DROP tables and restore"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
+    drop_all_tables
+    run_cmd "restore ${BACKUP_NAME}" chbackup restore "${BACKUP_NAME}"
 
-    if chbackup restore "${BACKUP_NAME}" 2>&1; then
-        pass "restore ${BACKUP_NAME}"
-    else
-        fail "restore ${BACKUP_NAME}"
-    fi
-
-    # Step 6: Verify row counts match pre-backup state
     info "  Step 6: Verify row counts"
-    POST_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
-    POST_USERS=$(clickhouse-client -q "SELECT count() FROM default.users")
-    POST_EVENTS=$(clickhouse-client -q "SELECT count() FROM default.events")
-    POST_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
-    POST_S3_METRICS=$(clickhouse-client -q "SELECT count() FROM default.s3_metrics")
+    verify_row_counts
 
-    if [[ "$POST_TRADES" -eq "$PRE_TRADES" ]]; then
-        pass "trades row count matches: ${POST_TRADES}"
-    else
-        fail "trades row count mismatch: expected=${PRE_TRADES} got=${POST_TRADES}"
-    fi
-
-    if [[ "$POST_USERS" -eq "$PRE_USERS" ]]; then
-        pass "users row count matches: ${POST_USERS}"
-    else
-        fail "users row count mismatch: expected=${PRE_USERS} got=${POST_USERS}"
-    fi
-
-    if [[ "$POST_EVENTS" -eq "$PRE_EVENTS" ]]; then
-        pass "events row count matches: ${POST_EVENTS}"
-    else
-        fail "events row count mismatch: expected=${PRE_EVENTS} got=${POST_EVENTS}"
-    fi
-
-    if [[ "$POST_S3_ORDERS" -eq "$PRE_S3_ORDERS" ]]; then
-        pass "s3_orders row count matches: ${POST_S3_ORDERS}"
-    else
-        fail "s3_orders row count mismatch: expected=${PRE_S3_ORDERS} got=${POST_S3_ORDERS}"
-    fi
-
-    if [[ "$POST_S3_METRICS" -eq "$PRE_S3_METRICS" ]]; then
-        pass "s3_metrics row count matches: ${POST_S3_METRICS}"
-    else
-        fail "s3_metrics row count mismatch: expected=${PRE_S3_METRICS} got=${POST_S3_METRICS}"
-    fi
-
-    # Cleanup: delete remote backup
-    info "  Cleanup: delete remote ${BACKUP_NAME}"
-    chbackup delete remote "${BACKUP_NAME}" 2>&1 || true
-    chbackup delete local "${BACKUP_NAME}" 2>&1 || true
+    # Cleanup
+    info "  Cleanup"
+    cleanup_backup "${BACKUP_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -300,79 +301,39 @@ if should_run "test_incremental_chain"; then
     FULL_NAME="incr_full_$$"
     INCR_NAME="incr_diff_$$"
 
-    # Capture initial row count
     PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
     info "  Pre-backup trades count: ${PRE_TRADES}"
 
-    # Step 1: Create and upload full backup
     info "  Step 1: Create full backup ${FULL_NAME}"
-    if chbackup create "${FULL_NAME}" 2>&1; then
-        pass "create full ${FULL_NAME}"
-    else
-        fail "create full ${FULL_NAME}"
-    fi
+    run_cmd "create full ${FULL_NAME}" chbackup create "${FULL_NAME}"
 
     info "  Step 2: Upload full backup"
-    if chbackup upload "${FULL_NAME}" 2>&1; then
-        pass "upload full ${FULL_NAME}"
-    else
-        fail "upload full ${FULL_NAME}"
-    fi
+    run_cmd "upload full ${FULL_NAME}" chbackup upload "${FULL_NAME}"
 
-    # Step 3: Insert more data
     info "  Step 3: Insert additional data"
     clickhouse-client -q "INSERT INTO default.trades VALUES ('2024-04-01', 99901, 'TSLA', 250.00, 50), ('2024-04-02', 99902, 'TSLA', 255.00, 75)"
     AFTER_INSERT=$(clickhouse-client -q "SELECT count() FROM default.trades")
     info "  After insert trades count: ${AFTER_INSERT}"
 
-    # Step 4: Create incremental backup with --diff-from
     info "  Step 4: Create incremental backup ${INCR_NAME} --diff-from ${FULL_NAME}"
-    if chbackup create "${INCR_NAME}" --diff-from "${FULL_NAME}" 2>&1; then
-        pass "create incremental ${INCR_NAME}"
-    else
-        fail "create incremental ${INCR_NAME}"
-    fi
+    run_cmd "create incremental ${INCR_NAME}" chbackup create "${INCR_NAME}" --diff-from "${FULL_NAME}"
 
-    # Step 5: Upload incremental
     info "  Step 5: Upload incremental backup"
-    if chbackup upload "${INCR_NAME}" 2>&1; then
-        pass "upload incremental ${INCR_NAME}"
-    else
-        fail "upload incremental ${INCR_NAME}"
-    fi
+    run_cmd "upload incremental ${INCR_NAME}" chbackup upload "${INCR_NAME}"
 
-    # Step 6: Delete local, download incremental, restore
     info "  Step 6: Delete local backups"
     chbackup delete local "${INCR_NAME}" 2>&1 || true
     chbackup delete local "${FULL_NAME}" 2>&1 || true
 
     info "  Step 7: Download incremental"
-    if chbackup download "${INCR_NAME}" 2>&1; then
-        pass "download incremental ${INCR_NAME}"
-    else
-        fail "download incremental ${INCR_NAME}"
-    fi
+    run_cmd "download incremental ${INCR_NAME}" chbackup download "${INCR_NAME}"
 
-    # Download full (needed for incremental restore base)
     info "  Step 8: Download full (base for incremental)"
-    if chbackup download "${FULL_NAME}" 2>&1; then
-        pass "download full ${FULL_NAME}"
-    else
-        fail "download full ${FULL_NAME}"
-    fi
+    run_cmd "download full ${FULL_NAME}" chbackup download "${FULL_NAME}"
 
     info "  Step 9: DROP tables and restore incremental"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
-
-    if chbackup restore "${INCR_NAME}" 2>&1; then
-        pass "restore incremental ${INCR_NAME}"
-    else
-        fail "restore incremental ${INCR_NAME}"
-    fi
+    drop_all_tables
+    run_cmd "restore incremental ${INCR_NAME}" chbackup restore "${INCR_NAME}"
 
     # Step 10: Verify all data present (full + incremental)
     POST_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
@@ -384,10 +345,7 @@ if should_run "test_incremental_chain"; then
 
     # Cleanup
     info "  Cleanup"
-    chbackup delete remote "${INCR_NAME}" 2>&1 || true
-    chbackup delete remote "${FULL_NAME}" 2>&1 || true
-    chbackup delete local "${INCR_NAME}" 2>&1 || true
-    chbackup delete local "${FULL_NAME}" 2>&1 || true
+    cleanup_backup "${INCR_NAME}" "${FULL_NAME}"
 
     # Remove the extra rows we inserted
     clickhouse-client -q "ALTER TABLE default.trades DELETE WHERE trade_id IN (99901, 99902)" 2>&1 || true
@@ -400,13 +358,8 @@ if should_run "test_schema_only"; then
     info "T5: Schema-only backup"
     SCHEMA_NAME="schema_only_$$"
 
-    # Step 1: Create schema-only backup
     info "  Step 1: Create schema-only backup"
-    if chbackup create "${SCHEMA_NAME}" --schema 2>&1; then
-        pass "create schema-only ${SCHEMA_NAME}"
-    else
-        fail "create schema-only ${SCHEMA_NAME}"
-    fi
+    run_cmd "create schema-only ${SCHEMA_NAME}" chbackup create "${SCHEMA_NAME}" --schema
 
     # Step 2: Verify no data parts in backup (metadata.json should have empty parts)
     MANIFEST="/var/lib/clickhouse/backup/${SCHEMA_NAME}/metadata.json"
@@ -430,17 +383,8 @@ print(total)
 
     # Step 3: Drop tables and restore schema only
     info "  Step 3: DROP tables and restore schema"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
-
-    if chbackup restore "${SCHEMA_NAME}" 2>&1; then
-        pass "restore schema-only ${SCHEMA_NAME}"
-    else
-        fail "restore schema-only ${SCHEMA_NAME}"
-    fi
+    drop_all_tables
+    run_cmd "restore schema-only ${SCHEMA_NAME}" chbackup restore "${SCHEMA_NAME}"
 
     # Step 4: Verify tables exist but have no data
     TABLE_COUNT=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database = 'default' AND name IN ('trades', 'users', 'events', 's3_orders', 's3_metrics')")
@@ -460,8 +404,7 @@ print(total)
     # Cleanup and re-seed data
     chbackup delete local "${SCHEMA_NAME}" 2>&1 || true
     info "  Re-seeding data after schema-only test"
-    clickhouse-client --multiquery < /test/fixtures/setup.sql
-    clickhouse-client --multiquery < /test/fixtures/seed_data.sql
+    reseed_data
 fi
 
 # ---------------------------------------------------------------------------
@@ -477,13 +420,8 @@ if should_run "test_partitioned_restore"; then
     TOTAL_ROWS=$(clickhouse-client -q "SELECT count() FROM default.trades")
     info "  Partition 202401 rows: ${ROWS_202401}, total: ${TOTAL_ROWS}"
 
-    # Step 1: Create backup
     info "  Step 1: Create backup ${PART_NAME}"
-    if chbackup create "${PART_NAME}" 2>&1; then
-        pass "create ${PART_NAME}"
-    else
-        fail "create ${PART_NAME}"
-    fi
+    run_cmd "create ${PART_NAME}" chbackup create "${PART_NAME}"
 
     # Step 2: Drop LOCAL tables and restore only partition 202401
     # Note: S3 disk tables are NOT dropped because ClickHouse deletes their S3
@@ -494,11 +432,7 @@ if should_run "test_partitioned_restore"; then
     clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
 
-    if chbackup restore "${PART_NAME}" -t "default.trades" --partitions "202401" 2>&1; then
-        pass "restore partitioned ${PART_NAME}"
-    else
-        fail "restore partitioned ${PART_NAME}"
-    fi
+    run_cmd "restore partitioned ${PART_NAME}" chbackup restore "${PART_NAME}" -t "default.trades" --partitions "202401"
 
     # Step 3: Verify only partition 202401 was restored
     POST_ROWS=$(clickhouse-client -q "SELECT count() FROM default.trades")
@@ -511,13 +445,7 @@ if should_run "test_partitioned_restore"; then
     # Cleanup and restore full data
     chbackup delete local "${PART_NAME}" 2>&1 || true
     info "  Re-seeding data after partitioned test"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
-    clickhouse-client --multiquery < /test/fixtures/setup.sql
-    clickhouse-client --multiquery < /test/fixtures/seed_data.sql
+    reseed_data
 fi
 
 # ---------------------------------------------------------------------------
@@ -624,8 +552,7 @@ else:
         info "  Cleanup"
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
-        chbackup delete remote "${API_NAME}" 2>&1 || true
-        chbackup delete local "${API_NAME}" 2>&1 || true
+        cleanup_backup "${API_NAME}"
     fi
 fi
 
@@ -667,20 +594,11 @@ if should_run "test_delete_and_list"; then
     info "T9: Delete and list"
     DEL_NAME="delete_test_$$"
 
-    # Step 1: Create and upload
     info "  Step 1: Create backup ${DEL_NAME}"
-    if chbackup create "${DEL_NAME}" 2>&1; then
-        pass "create ${DEL_NAME}"
-    else
-        fail "create ${DEL_NAME}"
-    fi
+    run_cmd "create ${DEL_NAME}" chbackup create "${DEL_NAME}"
 
     info "  Step 2: Upload backup ${DEL_NAME}"
-    if chbackup upload "${DEL_NAME}" 2>&1; then
-        pass "upload ${DEL_NAME}"
-    else
-        fail "upload ${DEL_NAME}"
-    fi
+    run_cmd "upload ${DEL_NAME}" chbackup upload "${DEL_NAME}"
 
     # Step 3: Verify in list
     info "  Step 3: Verify in list"
@@ -691,13 +609,8 @@ if should_run "test_delete_and_list"; then
         fail "${DEL_NAME} not found in list"
     fi
 
-    # Step 4: Delete remote
     info "  Step 4: Delete remote ${DEL_NAME}"
-    if chbackup delete remote "${DEL_NAME}" 2>&1; then
-        pass "delete remote ${DEL_NAME}"
-    else
-        fail "delete remote ${DEL_NAME}"
-    fi
+    run_cmd "delete remote ${DEL_NAME}" chbackup delete remote "${DEL_NAME}"
 
     # Step 5: Verify remote gone
     info "  Step 5: Verify remote backup gone"
@@ -708,13 +621,8 @@ if should_run "test_delete_and_list"; then
         pass "${DEL_NAME} removed from remote"
     fi
 
-    # Step 6: Delete local
     info "  Step 6: Delete local ${DEL_NAME}"
-    if chbackup delete local "${DEL_NAME}" 2>&1; then
-        pass "delete local ${DEL_NAME}"
-    else
-        fail "delete local ${DEL_NAME}"
-    fi
+    run_cmd "delete local ${DEL_NAME}" chbackup delete local "${DEL_NAME}"
 
     # Step 7: Verify local gone
     info "  Step 7: Verify local backup gone"
@@ -732,13 +640,8 @@ if should_run "test_clean_broken"; then
     info "T10: Clean broken backups"
     BROKEN_NAME="broken_test_$$"
 
-    # Step 1: Create a valid backup
     info "  Step 1: Create backup ${BROKEN_NAME}"
-    if chbackup create "${BROKEN_NAME}" 2>&1; then
-        pass "create ${BROKEN_NAME}"
-    else
-        fail "create ${BROKEN_NAME}"
-    fi
+    run_cmd "create ${BROKEN_NAME}" chbackup create "${BROKEN_NAME}"
 
     # Step 2: Corrupt its metadata.json
     MANIFEST="/var/lib/clickhouse/backup/${BROKEN_NAME}/metadata.json"
@@ -750,13 +653,8 @@ if should_run "test_clean_broken"; then
         fail "metadata.json not found at ${MANIFEST}"
     fi
 
-    # Step 3: Run clean_broken local
     info "  Step 3: Run clean_broken local"
-    if chbackup clean_broken local 2>&1; then
-        pass "clean_broken local completed"
-    else
-        fail "clean_broken local failed"
-    fi
+    run_cmd "clean_broken local completed" chbackup clean_broken local
 
     # Step 4: Verify the broken backup is cleaned up
     info "  Step 4: Verify broken backup cleaned"
@@ -798,44 +696,24 @@ if should_run "test_s3_disk_round_trip"; then
                 fail "no active parts found on S3 disk"
             fi
 
-            # Step 1: Create backup (includes S3 disk metadata)
             info "  Step 1: Create backup ${S3DISK_NAME}"
-            if chbackup create "${S3DISK_NAME}" 2>&1; then
-                pass "create ${S3DISK_NAME}"
-            else
-                fail "create ${S3DISK_NAME}"
-            fi
+            run_cmd "create ${S3DISK_NAME}" chbackup create "${S3DISK_NAME}"
 
-            # Step 2: Upload to S3 (S3 disk parts use CopyObject, local parts use PutObject)
             info "  Step 2: Upload ${S3DISK_NAME}"
-            if chbackup upload "${S3DISK_NAME}" 2>&1; then
-                pass "upload ${S3DISK_NAME}"
-            else
-                fail "upload ${S3DISK_NAME}"
-            fi
+            run_cmd "upload ${S3DISK_NAME}" chbackup upload "${S3DISK_NAME}"
 
             # Step 3: Delete local backup
             info "  Step 3: Delete local ${S3DISK_NAME}"
             chbackup delete local "${S3DISK_NAME}" 2>&1 || true
 
-            # Step 4: Download from S3
             info "  Step 4: Download ${S3DISK_NAME}"
-            if chbackup download "${S3DISK_NAME}" 2>&1; then
-                pass "download ${S3DISK_NAME}"
-            else
-                fail "download ${S3DISK_NAME}"
-            fi
+            run_cmd "download ${S3DISK_NAME}" chbackup download "${S3DISK_NAME}"
 
-            # Step 5: DROP S3 tables and restore
             info "  Step 5: DROP S3 tables and restore"
             clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
             clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
 
-            if chbackup restore "${S3DISK_NAME}" -t 'default.s3_orders,default.s3_metrics' 2>&1; then
-                pass "restore ${S3DISK_NAME}"
-            else
-                fail "restore ${S3DISK_NAME}"
-            fi
+            run_cmd "restore ${S3DISK_NAME}" chbackup restore "${S3DISK_NAME}" -t 'default.s3_orders,default.s3_metrics'
 
             # Step 6: Verify row counts
             info "  Step 6: Verify row counts"
@@ -864,8 +742,7 @@ if should_run "test_s3_disk_round_trip"; then
 
             # Cleanup
             info "  Cleanup"
-            chbackup delete remote "${S3DISK_NAME}" 2>&1 || true
-            chbackup delete local "${S3DISK_NAME}" 2>&1 || true
+            cleanup_backup "${S3DISK_NAME}"
         fi
     fi
 fi
@@ -889,20 +766,11 @@ if should_run "test_incremental_s3_disk"; then
         PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
         info "  Pre-backup counts: s3_orders=${PRE_S3_ORDERS}, s3_metrics=${PRE_S3_METRICS}, trades=${PRE_TRADES}"
 
-        # Step 1: Create and upload full backup
         info "  Step 1: Create full backup ${FULL_S3}"
-        if chbackup create "${FULL_S3}" 2>&1; then
-            pass "create full ${FULL_S3}"
-        else
-            fail "create full ${FULL_S3}"
-        fi
+        run_cmd "create full ${FULL_S3}" chbackup create "${FULL_S3}"
 
         info "  Step 2: Upload full backup"
-        if chbackup upload "${FULL_S3}" 2>&1; then
-            pass "upload full ${FULL_S3}"
-        else
-            fail "upload full ${FULL_S3}"
-        fi
+        run_cmd "upload full ${FULL_S3}" chbackup upload "${FULL_S3}"
 
         # Step 3: Insert more data into BOTH S3 and local tables
         info "  Step 3: Insert additional data into S3 and local tables"
@@ -915,13 +783,8 @@ if should_run "test_incremental_s3_disk"; then
         AFTER_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
         info "  After insert counts: s3_orders=${AFTER_S3_ORDERS}, s3_metrics=${AFTER_S3_METRICS}, trades=${AFTER_TRADES}"
 
-        # Step 4: Create incremental backup
         info "  Step 4: Create incremental backup ${INCR_S3} --diff-from ${FULL_S3}"
-        if chbackup create "${INCR_S3}" --diff-from "${FULL_S3}" 2>&1; then
-            pass "create incremental ${INCR_S3}"
-        else
-            fail "create incremental ${INCR_S3}"
-        fi
+        run_cmd "create incremental ${INCR_S3}" chbackup create "${INCR_S3}" --diff-from "${FULL_S3}"
 
         # Step 5: Verify incremental manifest has carried parts
         INCR_MANIFEST="/var/lib/clickhouse/backup/${INCR_S3}/metadata.json"
@@ -968,45 +831,22 @@ print(count)
             fail "incremental manifest not found at ${INCR_MANIFEST}"
         fi
 
-        # Step 6: Upload incremental
         info "  Step 6: Upload incremental backup"
-        if chbackup upload "${INCR_S3}" 2>&1; then
-            pass "upload incremental ${INCR_S3}"
-        else
-            fail "upload incremental ${INCR_S3}"
-        fi
+        run_cmd "upload incremental ${INCR_S3}" chbackup upload "${INCR_S3}"
 
-        # Step 7: Delete local, download, restore
         info "  Step 7: Delete local backups"
         chbackup delete local "${INCR_S3}" 2>&1 || true
         chbackup delete local "${FULL_S3}" 2>&1 || true
 
         info "  Step 8: Download incremental"
-        if chbackup download "${INCR_S3}" 2>&1; then
-            pass "download incremental ${INCR_S3}"
-        else
-            fail "download incremental ${INCR_S3}"
-        fi
+        run_cmd "download incremental ${INCR_S3}" chbackup download "${INCR_S3}"
 
         info "  Step 9: Download full (base for incremental)"
-        if chbackup download "${FULL_S3}" 2>&1; then
-            pass "download full ${FULL_S3}"
-        else
-            fail "download full ${FULL_S3}"
-        fi
+        run_cmd "download full ${FULL_S3}" chbackup download "${FULL_S3}"
 
         info "  Step 10: DROP all tables and restore incremental"
-        clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
-        clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
-        clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
-        clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
-        clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
-
-        if chbackup restore "${INCR_S3}" 2>&1; then
-            pass "restore incremental ${INCR_S3}"
-        else
-            fail "restore incremental ${INCR_S3}"
-        fi
+        drop_all_tables
+        run_cmd "restore incremental ${INCR_S3}" chbackup restore "${INCR_S3}"
 
         # Step 11: Verify all data including incremental inserts
         POST_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
@@ -1033,10 +873,7 @@ print(count)
 
         # Cleanup
         info "  Cleanup"
-        chbackup delete remote "${INCR_S3}" 2>&1 || true
-        chbackup delete remote "${FULL_S3}" 2>&1 || true
-        chbackup delete local "${INCR_S3}" 2>&1 || true
-        chbackup delete local "${FULL_S3}" 2>&1 || true
+        cleanup_backup "${INCR_S3}" "${FULL_S3}"
 
         # Remove extra rows (mutations_sync=2 ensures completion before next test)
         clickhouse-client -q "ALTER TABLE default.s3_orders DELETE WHERE order_id IN (99801, 99802) SETTINGS mutations_sync=2" 2>&1 || true
@@ -1062,20 +899,11 @@ if should_run "test_restore_rename_s3"; then
         PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
         info "  Pre-backup counts: s3_orders=${PRE_S3_ORDERS}, trades=${PRE_TRADES}"
 
-        # Step 1: Create and upload backup
         info "  Step 1: Create backup ${RENAME_NAME}"
-        if chbackup create "${RENAME_NAME}" 2>&1; then
-            pass "create ${RENAME_NAME}"
-        else
-            fail "create ${RENAME_NAME}"
-        fi
+        run_cmd "create ${RENAME_NAME}" chbackup create "${RENAME_NAME}"
 
         info "  Step 2: Upload backup ${RENAME_NAME}"
-        if chbackup upload "${RENAME_NAME}" 2>&1; then
-            pass "upload ${RENAME_NAME}"
-        else
-            fail "upload ${RENAME_NAME}"
-        fi
+        run_cmd "upload ${RENAME_NAME}" chbackup upload "${RENAME_NAME}"
 
         # Step 3: Create target tables with different names (schema only)
         info "  Step 3: Create renamed target tables"
@@ -1085,19 +913,10 @@ if should_run "test_restore_rename_s3"; then
         # Step 4: Delete local, download, and restore with --as mapping
         chbackup delete local "${RENAME_NAME}" 2>&1 || true
         info "  Step 4: Download backup"
-        if chbackup download "${RENAME_NAME}" 2>&1; then
-            pass "download ${RENAME_NAME}"
-        else
-            fail "download ${RENAME_NAME}"
-        fi
+        run_cmd "download ${RENAME_NAME}" chbackup download "${RENAME_NAME}"
 
-        # Restore using -t filter to only restore specific tables, with --as mapping
         info "  Step 5: Restore with --as (rename mapping)"
-        if chbackup restore "${RENAME_NAME}" --as "default.s3_orders:default.s3_orders_restored,default.trades:default.trades_restored" -t 'default.s3_orders,default.trades' 2>&1; then
-            pass "restore with rename ${RENAME_NAME}"
-        else
-            fail "restore with rename ${RENAME_NAME}"
-        fi
+        run_cmd "restore with rename ${RENAME_NAME}" chbackup restore "${RENAME_NAME}" --as "default.s3_orders:default.s3_orders_restored,default.trades:default.trades_restored" -t 'default.s3_orders,default.trades'
 
         # Step 6: Verify restored tables have correct data
         POST_S3_ORDERS=$(clickhouse-client -q "SELECT count() FROM default.s3_orders_restored" 2>/dev/null || echo "0")
@@ -1128,8 +947,7 @@ if should_run "test_restore_rename_s3"; then
         info "  Cleanup"
         clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders_restored SYNC"
         clickhouse-client -q "DROP TABLE IF EXISTS default.trades_restored SYNC"
-        chbackup delete remote "${RENAME_NAME}" 2>&1 || true
-        chbackup delete local "${RENAME_NAME}" 2>&1 || true
+        cleanup_backup "${RENAME_NAME}"
     fi
 fi
 
@@ -1146,28 +964,14 @@ if should_run "test_incremental_s3_diff_verify"; then
         DIFF_FULL="diff_verify_full_$$"
         DIFF_INCR="diff_verify_incr_$$"
 
-        # Step 1: Create full backup (all tables)
         info "  Step 1: Create full backup ${DIFF_FULL}"
-        if chbackup create "${DIFF_FULL}" 2>&1; then
-            pass "create full ${DIFF_FULL}"
-        else
-            fail "create full ${DIFF_FULL}"
-        fi
+        run_cmd "create full ${DIFF_FULL}" chbackup create "${DIFF_FULL}"
 
         info "  Step 2: Upload full backup"
-        if chbackup upload "${DIFF_FULL}" 2>&1; then
-            pass "upload full ${DIFF_FULL}"
-        else
-            fail "upload full ${DIFF_FULL}"
-        fi
+        run_cmd "upload full ${DIFF_FULL}" chbackup upload "${DIFF_FULL}"
 
-        # Step 3: Create incremental WITHOUT inserting data (all parts should be carried)
         info "  Step 3: Create incremental (no new data — all parts should carry)"
-        if chbackup create "${DIFF_INCR}" --diff-from "${DIFF_FULL}" 2>&1; then
-            pass "create incremental ${DIFF_INCR}"
-        else
-            fail "create incremental ${DIFF_INCR}"
-        fi
+        run_cmd "create incremental ${DIFF_INCR}" chbackup create "${DIFF_INCR}" --diff-from "${DIFF_FULL}"
 
         # Step 4: Analyze incremental manifest
         DIFF_MANIFEST="/var/lib/clickhouse/backup/${DIFF_INCR}/metadata.json"
@@ -1280,10 +1084,7 @@ print(keys)
 
         # Cleanup
         info "  Cleanup"
-        chbackup delete remote "${DIFF_INCR}" 2>&1 || true
-        chbackup delete remote "${DIFF_FULL}" 2>&1 || true
-        chbackup delete local "${DIFF_INCR}" 2>&1 || true
-        chbackup delete local "${DIFF_FULL}" 2>&1 || true
+        cleanup_backup "${DIFF_INCR}" "${DIFF_FULL}"
     fi
 fi
 
@@ -1299,13 +1100,8 @@ if should_run "test_restore_mode_a_rm"; then
     PRE_USERS_HASH=$(clickhouse-client -q "SELECT sum(cityHash64(*)) FROM default.users")
     info "  Pre-backup checksums: trades=${PRE_TRADES_HASH}, users=${PRE_USERS_HASH}"
 
-    # Step 1: Create backup
     info "  Step 1: Create backup ${RM_NAME}"
-    if chbackup create "${RM_NAME}" -t 'default.trades,default.users' 2>&1; then
-        pass "create ${RM_NAME}"
-    else
-        fail "create ${RM_NAME}"
-    fi
+    run_cmd "create ${RM_NAME}" chbackup create "${RM_NAME}" -t 'default.trades,default.users'
 
     # Step 2: Insert "poison" rows that should disappear after --rm restore
     info "  Step 2: Insert poison rows"
@@ -1314,13 +1110,8 @@ if should_run "test_restore_mode_a_rm"; then
     POISON_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades WHERE symbol = 'POISON'")
     info "  Poison rows inserted: trades=${POISON_TRADES}"
 
-    # Step 3: Restore with --rm (should DROP + recreate, removing poison rows)
     info "  Step 3: Restore with --rm"
-    if chbackup restore "${RM_NAME}" --rm -t 'default.trades,default.users' 2>&1; then
-        pass "restore --rm ${RM_NAME}"
-    else
-        fail "restore --rm ${RM_NAME}"
-    fi
+    run_cmd "restore --rm ${RM_NAME}" chbackup restore "${RM_NAME}" --rm -t 'default.trades,default.users'
 
     # Step 4: Verify checksums match pre-backup (poison rows gone)
     # Tables may not exist if restore failed — check existence first
@@ -1380,21 +1171,11 @@ if should_run "test_database_mapping"; then
     PRE_COUNT=$(clickhouse-client -q "SELECT count() FROM testdb.maptest")
     info "  testdb.maptest rows: ${PRE_COUNT}"
 
-    # Step 2: Create backup of testdb
     info "  Step 2: Create backup"
-    if chbackup create "${MAP_NAME}" -t 'testdb.*' 2>&1; then
-        pass "create ${MAP_NAME}"
-    else
-        fail "create ${MAP_NAME}"
-    fi
+    run_cmd "create ${MAP_NAME}" chbackup create "${MAP_NAME}" -t 'testdb.*'
 
-    # Step 3: Restore with database mapping
     info "  Step 3: Restore with -m testdb:testdb_copy"
-    if chbackup restore "${MAP_NAME}" -m "testdb:testdb_copy" 2>&1; then
-        pass "restore with database mapping"
-    else
-        fail "restore with database mapping"
-    fi
+    run_cmd "restore with database mapping" chbackup restore "${MAP_NAME}" -m "testdb:testdb_copy"
 
     # Step 4: Verify testdb_copy exists with same data
     COPY_EXISTS=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database = 'testdb_copy' AND name = 'maptest'" 2>/dev/null || echo "0")
@@ -1436,13 +1217,8 @@ if should_run "test_data_only_restore"; then
     PRE_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
     info "  Pre-backup trades count: ${PRE_COUNT}"
 
-    # Step 1: Create backup of trades
     info "  Step 1: Create backup"
-    if chbackup create "${DATA_ONLY_NAME}" -t 'default.trades' 2>&1; then
-        pass "create ${DATA_ONLY_NAME}"
-    else
-        fail "create ${DATA_ONLY_NAME}"
-    fi
+    run_cmd "create ${DATA_ONLY_NAME}" chbackup create "${DATA_ONLY_NAME}" -t 'default.trades'
 
     # Step 2: DROP and recreate trades (empty schema)
     info "  Step 2: DROP and recreate trades (empty)"
@@ -1463,13 +1239,8 @@ ORDER BY (symbol, trade_id);
     EMPTY_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
     info "  After recreate: trades rows = ${EMPTY_COUNT}"
 
-    # Step 3: Restore with --data-only (skips schema, only ATTACHes parts)
     info "  Step 3: Restore with --data-only"
-    if chbackup restore "${DATA_ONLY_NAME}" --data-only -t 'default.trades' 2>&1; then
-        pass "restore --data-only ${DATA_ONLY_NAME}"
-    else
-        fail "restore --data-only ${DATA_ONLY_NAME}"
-    fi
+    run_cmd "restore --data-only ${DATA_ONLY_NAME}" chbackup restore "${DATA_ONLY_NAME}" --data-only -t 'default.trades'
 
     # Step 4: Verify row count
     POST_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
@@ -1498,26 +1269,16 @@ if should_run "test_skip_empty_tables"; then
 
     PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
 
-    # Step 1: Create backup (includes both empty_table and trades)
     info "  Step 1: Create backup"
-    if chbackup create "${SKIP_EMPTY_NAME}" -t 'default.empty_table,default.trades' 2>&1; then
-        pass "create ${SKIP_EMPTY_NAME}"
-    else
-        fail "create ${SKIP_EMPTY_NAME}"
-    fi
+    run_cmd "create ${SKIP_EMPTY_NAME}" chbackup create "${SKIP_EMPTY_NAME}" -t 'default.empty_table,default.trades'
 
     # Step 2: DROP both tables
     info "  Step 2: DROP both tables"
     clickhouse-client -q "DROP TABLE IF EXISTS default.empty_table SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
 
-    # Step 3: Restore with --skip-empty-tables
     info "  Step 3: Restore with --skip-empty-tables"
-    if chbackup restore "${SKIP_EMPTY_NAME}" --skip-empty-tables -t 'default.empty_table,default.trades' 2>&1; then
-        pass "restore --skip-empty-tables"
-    else
-        fail "restore --skip-empty-tables"
-    fi
+    run_cmd "restore --skip-empty-tables" chbackup restore "${SKIP_EMPTY_NAME}" --skip-empty-tables -t 'default.empty_table,default.trades'
 
     # Step 4: Verify empty_table was NOT restored
     EMPTY_AFTER=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database = 'default' AND name = 'empty_table'" 2>/dev/null || echo "0")
@@ -1585,9 +1346,7 @@ if should_run "test_retention"; then
     # Cleanup: delete remaining backups
     info "  Cleanup"
     for i in 1 2 3 4 5; do
-        RET_NAME="ret_${i}_$$"
-        chbackup delete remote "${RET_NAME}" 2>&1 || true
-        chbackup delete local "${RET_NAME}" 2>&1 || true
+        cleanup_backup "ret_${i}_$$"
     done
 fi
 
@@ -1598,13 +1357,8 @@ if should_run "test_clean_shadow"; then
     info "T20: Clean shadow"
     SHADOW_NAME="shadow_test_$$"
 
-    # Step 1: Create backup (triggers FREEZE -> shadow dirs)
     info "  Step 1: Create backup ${SHADOW_NAME}"
-    if chbackup create "${SHADOW_NAME}" 2>&1; then
-        pass "create ${SHADOW_NAME}"
-    else
-        fail "create ${SHADOW_NAME}"
-    fi
+    run_cmd "create ${SHADOW_NAME}" chbackup create "${SHADOW_NAME}"
 
     # Step 2: Check shadow dir (may or may not have leftover chbackup_* dirs)
     # The backup process should clean its own shadow, but if it doesn't we still test clean
@@ -1616,13 +1370,8 @@ if should_run "test_clean_shadow"; then
         info "  Shadow dirs before clean: ${BEFORE_CLEAN}"
     fi
 
-    # Step 3: Run chbackup clean
     info "  Step 3: Run chbackup clean"
-    if chbackup clean 2>&1; then
-        pass "chbackup clean completed"
-    else
-        fail "chbackup clean failed"
-    fi
+    run_cmd "chbackup clean completed" chbackup clean
 
     # Step 4: Verify no chbackup_* dirs remain
     AFTER_CLEAN=$(find "${SHADOW_DIR}" -maxdepth 1 -name "chbackup_*" -type d 2>/dev/null | wc -l)
@@ -1806,8 +1555,7 @@ else:
         info "  Cleanup"
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
-        chbackup delete remote "${API_RT_NAME}" 2>&1 || true
-        chbackup delete local "${API_RT_NAME}" 2>&1 || true
+        cleanup_backup "${API_RT_NAME}"
     fi
 fi
 
@@ -1973,13 +1721,8 @@ if should_run "test_partition_create"; then
     PART_CREATE_NAME="part_create_$$"
 
     # trades has partitions: 202401, 202402, 202403
-    # Step 1: Create backup with --partitions 202401
     info "  Step 1: Create backup with --partitions 202401"
-    if chbackup create "${PART_CREATE_NAME}" -t 'default.trades' --partitions "202401" 2>&1; then
-        pass "create with --partitions 202401"
-    else
-        fail "create with --partitions 202401"
-    fi
+    run_cmd "create with --partitions 202401" chbackup create "${PART_CREATE_NAME}" -t 'default.trades' --partitions "202401"
 
     # Step 2: Inspect manifest
     MANIFEST="/var/lib/clickhouse/backup/${PART_CREATE_NAME}/metadata.json"
@@ -2046,13 +1789,8 @@ OPTIMIZE TABLE default.proj_test FINAL;
 "
     pass "proj_test table created with projection"
 
-    # Step 2: Backup WITH --skip-projections '*'
     info "  Step 2: Backup with --skip-projections '*'"
-    if chbackup create "${PROJ_SKIP_NAME}" -t 'default.proj_test' --skip-projections '*' 2>&1; then
-        pass "create with --skip-projections"
-    else
-        fail "create with --skip-projections"
-    fi
+    run_cmd "create with --skip-projections" chbackup create "${PROJ_SKIP_NAME}" -t 'default.proj_test' --skip-projections '*'
 
     # Check for .proj directories in skipped backup
     PROJ_DIRS_SKIP=$(find /var/lib/clickhouse/backup/${PROJ_SKIP_NAME}/ -name "*.proj" -type d 2>/dev/null | wc -l)
@@ -2063,13 +1801,8 @@ OPTIMIZE TABLE default.proj_test FINAL;
         fail "${PROJ_DIRS_SKIP} .proj directories found (expected 0)"
     fi
 
-    # Step 3: Backup WITHOUT skip (should have projections)
     info "  Step 3: Backup without --skip-projections"
-    if chbackup create "${PROJ_KEEP_NAME}" -t 'default.proj_test' 2>&1; then
-        pass "create without --skip-projections"
-    else
-        fail "create without --skip-projections"
-    fi
+    run_cmd "create without --skip-projections" chbackup create "${PROJ_KEEP_NAME}" -t 'default.proj_test'
 
     PROJ_DIRS_KEEP=$(find /var/lib/clickhouse/backup/${PROJ_KEEP_NAME}/ -name "*.proj" -type d 2>/dev/null | wc -l)
     info "  .proj dirs in normal backup: ${PROJ_DIRS_KEEP}"
@@ -2144,10 +1877,7 @@ if should_run "test_hardlink_dedup"; then
 
     # Cleanup
     info "  Cleanup"
-    chbackup delete remote "${HL_NAME1}" 2>&1 || true
-    chbackup delete remote "${HL_NAME2}" 2>&1 || true
-    chbackup delete local "${HL_NAME1}" 2>&1 || true
-    chbackup delete local "${HL_NAME2}" 2>&1 || true
+    cleanup_backup "${HL_NAME1}" "${HL_NAME2}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2166,13 +1896,8 @@ if should_run "test_rbac_backup_restore"; then
     clickhouse-client -q "GRANT testrole_rbac TO testuser_rbac" 2>&1 || true
     pass "RBAC objects created"
 
-    # Step 2: Create backup with --rbac (local tables only to avoid S3 disk CopyObject issues on restore)
     info "  Step 2: Create backup with --rbac"
-    if chbackup create "${RBAC_NAME}" --rbac -t 'default.trades,default.users,default.events' 2>&1; then
-        pass "create --rbac ${RBAC_NAME}"
-    else
-        fail "create --rbac ${RBAC_NAME}"
-    fi
+    run_cmd "create --rbac ${RBAC_NAME}" chbackup create "${RBAC_NAME}" --rbac -t 'default.trades,default.users,default.events'
 
     # Step 3: Check backup has RBAC data
     BACKUP_DIR="/var/lib/clickhouse/backup/${RBAC_NAME}"
@@ -2442,13 +2167,8 @@ if should_run "test_create_remote"; then
     info "T31: Create remote (one-step)"
     CR_NAME="cr_test_$$"
 
-    # Step 1: create_remote
     info "  Step 1: chbackup create_remote ${CR_NAME}"
-    if chbackup create_remote "${CR_NAME}" -t 'default.trades' 2>&1; then
-        pass "create_remote ${CR_NAME}"
-    else
-        fail "create_remote ${CR_NAME}"
-    fi
+    run_cmd "create_remote ${CR_NAME}" chbackup create_remote "${CR_NAME}" -t 'default.trades'
 
     # Step 2: Verify in remote list
     info "  Step 2: Verify in remote list"
@@ -2471,8 +2191,7 @@ if should_run "test_create_remote"; then
 
     # Cleanup
     info "  Cleanup"
-    chbackup delete remote "${CR_NAME}" 2>&1 || true
-    chbackup delete local "${CR_NAME}" 2>&1 || true
+    cleanup_backup "${CR_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2500,13 +2219,8 @@ if should_run "test_restore_remote"; then
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
 
-    # Step 4: restore_remote (download + restore in one step)
     info "  Step 4: chbackup restore_remote ${RR_NAME}"
-    if chbackup restore_remote "${RR_NAME}" -t 'default.trades,default.users' 2>&1; then
-        pass "restore_remote ${RR_NAME}"
-    else
-        fail "restore_remote ${RR_NAME}"
-    fi
+    run_cmd "restore_remote ${RR_NAME}" chbackup restore_remote "${RR_NAME}" -t 'default.trades,default.users'
 
     # Step 5: Verify row counts
     POST_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades" 2>/dev/null || echo "0")
@@ -2526,8 +2240,7 @@ if should_run "test_restore_remote"; then
 
     # Cleanup
     info "  Cleanup"
-    chbackup delete remote "${RR_NAME}" 2>&1 || true
-    chbackup delete local "${RR_NAME}" 2>&1 || true
+    cleanup_backup "${RR_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2537,14 +2250,8 @@ if should_run "test_freeze_by_part"; then
     info "T33: Freeze by part"
     FBP_NAME="fbp_test_$$"
 
-    # Step 1: Create backup with freeze_by_part=true via env override
     info "  Step 1: Create backup with freeze_by_part=true"
-    if chbackup create "${FBP_NAME}" -t 'default.trades' \
-        --env "clickhouse.freeze_by_part=true" 2>&1; then
-        pass "create with freeze_by_part=true"
-    else
-        fail "create with freeze_by_part=true"
-    fi
+    run_cmd "create with freeze_by_part=true" chbackup create "${FBP_NAME}" -t 'default.trades' --env "clickhouse.freeze_by_part=true"
 
     # Step 2: Verify backup was created successfully
     MANIFEST="/var/lib/clickhouse/backup/${FBP_NAME}/metadata.json"
@@ -2727,25 +2434,14 @@ if should_run "test_schema_only_restore"; then
     PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
     info "  Pre-backup trades count: ${PRE_TRADES}"
 
-    # Step 1: Create backup of trades
     info "  Step 1: Create backup"
-    if chbackup create "${SCHEMA_REST_NAME}" -t 'default.trades' 2>&1; then
-        pass "create ${SCHEMA_REST_NAME}"
-    else
-        fail "create ${SCHEMA_REST_NAME}"
-    fi
+    run_cmd "create ${SCHEMA_REST_NAME}" chbackup create "${SCHEMA_REST_NAME}" -t 'default.trades'
 
-    # Step 2: DROP trades
     info "  Step 2: DROP trades"
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
 
-    # Step 3: Restore with --schema flag
     info "  Step 3: Restore with --schema"
-    if chbackup restore "${SCHEMA_REST_NAME}" -t 'default.trades' --schema 2>&1; then
-        pass "restore --schema ${SCHEMA_REST_NAME}"
-    else
-        fail "restore --schema ${SCHEMA_REST_NAME}"
-    fi
+    run_cmd "restore --schema ${SCHEMA_REST_NAME}" chbackup restore "${SCHEMA_REST_NAME}" -t 'default.trades' --schema
 
     # Step 4: Verify table exists but is empty
     TBLEXISTS=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database='default' AND name='trades'" 2>/dev/null || echo "0")
@@ -2764,9 +2460,7 @@ if should_run "test_schema_only_restore"; then
 
     # Cleanup: re-seed
     info "  Cleanup: re-seed data"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC" 2>/dev/null || true
-    clickhouse-client --multiquery < /test/fixtures/setup.sql
-    clickhouse-client --multiquery < /test/fixtures/seed_data.sql
+    reseed_data
     chbackup delete local "${SCHEMA_REST_NAME}" 2>&1 || true
 fi
 
@@ -2780,21 +2474,11 @@ if should_run "test_single_table_rename_as"; then
     PRE_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
     info "  Pre-backup trades count: ${PRE_TRADES}"
 
-    # Step 1: Create backup
     info "  Step 1: Create backup"
-    if chbackup create "${RENAME_SINGLE_NAME}" -t 'default.trades' 2>&1; then
-        pass "create ${RENAME_SINGLE_NAME}"
-    else
-        fail "create ${RENAME_SINGLE_NAME}"
-    fi
+    run_cmd "create ${RENAME_SINGLE_NAME}" chbackup create "${RENAME_SINGLE_NAME}" -t 'default.trades'
 
-    # Step 2: Restore with --as rename
     info "  Step 2: Restore with --as"
-    if chbackup restore "${RENAME_SINGLE_NAME}" -t 'default.trades' --as 'default.trades:default.trades_copy' 2>&1; then
-        pass "restore with --as rename"
-    else
-        fail "restore with --as rename"
-    fi
+    run_cmd "restore with --as rename" chbackup restore "${RENAME_SINGLE_NAME}" -t 'default.trades' --as 'default.trades:default.trades_copy'
 
     # Step 3: Verify trades_copy exists with correct data
     COPY_EXISTS=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database='default' AND name='trades_copy'" 2>/dev/null || echo "0")
@@ -2832,13 +2516,8 @@ if should_run "test_upload_delete_local"; then
     info "T38: Upload --delete-local"
     DEL_LOCAL_NAME="del_local_$$"
 
-    # Step 1: Create backup
     info "  Step 1: Create backup"
-    if chbackup create "${DEL_LOCAL_NAME}" -t 'default.trades' 2>&1; then
-        pass "create ${DEL_LOCAL_NAME}"
-    else
-        fail "create ${DEL_LOCAL_NAME}"
-    fi
+    run_cmd "create ${DEL_LOCAL_NAME}" chbackup create "${DEL_LOCAL_NAME}" -t 'default.trades'
 
     # Verify in local list
     LOCAL_LIST=$(RUST_LOG=error chbackup list local 2>/dev/null)
@@ -2848,13 +2527,8 @@ if should_run "test_upload_delete_local"; then
         fail "${DEL_LOCAL_NAME} NOT in local list"
     fi
 
-    # Step 2: Upload with --delete-local
     info "  Step 2: Upload with --delete-local"
-    if chbackup upload --delete-local "${DEL_LOCAL_NAME}" 2>&1; then
-        pass "upload --delete-local"
-    else
-        fail "upload --delete-local"
-    fi
+    run_cmd "upload --delete-local" chbackup upload --delete-local "${DEL_LOCAL_NAME}"
 
     # Step 3: Verify local gone
     LOCAL_LIST2=$(RUST_LOG=error chbackup list local 2>/dev/null)
@@ -2894,21 +2568,11 @@ if should_run "test_diff_from_remote"; then
     info "  Step 2: Insert extra data"
     clickhouse-client -q "INSERT INTO default.trades VALUES ('2024-04-01', 88801, 'DFR', 111.11, 10), ('2024-04-02', 88802, 'DFR', 222.22, 20)"
 
-    # Step 3: Create incremental
     info "  Step 3: Create incremental"
-    if chbackup create "${DFR_INCR}" -t 'default.trades' 2>&1; then
-        pass "create ${DFR_INCR}"
-    else
-        fail "create ${DFR_INCR}"
-    fi
+    run_cmd "create ${DFR_INCR}" chbackup create "${DFR_INCR}" -t 'default.trades'
 
-    # Step 4: Upload with --diff-from-remote
     info "  Step 4: Upload with --diff-from-remote"
-    if chbackup upload --diff-from-remote "${DFR_BASE}" "${DFR_INCR}" 2>&1; then
-        pass "upload --diff-from-remote"
-    else
-        fail "upload --diff-from-remote"
-    fi
+    run_cmd "upload --diff-from-remote" chbackup upload --diff-from-remote "${DFR_BASE}" "${DFR_INCR}"
 
     # Step 5: Check manifest for carried parts
     MANIFEST="/var/lib/clickhouse/backup/${DFR_INCR}/metadata.json"
@@ -2935,10 +2599,7 @@ print(count)
     # Cleanup
     info "  Cleanup"
     clickhouse-client -q "ALTER TABLE default.trades DELETE WHERE trade_id IN (88801, 88802) SETTINGS mutations_sync=2" 2>&1 || true
-    chbackup delete remote "${DFR_INCR}" 2>&1 || true
-    chbackup delete remote "${DFR_BASE}" 2>&1 || true
-    chbackup delete local "${DFR_INCR}" 2>&1 || true
-    chbackup delete local "${DFR_BASE}" 2>&1 || true
+    cleanup_backup "${DFR_INCR}" "${DFR_BASE}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3010,8 +2671,7 @@ if should_run "test_tables_remote_backup"; then
 
     # Cleanup
     info "  Cleanup"
-    chbackup delete remote "${TBL_REMOTE_NAME}" 2>&1 || true
-    chbackup delete local "${TBL_REMOTE_NAME}" 2>&1 || true
+    cleanup_backup "${TBL_REMOTE_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3067,11 +2727,7 @@ else:
 
     # Step 4: Clean broken remote (always safe to run, no-op if nothing broken)
     info "  Step 4: Run clean_broken remote"
-    if chbackup clean_broken remote 2>&1; then
-        pass "clean_broken remote completed"
-    else
-        fail "clean_broken remote failed"
-    fi
+    run_cmd "clean_broken remote completed" chbackup clean_broken remote
 
     # Step 5: Verify no broken backups remain with this name
     REMOTE_JSON2=$(RUST_LOG=error chbackup list remote --format json 2>/dev/null || echo "[]")
@@ -3090,8 +2746,7 @@ print(len(found))
     # Cleanup
     info "  Cleanup"
     clickhouse-client -q "ALTER TABLE default.trades DELETE WHERE trade_id >= 400000 SETTINGS mutations_sync=2" 2>&1 || true
-    chbackup delete remote "${CBROK_NAME}" 2>&1 || true
-    chbackup delete local "${CBROK_NAME}" 2>&1 || true
+    cleanup_backup "${CBROK_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3108,13 +2763,8 @@ if should_run "test_latest_previous_shortcuts"; then
     sleep 1
     chbackup create "${SHORT_B}" -t 'default.trades' 2>&1 || true
 
-    # Step 2: Delete "latest" (should delete SHORT_B)
     info "  Step 2: Delete local latest"
-    if chbackup delete local latest 2>&1; then
-        pass "delete local latest"
-    else
-        fail "delete local latest"
-    fi
+    run_cmd "delete local latest" chbackup delete local latest
 
     # Verify SHORT_B gone, SHORT_A still exists
     if [ -d "/var/lib/clickhouse/backup/${SHORT_B}" ]; then
@@ -3133,11 +2783,7 @@ if should_run "test_latest_previous_shortcuts"; then
     info "  Step 3: Re-create SHORT_B, delete previous"
     chbackup create "${SHORT_B}" -t 'default.trades' 2>&1 || true
 
-    if chbackup delete local previous 2>&1; then
-        pass "delete local previous"
-    else
-        fail "delete local previous"
-    fi
+    run_cmd "delete local previous" chbackup delete local previous
 
     if [ -d "/var/lib/clickhouse/backup/${SHORT_A}" ]; then
         fail "${SHORT_A} still exists (should be deleted as previous)"
@@ -3348,8 +2994,7 @@ if should_run "test_api_tables_remote"; then
     # Cleanup
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
-    chbackup delete remote "${API_TBL_NAME}" 2>&1 || true
-    chbackup delete local "${API_TBL_NAME}" 2>&1 || true
+    cleanup_backup "${API_TBL_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3421,8 +3066,7 @@ print('found' if found else 'gone')
     # Cleanup
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
-    chbackup delete remote "${API_DEL_NAME}" 2>&1 || true
-    chbackup delete local "${API_DEL_NAME}" 2>&1 || true
+    cleanup_backup "${API_DEL_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3505,10 +3149,7 @@ if should_run "test_api_post_actions_dispatch"; then
     # Cleanup
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
-    chbackup delete remote "${ACT_NAME}" 2>&1 || true
-    chbackup delete remote "${ACT_CR_NAME}" 2>&1 || true
-    chbackup delete local "${ACT_NAME}" 2>&1 || true
-    chbackup delete local "${ACT_CR_NAME}" 2>&1 || true
+    cleanup_backup "${ACT_NAME}" "${ACT_CR_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3757,13 +3398,8 @@ if should_run "test_configs_backup_restore"; then
         fail "test config not created"
     fi
 
-    # Step 2: Create backup with --configs
     info "  Step 2: Create backup with --configs"
-    if chbackup create "${CFG_TEST_NAME}" --configs -t 'default.trades' 2>&1; then
-        pass "create --configs ${CFG_TEST_NAME}"
-    else
-        fail "create --configs ${CFG_TEST_NAME}"
-    fi
+    run_cmd "create --configs ${CFG_TEST_NAME}" chbackup create "${CFG_TEST_NAME}" --configs -t 'default.trades'
 
     # Step 3: Verify backup has configs
     BACKUP_DIR="/var/lib/clickhouse/backup/${CFG_TEST_NAME}"
@@ -3782,13 +3418,8 @@ if should_run "test_configs_backup_restore"; then
     info "  Step 4: Remove test config"
     rm -f "$CFG_FILE"
 
-    # Step 5: Restore with --configs
     info "  Step 5: Restore with --configs"
-    if chbackup restore --configs "${CFG_TEST_NAME}" 2>&1; then
-        pass "restore --configs"
-    else
-        fail "restore --configs"
-    fi
+    run_cmd "restore --configs" chbackup restore --configs "${CFG_TEST_NAME}"
 
     # Step 6: Verify config file restored
     if [ -f "$CFG_FILE" ]; then
@@ -3827,13 +3458,8 @@ if should_run "test_restore_remote_with_rm"; then
     POISON_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades WHERE symbol='POISON_RR'")
     info "  Poison rows: ${POISON_COUNT}"
 
-    # Step 3: Restore remote with --rm
     info "  Step 3: restore_remote --rm"
-    if chbackup restore_remote --rm "${RR_RM_NAME}" -t 'default.trades' 2>&1; then
-        pass "restore_remote --rm"
-    else
-        fail "restore_remote --rm"
-    fi
+    run_cmd "restore_remote --rm" chbackup restore_remote --rm "${RR_RM_NAME}" -t 'default.trades'
 
     # Step 4: Verify
     POST_HASH=$(clickhouse-client -q "SELECT sum(cityHash64(*)) FROM default.trades" 2>/dev/null || echo "0")
@@ -3860,8 +3486,7 @@ if should_run "test_restore_remote_with_rm"; then
 
     # Cleanup
     info "  Cleanup"
-    chbackup delete remote "${RR_RM_NAME}" 2>&1 || true
-    chbackup delete local "${RR_RM_NAME}" 2>&1 || true
+    cleanup_backup "${RR_RM_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3877,13 +3502,8 @@ if should_run "test_resume_upload"; then
     BULK_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades")
     info "  Trades count after bulk insert: ${BULK_COUNT}"
 
-    # Step 2: Create backup
     info "  Step 2: Create backup"
-    if chbackup create "${RESUME_UP_NAME}" -t 'default.trades' 2>&1; then
-        pass "create ${RESUME_UP_NAME}"
-    else
-        fail "create ${RESUME_UP_NAME}"
-    fi
+    run_cmd "create ${RESUME_UP_NAME}" chbackup create "${RESUME_UP_NAME}" -t 'default.trades'
 
     # Step 3: Start upload with rate limit and --resume, kill after 3s
     info "  Step 3: Start rate-limited upload, interrupt after 3s"
@@ -3903,13 +3523,8 @@ if should_run "test_resume_upload"; then
         info "  NOTE: upload.state.json not found (upload may have completed before interrupt)"
     fi
 
-    # Step 5: Resume upload
     info "  Step 5: Resume upload"
-    if chbackup upload --resume "${RESUME_UP_NAME}" 2>&1; then
-        pass "resume upload completed"
-    else
-        fail "resume upload failed"
-    fi
+    run_cmd "resume upload completed" chbackup upload --resume "${RESUME_UP_NAME}"
 
     # Step 6: Verify in remote list
     REMOTE_LIST=$(RUST_LOG=error chbackup list remote 2>/dev/null)
@@ -3922,8 +3537,7 @@ if should_run "test_resume_upload"; then
     # Cleanup
     info "  Cleanup"
     clickhouse-client -q "ALTER TABLE default.trades DELETE WHERE trade_id >= 100000 SETTINGS mutations_sync=2" 2>&1 || true
-    chbackup delete remote "${RESUME_UP_NAME}" 2>&1 || true
-    chbackup delete local "${RESUME_UP_NAME}" 2>&1 || true
+    cleanup_backup "${RESUME_UP_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3950,13 +3564,8 @@ if should_run "test_resume_download"; then
     wait $DL_PID 2>/dev/null
     set -e
 
-    # Step 3: Resume download
     info "  Step 3: Resume download"
-    if chbackup download --resume "${RESUME_DL_NAME}" 2>&1; then
-        pass "resume download completed"
-    else
-        fail "resume download failed"
-    fi
+    run_cmd "resume download completed" chbackup download --resume "${RESUME_DL_NAME}"
 
     # Step 4: Verify in local list
     LOCAL_LIST=$(RUST_LOG=error chbackup list local 2>/dev/null)
@@ -3969,8 +3578,7 @@ if should_run "test_resume_download"; then
     # Cleanup
     info "  Cleanup"
     clickhouse-client -q "ALTER TABLE default.trades DELETE WHERE trade_id >= 200000 SETTINGS mutations_sync=2" 2>&1 || true
-    chbackup delete remote "${RESUME_DL_NAME}" 2>&1 || true
-    chbackup delete local "${RESUME_DL_NAME}" 2>&1 || true
+    cleanup_backup "${RESUME_DL_NAME}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -4023,13 +3631,8 @@ if should_run "test_resume_restore"; then
     wait $RST_PID 2>/dev/null
     set -e
 
-    # Step 4: Resume restore
     info "  Step 4: Resume restore"
-    if chbackup restore --resume "${RESUME_RST_NAME}" -t 'default.trades' 2>&1; then
-        pass "resume restore completed"
-    else
-        fail "resume restore failed"
-    fi
+    run_cmd "resume restore completed" chbackup restore --resume "${RESUME_RST_NAME}" -t 'default.trades'
 
     # Step 5: Verify row count
     POST_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades" 2>/dev/null || echo "0")
@@ -4047,9 +3650,7 @@ if should_run "test_resume_restore"; then
 
     # Cleanup: re-seed original data
     info "  Cleanup: re-seed data"
-    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC" 2>/dev/null || true
-    clickhouse-client --multiquery < /test/fixtures/setup.sql
-    clickhouse-client --multiquery < /test/fixtures/seed_data.sql
+    reseed_data
     chbackup delete local "${RESUME_RST_NAME}" 2>&1 || true
 fi
 
@@ -4076,13 +3677,8 @@ if should_run "test_clean_targeted"; then
         fail "shadow fixtures not created (a=${A_EXISTS}, b=${B_EXISTS})"
     fi
 
-    # Step 2: Run targeted clean for clean_a only
     info "  Step 2: Clean --name clean_a_$$"
-    if chbackup clean --name "clean_a_$$" 2>&1; then
-        pass "clean --name clean_a_$$ completed"
-    else
-        fail "clean --name clean_a_$$ failed"
-    fi
+    run_cmd "clean --name clean_a_$$ completed" chbackup clean --name "clean_a_$$"
 
     # Step 3: Verify clean_a gone, clean_b still exists
     A_AFTER=$(find "${SHADOW_DIR}" -maxdepth 1 -name "chbackup_clean_a_$$*" -type d 2>/dev/null | wc -l)
@@ -4100,13 +3696,8 @@ if should_run "test_clean_targeted"; then
         fail "clean_b shadow dirs unexpectedly removed"
     fi
 
-    # Step 4: Clean all
     info "  Step 4: Clean all (no --name)"
-    if chbackup clean 2>&1; then
-        pass "clean all completed"
-    else
-        fail "clean all failed"
-    fi
+    run_cmd "clean all completed" chbackup clean
 
     # Step 5: Verify all gone
     ALL_AFTER=$(find "${SHADOW_DIR}" -maxdepth 1 -name "chbackup_*" -type d 2>/dev/null | wc -l)

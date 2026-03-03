@@ -198,28 +198,24 @@ done
 
 #### 1.4.4 Test Suite Structure
 
-Tests are organized by operation and progressively build on each other:
+All integration tests are bash-based, running inside a Docker container with real
+ClickHouse and S3 backends. There are no Rust integration test files -- all 62 tests
+(T1-T62) live in `test/run_tests.sh`.
 
 ```
 test/
-├── run_tests.sh              # Entrypoint: starts tests, reports results
+├── run_tests.sh                  # Integration test runner with 62 tests (T1-T62)
+├── clean-s3.sh                   # S3 test data cleanup script (--dry-run supported)
 ├── configs/
-│   ├── clickhouse-config.xml # ZK connection, multi-disk, replicated settings
-│   └── chbackup-test.yml     # chbackup config pointing to S3 + localhost CH
+│   ├── clickhouse-config.xml     # ZK connection, multi-disk, replicated settings
+│   ├── chbackup-test.yml         # chbackup config pointing to S3 + localhost CH
+│   └── generate-s3-disk-config.sh # Generates S3 disk config from env vars
 ├── fixtures/
-│   ├── setup.sql             # Creates databases, tables, views, dictionaries
-│   ├── seed_data.sql         # Deterministic INSERT statements for checksum validation
-│   └── seed_large.sql        # Large data generator for multipart upload tests (T13)
-└── integration/
-    ├── test_create_local.rs
-    ├── test_upload_download.rs
-    ├── test_restore_clean.rs
-    ├── test_diff_from.rs
-    ├── test_retention.rs
-    ├── test_replicated.rs
-    ├── test_api_server.rs
-    ├── test_crash_recovery.rs
-    └── test_watch_mode.rs
+│   ├── setup.sql                 # Creates test databases, tables (3 local + 2 S3 disk + 1 empty)
+│   ├── seed_data.sql             # Deterministic INSERT statements for checksum validation
+│   └── seed_large.sql            # Large data generator for multipart upload tests
+Dockerfile.local-test             # Multi-stage build (rust:alpine -> altinity/clickhouse-server)
+docker-compose.local.yml          # ZooKeeper + ClickHouse/chbackup test compose
 ```
 
 **Fixture: setup.sql** — Creates every table type referenced by T1-T18.

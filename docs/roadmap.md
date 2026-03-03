@@ -472,14 +472,16 @@ kill -HUP $(pidof chbackup)
 
 ### Tests
 
-All Phase 4 tests are aspirational future work. None are currently in `test/run_tests.sh`.
+Test coverage for Phase 4 features in `test/run_tests.sh` (62 tests total, T1-T62):
 
-- T9: Replicated tables + ZK path conflict (4d)
-- T12: Streaming engine postponed activation (4c)
-- T19: RBAC backup + restore round-trip (4e)
-- T20: ON CLUSTER restore — DDL propagates to all cluster nodes (4d)
-- T25: Partition-level backup + restore with --partitions (2d) (already **(impl: `test_partitioned_restore`)** from Phase 2)
-- T28: Replicated Database Engine — no ON CLUSTER, UUID regeneration (4d)
+- [done] T19 (RBAC): RBAC backup + restore round-trip with `--rbac` flag (run_tests.sh T28)
+- [done] T25 (Partitions): Partition-level backup with `--partitions` (run_tests.sh T6, T25)
+- [done] T12 (S3 disk incremental): Incremental backup/restore with S3 disk tables (run_tests.sh T12)
+- [done] T56 (Configs): Configs backup + restore with `--configs` flag (run_tests.sh T56)
+- TODO: T9: Replicated tables + ZK path conflict (requires multi-replica test environment)
+- TODO: T12 (streaming): Streaming engine postponed activation (requires Kafka/NATS broker)
+- TODO: T20: ON CLUSTER restore (requires multi-node ClickHouse cluster)
+- TODO: T28: Replicated Database Engine (requires DatabaseReplicated test setup)
 
 ### Design sections consumed: §5.5-5.7, §6, §16.4
 
