@@ -223,10 +223,7 @@ pub async fn restore(
     }
 
     // Phase 2: CREATE data tables (not DDL-only objects)
-    info!(
-        count = phases.data_tables.len(),
-        "Phase 2: data tables"
-    );
+    info!(count = phases.data_tables.len(), "Phase 2: data tables");
     create_tables(
         ch,
         &manifest,
@@ -244,10 +241,7 @@ pub async fn restore(
     if schema_only {
         if !data_only && !phases.ddl_only_tables.is_empty() {
             let sorted_ddl = topological_sort(&manifest.tables, &phases.ddl_only_tables)?;
-            info!(
-                count = sorted_ddl.len(),
-                "Phase 3: DDL-only objects"
-            );
+            info!(count = sorted_ddl.len(), "Phase 3: DDL-only objects");
             create_ddl_objects(
                 ch,
                 &manifest,
@@ -504,10 +498,9 @@ pub async fn restore(
                         disks = ?s3_disks_without_remote,
                         "S3 disks without remote_path, discovering from ClickHouse config"
                     );
-                    let discovered =
-                        crate::clickhouse::client::discover_s3_disk_endpoints(
-                            &config.clickhouse.config_dir,
-                        );
+                    let discovered = crate::clickhouse::client::discover_s3_disk_endpoints(
+                        &config.clickhouse.config_dir,
+                    );
                     for disk_name in &s3_disks_without_remote {
                         if let Some(uri) = discovered.get(disk_name) {
                             paths.insert(disk_name.clone(), uri.clone());
@@ -696,16 +689,14 @@ pub async fn restore(
             // Check if the table has S3 disk parts -- ATTACH TABLE mode
             // only hardlinks metadata without S3 CopyObject or metadata
             // rewrite, so S3 disk tables must use per-part ATTACH flow.
-            let has_s3_disk_parts =
-                params.parts_by_disk.iter().any(|(disk_name, disk_parts)| {
-                    let disk_type = params
-                        .disk_type_map
-                        .get(disk_name)
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    is_s3_disk(disk_type)
-                        && disk_parts.iter().any(|p| p.s3_objects.is_some())
-                });
+            let has_s3_disk_parts = params.parts_by_disk.iter().any(|(disk_name, disk_parts)| {
+                let disk_type = params
+                    .disk_type_map
+                    .get(disk_name)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                is_s3_disk(disk_type) && disk_parts.iter().any(|p| p.s3_objects.is_some())
+            });
 
             if is_replicated_engine(&params.engine) && !has_s3_disk_parts {
                 // Try ATTACH TABLE mode for Replicated tables
@@ -859,10 +850,7 @@ pub async fn restore(
     // Phase 3: DDL-only objects (topologically sorted)
     if !data_only && !phases.ddl_only_tables.is_empty() {
         let sorted_ddl = topological_sort(&manifest.tables, &phases.ddl_only_tables)?;
-        info!(
-            count = sorted_ddl.len(),
-            "Phase 3: DDL-only objects"
-        );
+        info!(count = sorted_ddl.len(), "Phase 3: DDL-only objects");
         create_ddl_objects(
             ch,
             &manifest,
@@ -1419,9 +1407,7 @@ mod tests {
         tables.insert(
             "default.trades".to_string(),
             TableManifest::test_new("MergeTree")
-                .with_ddl(
-                    "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id",
-                ),
+                .with_ddl("CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id"),
         );
 
         let manifest = BackupManifest::test_new("test")
@@ -1441,9 +1427,8 @@ mod tests {
     fn test_mutation_reapply_with_mutations() {
         use crate::manifest::{MutationInfo, TableManifest};
 
-        let mut tm = TableManifest::test_new("MergeTree").with_ddl(
-            "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id",
-        );
+        let mut tm = TableManifest::test_new("MergeTree")
+            .with_ddl("CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id");
         tm.pending_mutations = vec![
             MutationInfo {
                 mutation_id: "0000000001".to_string(),
@@ -1567,5 +1552,93 @@ mod tests {
         );
         assert!(resolved.is_some(), "Should find part at per-disk path");
         assert_eq!(resolved.unwrap(), per_disk_part);
+    }
+
+    #[test]
+    fn test_find_table_data_path_multiple_tables() {
+        let live_tables = vec![
+            TableRow {
+                database: "default".to_string(),
+                name: "trades".to_string(),
+                engine: "MergeTree".to_string(),
+                create_table_query: String::new(),
+                uuid: "abc-123".to_string(),
+                data_paths: vec!["/data/store/abc/abc123/".to_string()],
+                total_bytes: Some(1000),
+            },
+            TableRow {
+                database: "default".to_string(),
+                name: "users".to_string(),
+                engine: "ReplacingMergeTree".to_string(),
+                create_table_query: String::new(),
+                uuid: "def-456".to_string(),
+                data_paths: vec!["/data/store/def/def456/".to_string()],
+                total_bytes: Some(500),
+            },
+        ];
+
+        // Should find the correct table
+        let result = find_table_data_path(&live_tables, "default", "users", "/data");
+        assert_eq!(result, PathBuf::from("/data/store/def/def456/"));
+
+        // Non-existent table falls back to default path
+        let result = find_table_data_path(&live_tables, "default", "missing", "/data");
+        assert_eq!(result, PathBuf::from("/data/data/default/missing"));
+    }
+
+    #[test]
+    fn test_find_table_uuid_found() {
+        let live_tables = vec![TableRow {
+            database: "default".to_string(),
+            name: "trades".to_string(),
+            engine: "MergeTree".to_string(),
+            create_table_query: String::new(),
+            uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            data_paths: vec![],
+            total_bytes: None,
+        }];
+        let uuid = find_table_uuid(&live_tables, "default", "trades");
+        assert_eq!(
+            uuid,
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_table_uuid_not_found() {
+        let live_tables: Vec<TableRow> = vec![];
+        let uuid = find_table_uuid(&live_tables, "default", "trades");
+        assert_eq!(uuid, None);
+    }
+
+    #[test]
+    fn test_find_table_uuid_empty_uuid() {
+        let live_tables = vec![TableRow {
+            database: "default".to_string(),
+            name: "trades".to_string(),
+            engine: "MergeTree".to_string(),
+            create_table_query: String::new(),
+            uuid: String::new(),
+            data_paths: vec![],
+            total_bytes: None,
+        }];
+        let uuid = find_table_uuid(&live_tables, "default", "trades");
+        assert_eq!(uuid, None);
+    }
+
+    #[test]
+    fn test_find_table_uuid_wrong_db() {
+        let live_tables = vec![TableRow {
+            database: "default".to_string(),
+            name: "trades".to_string(),
+            engine: "MergeTree".to_string(),
+            create_table_query: String::new(),
+            uuid: "abc-123".to_string(),
+            data_paths: vec![],
+            total_bytes: None,
+        }];
+        // Wrong database should not match
+        let uuid = find_table_uuid(&live_tables, "other_db", "trades");
+        assert_eq!(uuid, None);
     }
 }

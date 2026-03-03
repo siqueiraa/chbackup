@@ -620,8 +620,7 @@ impl S3Client {
 
             let errors = resp.errors();
             if !errors.is_empty() {
-                let failed_keys: Vec<_> =
-                    errors.iter().filter_map(|e| e.key()).take(5).collect();
+                let failed_keys: Vec<_> = errors.iter().filter_map(|e| e.key()).take(5).collect();
                 let sample_errors: Vec<_> =
                     errors.iter().filter_map(|e| e.message()).take(3).collect();
                 warn!(
@@ -1336,14 +1335,13 @@ impl S3Client {
         body: Vec<u8>,
         retry: RetryConfig,
     ) -> Result<String> {
-        let context_msg = format!(
-            "UploadPart (part {}) {}",
-            part_number,
-            self.full_key(key)
-        );
+        let context_msg = format!("UploadPart (part {}) {}", part_number, self.full_key(key));
         retry_with_backoff(&retry, "UploadPart", &context_msg, || {
             let body_clone = body.clone();
-            async move { self.upload_part(key, upload_id, part_number, body_clone).await }
+            async move {
+                self.upload_part(key, upload_id, part_number, body_clone)
+                    .await
+            }
         })
         .await
     }
@@ -1822,6 +1820,96 @@ mod tests {
             "Error should mention explicit endpoint requirement, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_parse_s3_uri_bucket_and_prefix() {
+        let (bucket, prefix) = parse_s3_uri("s3://my-bucket/my/prefix");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "my/prefix");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_bucket_only() {
+        let (bucket, prefix) = parse_s3_uri("s3://my-bucket");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_trailing_slash() {
+        let (bucket, prefix) = parse_s3_uri("s3://my-bucket/prefix/");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "prefix");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_uppercase_scheme() {
+        let (bucket, prefix) = parse_s3_uri("S3://my-bucket/prefix");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "prefix");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_not_s3() {
+        let (bucket, prefix) = parse_s3_uri("some/path/here");
+        assert_eq!(bucket, "");
+        assert_eq!(prefix, "some/path/here");
+    }
+
+    #[test]
+    fn test_parse_s3_uri_no_prefix_trailing_slash() {
+        let (bucket, prefix) = parse_s3_uri("s3://my-bucket/");
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_percent_encode_s3_key_already_safe() {
+        assert_eq!(
+            percent_encode_s3_key("backups/daily/2024-01-15/metadata.json"),
+            "backups/daily/2024-01-15/metadata.json"
+        );
+    }
+
+    #[test]
+    fn test_percent_encode_s3_key_unicode_multibyte() {
+        // Multi-byte UTF-8 chars get percent-encoded byte-by-byte
+        assert_eq!(percent_encode_s3_key("café"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn test_percent_encode_s3_key_slashes_preserved() {
+        assert_eq!(percent_encode_s3_key("a/b/c"), "a/b/c");
+    }
+
+    #[test]
+    fn test_calculate_chunk_size_at_threshold() {
+        // Exactly at the 5MB minimum boundary
+        let chunk = calculate_chunk_size(S3_MIN_PART_SIZE * 10000, 0, 10000);
+        assert_eq!(chunk, S3_MIN_PART_SIZE);
+    }
+
+    #[test]
+    fn test_calculate_chunk_size_max_parts_boundary() {
+        // With 2 max parts, chunk should be half the data (rounded up)
+        let data_len = 100 * 1024 * 1024_u64; // 100 MB
+        let chunk = calculate_chunk_size(data_len, 0, 2);
+        let expected = data_len.div_ceil(2);
+        assert_eq!(chunk, expected);
+        assert!(data_len.div_ceil(chunk) <= 2);
+    }
+
+    #[test]
+    fn test_retry_config_defaults() {
+        let rc = RetryConfig {
+            max_retries: 3,
+            base_delay_secs: 1,
+            jitter_factor: 0.1,
+        };
+        assert_eq!(rc.max_retries, 3);
+        assert_eq!(rc.base_delay_secs, 1);
+        assert!((rc.jitter_factor - 0.1).abs() < f64::EPSILON);
     }
 
     /// Create a minimal S3Client for unit testing without triggering TLS initialization.

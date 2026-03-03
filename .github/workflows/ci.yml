@@ -59,6 +59,25 @@ jobs:
       - name: cargo test
         run: cargo test
 
+      - name: Coverage check
+        run: |
+          cargo install cargo-tarpaulin --locked || true
+          cargo tarpaulin --out json --output-file tarpaulin-report.json \
+            --skip-clean --timeout 300 2>/dev/null || true
+          COVERAGE=$(python3 -c "
+          import json
+          d=json.load(open('tarpaulin-report.json'))
+          pct = d.get('coverage', d.get('coverage_percentage', 0))
+          print(f'{pct:.1f}')
+          " 2>/dev/null || echo "0")
+          echo "Coverage: ${COVERAGE}%"
+          # Soft gate: warn but don't fail (enforce once we hit 40%)
+          # python3 -c "
+          # import json; d=json.load(open('tarpaulin-report.json'))
+          # pct = d.get('coverage', d.get('coverage_percentage', 0))
+          # assert pct >= 40, f'Coverage {pct:.1f}% < 40%'
+          # "
+
   # ---------------------------------------------------------------------------
   # Job 2: Build static musl binary
   # ---------------------------------------------------------------------------

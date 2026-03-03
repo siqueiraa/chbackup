@@ -158,12 +158,13 @@ pub async fn create(
             // Normalize disk type: CH 24.8+ reports "ObjectStorage" with a separate
             // object_storage_type field. Map "ObjectStorage" with object_storage_type="S3"
             // to "s3" for downstream is_s3_disk() compatibility.
-            let effective_type =
-                if d.disk_type.eq_ignore_ascii_case("objectstorage") && !d.object_storage_type.is_empty() {
-                    d.object_storage_type.to_ascii_lowercase()
-                } else {
-                    d.disk_type.clone()
-                };
+            let effective_type = if d.disk_type.eq_ignore_ascii_case("objectstorage")
+                && !d.object_storage_type.is_empty()
+            {
+                d.object_storage_type.to_ascii_lowercase()
+            } else {
+                d.disk_type.clone()
+            };
             (d.name.clone(), effective_type)
         })
         .collect();
@@ -189,9 +190,8 @@ pub async fn create(
             disks = ?s3_disks_without_remote,
             "S3 disks without remote_path, discovering from ClickHouse config"
         );
-        let discovered = crate::clickhouse::client::discover_s3_disk_endpoints(
-            &config.clickhouse.config_dir,
-        );
+        let discovered =
+            crate::clickhouse::client::discover_s3_disk_endpoints(&config.clickhouse.config_dir);
         for disk_name in &s3_disks_without_remote {
             if let Some(uri) = discovered.get(*disk_name) {
                 disk_remote_paths.insert(disk_name.to_string(), uri.clone());
@@ -1397,6 +1397,143 @@ mod tests {
             err_msg.contains("already exists"),
             "Error should mention 'already exists', got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn test_normalize_uuid_nil() {
+        assert_eq!(normalize_uuid("00000000-0000-0000-0000-000000000000"), None);
+    }
+
+    #[test]
+    fn test_normalize_uuid_empty() {
+        assert_eq!(normalize_uuid(""), None);
+    }
+
+    #[test]
+    fn test_normalize_uuid_valid() {
+        assert_eq!(
+            normalize_uuid("550e8400-e29b-41d4-a716-446655440000"),
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_uuid_undashed() {
+        // Non-standard format still passes through (not nil/empty)
+        assert_eq!(
+            normalize_uuid("550e8400e29b41d4a716446655440000"),
+            Some("550e8400e29b41d4a716446655440000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_partition_list_whitespace_only() {
+        let result = parse_partition_list(Some("  ,  ,  "));
+        assert!(
+            result.is_empty(),
+            "whitespace-only entries should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_is_metadata_only_engine_all_variants() {
+        // All metadata-only engines
+        for engine in &[
+            "View",
+            "MaterializedView",
+            "LiveView",
+            "WindowView",
+            "Dictionary",
+            "Null",
+            "Set",
+            "Join",
+            "Buffer",
+            "Distributed",
+            "Merge",
+        ] {
+            assert!(
+                is_metadata_only_engine(engine),
+                "{engine} should be metadata-only"
+            );
+        }
+
+        // Data engines
+        for engine in &[
+            "MergeTree",
+            "ReplicatedMergeTree",
+            "ReplacingMergeTree",
+            "AggregatingMergeTree",
+            "CollapsingMergeTree",
+            "VersionedCollapsingMergeTree",
+            "SummingMergeTree",
+        ] {
+            assert!(
+                !is_metadata_only_engine(engine),
+                "{engine} should NOT be metadata-only"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_benign_type_variants() {
+        // Positive cases
+        assert!(is_benign_type("Enum8('a' = 1)"));
+        assert!(is_benign_type("Tuple(a UInt64)"));
+        assert!(is_benign_type("Nullable(Enum8('x' = 1))"));
+        assert!(is_benign_type("Nullable(Tuple(a UInt64))"));
+        assert!(is_benign_type("Array(Tuple(a String, b Int32))"));
+
+        // Negative cases
+        assert!(!is_benign_type("UInt64"));
+        assert!(!is_benign_type("String"));
+        assert!(!is_benign_type("Float64"));
+        assert!(!is_benign_type("Decimal(18,2)"));
+        assert!(!is_benign_type("Array(UInt64)"));
+        assert!(!is_benign_type("Nullable(UInt64)"));
+    }
+
+    #[test]
+    fn test_filter_benign_type_drift_all_benign() {
+        let all_benign = vec![
+            ColumnInconsistency {
+                database: "default".to_string(),
+                table: "t1".to_string(),
+                column: "c1".to_string(),
+                types: vec![
+                    "Enum8('a' = 1)".to_string(),
+                    "Enum8('a' = 1, 'b' = 2)".to_string(),
+                ],
+            },
+            ColumnInconsistency {
+                database: "default".to_string(),
+                table: "t2".to_string(),
+                column: "c2".to_string(),
+                types: vec![
+                    "Tuple(x UInt64)".to_string(),
+                    "Tuple(x UInt64, y String)".to_string(),
+                ],
+            },
+        ];
+        let result = filter_benign_type_drift(all_benign);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_benign_type_drift_none_benign() {
+        let non_benign = vec![ColumnInconsistency {
+            database: "default".to_string(),
+            table: "t".to_string(),
+            column: "c".to_string(),
+            types: vec!["UInt64".to_string(), "Int64".to_string()],
+        }];
+        let result = filter_benign_type_drift(non_benign);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_benign_type_drift_empty() {
+        let result = filter_benign_type_drift(Vec::new());
+        assert!(result.is_empty());
     }
 
     #[test]
