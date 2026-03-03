@@ -24,12 +24,11 @@ Resolves backup name templates with macro substitution. Supported placeholders:
 Unrecognized `{...}` patterns are left as-is (not removed). Uses a char-by-char parser, not regex.
 
 ### Backup Type Classification (classify_backup_type)
-Determines whether a backup name represents a "full" or "incr" backup by analyzing where `{type}` appears in the name template. Instead of fragile `name.contains("full")` substring matching (which breaks when shard names or other template segments contain "full" or "incr"), this function:
-1. Locates `{type}` in the template string
-2. Identifies static delimiter characters immediately before and after `{type}`
-3. Uses `count_static_chars()` to compute a minimum search offset (accounting for variable-length macro expansions like `{shard}`)
-4. Extracts the corresponding token from the backup name using the delimiters
-5. Returns `Some("full")`, `Some("incr")`, or `None` (if no `{type}` placeholder, name does not match template structure, or extracted token is neither "full" nor "incr")
+Determines whether a backup name represents a "full" or "incr" backup using glob pattern matching against the name template. For each candidate ("full", "incr"), `build_type_glob()` replaces `{type}` with the candidate literal and all other `{...}` macros with `*` glob wildcards (escaping glob special chars in static text). This approach is delimiter-agnostic and correctly handles macro values containing the template delimiter (e.g., shard="a-b" with "-" delimiter).
+1. Checks template contains `{type}` placeholder
+2. Builds glob pattern for "full" candidate via `build_type_glob()` and tests match
+3. Builds glob pattern for "incr" candidate via `build_type_glob()` and tests match
+4. Returns `Some("full")` if only full matches, `Some("incr")` if only incr matches, `None` if both match (ambiguous) or neither matches
 
 Used by `resume_state()` to classify backups as full or incremental.
 

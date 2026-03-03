@@ -90,105 +90,91 @@ pub fn resolve_name_template(
 
 /// Classify a backup name as "full" or "incr" based on the template structure.
 ///
-/// Finds where `{type}` appears in the template, extracts the corresponding
-/// substring from `name`, and checks if it matches "full" or "incr".
+/// Uses glob pattern matching to determine the backup type. For each candidate
+/// ("full", "incr"), builds a glob pattern by replacing `{type}` with the
+/// candidate literal and all other `{...}` macros with `*`. This approach is
+/// delimiter-agnostic and correctly handles macro values that contain the
+/// template delimiter character (e.g., shard="a-b" with delimiter "-").
+///
 /// Returns `None` if:
 /// - Template has no `{type}` placeholder
-/// - Name doesn't match the template structure around `{type}`
-/// - Extracted token is neither "full" nor "incr"
+/// - Name doesn't match either "full" or "incr" pattern
+/// - Both "full" and "incr" patterns match (ambiguous)
 pub fn classify_backup_type(template: &str, name: &str) -> Option<&'static str> {
-    let type_marker = "{type}";
-    let type_pos = template.find(type_marker)?;
-
-    // Extract prefix before {type} and suffix after {type}
-    let prefix = &template[..type_pos];
-    let after_type = &template[type_pos + type_marker.len()..];
-
-    // The delimiter after {type} is the first static character after {type}.
-    // If the next char is '{', it's another macro -- no static delimiter available.
-    let end_delim: Option<char> = after_type.chars().next().filter(|c| *c != '{');
-
-    // The delimiter before {type} is the last character of prefix (if static).
-    // If the preceding char is '}', it's the end of another macro -- no static delimiter.
-    let start_delim: Option<char> = prefix.chars().last().filter(|c| *c != '}');
-
-    // Count the byte length of static characters before {type} in the template prefix.
-    // This gives us a minimum byte offset to start searching for the delimiter in the name.
-    // Static chars are those outside of {...} blocks. Using bytes (not char count) ensures
-    // correct indexing for templates with non-ASCII static characters.
-    let static_char_count_before = count_static_bytes(prefix);
-
-    // Extract token from name using delimiters and the static prefix hint.
-    let token_start = match start_delim {
-        Some(d) => {
-            // Search for the delimiter in the name starting from after the known
-            // static prefix length. We scan forward from the minimum possible position
-            // to find the first occurrence of the delimiter that could precede {type}.
-            // The minimum position is (static_char_count_before - 1) since that's
-            // where the delimiter char itself would be at minimum, but macros expand
-            // to variable length. We use the static count as a lower bound and
-            // search forward from there.
-            let search_start = if static_char_count_before > 0 {
-                static_char_count_before - 1
-            } else {
-                0
-            };
-            // Verify search_start lands on a valid UTF-8 char boundary before slicing.
-            // If not (e.g., non-ASCII macro expansions shifted the offset mid-character),
-            // the name cannot match the template structure, so return None.
-            if !name.is_char_boundary(search_start) {
-                return None;
-            }
-            // Find the delimiter at or after search_start
-            name[search_start..]
-                .find(d)
-                .map(|p| search_start + p + d.len_utf8())?
-        }
-        None => 0, // {type} is at the start of template
-    };
-
-    let token_end = match end_delim {
-        Some(d) => name[token_start..]
-            .find(d)
-            .map(|p| token_start + p)
-            .unwrap_or(name.len()),
-        None => name.len(), // {type} is at the end of template
-    };
-
-    if token_start > name.len()
-        || token_end > name.len()
-        || token_start > token_end
-        || !name.is_char_boundary(token_start)
-        || !name.is_char_boundary(token_end)
-    {
+    // Template must contain {type} placeholder
+    if !template.contains("{type}") {
         return None;
     }
 
-    let token = &name[token_start..token_end];
-    match token {
-        "full" => Some("full"),
-        "incr" => Some("incr"),
+    let full_matches = build_type_glob(template, "full")
+        .map(|p| p.matches(name))
+        .unwrap_or(false);
+    let incr_matches = build_type_glob(template, "incr")
+        .map(|p| p.matches(name))
+        .unwrap_or(false);
+
+    match (full_matches, incr_matches) {
+        (true, false) => Some("full"),
+        (false, true) => Some("incr"),
+        // Both match (ambiguous) or neither match
         _ => None,
     }
 }
 
-/// Count the byte length of static (non-macro) characters in a template fragment.
+/// Build a glob pattern from a name template by substituting `{type}` with a
+/// candidate literal ("full" or "incr") and all other `{...}` macros with `*`.
 ///
-/// Bytes inside `{...}` blocks are not counted. Bytes outside are counted.
-/// Returns a byte count (not char count) so the result can be used directly
-/// as a byte offset into a `str` slice.
-fn count_static_bytes(s: &str) -> usize {
-    let mut count = 0;
-    let mut in_macro = false;
-    for ch in s.chars() {
-        match ch {
-            '{' => in_macro = true,
-            '}' => in_macro = false,
-            _ if !in_macro => count += ch.len_utf8(),
-            _ => {}
+/// Glob special characters (`*`, `?`, `[`, `]`) in static text portions are
+/// escaped so they match literally.
+fn build_type_glob(template: &str, candidate: &str) -> Option<glob::Pattern> {
+    let mut pattern = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            // Collect the macro name (everything up to '}')
+            let mut macro_name = String::new();
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    break;
+                }
+                macro_name.push(inner);
+            }
+
+            // Check if this is the {type} placeholder (compare just the name
+            // portion before any ':' format specifier, though {type} has none)
+            let key = macro_name.split(':').next().unwrap_or(&macro_name);
+            if key == "type" {
+                // Replace with the literal candidate value
+                // Escape candidate in case it contains glob special chars (it won't
+                // for "full"/"incr", but be defensive)
+                for c in candidate.chars() {
+                    push_escaped_glob_char(&mut pattern, c);
+                }
+            } else {
+                // Replace any other macro with glob wildcard
+                pattern.push('*');
+            }
+        } else {
+            // Static character -- escape glob special chars
+            push_escaped_glob_char(&mut pattern, ch);
         }
     }
-    count
+
+    glob::Pattern::new(&pattern).ok()
+}
+
+/// Push a character to a glob pattern string, escaping glob special characters
+/// (`*`, `?`, `[`, `]`) so they match literally.
+fn push_escaped_glob_char(pattern: &mut String, ch: char) {
+    match ch {
+        '*' | '?' | '[' | ']' => {
+            pattern.push('[');
+            pattern.push(ch);
+            pattern.push(']');
+        }
+        _ => pattern.push(ch),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +999,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_classify_delimiter_in_macro() {
+        // Bug case: shard="a-b" contains the delimiter "-"
+        // Old implementation extracted "b" instead of "full"
+        let template = "{shard}-{type}-{time:%Y%m%d}";
+        assert_eq!(
+            classify_backup_type(template, "a-b-full-20260303"),
+            Some("full")
+        );
+        assert_eq!(
+            classify_backup_type(template, "a-b-incr-20260303"),
+            Some("incr")
+        );
+    }
+
+    #[test]
+    fn test_classify_ambiguous_both_match() {
+        // When both "full" and "incr" globs match (template is just `{type}` with
+        // wildcards that absorb the candidate literal), the result is None.
+        // Template: `{type}{other}` → full glob `full*`, incr glob `incr*`
+        // Name "fullincr" matches `full*` but not `incr*`, so NOT ambiguous.
+        // True ambiguity: template `{a}{type}{b}` → glob `*full*` / `*incr*`
+        // Name "incr_full_data" matches BOTH `*full*` and `*incr*`.
+        let template = "{a}{type}{b}";
+        assert_eq!(
+            classify_backup_type(template, "incr_full_data"),
+            None,
+            "Both full and incr globs match => ambiguous => None"
+        );
+    }
+
+    #[test]
+    fn test_classify_neither_match() {
+        // A name that matches neither "full" nor "incr" returns None
+        let template = "{shard}-{type}-{time:%Y%m%d}";
+        assert_eq!(
+            classify_backup_type(template, "a-b-partial-20260303"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_no_delimiters() {
+        // {type} immediately adjacent to another macro with no delimiter separation
+        let template = "{type}{time}";
+        assert_eq!(
+            classify_backup_type(template, "full20260303"),
+            Some("full")
+        );
+        assert_eq!(
+            classify_backup_type(template, "incr20260303"),
+            Some("incr")
+        );
+    }
+
+    #[test]
+    fn test_classify_adjacent_macros() {
+        // All macros adjacent with no separators
+        let template = "{shard}{type}{time}";
+        // "shardAfull20260303" -- glob "*full*" matches
+        assert_eq!(
+            classify_backup_type(template, "shardAfull20260303"),
+            Some("full")
+        );
+        // "shardAincr20260303" -- glob "*incr*" matches
+        assert_eq!(
+            classify_backup_type(template, "shardAincr20260303"),
+            Some("incr")
+        );
+    }
+
     // -- Resume state tests --
 
     fn make_summary(name: &str, ts: DateTime<Utc>, broken: bool) -> BackupSummary {
@@ -1264,5 +1321,253 @@ mod tests {
             !should_abort,
             "should NOT abort when max_consecutive_errors is 0 (unlimited)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: watch_state_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_watch_state_name_all_variants() {
+        assert_eq!(watch_state_name(WatchState::Idle), "idle");
+        assert_eq!(watch_state_name(WatchState::CreatingFull), "creating_full");
+        assert_eq!(watch_state_name(WatchState::CreatingIncr), "creating_incr");
+        assert_eq!(watch_state_name(WatchState::Uploading), "uploading");
+        assert_eq!(watch_state_name(WatchState::Cleaning), "cleaning");
+        assert_eq!(watch_state_name(WatchState::Sleeping), "sleeping");
+        assert_eq!(watch_state_name(WatchState::Error), "error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: resolve_name_template edge cases
+    // -----------------------------------------------------------------------
+
+    /// Test resolve_name_template with unclosed brace (no closing '}'). This
+    /// exercises the `!found_close` branch (lines 58-63).
+    #[test]
+    fn test_resolve_name_template_unclosed_brace() {
+        let macros = HashMap::new();
+        let now = Utc::now();
+
+        let result = resolve_name_template("prefix-{unclosed", "full", now, &macros);
+        assert_eq!(result, "prefix-{unclosed");
+    }
+
+    /// Test resolve_name_template with empty braces.
+    #[test]
+    fn test_resolve_name_template_empty_braces() {
+        let macros = HashMap::new();
+        let now = Utc::now();
+
+        let result = resolve_name_template("prefix-{}-suffix", "full", now, &macros);
+        // Empty braces are not "type" or "time:*" and empty key not in macros,
+        // so they are left as-is.
+        assert_eq!(result, "prefix-{}-suffix");
+    }
+
+    /// Test resolve_name_template with multiple macros of same type.
+    #[test]
+    fn test_resolve_name_template_multiple_type_macros() {
+        let macros = HashMap::new();
+        let now = Utc::now();
+
+        let result = resolve_name_template("{type}-{type}", "full", now, &macros);
+        assert_eq!(result, "full-full");
+    }
+
+    /// Test resolve_name_template with no macros at all (pure static name).
+    #[test]
+    fn test_resolve_name_template_static_only() {
+        let macros = HashMap::new();
+        let now = Utc::now();
+
+        let result = resolve_name_template("static-backup-name", "full", now, &macros);
+        assert_eq!(result, "static-backup-name");
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: build_type_glob and push_escaped_glob_char
+    // -----------------------------------------------------------------------
+
+    /// Test that build_type_glob escapes glob special characters in static text.
+    #[test]
+    fn test_classify_with_glob_special_chars_in_template() {
+        // Template has literal '*' and '?' which must be escaped
+        let template = "backup[1]-{type}-data?";
+        // This should still classify correctly because the static chars are escaped
+        let result = classify_backup_type(template, "backup[1]-full-data?");
+        assert_eq!(result, Some("full"));
+
+        let result = classify_backup_type(template, "backup[1]-incr-data?");
+        assert_eq!(result, Some("incr"));
+    }
+
+    /// Test build_type_glob with template containing only {type}.
+    #[test]
+    fn test_classify_type_only_template() {
+        let template = "{type}";
+        assert_eq!(classify_backup_type(template, "full"), Some("full"));
+        assert_eq!(classify_backup_type(template, "incr"), Some("incr"));
+        assert_eq!(classify_backup_type(template, "other"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: resume_state edge cases
+    // -----------------------------------------------------------------------
+
+    /// Test resume_state with broken backups filtered out.
+    #[test]
+    fn test_resume_state_broken_backups_excluded() {
+        let now = Utc::now();
+        let full_ts = now - chrono::Duration::minutes(30);
+
+        let backups = vec![
+            // Only backup is broken -- should be excluded
+            make_summary("shard1-full-20250315", full_ts, true),
+        ];
+
+        let decision = resume_state(
+            &backups,
+            "shard1-{type}-{time:%Y%m%d}",
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(86400),
+            now,
+        );
+
+        // Broken backup excluded => no matching backups => FullNow
+        assert_eq!(decision, ResumeDecision::FullNow);
+    }
+
+    /// Test resume_state with backups that have no timestamp.
+    #[test]
+    fn test_resume_state_no_timestamp_excluded() {
+        let now = Utc::now();
+
+        let mut backup = make_summary("shard1-full-20250315", now, false);
+        backup.timestamp = None; // Remove timestamp
+
+        let backups = vec![backup];
+
+        let decision = resume_state(
+            &backups,
+            "shard1-{type}-{time:%Y%m%d}",
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(86400),
+            now,
+        );
+
+        // No-timestamp backup excluded => FullNow
+        assert_eq!(decision, ResumeDecision::FullNow);
+    }
+
+    /// Test resume_state where incr backup is more recent than full backup
+    /// but both are within full_interval. This tests the branch where
+    /// incr_ts > full_ts.
+    #[test]
+    fn test_resume_state_incr_more_recent_than_full() {
+        let now = Utc::now();
+        let full_ts = now - chrono::Duration::hours(6);
+        let incr_ts = now - chrono::Duration::minutes(10);
+
+        let backups = vec![
+            make_summary("shard1-full-20250315", full_ts, false),
+            make_summary("shard1-incr-20250315_1", incr_ts, false),
+        ];
+
+        let decision = resume_state(
+            &backups,
+            "shard1-{type}-{time:%Y%m%d}",
+            std::time::Duration::from_secs(3600), // 1h
+            std::time::Duration::from_secs(86400), // 24h
+            now,
+        );
+
+        // incr was 10 minutes ago, watch_interval is 1h => SleepThen ~50min
+        match decision {
+            ResumeDecision::SleepThen {
+                remaining,
+                backup_type,
+            } => {
+                assert_eq!(backup_type, "incr");
+                assert!(remaining.as_secs() > 2900 && remaining.as_secs() <= 3000);
+            }
+            other => panic!("Expected SleepThen, got {:?}", other),
+        }
+    }
+
+    /// Test resume_state with empty template prefix (template starts with {type}).
+    #[test]
+    fn test_resume_state_empty_prefix_matches_all() {
+        let now = Utc::now();
+        let full_ts = now - chrono::Duration::minutes(10);
+
+        let backups = vec![
+            make_summary("full-20250315", full_ts, false),
+        ];
+
+        let decision = resume_state(
+            &backups,
+            "{type}-{time:%Y%m%d}",
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(86400),
+            now,
+        );
+
+        // Recent full backup => SleepThen
+        match decision {
+            ResumeDecision::SleepThen { backup_type, .. } => {
+                assert_eq!(backup_type, "incr");
+            }
+            other => panic!("Expected SleepThen, got {:?}", other),
+        }
+    }
+
+    /// Test resume_state where only non-classified backups exist (e.g., the
+    /// template cannot classify them as "full" or "incr").
+    #[test]
+    fn test_resume_state_no_classifiable_full_backup() {
+        let now = Utc::now();
+        let ts = now - chrono::Duration::minutes(30);
+
+        // Backup name doesn't match any type classification for this template
+        let backups = vec![
+            make_summary("shard1-partial-20250315", ts, false),
+        ];
+
+        let decision = resume_state(
+            &backups,
+            "shard1-{type}-{time:%Y%m%d}",
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(86400),
+            now,
+        );
+
+        // Matching backups exist, but no full backup classified => FullNow
+        assert_eq!(decision, ResumeDecision::FullNow);
+    }
+
+    /// Test resolve_template_prefix with no braces at all.
+    #[test]
+    fn test_resolve_template_prefix_no_braces() {
+        assert_eq!(resolve_template_prefix("mybackup"), "mybackup");
+    }
+
+    /// Test resolve_template_prefix with brace at position 0.
+    #[test]
+    fn test_resolve_template_prefix_brace_at_start() {
+        assert_eq!(resolve_template_prefix("{type}-backup"), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: WatchLoopExit variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_watch_loop_exit_variants() {
+        assert_eq!(WatchLoopExit::Shutdown, WatchLoopExit::Shutdown);
+        assert_eq!(WatchLoopExit::MaxErrors, WatchLoopExit::MaxErrors);
+        assert_eq!(WatchLoopExit::Stopped, WatchLoopExit::Stopped);
+        assert_ne!(WatchLoopExit::Shutdown, WatchLoopExit::MaxErrors);
+        assert_ne!(WatchLoopExit::Shutdown, WatchLoopExit::Stopped);
     }
 }
