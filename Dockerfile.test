@@ -7,6 +7,9 @@
 # Used by docker-compose.test.yml. No pre-built binary required.
 # =============================================================================
 
+# Global ARG must be before first FROM for multi-stage availability
+ARG CH_VERSION=25.3.8.10041.altinitystable
+
 # --- Stage 1: Build static binary from source ---
 FROM rust:1.93-alpine AS builder
 
@@ -25,7 +28,7 @@ COPY src/ src/
 RUN cargo build --release
 
 # --- Stage 2: Test runtime ---
-ARG CH_VERSION=25.3.8.10041.altinitystable
+ARG CH_VERSION
 FROM altinity/clickhouse-server:${CH_VERSION}
 
 # Install test dependencies

@@ -494,7 +494,7 @@ if should_run "test_server_api_create_upload"; then
 
         # Step 3: Wait for create to complete (poll actions)
         info "  Step 3: Wait for create to complete"
-        RESULT=$(poll_action_completion 30)
+        RESULT=$(poll_action_completion 30) || true
         if [[ "$RESULT" == "completed" ]]; then
             pass "create operation completed"
         else
@@ -513,7 +513,7 @@ if should_run "test_server_api_create_upload"; then
 
         # Step 5: Wait for upload to complete
         info "  Step 5: Wait for upload to complete"
-        RESULT=$(poll_action_completion 60)
+        RESULT=$(poll_action_completion 60) || true
         if [[ "$RESULT" == "completed" ]]; then
             pass "upload operation completed"
         else
@@ -1455,7 +1455,7 @@ if should_run "test_api_full_round_trip"; then
         info "  Download response: ${DL_RESP}"
 
         # Wait for download to complete
-        RESULT=$(poll_action_completion 60)
+        RESULT=$(poll_action_completion 60) || true
         if [[ "$RESULT" == "completed" ]]; then
             pass "download via API completed"
         else
@@ -1473,7 +1473,7 @@ if should_run "test_api_full_round_trip"; then
         info "  Restore response: ${REST_RESP}"
 
         # Wait for restore to complete
-        RESULT=$(poll_action_completion 60)
+        RESULT=$(poll_action_completion 60) || true
         if [[ "$RESULT" == "completed" ]]; then
             pass "restore via API completed"
         else
@@ -1587,7 +1587,7 @@ if should_run "test_api_concurrent_rejection"; then
 
         # Wait for first op to complete
         info "  Waiting for first operation to complete"
-        RESULT=$(poll_action_completion 30)
+        RESULT=$(poll_action_completion 30) || true
         if [[ "$RESULT" != "completed" ]]; then
             info "  first operation did not complete cleanly: ${RESULT}"
         fi
@@ -3046,7 +3046,7 @@ if should_run "test_api_post_actions_dispatch"; then
         fi
 
         # Poll for completion
-        RESULT=$(poll_action_completion 30)
+        RESULT=$(poll_action_completion 30) || true
         if [[ "$RESULT" == "completed" ]]; then
             pass "actions create completed"
         else
@@ -3066,7 +3066,7 @@ if should_run "test_api_post_actions_dispatch"; then
         curl -s -X POST http://localhost:7171/api/v1/actions \
             -H "Content-Type: application/json" \
             -d "[{\"command\":\"upload ${ACT_NAME}\"}]" >/dev/null 2>&1
-        RESULT=$(poll_action_completion 60)
+        RESULT=$(poll_action_completion 60) || true
         if [[ "$RESULT" == "completed" ]]; then
             pass "actions upload completed"
         else
@@ -3078,7 +3078,7 @@ if should_run "test_api_post_actions_dispatch"; then
         curl -s -X POST http://localhost:7171/api/v1/actions \
             -H "Content-Type: application/json" \
             -d "[{\"command\":\"create_remote ${ACT_CR_NAME}\"}]" >/dev/null 2>&1
-        RESULT=$(poll_action_completion 60)
+        RESULT=$(poll_action_completion 60) || true
         if [[ "$RESULT" == "completed" ]]; then
             pass "actions create_remote completed"
         else
