@@ -221,4 +221,50 @@ mod tests {
     fn make_part(name: &str) -> PartInfo {
         PartInfo::new(name, 0, 0)
     }
+
+    // -----------------------------------------------------------------------
+    // Extended from_part_name tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_from_part_name_4_component_standard() {
+        let key = PartSortKey::from_part_name("20230101_1_1_0").unwrap();
+        assert_eq!(key.partition, "20230101");
+        assert_eq!(key.min_block, 1);
+    }
+
+    #[test]
+    fn test_from_part_name_5_component_after_mutation() {
+        let key = PartSortKey::from_part_name("20230101_1_1_0_7").unwrap();
+        assert_eq!(key.partition, "20230101");
+        assert_eq!(key.min_block, 1);
+    }
+
+    #[test]
+    fn test_from_part_name_partition_with_underscores() {
+        // tuple() partitions can contain underscores:
+        // e.g. partition "tuple_val_1" with 4-component: tuple_val_1_2_3_0
+        // This has segments when splitting from right:
+        //   rsplitn(5): [0, 3, 2, 1, "tuple_val"] -> all 4 trailing numeric -> 5-component
+        //   partition = "tuple_val", min_block = 1
+        let key = PartSortKey::from_part_name("tuple_val_1_2_3_0").unwrap();
+        // With 5-component parse: seg5 = ["0", "3", "2", "1", "tuple_val"]
+        // all 4 trailing are numeric, so partition = "tuple_val", min_block = 1
+        assert_eq!(key.partition, "tuple_val");
+        assert_eq!(key.min_block, 1);
+    }
+
+    #[test]
+    fn test_from_part_name_ordering_across_partitions() {
+        let k1 = PartSortKey::from_part_name("202301_1_1_0").unwrap();
+        let k2 = PartSortKey::from_part_name("202302_1_1_0").unwrap();
+        assert!(k1 < k2, "Partition 202301 should sort before 202302");
+    }
+
+    #[test]
+    fn test_from_part_name_ordering_same_partition() {
+        let k1 = PartSortKey::from_part_name("202301_1_10_0").unwrap();
+        let k2 = PartSortKey::from_part_name("202301_5_20_1").unwrap();
+        assert!(k1 < k2, "min_block 1 should sort before min_block 5");
+    }
 }

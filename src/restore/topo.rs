@@ -718,4 +718,72 @@ mod tests {
         let sorted = sort_tables_for_drop(&manifest, &keys);
         assert!(sorted.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Extended is_streaming_engine tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_streaming_engine_negative_cases() {
+        // Non-streaming engines must return false
+        assert!(!is_streaming_engine("MergeTree"));
+        assert!(!is_streaming_engine("ReplicatedMergeTree"));
+        assert!(!is_streaming_engine("Null"));
+        assert!(!is_streaming_engine("Memory"));
+        assert!(!is_streaming_engine("Buffer"));
+        assert!(!is_streaming_engine("Distributed"));
+        assert!(!is_streaming_engine(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended is_refreshable_mv tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_refreshable_mv_comment_with_refresh() {
+        // A regular MV whose DDL happens to contain "REFRESH" as a column name
+        // should NOT be detected as refreshable (engine check gates it)
+        let mut tm = make_table_manifest("MergeTree", false, vec![]);
+        tm.ddl = "CREATE TABLE default.t (refresh_rate UInt64) ENGINE = MergeTree() ORDER BY refresh_rate".to_string();
+        assert!(!is_refreshable_mv(&tm));
+    }
+
+    #[test]
+    fn test_is_refreshable_mv_regular_mv_no_refresh() {
+        let mut tm = make_table_manifest("MaterializedView", true, vec![]);
+        tm.ddl = "CREATE MATERIALIZED VIEW default.mv ENGINE = MergeTree() ORDER BY id AS SELECT * FROM default.t".to_string();
+        assert!(!is_refreshable_mv(&tm));
+    }
+
+    // -----------------------------------------------------------------------
+    // engine_drop_priority is reverse of engine_restore_priority
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_engine_drop_priority_is_reverse_of_restore() {
+        // Verify the ordering relationship:
+        // restore: Dictionary(0) < View(1) < Distributed(2) < MergeTree(3)
+        // drop:    Distributed(0) < View(1) < Dictionary(2) < MergeTree(3)
+        // i.e., highest restore priority = lowest drop priority
+        assert!(engine_drop_priority("Distributed") < engine_drop_priority("Dictionary"));
+        assert!(
+            engine_restore_priority("Dictionary") < engine_restore_priority("Distributed")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // data_table_priority extended tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_data_table_priority_edge_cases() {
+        // .inner prefix detection
+        assert_eq!(data_table_priority("default..inner_id.5f3a7b2c-1234-5678"), 1);
+        assert_eq!(data_table_priority("default..inner.mv_target"), 1);
+        // Regular tables
+        assert_eq!(data_table_priority("default.my_table"), 0);
+        assert_eq!(data_table_priority("system.tables"), 0);
+        // Key without a dot (edge case) - falls through to the name itself
+        assert_eq!(data_table_priority("just_table"), 0);
+    }
 }

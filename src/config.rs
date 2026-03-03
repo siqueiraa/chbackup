@@ -1608,6 +1608,15 @@ impl Config {
             }
         }
 
+        // Validate API auth: username and password must both be set or both be empty
+        let user_set = !self.api.username.is_empty();
+        let pass_set = !self.api.password.is_empty();
+        if user_set != pass_set {
+            return Err(anyhow::anyhow!(
+                "api.username and api.password must both be set or both be empty"
+            ));
+        }
+
         Ok(())
     }
 }
@@ -2120,5 +2129,91 @@ mod tests {
             .apply_cli_env_overrides(&["clickhouse.host=dot-host".to_string()])
             .unwrap();
         assert_eq!(config.clickhouse.host, "dot-host");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_duration_secs extended tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_duration_secs_plain_number() {
+        // Plain number without suffix should be treated as seconds
+        assert_eq!(parse_duration_secs("3600").unwrap(), 3600);
+        assert_eq!(parse_duration_secs("0").unwrap(), 0);
+        assert_eq!(parse_duration_secs("1").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_parse_duration_secs_whitespace() {
+        // Leading/trailing whitespace should be trimmed
+        assert_eq!(parse_duration_secs("  5h  ").unwrap(), 18000);
+        assert_eq!(parse_duration_secs(" 30m ").unwrap(), 1800);
+    }
+
+    #[test]
+    fn test_parse_duration_secs_empty_and_invalid() {
+        assert!(parse_duration_secs("").is_err());
+        assert!(parse_duration_secs("   ").is_err());
+        assert!(parse_duration_secs("abc").is_err());
+        assert!(parse_duration_secs("5x").is_err());
+        assert!(parse_duration_secs("h").is_err());
+        assert!(parse_duration_secs("m").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_secs_large_values() {
+        // 1000h should work via saturating_mul
+        assert_eq!(parse_duration_secs("1000h").unwrap(), 3_600_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Config::validate() API auth tests (Fix 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_api_auth_both_set() {
+        let mut config = Config::default();
+        config.api.username = "admin".to_string();
+        config.api.password = "secret".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_api_auth_both_empty() {
+        let config = Config::default();
+        // Default has both empty
+        assert!(config.api.username.is_empty());
+        assert!(config.api.password.is_empty());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_api_auth_username_only() {
+        let mut config = Config::default();
+        config.api.username = "admin".to_string();
+        // password is empty
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("api.username and api.password must both be set or both be empty"),
+            "Expected auth validation error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_api_auth_password_only() {
+        let mut config = Config::default();
+        config.api.password = "secret".to_string();
+        // username is empty
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("api.username and api.password must both be set or both be empty"),
+            "Expected auth validation error, got: {}",
+            err
+        );
     }
 }

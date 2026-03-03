@@ -17,6 +17,7 @@ use crate::clickhouse::{sanitize_name, ChClient};
 use crate::config::Config;
 use crate::error::ChBackupError;
 use crate::manifest::BackupManifest;
+use crate::path_encoding::validate_disk_path;
 use crate::resume::{load_state_file, DownloadState};
 use crate::storage::S3Client;
 
@@ -555,7 +556,15 @@ pub fn delete_local(data_path: &str, backup_name: &str) -> Result<()> {
     seen.insert(canonical_default);
 
     // Per-disk dirs (skip if same canonical path as default)
-    for disk_path in disk_map.values() {
+    for (disk_name, disk_path) in &disk_map {
+        if !validate_disk_path(disk_path) {
+            warn!(
+                disk_path = %disk_path,
+                disk_name = %disk_name,
+                "Disk path failed validation, skipping deletion"
+            );
+            continue;
+        }
         let per_disk = per_disk_backup_dir(disk_path.trim_end_matches('/'), backup_name);
         if per_disk.exists() {
             let canonical = std::fs::canonicalize(&per_disk).unwrap_or_else(|_| per_disk.clone());
@@ -3035,5 +3044,115 @@ mod tests {
             !per_disk_real.exists(),
             "Per-disk real dir should be removed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // csv_quote tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_csv_quote_no_quoting_needed() {
+        assert_eq!(csv_quote("hello", ','), "hello");
+        assert_eq!(csv_quote("simple-name", ','), "simple-name");
+    }
+
+    #[test]
+    fn test_csv_quote_with_comma() {
+        assert_eq!(csv_quote("hello,world", ','), "\"hello,world\"");
+    }
+
+    #[test]
+    fn test_csv_quote_with_double_quote() {
+        assert_eq!(csv_quote("say \"hi\"", ','), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn test_csv_quote_with_newline() {
+        assert_eq!(csv_quote("line1\nline2", ','), "\"line1\nline2\"");
+    }
+
+    #[test]
+    fn test_csv_quote_with_carriage_return() {
+        assert_eq!(csv_quote("line1\rline2", ','), "\"line1\rline2\"");
+    }
+
+    #[test]
+    fn test_csv_quote_empty_string() {
+        assert_eq!(csv_quote("", ','), "");
+    }
+
+    #[test]
+    fn test_csv_quote_tab_delimiter() {
+        // With tab delimiter, comma should not trigger quoting
+        assert_eq!(csv_quote("hello,world", '\t'), "hello,world");
+        // But tab should
+        assert_eq!(csv_quote("hello\tworld", '\t'), "\"hello\tworld\"");
+    }
+
+    // -----------------------------------------------------------------------
+    // broken_summary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_broken_summary_structure() {
+        let summary =
+            broken_summary("bad-backup".to_string(), "metadata.json not found".to_string());
+        assert_eq!(summary.name, "bad-backup");
+        assert!(summary.is_broken);
+        assert_eq!(
+            summary.broken_reason,
+            Some("metadata.json not found".to_string())
+        );
+        assert!(summary.timestamp.is_none());
+        assert_eq!(summary.size, 0);
+        assert_eq!(summary.compressed_size, 0);
+        assert_eq!(summary.table_count, 0);
+    }
+
+    #[test]
+    fn test_broken_summary_has_zero_sizes() {
+        let summary = broken_summary("b".to_string(), "err".to_string());
+        assert_eq!(summary.metadata_size, 0);
+        assert_eq!(summary.rbac_size, 0);
+        assert_eq!(summary.config_size, 0);
+        assert_eq!(summary.object_disk_size, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // effective_retention_local / effective_retention_remote tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_effective_retention_local_override_precedence() {
+        let mut config = Config::default();
+        config.general.backups_to_keep_local = 5;
+        config.retention.backups_to_keep_local = 10;
+        // retention.* overrides general.* when non-zero
+        assert_eq!(effective_retention_local(&config), 10);
+    }
+
+    #[test]
+    fn test_effective_retention_local_fallback() {
+        let mut config = Config::default();
+        config.general.backups_to_keep_local = 5;
+        config.retention.backups_to_keep_local = 0;
+        // Falls back to general when retention is 0
+        assert_eq!(effective_retention_local(&config), 5);
+    }
+
+    #[test]
+    fn test_effective_retention_remote_override_precedence() {
+        let mut config = Config::default();
+        config.general.backups_to_keep_remote = 3;
+        config.retention.backups_to_keep_remote = 7;
+        assert_eq!(effective_retention_remote(&config), 7);
+    }
+
+    #[test]
+    fn test_effective_retention_remote_fallback() {
+        let mut config = Config::default();
+        config.general.backups_to_keep_remote = 3;
+        config.retention.backups_to_keep_remote = 0;
+        assert_eq!(effective_retention_remote(&config), 3);
     }
 }

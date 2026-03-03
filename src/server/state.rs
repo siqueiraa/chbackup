@@ -1468,4 +1468,62 @@ mod tests {
         assert!(loaded.skip_empty_tables);
         assert_eq!(loaded.tables, Some("mydb.*".to_string()));
     }
+
+    // -----------------------------------------------------------------------
+    // validate_backup_name extended edge case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_backup_name_unicode() {
+        // Unicode characters should be accepted (no path traversal risk)
+        assert!(validate_backup_name("backup-\u{00E9}\u{00E8}").is_ok());
+        assert!(validate_backup_name("\u{4E2D}\u{6587}\u{5907}\u{4EFD}").is_ok());
+    }
+
+    #[test]
+    fn test_validate_backup_name_control_chars() {
+        // NUL byte is explicitly rejected
+        assert!(validate_backup_name("foo\0bar").is_err());
+        // Other control characters are not explicitly rejected by the validator
+        // (they are unusual but not a path traversal vector)
+    }
+
+    #[test]
+    fn test_validate_backup_name_very_long() {
+        // 255 chars should be accepted (common filesystem limit)
+        let long_name = "a".repeat(255);
+        assert!(validate_backup_name(&long_name).is_ok());
+
+        // 256 chars should also be accepted by our validator
+        // (filesystem limits are enforced by the OS, not our validation)
+        let very_long = "b".repeat(256);
+        assert!(validate_backup_name(&very_long).is_ok());
+    }
+
+    #[test]
+    fn test_validate_backup_name_only_dots() {
+        // Single dot is explicitly rejected
+        assert!(validate_backup_name(".").is_err());
+        // Double dot is rejected by the ".." check
+        assert!(validate_backup_name("..").is_err());
+        // Triple dot is rejected because it contains ".."
+        assert!(validate_backup_name("...").is_err());
+    }
+
+    #[test]
+    fn test_validate_backup_name_path_separators() {
+        assert!(validate_backup_name("foo/bar").is_err());
+        assert!(validate_backup_name("foo\\bar").is_err());
+        assert!(validate_backup_name("/leading").is_err());
+        assert!(validate_backup_name("trailing/").is_err());
+    }
+
+    #[test]
+    fn test_validate_backup_name_with_spaces_and_special() {
+        // Spaces and dashes are fine
+        assert!(validate_backup_name("backup with spaces").is_ok());
+        assert!(validate_backup_name("backup-2024-01-15T14:30:52").is_ok());
+        assert!(validate_backup_name("backup@host").is_ok());
+        assert!(validate_backup_name("backup#1").is_ok());
+    }
 }

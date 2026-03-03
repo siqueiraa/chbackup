@@ -1632,4 +1632,108 @@ mod tests {
         assert_eq!(remapped[1], ("staging".to_string(), "orders".to_string()));
         assert_eq!(remapped[2], ("logs".to_string(), "events".to_string()));
     }
+
+    // -----------------------------------------------------------------------
+    // add_on_cluster_clause extended tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_on_cluster_clause_create_view() {
+        let ddl = "CREATE VIEW default.my_view AS SELECT * FROM default.trades";
+        let result = add_on_cluster_clause(ddl, "c1");
+        assert!(
+            result.contains("ON CLUSTER 'c1'"),
+            "Should contain ON CLUSTER: {}",
+            result
+        );
+        assert!(
+            result.starts_with("CREATE VIEW default.my_view ON CLUSTER 'c1'"),
+            "ON CLUSTER should follow view name: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_add_on_cluster_clause_create_materialized_view() {
+        let ddl = "CREATE MATERIALIZED VIEW default.mv ENGINE = MergeTree() ORDER BY id AS SELECT * FROM default.trades";
+        let result = add_on_cluster_clause(ddl, "c1");
+        assert!(
+            result.contains("ON CLUSTER 'c1'"),
+            "Should contain ON CLUSTER: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_add_on_cluster_clause_already_present_no_double_add() {
+        let ddl = "CREATE TABLE default.t ON CLUSTER 'existing_cluster' (id UInt64) ENGINE = MergeTree ORDER BY id";
+        let result = add_on_cluster_clause(ddl, "new_cluster");
+        // Should NOT add a second ON CLUSTER
+        assert_eq!(result, ddl);
+        assert!(
+            !result.contains("new_cluster"),
+            "Should not add new cluster when already present"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rewrite_distributed_cluster extended tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_distributed_cluster_non_distributed_passthrough() {
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = ReplicatedMergeTree('/path', '{replica}') ORDER BY id";
+        let result = rewrite_distributed_cluster(ddl, "new_cluster");
+        assert_eq!(result, ddl, "Non-Distributed DDL should be unchanged");
+    }
+
+    #[test]
+    fn test_rewrite_distributed_cluster_view_passthrough() {
+        let ddl = "CREATE VIEW default.v AS SELECT * FROM default.t";
+        let result = rewrite_distributed_cluster(ddl, "new_cluster");
+        assert_eq!(result, ddl, "View DDL should be unchanged");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_replicated_params extended tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_replicated_params_short_syntax_with_quoted_args() {
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = ReplicatedMergeTree('/zk/path/{shard}', '{replica}') ORDER BY id";
+        let result = parse_replicated_params(ddl);
+        assert!(result.is_some());
+        let (path, replica) = result.unwrap();
+        assert_eq!(path, "/zk/path/{shard}");
+        assert_eq!(replica, "{replica}");
+    }
+
+    #[test]
+    fn test_parse_replicated_params_non_replicated_returns_none() {
+        // Various non-Replicated engines
+        assert!(
+            parse_replicated_params(
+                "CREATE TABLE t (id UInt64) ENGINE = MergeTree ORDER BY id"
+            )
+            .is_none()
+        );
+        assert!(parse_replicated_params(
+            "CREATE TABLE t (id UInt64) ENGINE = Memory"
+        )
+        .is_none());
+        assert!(
+            parse_replicated_params("CREATE TABLE t (id UInt64) ENGINE = Log")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_parse_replicated_params_versioned_collapsing() {
+        let ddl = "CREATE TABLE default.t (id UInt64, sign Int8, ver UInt64) ENGINE = ReplicatedVersionedCollapsingMergeTree('/clickhouse/tables/01/default/t', 'r1', sign, ver) ORDER BY id";
+        let result = parse_replicated_params(ddl);
+        assert!(result.is_some());
+        let (path, replica) = result.unwrap();
+        assert_eq!(path, "/clickhouse/tables/01/default/t");
+        assert_eq!(replica, "r1");
+    }
 }
