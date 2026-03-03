@@ -62,13 +62,14 @@ run_cmd() {
     fi
 }
 
-# drop_all_tables — drops the 5 standard test tables (3 local + 2 S3)
+# drop_all_tables — drops the 6 standard test tables (3 local + 2 S3 + 1 empty)
 drop_all_tables() {
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.events SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.empty_table SYNC"
 }
 
 # capture_row_counts — captures PRE_TRADES/PRE_USERS/PRE_EVENTS/PRE_S3_ORDERS/PRE_S3_METRICS
@@ -203,7 +204,7 @@ fi
 # 3. Drop all test tables to start completely fresh
 info "  Dropping test tables"
 drop_all_tables
-for tbl in s3_orders_restored trades_restored empty_table proj_test; do
+for tbl in s3_orders_restored trades_restored proj_test; do
     clickhouse-client -q "DROP TABLE IF EXISTS default.${tbl} SYNC" 2>/dev/null || true
 done
 
@@ -493,18 +494,12 @@ if should_run "test_server_api_create_upload"; then
 
         # Step 3: Wait for create to complete (poll actions)
         info "  Step 3: Wait for create to complete"
-        for i in $(seq 1 30); do
-            ACTIONS=$(curl -s http://localhost:7171/api/v1/actions 2>/dev/null || echo "[]")
-            if echo "$ACTIONS" | grep -q '"completed"'; then
-                break
-            fi
-            if echo "$ACTIONS" | grep -q '"failed"'; then
-                fail "create operation failed"
-                break
-            fi
-            sleep 1
-        done
-        pass "create operation completed"
+        RESULT=$(poll_action_completion 30)
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "create operation completed"
+        else
+            fail "create operation ${RESULT}"
+        fi
 
         # Step 4: POST /api/v1/upload
         info "  Step 4: POST /api/v1/upload/${API_NAME}"
@@ -518,26 +513,12 @@ if should_run "test_server_api_create_upload"; then
 
         # Step 5: Wait for upload to complete
         info "  Step 5: Wait for upload to complete"
-        for i in $(seq 1 60); do
-            ACTIONS=$(curl -s http://localhost:7171/api/v1/actions 2>/dev/null || echo "[]")
-            LAST_STATUS=$(echo "$ACTIONS" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-if data:
-    print(data[-1].get('status', 'unknown'))
-else:
-    print('unknown')
-" 2>/dev/null || echo "unknown")
-            if [[ "$LAST_STATUS" == "completed" ]]; then
-                break
-            fi
-            if [[ "$LAST_STATUS" == "failed" ]]; then
-                fail "upload operation failed"
-                break
-            fi
-            sleep 1
-        done
-        pass "upload operation completed"
+        RESULT=$(poll_action_completion 60)
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "upload operation completed"
+        else
+            fail "upload operation ${RESULT}"
+        fi
 
         # Step 6: Verify via /api/v1/list
         info "  Step 6: Verify backup in list"
@@ -1474,26 +1455,12 @@ if should_run "test_api_full_round_trip"; then
         info "  Download response: ${DL_RESP}"
 
         # Wait for download to complete
-        for i in $(seq 1 60); do
-            ACTIONS=$(curl -s http://localhost:7171/api/v1/actions 2>/dev/null || echo "[]")
-            LAST_STATUS=$(echo "$ACTIONS" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-if data:
-    print(data[-1].get('status', 'unknown'))
-else:
-    print('unknown')
-" 2>/dev/null || echo "unknown")
-            if [[ "$LAST_STATUS" == "completed" ]] || [[ "$LAST_STATUS" == "unknown" ]]; then
-                break
-            fi
-            if [[ "$LAST_STATUS" == "failed" ]]; then
-                fail "download failed"
-                break
-            fi
-            sleep 1
-        done
-        pass "download via API completed"
+        RESULT=$(poll_action_completion 60)
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "download via API completed"
+        else
+            fail "download via API ${RESULT}"
+        fi
 
         # Step 4: DROP tables and restore via API
         info "  Step 4: DROP tables and restore via API"
@@ -1506,26 +1473,12 @@ else:
         info "  Restore response: ${REST_RESP}"
 
         # Wait for restore to complete
-        for i in $(seq 1 60); do
-            ACTIONS=$(curl -s http://localhost:7171/api/v1/actions 2>/dev/null || echo "[]")
-            LAST_STATUS=$(echo "$ACTIONS" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-if data:
-    print(data[-1].get('status', 'unknown'))
-else:
-    print('unknown')
-" 2>/dev/null || echo "unknown")
-            if [[ "$LAST_STATUS" == "completed" ]] || [[ "$LAST_STATUS" == "unknown" ]]; then
-                break
-            fi
-            if [[ "$LAST_STATUS" == "failed" ]]; then
-                fail "restore via API failed"
-                break
-            fi
-            sleep 1
-        done
-        pass "restore via API completed"
+        RESULT=$(poll_action_completion 60)
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "restore via API completed"
+        else
+            fail "restore via API ${RESULT}"
+        fi
 
         # Step 5: Verify row counts
         POST_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades" 2>/dev/null || echo "0")
@@ -1634,13 +1587,10 @@ if should_run "test_api_concurrent_rejection"; then
 
         # Wait for first op to complete
         info "  Waiting for first operation to complete"
-        for i in $(seq 1 30); do
-            ACTIONS=$(curl -s http://localhost:7171/api/v1/actions 2>/dev/null || echo "[]")
-            if echo "$ACTIONS" | grep -q '"completed"\|"failed"'; then
-                break
-            fi
-            sleep 1
-        done
+        RESULT=$(poll_action_completion 30)
+        if [[ "$RESULT" != "completed" ]]; then
+            info "  first operation did not complete cleanly: ${RESULT}"
+        fi
 
         # Cleanup
         info "  Cleanup"

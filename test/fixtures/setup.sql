@@ -99,3 +99,13 @@ INSERT INTO default.s3_metrics VALUES
     ('2024-01-15', 2, 'mem_usage', 72.8, '{"host":"srv1"}'),
     ('2024-02-01', 3, 'cpu_usage', 38.5, '{"host":"srv2"}'),
     ('2024-02-15', 4, 'disk_io', 91.0, '{"host":"srv2"}');
+
+-- Empty MergeTree table (T18: --skip-empty-tables flag)
+CREATE TABLE IF NOT EXISTS default.empty_table
+(
+    id    UInt64,
+    value String
+)
+ENGINE = MergeTree()
+ORDER BY id;
+-- No data inserted — intentionally empty
