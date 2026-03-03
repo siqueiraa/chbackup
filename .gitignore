@@ -1,2 +1,5 @@
 /target/
 .idea/
+/coverage/
+tarpaulin-report.json
+cobertura.xml
