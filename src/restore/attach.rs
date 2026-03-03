@@ -1069,12 +1069,6 @@ mod tests {
         assert!(gid.is_none());
     }
 
-    #[test]
-    fn test_encode_path_component() {
-        assert_eq!(encode_path_component("default"), "default");
-        assert_eq!(encode_path_component("my table"), "my%20table");
-    }
-
     // ---- Task 8: UUID-isolated S3 restore tests ----
 
     #[test]

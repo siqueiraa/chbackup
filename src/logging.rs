@@ -73,8 +73,8 @@ mod tests {
         let filter_str = build_default_filter("debug");
 
         // Verify the string parses into a valid EnvFilter
-        let _filter = EnvFilter::try_new(&filter_str)
-            .expect("filter string should parse as valid EnvFilter");
+        let _filter =
+            EnvFilter::try_new(&filter_str).expect("filter string should parse as valid EnvFilter");
 
         // Verify the filter string contains the expected target suppressions
         assert!(
@@ -89,14 +89,8 @@ mod tests {
             filter_str.contains("aws_smithy_runtime=warn"),
             "Should suppress aws_smithy_runtime"
         );
-        assert!(
-            filter_str.contains("hyper=warn"),
-            "Should suppress hyper"
-        );
-        assert!(
-            filter_str.contains("rustls=warn"),
-            "Should suppress rustls"
-        );
+        assert!(filter_str.contains("hyper=warn"), "Should suppress hyper");
+        assert!(filter_str.contains("rustls=warn"), "Should suppress rustls");
         assert!(
             filter_str.starts_with("debug,"),
             "Should start with the configured level"

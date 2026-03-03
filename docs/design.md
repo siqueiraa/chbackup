@@ -666,188 +666,82 @@ log "Setup complete. Tables: $(clickhouse-client -q \
 
 #### 1.4.5 Test Cases — Full Coverage
 
-**T1: Create + Local Verify**
-- Run `setup.sql` + `seed_data.sql` (creates 11 tables across 2 databases, seeds ~2.5M rows)
-- `chbackup create daily_t1`
-- Verify: manifest exists in `/var/lib/clickhouse/backup/daily_t1/`
-- Verify: shadow/ cleaned up (no leftovers)
-- Verify: freeze naming uses `chbackup_daily_t1_{db}_{table}` convention
-- Verify: part checksums in manifest match `checksums.txt` on disk
+Authoritative source: `test/run_tests.sh`. All tests run inside the Docker container
+(`Dockerfile.test`) against a real ClickHouse + S3 backend.
 
-**T2: Upload + Download round-trip**
-- `chbackup upload daily_t1`
-- Verify: S3 objects exist at expected paths
-- Delete local backup: `chbackup delete local daily_t1`
-- `chbackup download daily_t1`
-- Verify: downloaded manifest matches uploaded manifest byte-for-byte
-- Verify: all part files present, CRC64 matches
+| ID | Name | `should_run` key | Validates |
+|----|------|-------------------|-----------|
+| — | Smoke: binary | `smoke_binary` | `chbackup --help` exits 0 |
+| — | Smoke: config | `smoke_config` | `print-config` outputs YAML, redacts secrets |
+| — | Smoke: list | `smoke_list` | `chbackup list` exits 0 |
+| — | Round-trip | `test_round_trip` | create → upload → delete local → download → restore → verify row counts |
+| T4 | Incremental backup chain | `test_incremental_chain` | `--diff-from`, carried parts skip re-upload, CRC64 verification |
+| T5 | Schema-only backup | `test_schema_only` | `--schema-only` creates DDL but no data parts |
+| T6 | Partitioned restore | `test_partitioned_restore` | `--partitions` filters parts by partition_id |
+| T7 | Server API create + upload | `test_server_api_create_upload` | API create → upload → list round-trip |
+| T8 | Backup name validation | `test_backup_name_validation` | Rejects reserved names, path traversal |
+| T9 | Delete and list | `test_delete_and_list` | `delete local`, `delete remote`, `list` correctness |
+| T10 | Clean broken | `test_clean_broken` | Detects and removes broken backups (missing metadata.json) |
+| T11 | S3 object disk round-trip | `test_s3_disk_round_trip` | S3 disk create → upload → download → restore with CopyObject |
+| T12 | Incremental with S3 disk | `test_s3_disk_incremental` | `--diff-from` carries S3 disk parts forward |
+| T13 | S3 tables rename | `test_s3_restore_rename` | `--as` flag remap with S3 disk tables |
+| T14 | S3 diff verification | `test_s3_incremental_diff` | Carried S3 parts not re-uploaded; new parts uploaded |
+| T15 | Restore mode A (--rm) | `test_restore_mode_a` | DROP + recreate, extra rows removed |
+| T16 | Database mapping (-m) | `test_database_mapping` | `-m src:dst` remap during restore |
+| T17 | Data-only restore | `test_data_only_restore` | `--data-only` skips schema creation |
+| T18 | Skip empty tables | `test_skip_empty_tables` | `--skip-empty-tables` omits CREATE for empty tables |
+| T19 | Retention | `test_retention` | Local + remote retention with keep count |
+| T20 | Clean shadow | `test_clean_shadow` | `chbackup clean` removes shadow directories |
+| T21 | Structured exit codes | `test_exit_codes` | Exit codes 0/1/3/4 for success/error/not-found/lock |
+| T22 | API full round-trip | `test_api_full_round_trip` | API download + restore + list pagination |
+| T23 | API concurrent rejection | `test_api_concurrent` | HTTP 423 for overlapping operations |
+| T24 | API kill | `test_api_kill` | `/api/v1/kill` cancels running operation |
+| T25 | Partition-level create | `test_partitioned_create` | `--partitions` in create command |
+| T26 | Skip projections | `test_skip_projections` | `--skip-projections '*'` excludes .proj dirs |
+| T27 | Hardlink dedup | `test_hardlink_dedup` | `--hardlink-exists-files` deduplicates via hardlinks |
+| T28 | RBAC backup and restore | `test_rbac` | `--rbac` flag backup/restore round-trip |
+| T29 | Watch mode | `test_watch_mode` | Full + incremental cycle with watch loop |
+| T30 | List formats | `test_list_formats` | `--format json/yaml/csv/tsv` output |
+| T31 | Create remote | `test_create_remote` | One-step create + upload |
+| T32 | Restore remote | `test_restore_remote` | One-step download + restore |
+| T33 | Freeze by part | `test_freeze_by_part` | `freeze_by_part` config, per-partition FREEZE |
+| T34 | Disk filtering | `test_disk_filtering` | `skip_disk_types` excludes disks from backup |
+| T35 | Default config output | `test_default_config` | `print-config` default values match design doc |
+| T36 | Schema-only restore | `test_schema_only_restore` | `--schema` restores DDL without data |
+| T37 | Single table rename | `test_single_table_rename` | `--as` flag for single table remap |
+| T38 | Upload --delete-local | `test_upload_delete_local` | Local backup removed after upload |
+| T39 | Upload --diff-from-remote | `test_upload_diff_from_remote` | Remote-side incremental diff during upload |
+| T40 | Tables command | `test_tables_command` | `-t` filter + `--all` flag |
+| T41 | Tables --remote-backup | `test_tables_remote` | Tables listing from remote manifest |
+| T42 | Clean broken remote | `test_clean_broken_remote` | Removes broken remote backups |
+| T43 | Latest/previous shortcuts | `test_latest_previous` | `latest`/`previous` aliases in delete |
+| T44 | Env var overlay | `test_env_overlay` | CLICKHOUSE_HOST, CHBACKUP_LOG_LEVEL override config |
+| T45 | Config --env flag | `test_env_flag` | CLI `--env` overrides config values |
+| T46 | API health/version/status | `test_api_health` | Health JSON, version, status endpoints |
+| T47 | API tables pagination | `test_api_tables_pagination` | `offset`/`limit` params, `X-Total-Count` header |
+| T48 | API tables remote | `test_api_tables_remote` | Tables endpoint with `remote_backup` param |
+| T49 | API delete | `test_api_delete` | DELETE endpoint for local/remote backups |
+| T50 | API actions dispatch | `test_api_actions` | `POST /api/v1/actions` command dispatch |
+| T51 | API reload | `test_api_reload` | `/api/v1/reload` hot-reloads config |
+| T52 | API restart | `test_api_restart` | `/api/v1/restart` recreates clients |
+| T53 | API basic auth | `test_api_auth` | 401 for unauthenticated, 200 for authenticated |
+| T54 | API clean endpoints | `test_api_clean` | API-driven clean operations |
+| T55 | API Prometheus metrics | `test_api_metrics` | `/metrics` endpoint with operation counters |
+| T56 | Configs backup/restore | `test_configs` | `--configs` flag backup/restore round-trip |
+| T57 | Restore remote --rm | `test_restore_remote_rm` | Remote restore with destructive Mode A |
+| T58 | Resume upload | `test_resume_upload` | Resumable upload via state file |
+| T59 | Resume download | `test_resume_download` | Resumable download via state file |
+| T60 | Print config overrides | `test_print_config_combined` | Combined config + env + CLI overrides |
+| T61 | Resume restore | `test_resume_restore` | Resumable restore via state file |
+| T62 | Clean --name | `test_clean_name` | Targeted shadow cleanup by backup name |
 
-**T3: Restore — Mode B (safe, no DROP)**
-- Drop all test tables manually
-- `chbackup restore daily_t1`
-- Verify: all tables recreated, SELECT COUNT(*) matches
-- Verify: checksum of `SELECT * FROM ... ORDER BY` matches pre-backup checksum
-
-**T4: Restore — Mode A (--rm, DROP + recreate)**
-- INSERT extra rows into existing tables (make them diverge)
-- `chbackup restore --rm daily_t1`
-- Verify: tables restored to exact backup state (extra rows gone)
-
-**T5: Diff-from + CRC64 verification**
-- Create backup `base_t5`
-- INSERT more data into default.trades (adds new parts)
-- `ALTER TABLE default.events ADD COLUMN browser String DEFAULT ''` (schema change)
-- Create backup `incr_t5 --diff-from=base_t5`
-- Verify: incr manifest only contains new/changed parts
-- Verify: unchanged parts reference base backup (no re-upload)
-- Simulate CRC64 mismatch: mutate a part with same name on disk
-- Verify: diff-from detects mismatch via CRC64(checksums.txt), re-uploads + warns
-
-**T6: Retention / GC**
-- Create backups: `ret_1`, `ret_2`, `ret_3`, `ret_4`
-- Set retention policy: `backups_to_keep_remote: 2`
-- Run retention
-- Verify: only `ret_3` and `ret_4` remain
-- Verify: S3 keys shared by `ret_3`/`ret_4` (carried-forward parts) NOT deleted by GC of `ret_1`/`ret_2`
-
-**T7: Partitioned backup/restore**
-- Create partitioned table (toYYYYMM partitioning)
-- INSERT data spanning 3 months
-- `chbackup create part_t7 --partitions "202401,202402"`
-- Verify: only 2 partitions in backup (not 3)
-- Restore and verify only those partitions come back
-
-**T8: Table filtering**
-- Uses existing tables across `default` (8 tables) and `logs` (3 tables) databases
-- `chbackup create filter_t8 -t "default.trades,default.orders"`
-- Verify: only 2 tables in manifest
-- `chbackup create filter_t8b -t "logs.*"` (wildcard)
-- Verify: all tables in `logs` database captured
-
-**T9: Replicated tables**
-- Create ReplicatedMergeTree table with ZooKeeper
-- Backup and restore to verify ZK path handling
-- Verify: SYSTEM DROP REPLICA uses actual ZK path (not macro template)
-
-**T10: API server**
-- Start `chbackup server` in background
-- Hit `/api/create`, `/api/status`, `/api/list` via curl
-- Verify: concurrent requests are properly serialized (PID lock)
-- Verify: status endpoint shows progress during upload
-
-**T11: Crash recovery + clean**
-- Start `chbackup create crash_t11`
-- Kill process mid-freeze (SIGKILL)
-- Verify: shadow/ directories have human-readable names
-- Run `chbackup clean --name crash_t11`
-- Verify: only crash_t11 shadows removed, others untouched
-- Verify: resumable state file exists, next create resumes
-
-**T12: Streaming engine safety**
-- Test creates Kafka-engine table DDL in the backup manifest (parsed from setup.sql comment)
-- On restore, verify: streaming engine table CREATE issued AFTER all data tables ATTACH complete
-- Alternative for CH ≥ 24.1: test with `REFRESH EVERY` materialized view (same Phase 2b logic)
-
-**T13: Large part upload (multipart)**
-- Run `seed_large.sql` (5M rows × 200-byte strings → parts > 100MB after OPTIMIZE)
-- `chbackup create` + `chbackup upload`
-- Verify: S3 multipart upload used (check debug logs)
-- Download and verify integrity
-
-**T14: Space check with hardlink dedup**
-- Create backup, upload, create second backup with `--diff-from`
-- Download with `--hardlink-exists-files`
-- Verify: space calculation accounts for deduplicated parts
-- Verify: no unnecessary disk space consumed
-
-**T15: Cross-version compatibility**
-- Create backup on CH 24.3
-- Restore on CH 24.8
-- Verify: schema and data integrity maintained
-
-**T16: Watch mode — full + incremental cycle**
-- Start watch with `--watch-interval=5s --full-interval=20s` (accelerated for testing)
-- Wait 25 seconds (enough for 1 full + ~4 incrementals + 1 new full)
-- Stop watch
-- Verify: remote backups exist with correct naming pattern (`*-full-*`, `*-incr-*`)
-- Verify: first backup is full, subsequent are incremental with diff-from set
-- Verify: second full appears after ~20s
-- Verify: incrementals reference previous backup as diff-from base
-- Verify: retention applied (if backups_to_keep_remote configured)
-
-**T17: Watch mode — resume after restart**
-- Start watch, let it create 2 backups (1 full + 1 incremental)
-- Kill watch process (SIGKILL)
-- Restart watch with same config
-- Verify: resumes correctly — doesn't create duplicate full, calculates time since last backup
-- Verify: next backup is incremental (not full) if within full_interval
-
-**T18: Watch mode — error recovery**
-- Start watch with invalid S3 credentials (force upload failure)
-- Verify: consecutive error count increments
-- Verify: after fixing credentials (config reload via SIGHUP), next backup is FULL (not incremental on broken base)
-- Verify: aborts after max_consecutive_errors reached
-
-**T19: RBAC backup + restore**
-- Create users, roles, quotas, settings profiles in ClickHouse
-- `chbackup create --rbac rbac_test`
-- Verify: `access/` directory in backup contains serialized RBAC objects
-- Drop all RBAC objects, restore with `chbackup restore --rbac rbac_test`
-- Verify: users, roles, quotas restored
-- Test `rbac_resolve_conflicts: "ignore"` — duplicate objects skipped without error
-
-**T20: ON CLUSTER restore (Distributed DDL)**
-- Uses 2-node replicated cluster in test environment
-- `restore_schema_on_cluster: "test_cluster"` in config
-- Create backup from node 1, restore on node 1 with ON CLUSTER
-- Verify: tables exist on both nodes
-
-**T21: Empty backup handling**
-- `chbackup create -t "nonexistent_db.*" empty_test` with `allow_empty_backups: false`
-- Verify: error "no tables matched filter"
-- Set `allow_empty_backups: true`, retry
-- Verify: empty backup created with valid metadata, zero tables
-
-**T22: Table dropped during FREEZE (race condition)**
-- Create 10 test tables, start backup
-- In parallel: DROP one table after table list is gathered but before all FREEZE complete
-- Verify: backup completes with warning "table disappeared during backup"
-- Verify: backup contains 9 tables (skipped the dropped one)
-
-**T23: ClickHouse TLS connection**
-- Configure CH with TLS (self-signed cert)
-- Set `clickhouse.secure: true`, `clickhouse.tls_ca: /path/to/ca.pem`
-- Verify: backup creates successfully over TLS
-
-**T24: API authentication**
-- Configure `api.username: "admin"`, `api.password: "secret"`
-- Verify: unauthenticated GET /api/v1/list returns 401
-- Verify: authenticated request succeeds
-- Verify: integration tables work with auth (URL includes credentials)
-
-**T25: Partition-level backup + restore**
-- Table with 3 monthly partitions (202401, 202402, 202403)
-- `chbackup create --partitions "202401,202402" part_test`
-- Verify: only 2 partitions in backup manifest
-- Restore and verify only those partitions come back
-- Third partition data untouched in target
-
-**T26: Integration tables (SQL interface)**
-- Start server with `create_integration_tables: true`
-- `SELECT * FROM system.backup_list` — verify returns backup inventory
-- `INSERT INTO system.backup_actions(command) VALUES ('create test_sql')` — verify triggers backup
-- `SELECT * FROM system.backup_actions WHERE status = 'in progress'` — verify shows running
-- On server shutdown, verify tables are dropped
-
-**T27: Auto-resume after server restart**
-- Start upload, kill server mid-upload (state file exists)
-- Restart server with `complete_resumable_after_restart: true`
-- Verify: upload resumes automatically, completes without re-creating backup
-
-**T28: Replicated Database Engine**
-- Create database with ENGINE = Replicated
-- Create tables inside it, backup, restore to same database
-- Verify: no ON CLUSTER clause used, UUIDs re-generated
+**Aspirational tests** (require infrastructure not in the single-node Docker environment):
+- Replicated tables + ZK path conflict (multi-replica)
+- Streaming engine postponement (Kafka/NATS broker)
+- ON CLUSTER restore (multi-node cluster)
+- DatabaseReplicated engine (DatabaseReplicated setup)
+- ClickHouse TLS connection (self-signed cert)
+- Cross-version compatibility (CI matrix provides implicit coverage)
 
 #### 1.4.6 CI Integration (GitHub Actions)
 

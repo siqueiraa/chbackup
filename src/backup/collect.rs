@@ -588,24 +588,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_path_component_simple() {
-        assert_eq!(encode_path_component("default"), "default");
-        assert_eq!(encode_path_component("my_database"), "my_database");
-    }
-
-    #[test]
-    fn test_encode_path_component_special_chars() {
-        assert_eq!(encode_path_component("my db"), "my%20db");
-        assert_eq!(encode_path_component("test+table"), "test%2Btable");
-    }
-
-    #[test]
-    fn test_encode_path_component_safe_chars() {
-        // encode_path_component does NOT preserve `/` (unlike old url_encode_path)
-        assert_eq!(encode_path_component("a-b_c.d"), "a-b_c.d");
-    }
-
-    #[test]
     fn test_hardlink_dir_roundtrip() {
         let src_dir = tempfile::tempdir().unwrap();
         let dst_dir = tempfile::tempdir().unwrap();

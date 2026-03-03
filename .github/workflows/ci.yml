@@ -70,12 +70,11 @@ jobs:
           print(f'{pct:.1f}')
           " 2>/dev/null || echo "0")
           echo "Coverage: ${COVERAGE}%"
-          # Soft gate: warn but don't fail (enforce once we hit 40%)
-          # python3 -c "
-          # import json; d=json.load(open('tarpaulin-report.json'))
-          # pct = d.get('coverage', d.get('coverage_percentage', 0))
-          # assert pct >= 40, f'Coverage {pct:.1f}% < 40%'
-          # "
+          python3 -c "
+          import json; d=json.load(open('tarpaulin-report.json'))
+          pct = d.get('coverage', d.get('coverage_percentage', 0))
+          assert pct >= 35, f'Coverage {pct:.1f}% < 35%'
+          "
 
   # ---------------------------------------------------------------------------
   # Job 2: Integration tests with ClickHouse version matrix

@@ -1309,25 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_path_component_simple() {
-        assert_eq!(encode_path_component("default"), "default");
-        assert_eq!(encode_path_component("my_table"), "my_table");
-        assert_eq!(encode_path_component("my-table"), "my-table");
-    }
-
-    #[test]
-    fn test_encode_path_component_special_chars() {
-        assert_eq!(encode_path_component("my table"), "my%20table");
-        assert_eq!(encode_path_component("db:name"), "db%3Aname");
-        assert_eq!(encode_path_component("test+data"), "test%2Bdata");
-    }
-
-    #[test]
-    fn test_encode_path_component_preserves_dots() {
-        assert_eq!(encode_path_component("db.table"), "db.table");
-    }
-
-    #[test]
     fn test_download_skips_completed_parts() {
         // Verify that completed_keys causes parts to be skipped
         let completed_keys: HashSet<String> =

@@ -140,11 +140,11 @@ S3 GetObject body → lz4_decoder → tar_extract → files on disk
 Integration test using the all-in-one Docker container from §1.4.
 Tests marked **(impl)** are in `test/run_tests.sh`; unmarked are aspirational future work.
 
-- T1: Create → upload → download → restore round-trip with checksum verification **(impl: `test_round_trip`)**
-- T3: Restore Mode B (safe ATTACH, table doesn't exist)
-- T21: Empty backup handling (allow_empty_backups true/false)
-- T22: Table dropped during FREEZE (error code 60/81 — ignore_not_exists)
-- Basic CRC64 checksum computation (covered by `test_round_trip`)
+- Round-trip: create → upload → delete local → download → restore **(impl: `test_round_trip`)**
+- Restore Mode B (safe ATTACH, table doesn't exist) — covered by `test_round_trip`
+- Empty backup handling (allow_empty_backups true/false) — aspirational
+- Table dropped during FREEZE (error code 60/81 — ignore_not_exists) — aspirational
+- Basic CRC64 checksum computation — covered by `test_round_trip`
 
 ### Definition of done
 
@@ -234,19 +234,16 @@ clickhouse-client -q "SELECT count() FROM default.trades"
 Expand integration test suite.
 Tests marked **(impl)** are in `test/run_tests.sh`; unmarked are aspirational future work.
 
-- T2: Multi-table parallel create + upload + download + restore
-- T4: Restore Mode A (`--rm` DROP first)
-- T5: Diff-from with CRC64 mismatch detection (incremental chain: **(impl: `test_incremental_chain`)**)
-- T7-T8: Partition and table filtering
-- T9: Replicated tables + actual ZK path handling
-- T11: Crash recovery — kill mid-freeze, verify scopeguard UNFREEZE
-- T13: Large parts → multipart upload
-- T14: Space check with hardlink dedup
-- T15: Cross-version compatibility (backup on 24.3, restore on 24.8) (CI matrix provides this implicitly)
-- T23: ClickHouse TLS connection (self-signed cert)
-- T25: Partition-level backup + restore (--partitions flag) **(impl: `test_partitioned_restore`)**
-
-Additional implemented tests not tied to a roadmap T-number: `test_schema_only` (schema-only backup/restore), `test_backup_name_validation` (reserved name rejection).
+- T4: Incremental backup chain **(impl: `test_incremental_chain`)**
+- T5: Schema-only backup **(impl: `test_schema_only`)**
+- T6: Partitioned restore **(impl: `test_partitioned_restore`)**
+- T8: Backup name validation **(impl: `test_backup_name_validation`)**
+- T15: Restore mode A — `--rm` DROP first **(impl: `test_restore_mode_a`)**
+- T25: Partition-level create — `--partitions` **(impl: `test_partitioned_create`)**
+- Replicated tables + ZK path handling — aspirational (requires multi-replica)
+- Crash recovery — aspirational (requires SIGKILL mid-freeze)
+- Large parts → multipart upload — aspirational
+- Cross-version compatibility — CI matrix provides implicit coverage
 
 ### Definition of done
 
@@ -363,14 +360,16 @@ Use `prometheus` crate. Expose via `GET /metrics`.
 
 Tests marked **(impl)** are in `test/run_tests.sh`; unmarked are aspirational future work.
 
-- T6: Retention/GC with self-contained manifest chain preservation (delete + clean_broken: **(impl: `test_delete_and_list`, `test_clean_broken`)**; GC chain preservation not covered)
-- T10: API server concurrency + PID lock (basic API: **(impl: `test_server_api_create_upload`)**; concurrency/lock not covered)
-- T16: Watch mode — full + incremental cycle
-- T17: Watch mode — resume after restart
-- T18: Watch mode — error recovery (error → full fallback)
-- T24: API basic auth (reject unauthenticated, accept authenticated)
-- T26: Integration tables (SELECT from system.backup_list, INSERT into system.backup_actions)
-- T27: Auto-resume after server restart (complete_resumable_after_restart)
+- T7: Server API create + upload **(impl: `test_server_api_create_upload`)**
+- T9: Delete and list **(impl: `test_delete_and_list`)**
+- T10: Clean broken **(impl: `test_clean_broken`)**
+- T19: Retention (local + remote) **(impl: `test_retention`)**
+- T23: API concurrent rejection (HTTP 423) **(impl: `test_api_concurrent`)**
+- T29: Watch mode — full + incremental cycle **(impl: `test_watch_mode`)**
+- T53: API basic auth **(impl: `test_api_auth`)**
+- Watch resume after restart — aspirational
+- Watch error recovery — aspirational
+- Auto-resume after server restart — aspirational
 
 ### Definition of done
 
@@ -472,16 +471,16 @@ kill -HUP $(pidof chbackup)
 
 ### Tests
 
-Test coverage for Phase 4 features in `test/run_tests.sh` (62 tests total, T1-T62):
+Test coverage for Phase 4 features in `test/run_tests.sh` (62 tests total, T4-T62 + smoke/round-trip):
 
-- [done] T19 (RBAC): RBAC backup + restore round-trip with `--rbac` flag (run_tests.sh T28)
-- [done] T25 (Partitions): Partition-level backup with `--partitions` (run_tests.sh T6, T25)
-- [done] T12 (S3 disk incremental): Incremental backup/restore with S3 disk tables (run_tests.sh T12)
-- [done] T56 (Configs): Configs backup + restore with `--configs` flag (run_tests.sh T56)
-- TODO: T9: Replicated tables + ZK path conflict (requires multi-replica test environment)
-- TODO: T12 (streaming): Streaming engine postponed activation (requires Kafka/NATS broker)
-- TODO: T20: ON CLUSTER restore (requires multi-node ClickHouse cluster)
-- TODO: T28: Replicated Database Engine (requires DatabaseReplicated test setup)
+- [done] T28: RBAC backup + restore round-trip with `--rbac` flag
+- [done] T6/T25: Partition-level backup/restore with `--partitions`
+- [done] T12: Incremental backup/restore with S3 disk tables
+- [done] T56: Configs backup + restore with `--configs` flag
+- TODO: Replicated tables + ZK path conflict (requires multi-replica test environment)
+- TODO: Streaming engine postponed activation (requires Kafka/NATS broker)
+- TODO: ON CLUSTER restore (requires multi-node ClickHouse cluster)
+- TODO: DatabaseReplicated engine (requires DatabaseReplicated test setup)
 
 ### Design sections consumed: §5.5-5.7, §6, §16.4
 

@@ -663,7 +663,7 @@ pub async fn create(
                 Ok(results) => results,
                 Err(join_err) => {
                     // Task panicked -- unfreeze everything that was frozen so far
-                    let infos: Vec<FreezeInfo> = frozen_so_far.lock().unwrap().drain(..).collect();
+                    let infos: Vec<FreezeInfo> = frozen_so_far.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
                     if !infos.is_empty() {
                         let mut guard = FreezeGuard::new();
                         for fi in infos {
@@ -682,7 +682,7 @@ pub async fn create(
             for ah in &abort_handles {
                 ah.abort();
             }
-            let infos: Vec<FreezeInfo> = frozen_so_far.lock().unwrap().drain(..).collect();
+            let infos: Vec<FreezeInfo> = frozen_so_far.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
             if !infos.is_empty() {
                 let mut cancel_guard = FreezeGuard::new();
                 for fi in infos {

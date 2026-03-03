@@ -494,7 +494,7 @@ pub async fn upload(
                     // Abort any in-progress multipart upload before returning.
                     let uid = active_mpu_cancel
                         .lock()
-                        .expect("MPU lock poisoned")
+                        .unwrap_or_else(|e| e.into_inner())
                         .take();
                     if let Some(uid) = uid {
                         let _ = s3_abort.abort_multipart_upload(&abort_key, &uid).await;
@@ -554,7 +554,7 @@ pub async fn upload(
                 // Create multipart upload
                 let upload_id = s3.create_multipart_upload(&item.s3_key).await?;
                 // Register upload_id so the cancel arm can abort it if needed.
-                *active_mpu.lock().expect("MPU lock poisoned") = Some(upload_id.clone());
+                *active_mpu.lock().unwrap_or_else(|e| e.into_inner()) = Some(upload_id.clone());
 
                 // Pipeline: bridge the sync mpsc::Receiver (compression thread) to async
                 // upload via a tokio channel.  Compression and upload run concurrently:
@@ -619,7 +619,7 @@ pub async fn upload(
                 // Clear tracking before handling result.  The error arm below calls abort
                 // explicitly; the cancel arm uses take() so clearing here prevents a
                 // redundant abort if cancel fires after the upload_result block finishes.
-                *active_mpu.lock().expect("MPU lock poisoned") = None;
+                *active_mpu.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
                 match upload_result {
                     Ok(total) => total,
@@ -670,7 +670,7 @@ pub async fn upload(
                     // Create multipart upload
                     let upload_id = s3.create_multipart_upload(&item.s3_key).await?;
                     // Register upload_id so the cancel arm can abort it if needed.
-                    *active_mpu.lock().expect("MPU lock poisoned") = Some(upload_id.clone());
+                    *active_mpu.lock().unwrap_or_else(|e| e.into_inner()) = Some(upload_id.clone());
 
                     // Upload chunks, aborting on error
                     let upload_result = async {
@@ -703,7 +703,7 @@ pub async fn upload(
                     .await;
 
                     // Clear tracking before handling result.
-                    *active_mpu.lock().expect("MPU lock poisoned") = None;
+                    *active_mpu.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
                     if let Err(e) = upload_result {
                         // Best-effort abort to clean up partial upload
@@ -1236,18 +1236,6 @@ mod tests {
             work_item.s3_key,
             "daily/data/default/trades/202401_1_50_3.tar.lz4"
         );
-    }
-
-    #[test]
-    fn test_encode_path_component_simple() {
-        assert_eq!(encode_path_component("default"), "default");
-        assert_eq!(encode_path_component("my_table"), "my_table");
-    }
-
-    #[test]
-    fn test_encode_path_component_special() {
-        assert_eq!(encode_path_component("my table"), "my%20table");
-        assert_eq!(encode_path_component("db:name"), "db%3Aname");
     }
 
     #[test]

@@ -2810,7 +2810,10 @@ mod tests {
         let (loc, name) = if parts_owned.len() >= 3 {
             (parts_owned[1].as_str().to_string(), parts_owned[2].clone())
         } else {
-            ("remote".to_string(), parts_owned.get(1).cloned().unwrap_or_default())
+            (
+                "remote".to_string(),
+                parts_owned.get(1).cloned().unwrap_or_default(),
+            )
         };
 
         // The match should now reject unknown locations instead of falling through to remote
@@ -2823,7 +2826,10 @@ mod tests {
             )),
         };
 
-        assert!(result.is_err(), "Typo 'loacl' should be rejected, not fall through to remote");
+        assert!(
+            result.is_err(),
+            "Typo 'loacl' should be rejected, not fall through to remote"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("invalid location"),

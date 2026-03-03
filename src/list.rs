@@ -409,7 +409,11 @@ pub fn list_local(data_path: &str) -> Result<Vec<BackupSummary>> {
     }
 
     // Sort by timestamp (falling back to name for broken backups with None timestamp)
-    summaries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.name.cmp(&b.name)));
+    summaries.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     info!(count = summaries.len(), "Listed local backups");
     Ok(summaries)
@@ -481,7 +485,11 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
     }
 
     // Sort by timestamp (falling back to name for broken backups with None timestamp)
-    summaries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.name.cmp(&b.name)));
+    summaries.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     info!(count = summaries.len(), "Listed remote backups");
     Ok(summaries)
@@ -3469,9 +3477,18 @@ mod tests {
 
         // Create backups with explicit timestamps where name order differs from timestamp order
         let cases = [
-            ("zebra", chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
-            ("alpha", chrono::Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap()),
-            ("middle", chrono::Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap()),
+            (
+                "zebra",
+                chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            ),
+            (
+                "alpha",
+                chrono::Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap(),
+            ),
+            (
+                "middle",
+                chrono::Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap(),
+            ),
         ];
         for (name, ts) in &cases {
             let backup_dir = backup_base.join(name);
@@ -3486,9 +3503,9 @@ mod tests {
         let summaries = list_local(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(summaries.len(), 3);
         // Should be sorted by timestamp, not name
-        assert_eq!(summaries[0].name, "zebra");  // oldest: 2024-01-01
+        assert_eq!(summaries[0].name, "zebra"); // oldest: 2024-01-01
         assert_eq!(summaries[1].name, "middle"); // middle: 2024-03-01
-        assert_eq!(summaries[2].name, "alpha");  // newest: 2024-06-01
+        assert_eq!(summaries[2].name, "alpha"); // newest: 2024-06-01
     }
 
     // -----------------------------------------------------------------------
@@ -3975,11 +3992,24 @@ mod tests {
         ];
 
         // Apply the same sort used by list_local / list_remote
-        summaries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.name.cmp(&b.name)));
+        summaries.sort_by(|a, b| {
+            a.timestamp
+                .cmp(&b.timestamp)
+                .then_with(|| a.name.cmp(&b.name))
+        });
 
         // None timestamps sort first, then ascending by timestamp
-        assert_eq!(summaries[0].name, "m-broken", "Broken (None ts) should be first");
-        assert_eq!(summaries[1].name, "z-old", "Oldest timestamp should be second");
-        assert_eq!(summaries[2].name, "a-new", "Newest timestamp should be last");
+        assert_eq!(
+            summaries[0].name, "m-broken",
+            "Broken (None ts) should be first"
+        );
+        assert_eq!(
+            summaries[1].name, "z-old",
+            "Oldest timestamp should be second"
+        );
+        assert_eq!(
+            summaries[2].name, "a-new",
+            "Newest timestamp should be last"
+        );
     }
 }
