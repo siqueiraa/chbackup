@@ -15,7 +15,6 @@ use chbackup::server::state::validate_backup_name;
 use chbackup::storage::S3Client;
 use chbackup::table_filter::TableFilter;
 use chbackup::{backup, download, list, restore, upload};
-use chrono::Utc;
 use clap::Parser;
 use cli::{Cli, Command};
 use tokio_util::sync::CancellationToken;
@@ -736,7 +735,7 @@ fn resolve_backup_name(name: Option<String>) -> Result<String> {
             }
             Ok(n)
         }
-        None => Ok(Utc::now().format("%Y-%m-%dT%H%M%S").to_string()),
+        None => Ok(chbackup::generate_backup_name()),
     }
 }
 

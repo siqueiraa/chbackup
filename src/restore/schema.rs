@@ -1325,10 +1325,7 @@ mod tests {
     /// All items succeed on the first round → Done, pending cleared.
     #[test]
     fn test_retry_loop_clears_pending_on_first_round_success() {
-        let mut state = RetryLoopState::new(
-            vec!["t1".into(), "t2".into(), "t3".into()],
-            10,
-        );
+        let mut state = RetryLoopState::new(vec!["t1".into(), "t2".into(), "t3".into()], 10);
         let result = state.finish_round(vec![], 3, 0, "test");
         assert!(matches!(result.unwrap(), RetryAction::Done));
         assert!(state.pending.is_empty());
@@ -1338,10 +1335,7 @@ mod tests {
     /// Some items fail then succeed on retry → Continue then Done.
     #[test]
     fn test_retry_loop_clears_pending_after_retry_success() {
-        let mut state = RetryLoopState::new(
-            vec!["t1".into(), "t2".into(), "t3".into()],
-            10,
-        );
+        let mut state = RetryLoopState::new(vec!["t1".into(), "t2".into(), "t3".into()], 10);
         // Round 0: t2 fails, 2 succeeded
         let failed = vec![("t2".into(), "dependency error".into())];
         let result = state.finish_round(failed, 2, 0, "test");

@@ -20,6 +20,12 @@ pub mod table_filter;
 pub mod upload;
 pub mod watch;
 
+/// Generate a timestamp-based backup name with millisecond precision.
+/// Used by CLI and API when no explicit name is provided.
+pub fn generate_backup_name() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H%M%S%.3f").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     //! Compile-time verification that all Phase 2c public types and functions

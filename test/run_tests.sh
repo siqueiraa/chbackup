@@ -160,6 +160,23 @@ else:
     return 1
 }
 
+# wait_for_server <max_wait> [auth_user] [auth_pass] — poll /health until ready
+wait_for_server() {
+    local max_wait="${1:-30}"
+    local auth_user="${2:-}"
+    local auth_pass="${3:-}"
+    for i in $(seq 1 "$max_wait"); do
+        if [[ -n "$auth_user" ]]; then
+            if curl -sf -u "${auth_user}:${auth_pass}" http://localhost:7171/health >/dev/null 2>&1; then return 0; fi
+        else
+            if curl -sf http://localhost:7171/health >/dev/null 2>&1; then return 0; fi
+        fi
+        sleep 1
+    done
+    echo "Server failed to start within ${max_wait}s"
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Validate required env vars
 # ---------------------------------------------------------------------------
@@ -382,7 +399,7 @@ if should_run "test_incremental_chain"; then
     cleanup_backup "${INCR_NAME}" "${FULL_NAME}"
 
     # Remove the extra rows we inserted
-    clickhouse-client -q "ALTER TABLE default.trades DELETE WHERE trade_id IN (99901, 99902)" 2>&1 || true
+    clickhouse-client -q "ALTER TABLE default.trades DELETE WHERE trade_id IN (99901, 99902) SETTINGS mutations_sync=1" 2>&1 || true
 fi
 
 # ---------------------------------------------------------------------------
@@ -496,21 +513,10 @@ if should_run "test_server_api_create_upload"; then
     SERVER_PID=$!
     sleep 2
 
-    # Wait for server to be ready (up to 10s)
-    api_ready=0
-    for i in $(seq 1 10); do
-        if curl -s http://localhost:7171/health >/dev/null 2>&1; then
-            api_ready=1
-            break
-        fi
-        sleep 1
-    done
-
-    if [[ $api_ready -eq 0 ]]; then
+    if ! wait_for_server 10; then
         fail "Server did not become ready within 10s"
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
-        # Skip remaining steps
     else
         pass "Server is ready"
 
@@ -1465,16 +1471,7 @@ if should_run "test_api_full_round_trip"; then
     SERVER_PID=$!
     sleep 2
 
-    api_ready=0
-    for i in $(seq 1 10); do
-        if curl -s http://localhost:7171/health >/dev/null 2>&1; then
-            api_ready=1
-            break
-        fi
-        sleep 1
-    done
-
-    if [[ $api_ready -eq 0 ]]; then
+    if ! wait_for_server 10; then
         fail "Server did not become ready"
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
@@ -1559,16 +1556,7 @@ if should_run "test_api_concurrent_rejection"; then
     SERVER_PID=$!
     sleep 2
 
-    api_ready=0
-    for i in $(seq 1 10); do
-        if curl -s http://localhost:7171/health >/dev/null 2>&1; then
-            api_ready=1
-            break
-        fi
-        sleep 1
-    done
-
-    if [[ $api_ready -eq 0 ]]; then
+    if ! wait_for_server 10; then
         fail "Server did not become ready"
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
@@ -1651,16 +1639,7 @@ if should_run "test_api_kill"; then
     SERVER_PID=$!
     sleep 2
 
-    api_ready=0
-    for i in $(seq 1 10); do
-        if curl -s http://localhost:7171/health >/dev/null 2>&1; then
-            api_ready=1
-            break
-        fi
-        sleep 1
-    done
-
-    if [[ $api_ready -eq 0 ]]; then
+    if ! wait_for_server 10; then
         fail "Server did not become ready"
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
@@ -1983,16 +1962,7 @@ if should_run "test_watch_mode"; then
     SERVER_PID=$!
     sleep 2
 
-    api_ready=0
-    for i in $(seq 1 10); do
-        if curl -s http://localhost:7171/health >/dev/null 2>&1; then
-            api_ready=1
-            break
-        fi
-        sleep 1
-    done
-
-    if [[ $api_ready -eq 0 ]]; then
+    if ! wait_for_server 10; then
         fail "Server did not become ready"
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
@@ -2322,25 +2292,6 @@ print(f'{local_parts} {s3_parts}')
         chbackup delete local "${DISKF_NAME}" 2>&1 || true
     fi
 fi
-
-# ===========================================================================
-# Helper: wait_for_server (used by T46-T55 API tests)
-# ===========================================================================
-wait_for_server() {
-    local max_wait="${1:-30}"
-    local auth_user="${2:-}"
-    local auth_pass="${3:-}"
-    for i in $(seq 1 "$max_wait"); do
-        if [[ -n "$auth_user" ]]; then
-            if curl -sf -u "${auth_user}:${auth_pass}" http://localhost:7171/health >/dev/null 2>&1; then return 0; fi
-        else
-            if curl -sf http://localhost:7171/health >/dev/null 2>&1; then return 0; fi
-        fi
-        sleep 1
-    done
-    echo "Server failed to start within ${max_wait}s"
-    return 1
-}
 
 # ---------------------------------------------------------------------------
 # T35: Default config output validation

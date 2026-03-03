@@ -413,7 +413,7 @@ pub async fn post_actions(
                 let backup_name = parts_owned
                     .get(1)
                     .cloned()
-                    .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
+                    .unwrap_or_else(crate::generate_backup_name);
 
                 let op = parts_owned[0].as_str();
 
@@ -837,7 +837,7 @@ pub async fn create_backup(
     let backup_name = req
         .backup_name
         .clone()
-        .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
+        .unwrap_or_else(crate::generate_backup_name);
 
     let metrics_clone = state.metrics.clone();
     run_operation(
@@ -1091,7 +1091,7 @@ pub async fn create_remote(
     let backup_name = req
         .backup_name
         .clone()
-        .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%S").to_string());
+        .unwrap_or_else(crate::generate_backup_name);
 
     let metrics_clone = state.metrics.clone();
     let cache_clone = state.manifest_cache.clone();
