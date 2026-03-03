@@ -1,0 +1,39 @@
+{
+  "git_base": "421cc296",
+  "modules": [
+    {
+      "path": "src/backup",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "none",
+      "note": "Adding tests only to existing #[cfg(test)] mod; no CLAUDE.md update needed"
+    },
+    {
+      "path": "src/download",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "none",
+      "note": "Adding tests only to existing #[cfg(test)] mod; no CLAUDE.md update needed"
+    },
+    {
+      "path": "src/restore",
+      "claude_md": "exists",
+      "triggers": [],
+      "action": "none",
+      "note": "Adding tests only to existing #[cfg(test)] mod; no CLAUDE.md update needed"
+    },
+    {
+      "path": ".github/workflows",
+      "claude_md": "new_directory",
+      "triggers": [],
+      "action": "none",
+      "note": "CI config change (coverage threshold); no CLAUDE.md applicable"
+    }
+  ],
+  "summary": {
+    "to_create": [],
+    "to_update": [],
+    "total_affected": 4,
+    "note": "All changes are test-only additions or CI config; no CLAUDE.md updates triggered"
+  }
+}

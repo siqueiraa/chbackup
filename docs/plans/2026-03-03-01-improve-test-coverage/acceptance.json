@@ -1,0 +1,216 @@
+{
+  "plan": "2026-03-03-01-improve-test-coverage",
+  "status": {"pass": 0, "fail": 5, "total": 5},
+  "last_updated": "2026-03-03T20:50:00Z",
+  "features": [
+    {
+      "id": "F001",
+      "category": "test",
+      "description": "Unit tests for pure helper functions in main.rs (backup_name_from_command, resolve_backup_name, backup_name_required, map_cli_location, map_cli_list_format, merge_skip_projections)",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c '#\\[cfg(test)\\]' src/main.rs",
+            "expected": "1",
+            "fail_message": "No #[cfg(test)] module found in main.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check --bin chbackup --tests 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "main.rs tests have compilation errors"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "main.rs unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Test-only code, no runtime binary behavior change",
+            "covered_by": ["F005"],
+            "alternative_verification": {
+              "command": "cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            }
+          }
+        ]
+      },
+      "related_tasks": [1],
+      "verified_at": null
+    },
+    {
+      "id": "F002",
+      "category": "test",
+      "description": "Unit tests for normalize_uuid and is_benign_type in backup/mod.rs",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'test_normalize_uuid\\|test_is_benign_type' src/backup/mod.rs",
+            "expected_minimum": 4,
+            "fail_message": "Expected at least 4 new test functions for normalize_uuid and is_benign_type"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check --lib --tests 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "backup/mod.rs tests have compilation errors"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- backup::tests::test_normalize_uuid backup::tests::test_is_benign_type backup::tests::test_filter_benign_type_drift 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "backup/mod.rs unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Test-only code, no runtime binary behavior change",
+            "covered_by": ["F005"],
+            "alternative_verification": {
+              "command": "cargo test --lib -- backup::tests::test_normalize_uuid backup::tests::test_is_benign_type 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            }
+          }
+        ]
+      },
+      "related_tasks": [2],
+      "verified_at": null
+    },
+    {
+      "id": "F003",
+      "category": "test",
+      "description": "Unit tests for sanitize_relative_path in download/mod.rs (SECURITY-CRITICAL path traversal prevention)",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'test_sanitize_relative_path' src/download/mod.rs",
+            "expected_minimum": 6,
+            "fail_message": "Expected at least 6 test functions for sanitize_relative_path"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check --lib --tests 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "download/mod.rs tests have compilation errors"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- download::tests::test_sanitize_relative_path 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "download/mod.rs sanitize_relative_path tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Test-only code, no runtime binary behavior change",
+            "covered_by": ["F005"],
+            "alternative_verification": {
+              "command": "cargo test --lib -- download::tests::test_sanitize_relative_path 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            }
+          }
+        ]
+      },
+      "related_tasks": [3],
+      "verified_at": null
+    },
+    {
+      "id": "F004",
+      "category": "test",
+      "description": "Unit tests for is_attach_warning, uuid_s3_prefix edge cases, and filesystem helpers in restore/attach.rs",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c 'test_is_attach_warning\\|test_uuid_s3_prefix_short\\|test_uuid_s3_prefix_no_dashes\\|test_detect_clickhouse_ownership_tempdir\\|test_hardlink_or_copy_dir_empty' src/restore/attach.rs",
+            "expected_minimum": 4,
+            "fail_message": "Expected at least 4 new test functions in restore/attach.rs"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check --lib --tests 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "restore/attach.rs tests have compilation errors"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test --lib -- restore::attach::tests::test_is_attach_warning restore::attach::tests::test_uuid_s3_prefix_short restore::attach::tests::test_uuid_s3_prefix_no_dashes restore::attach::tests::test_detect_clickhouse_ownership_tempdir restore::attach::tests::test_hardlink_or_copy_dir_empty 2>&1 | grep -c 'test result: ok'",
+            "expected": "1",
+            "fail_message": "restore/attach.rs unit tests failed"
+          },
+          {
+            "name": "runtime",
+            "status": "not_applicable",
+            "justification": "Test-only code, no runtime binary behavior change",
+            "covered_by": ["F005"],
+            "alternative_verification": {
+              "command": "cargo test --lib -- restore::attach::tests::test_is_attach_warning 2>&1 | grep 'test result: ok'",
+              "expected": "test result: ok"
+            }
+          }
+        ]
+      },
+      "related_tasks": [4],
+      "verified_at": null
+    },
+    {
+      "id": "F005",
+      "category": "feature",
+      "description": "CI coverage gate raised from 35% to 55% and all tests pass with no regressions",
+      "status": "fail",
+      "verification": {
+        "type": "multi_layer",
+        "layers": [
+          {
+            "name": "structural",
+            "command": "grep -c '>= 55' .github/workflows/ci.yml",
+            "expected": "1",
+            "fail_message": "CI coverage gate not updated to 55%"
+          },
+          {
+            "name": "compilation",
+            "command": "cargo check --all-targets 2>&1 | grep -c '^error' || echo 0",
+            "expected": "0",
+            "fail_message": "Compilation errors after all changes"
+          },
+          {
+            "name": "behavioral",
+            "command": "cargo test 2>&1 | tail -5 | grep -c 'test result: ok'",
+            "expected_minimum": 1,
+            "fail_message": "Some tests failed after all changes"
+          },
+          {
+            "name": "runtime",
+            "binary": "chbackup",
+            "build_command": "cargo build --release",
+            "wait_seconds": 0,
+            "patterns": ["test result: ok"],
+            "forbidden": ["test result: FAILED"],
+            "cleanup_markers": false,
+            "fail_message": "Full test suite regression",
+            "alternative_verification": {
+              "command": "cargo test 2>&1 | grep 'test result' | head -1",
+              "expected": "test result: ok"
+            }
+          }
+        ]
+      },
+      "related_tasks": [5],
+      "verified_at": null
+    }
+  ]
+}
