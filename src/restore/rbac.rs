@@ -349,7 +349,6 @@ fn make_drop_ddl(entity_type: &str, name: &str) -> Option<String> {
     Some(format!("DROP {} IF EXISTS `{}`", keyword, escaped_name))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,10 +398,7 @@ mod tests {
     #[test]
     fn test_make_drop_ddl_backtick_escape() {
         let ddl = make_drop_ddl("user", "user`name");
-        assert_eq!(
-            ddl,
-            Some("DROP USER IF EXISTS `user``name`".to_string())
-        );
+        assert_eq!(ddl, Some("DROP USER IF EXISTS `user``name`".to_string()));
     }
 
     #[test]
@@ -469,10 +465,7 @@ mod tests {
     #[test]
     fn test_make_drop_ddl_multiple_backticks() {
         let ddl = make_drop_ddl("role", "ro`le`name");
-        assert_eq!(
-            ddl,
-            Some("DROP ROLE IF EXISTS `ro``le``name`".to_string())
-        );
+        assert_eq!(ddl, Some("DROP ROLE IF EXISTS `ro``le``name`".to_string()));
     }
 
     /// Test make_drop_ddl with empty entity name.
@@ -505,10 +498,7 @@ mod tests {
     #[test]
     fn test_make_drop_ddl_unicode_name() {
         let ddl = make_drop_ddl("user", "admin_user");
-        assert_eq!(
-            ddl,
-            Some("DROP USER IF EXISTS `admin_user`".to_string())
-        );
+        assert_eq!(ddl, Some("DROP USER IF EXISTS `admin_user`".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -547,7 +537,11 @@ mod tests {
 
         for (entity_type, expected_prefix) in types_and_keywords {
             let result = make_drop_ddl(entity_type, "test_entity");
-            assert!(result.is_some(), "Expected Some for entity_type: {}", entity_type);
+            assert!(
+                result.is_some(),
+                "Expected Some for entity_type: {}",
+                entity_type
+            );
             let ddl = result.unwrap();
             assert!(
                 ddl.starts_with(expected_prefix),
@@ -563,7 +557,11 @@ mod tests {
     #[test]
     fn test_execute_restart_commands_sql_only() {
         let cmd = "sql:SYSTEM RELOAD CONFIG";
-        let parts: Vec<&str> = cmd.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = cmd
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         assert_eq!(parts.len(), 1);
         assert!(parts[0].starts_with("sql:"));
         let sql = parts[0].strip_prefix("sql:").unwrap().trim();
@@ -574,7 +572,11 @@ mod tests {
     #[test]
     fn test_execute_restart_commands_no_prefix() {
         let cmd = "systemctl restart clickhouse-server";
-        let parts: Vec<&str> = cmd.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = cmd
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         assert_eq!(parts.len(), 1);
         assert!(!parts[0].starts_with("exec:"));
         assert!(!parts[0].starts_with("sql:"));
@@ -584,7 +586,11 @@ mod tests {
     #[test]
     fn test_execute_restart_commands_mixed() {
         let cmd = "exec:echo hello;sql:SELECT 1;/usr/bin/service restart";
-        let parts: Vec<&str> = cmd.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = cmd
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         assert_eq!(parts.len(), 3);
         assert!(parts[0].starts_with("exec:"));
         assert!(parts[1].starts_with("sql:"));
@@ -694,7 +700,11 @@ mod tests {
 
         for (entity_type, keyword) in cases {
             let result = make_drop_ddl(entity_type, "test_name");
-            assert!(result.is_some(), "Expected Some for entity_type: {}", entity_type);
+            assert!(
+                result.is_some(),
+                "Expected Some for entity_type: {}",
+                entity_type
+            );
             let ddl = result.unwrap();
             assert_eq!(
                 ddl,
@@ -956,7 +966,10 @@ mod tests {
         let result = restore_rbac(&ch, &config, backup_dir.path(), "recreate").await;
         // Result depends on whether DDL failure is propagated — in recreate mode
         // it should be non-fatal, so Ok is expected
-        assert!(result.is_ok(), "Recreate mode should handle DDL failures gracefully");
+        assert!(
+            result.is_ok(),
+            "Recreate mode should handle DDL failures gracefully"
+        );
     }
 
     #[tokio::test]
@@ -975,7 +988,10 @@ mod tests {
         std::fs::write(access_dir.join("roles.jsonl"), jsonl).unwrap();
 
         let result = restore_rbac(&ch, &config, backup_dir.path(), "ignore").await;
-        assert!(result.is_ok(), "Ignore mode should handle DDL failures gracefully");
+        assert!(
+            result.is_ok(),
+            "Ignore mode should handle DDL failures gracefully"
+        );
     }
 
     #[tokio::test]
@@ -994,7 +1010,10 @@ mod tests {
         std::fs::write(access_dir.join("users.jsonl"), jsonl).unwrap();
 
         let result = restore_rbac(&ch, &config, backup_dir.path(), "fail").await;
-        assert!(result.is_err(), "Fail mode should return error on DDL failure");
+        assert!(
+            result.is_err(),
+            "Fail mode should return error on DDL failure"
+        );
     }
 
     // ---- restore_configs tests (file I/O only, no ChClient) ----

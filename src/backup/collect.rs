@@ -350,8 +350,7 @@ pub fn collect_parts(
                         hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
 
                         let part_info =
-                            PartInfo::new(part_name, part_size, crc64)
-                                .with_s3_objects(s3_objects);
+                            PartInfo::new(part_name, part_size, crc64).with_s3_objects(s3_objects);
 
                         result
                             .entry(full_table_name.clone())
@@ -1077,7 +1076,8 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&per_disk_part).unwrap();
 
-        let disks = BTreeMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
+        let disks =
+            BTreeMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
 
         let result = resolve_shadow_part_path(
             &backup_dir,
@@ -1110,7 +1110,8 @@ mod tests {
             .join("202401_1_50_3");
         std::fs::create_dir_all(&legacy_path).unwrap();
 
-        let disks = BTreeMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
+        let disks =
+            BTreeMap::from([("nvme1".to_string(), disk_path.to_string_lossy().to_string())]);
 
         let result = resolve_shadow_part_path(
             &backup_dir,

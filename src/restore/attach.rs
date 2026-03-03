@@ -708,7 +708,10 @@ async fn attach_parts_inner(params: &AttachParams<'_>, engine: &str) -> Result<u
                 "S3 disk part already prepared in detached/, skipping hardlink"
             );
         } else {
-            let disk_name = part_to_disk.get(part.name.as_str()).copied().unwrap_or("default");
+            let disk_name = part_to_disk
+                .get(part.name.as_str())
+                .copied()
+                .unwrap_or("default");
 
             // Resolve source directory using per-disk fallback chain
             let source_dir = resolve_shadow_part_path(

@@ -766,9 +766,7 @@ mod tests {
         // drop:    Distributed(0) < View(1) < Dictionary(2) < MergeTree(3)
         // i.e., highest restore priority = lowest drop priority
         assert!(engine_drop_priority("Distributed") < engine_drop_priority("Dictionary"));
-        assert!(
-            engine_restore_priority("Dictionary") < engine_restore_priority("Distributed")
-        );
+        assert!(engine_restore_priority("Dictionary") < engine_restore_priority("Distributed"));
     }
 
     // -----------------------------------------------------------------------
@@ -778,7 +776,10 @@ mod tests {
     #[test]
     fn test_data_table_priority_edge_cases() {
         // .inner prefix detection
-        assert_eq!(data_table_priority("default..inner_id.5f3a7b2c-1234-5678"), 1);
+        assert_eq!(
+            data_table_priority("default..inner_id.5f3a7b2c-1234-5678"),
+            1
+        );
         assert_eq!(data_table_priority("default..inner.mv_target"), 1);
         // Regular tables
         assert_eq!(data_table_priority("default.my_table"), 0);

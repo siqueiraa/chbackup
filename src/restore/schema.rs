@@ -174,10 +174,7 @@ pub async fn drop_tables(
 
     let sorted = sort_tables_for_drop(manifest, table_keys);
 
-    info!(
-        count = sorted.len(),
-        "Phase 0: Dropping tables (Mode A)"
-    );
+    info!(count = sorted.len(), "Phase 0: Dropping tables (Mode A)");
 
     let mut pending = sorted;
     let max_rounds = 10;
@@ -1091,7 +1088,10 @@ mod tests {
         // DDL that doesn't match any known CREATE pattern
         let ddl = "ALTER TABLE default.trades ADD COLUMN x UInt64";
         let result = ensure_if_not_exists_table(ddl);
-        assert_eq!(result, ddl, "Unrecognized DDL should pass through unchanged");
+        assert_eq!(
+            result, ddl,
+            "Unrecognized DDL should pass through unchanged"
+        );
     }
 
     /// Test ensure_if_not_exists_table when DDL already has IF NOT EXISTS
@@ -1100,7 +1100,10 @@ mod tests {
     fn test_ensure_if_not_exists_table_already_present() {
         let ddl = "CREATE TABLE IF NOT EXISTS default.t (id UInt64) ENGINE = MergeTree ORDER BY id";
         let result = ensure_if_not_exists_table(ddl);
-        assert_eq!(result, ddl, "Should return DDL unchanged when IF NOT EXISTS already present");
+        assert_eq!(
+            result, ddl,
+            "Should return DDL unchanged when IF NOT EXISTS already present"
+        );
     }
 
     /// Test ensure_if_not_exists_table when DDL already has IF NOT EXISTS
@@ -1257,8 +1260,7 @@ mod tests {
     /// CREATE TABLE already containing IF NOT EXISTS is returned unchanged.
     #[test]
     fn test_ensure_if_not_exists_table_already_present_v2() {
-        let ddl =
-            "CREATE TABLE IF NOT EXISTS db.t (col Int32) ENGINE = MergeTree ORDER BY col";
+        let ddl = "CREATE TABLE IF NOT EXISTS db.t (col Int32) ENGINE = MergeTree ORDER BY col";
         let result = ensure_if_not_exists_table(ddl);
         assert_eq!(result, ddl);
     }

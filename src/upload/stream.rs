@@ -69,7 +69,11 @@ pub fn compress_part(
 /// This is the shared tar-creation logic used by all buffered compression functions.
 /// The writer is borrowed mutably, so the caller retains ownership and can finalize
 /// any encoder wrapping it after this returns.
-fn tar_into_writer<W: std::io::Write>(writer: &mut W, part_dir: &Path, archive_name: &str) -> Result<()> {
+fn tar_into_writer<W: std::io::Write>(
+    writer: &mut W,
+    part_dir: &Path,
+    archive_name: &str,
+) -> Result<()> {
     let mut tar_builder = tar::Builder::new(writer);
     tar_builder
         .append_dir_all(archive_name, part_dir)
@@ -93,8 +97,8 @@ fn compress_lz4(part_dir: &Path, archive_name: &str) -> Result<Vec<u8>> {
 /// Compress with Zstandard format.
 fn compress_zstd(part_dir: &Path, archive_name: &str, compression_level: u32) -> Result<Vec<u8>> {
     let level = compression_level.min(22) as i32;
-    let mut encoder = zstd::Encoder::new(Vec::new(), level)
-        .context("Failed to create zstd encoder")?;
+    let mut encoder =
+        zstd::Encoder::new(Vec::new(), level).context("Failed to create zstd encoder")?;
     tar_into_writer(&mut encoder, part_dir, archive_name)?;
     let compressed = encoder
         .finish()
@@ -273,8 +277,8 @@ fn streaming_compress_inner(
         "zstd" => {
             let chunked = ChunkedWriter::new(chunk_size, sender.clone());
             let level = compression_level.min(22) as i32;
-            let mut encoder = zstd::Encoder::new(chunked, level)
-                .context("Failed to create zstd encoder")?;
+            let mut encoder =
+                zstd::Encoder::new(chunked, level).context("Failed to create zstd encoder")?;
             tar_into_writer(&mut encoder, part_dir, archive_name)?;
             let mut chunked = encoder
                 .finish()

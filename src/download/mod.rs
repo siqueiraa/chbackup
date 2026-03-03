@@ -204,8 +204,8 @@ fn find_existing_part(
         if validate_disk_path(dp) {
             let per_disk_base = Path::new(dp).join("backup");
             if per_disk_base.exists() {
-                let canonical = std::fs::canonicalize(&per_disk_base)
-                    .unwrap_or_else(|_| per_disk_base.clone());
+                let canonical =
+                    std::fs::canonicalize(&per_disk_base).unwrap_or_else(|_| per_disk_base.clone());
                 if seen.insert(canonical) {
                     search_bases.push(per_disk_base);
                 }
@@ -285,8 +285,7 @@ fn hardlink_existing_part(existing: &Path, target: &Path) -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             if let Err(e) = std::fs::hard_link(entry.path(), &dest) {
-                let is_exdev =
-                    e.raw_os_error() == Some(nix::errno::Errno::EXDEV as i32);
+                let is_exdev = e.raw_os_error() == Some(nix::errno::Errno::EXDEV as i32);
                 if is_exdev {
                     std::fs::copy(entry.path(), &dest)?;
                 } else {
@@ -492,7 +491,11 @@ pub async fn download(
             completed_keys: HashSet::new(),
             backup_name: backup_name.to_string(),
             params_hash: current_params_hash.clone(),
-            disk_map: manifest.disks.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            disk_map: manifest
+                .disks
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         };
         save_state_graceful(&state_path, &disk_map_state);
     }
@@ -576,7 +579,11 @@ pub async fn download(
             completed_keys,
             backup_name: backup_name.to_string(),
             params_hash: current_params_hash,
-            disk_map: manifest.disks.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            disk_map: manifest
+                .disks
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         };
         Some(Arc::new(tokio::sync::Mutex::new((
             state,
@@ -1122,10 +1129,7 @@ async fn download_simple_directory(
             match s3.get_object(relative_key).await {
                 Ok(data) => {
                     let full_s3_prefix = format!("{}{}", client_prefix_slash, s3_prefix);
-                    let rel_str = obj
-                        .key
-                        .strip_prefix(&full_s3_prefix)
-                        .unwrap_or(&obj.key);
+                    let rel_str = obj.key.strip_prefix(&full_s3_prefix).unwrap_or(&obj.key);
                     let safe_rel = sanitize_relative_path(rel_str);
                     let file_path = target_dir.join(&safe_rel);
                     if let Some(parent) = file_path.parent() {
@@ -1230,8 +1234,7 @@ mod tests {
     fn test_download_local_parts_not_flagged_as_s3() {
         // Verify that local disk parts are NOT flagged as S3
         let mut local_part = PartInfo::new("202401_1_50_3", 4096, 11111);
-        local_part.backup_key =
-            "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string();
+        local_part.backup_key = "daily/data/default/trades/202401_1_50_3.tar.lz4".to_string();
 
         let disk_types: HashMap<String, String> =
             HashMap::from([("default".to_string(), "local".to_string())]);

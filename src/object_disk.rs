@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(lines[2], "500\tstore/new/store/abc/data.bin"); // object
         assert_eq!(lines[3], "0"); // ref_count = 0
         assert_eq!(lines[4], "0"); // read_only = false
-        // Line 5 should be empty (inline_data = None produces empty line)
+                                   // Line 5 should be empty (inline_data = None produces empty line)
         assert_eq!(lines.len(), 6);
         assert_eq!(lines[5], "");
     }
@@ -710,7 +710,7 @@ mod tests {
         assert_eq!(lines[2], "500\tstore/abc/data.bin"); // object
         assert_eq!(lines[3], "2"); // ref_count
         assert_eq!(lines[4], "0"); // read_only
-        // Line 5 should be empty (inline_data = None produces empty line)
+                                   // Line 5 should be empty (inline_data = None produces empty line)
         assert_eq!(lines.len(), 6);
         assert_eq!(lines[5], "");
     }

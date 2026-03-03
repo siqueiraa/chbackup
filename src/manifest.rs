@@ -402,10 +402,7 @@ impl BackupManifest {
         self
     }
 
-    pub fn with_disk_remote_paths(
-        mut self,
-        disk_remote_paths: BTreeMap<String, String>,
-    ) -> Self {
+    pub fn with_disk_remote_paths(mut self, disk_remote_paths: BTreeMap<String, String>) -> Self {
         self.disk_remote_paths = disk_remote_paths;
         self
     }
@@ -772,12 +769,15 @@ mod tests {
     fn test_manifest_all_optional_fields() {
         let mut tables = BTreeMap::new();
         let mut parts = BTreeMap::new();
-        parts.insert("default".to_string(), vec![{
-            let mut p = PartInfo::new("all_0_0_0", 500, 11111);
-            p.backup_key = "backup/data/part.tar.lz4".to_string();
-            p.backup_size = 300;
-            p
-        }]);
+        parts.insert(
+            "default".to_string(),
+            vec![{
+                let mut p = PartInfo::new("all_0_0_0", 500, 11111);
+                p.backup_key = "backup/data/part.tar.lz4".to_string();
+                p.backup_size = 300;
+                p
+            }],
+        );
         tables.insert(
             "mydb.mytable".to_string(),
             TableManifest::test_new("ReplicatedMergeTree")
@@ -805,9 +805,10 @@ mod tests {
                 ("default".to_string(), "local".to_string()),
                 ("s3disk".to_string(), "s3".to_string()),
             ]),
-            disk_remote_paths: BTreeMap::from([
-                ("s3disk".to_string(), "s3://mybucket/data/".to_string()),
-            ]),
+            disk_remote_paths: BTreeMap::from([(
+                "s3disk".to_string(),
+                "s3://mybucket/data/".to_string(),
+            )]),
             tables,
             databases: vec![DatabaseInfo::test_new("mydb")],
             functions: vec!["my_udf".to_string()],
@@ -1040,9 +1041,7 @@ mod tests {
             .with_metadata_size(500)
             .with_disks(BTreeMap::from([("d".to_string(), "/data".to_string())]))
             .with_disk_types(BTreeMap::from([("d".to_string(), "local".to_string())]))
-            .with_disk_remote_paths(BTreeMap::from([
-                ("s3".to_string(), "s3://b/p".to_string()),
-            ]))
+            .with_disk_remote_paths(BTreeMap::from([("s3".to_string(), "s3://b/p".to_string())]))
             .with_databases(vec![DatabaseInfo::test_new("db1")])
             .with_tables(BTreeMap::from([(
                 "db1.t1".to_string(),

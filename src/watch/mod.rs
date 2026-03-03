@@ -1034,24 +1034,15 @@ mod tests {
     fn test_classify_neither_match() {
         // A name that matches neither "full" nor "incr" returns None
         let template = "{shard}-{type}-{time:%Y%m%d}";
-        assert_eq!(
-            classify_backup_type(template, "a-b-partial-20260303"),
-            None
-        );
+        assert_eq!(classify_backup_type(template, "a-b-partial-20260303"), None);
     }
 
     #[test]
     fn test_classify_no_delimiters() {
         // {type} immediately adjacent to another macro with no delimiter separation
         let template = "{type}{time}";
-        assert_eq!(
-            classify_backup_type(template, "full20260303"),
-            Some("full")
-        );
-        assert_eq!(
-            classify_backup_type(template, "incr20260303"),
-            Some("incr")
-        );
+        assert_eq!(classify_backup_type(template, "full20260303"), Some("full"));
+        assert_eq!(classify_backup_type(template, "incr20260303"), Some("incr"));
     }
 
     #[test]
@@ -1477,7 +1468,7 @@ mod tests {
         let decision = resume_state(
             &backups,
             "shard1-{type}-{time:%Y%m%d}",
-            std::time::Duration::from_secs(3600), // 1h
+            std::time::Duration::from_secs(3600),  // 1h
             std::time::Duration::from_secs(86400), // 24h
             now,
         );
@@ -1501,9 +1492,7 @@ mod tests {
         let now = Utc::now();
         let full_ts = now - chrono::Duration::minutes(10);
 
-        let backups = vec![
-            make_summary("full-20250315", full_ts, false),
-        ];
+        let backups = vec![make_summary("full-20250315", full_ts, false)];
 
         let decision = resume_state(
             &backups,
@@ -1530,9 +1519,7 @@ mod tests {
         let ts = now - chrono::Duration::minutes(30);
 
         // Backup name doesn't match any type classification for this template
-        let backups = vec![
-            make_summary("shard1-partial-20250315", ts, false),
-        ];
+        let backups = vec![make_summary("shard1-partial-20250315", ts, false)];
 
         let decision = resume_state(
             &backups,

@@ -100,7 +100,10 @@ impl RateLimiter {
 
         // Sleep outside the lock to avoid blocking other consumers
         if !sleep_duration.is_zero() {
-            debug!(sleep_ms = sleep_duration.as_millis(), "Rate limiter sleeping");
+            debug!(
+                sleep_ms = sleep_duration.as_millis(),
+                "Rate limiter sleeping"
+            );
             tokio::time::sleep(sleep_duration).await;
         }
     }

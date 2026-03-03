@@ -883,35 +883,50 @@ impl Config {
             if let Ok(n) = v.parse::<i32>() {
                 self.general.backups_to_keep_local = n;
             } else {
-                warn!("CHBACKUP_BACKUPS_TO_KEEP_LOCAL='{}' is not a valid i32, ignoring", v);
+                warn!(
+                    "CHBACKUP_BACKUPS_TO_KEEP_LOCAL='{}' is not a valid i32, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUPS_TO_KEEP_REMOTE") {
             if let Ok(n) = v.parse::<i32>() {
                 self.general.backups_to_keep_remote = n;
             } else {
-                warn!("CHBACKUP_BACKUPS_TO_KEEP_REMOTE='{}' is not a valid i32, ignoring", v);
+                warn!(
+                    "CHBACKUP_BACKUPS_TO_KEEP_REMOTE='{}' is not a valid i32, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_UPLOAD_CONCURRENCY") {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.upload_concurrency = n;
             } else {
-                warn!("CHBACKUP_UPLOAD_CONCURRENCY='{}' is not a valid u32, ignoring", v);
+                warn!(
+                    "CHBACKUP_UPLOAD_CONCURRENCY='{}' is not a valid u32, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_DOWNLOAD_CONCURRENCY") {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.download_concurrency = n;
             } else {
-                warn!("CHBACKUP_DOWNLOAD_CONCURRENCY='{}' is not a valid u32, ignoring", v);
+                warn!(
+                    "CHBACKUP_DOWNLOAD_CONCURRENCY='{}' is not a valid u32, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_RETRIES_ON_FAILURE") {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.retries_on_failure = n;
             } else {
-                warn!("CHBACKUP_RETRIES_ON_FAILURE='{}' is not a valid u32, ignoring", v);
+                warn!(
+                    "CHBACKUP_RETRIES_ON_FAILURE='{}' is not a valid u32, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_RETRIES_PAUSE") {
@@ -921,7 +936,10 @@ impl Config {
             if let Ok(n) = v.parse::<u64>() {
                 self.general.remote_cache_ttl_secs = n;
             } else {
-                warn!("CHBACKUP_REMOTE_CACHE_TTL_SECS='{}' is not a valid u64, ignoring", v);
+                warn!(
+                    "CHBACKUP_REMOTE_CACHE_TTL_SECS='{}' is not a valid u64, ignoring",
+                    v
+                );
             }
         }
 
@@ -956,7 +974,10 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.skip_verify = b;
             } else {
-                warn!("CLICKHOUSE_SKIP_VERIFY='{}' is not a valid bool, ignoring", v);
+                warn!(
+                    "CLICKHOUSE_SKIP_VERIFY='{}' is not a valid bool, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_TLS_KEY") {
@@ -972,14 +993,20 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.sync_replicated_tables = b;
             } else {
-                warn!("CLICKHOUSE_SYNC_REPLICATED_TABLES='{}' is not a valid bool, ignoring", v);
+                warn!(
+                    "CLICKHOUSE_SYNC_REPLICATED_TABLES='{}' is not a valid bool, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_MAX_CONNECTIONS") {
             if let Ok(n) = v.parse::<u32>() {
                 self.clickhouse.max_connections = n;
             } else {
-                warn!("CLICKHOUSE_MAX_CONNECTIONS='{}' is not a valid u32, ignoring", v);
+                warn!(
+                    "CLICKHOUSE_MAX_CONNECTIONS='{}' is not a valid u32, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_TIMEOUT") {
@@ -1076,7 +1103,10 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.s3.disable_cert_verification = b;
             } else {
-                warn!("S3_DISABLE_CERT_VERIFICATION='{}' is not a valid bool, ignoring", v);
+                warn!(
+                    "S3_DISABLE_CERT_VERIFICATION='{}' is not a valid bool, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("S3_CONCURRENCY") {
@@ -1098,21 +1128,30 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.upload_concurrency = n;
             } else {
-                warn!("CHBACKUP_BACKUP_UPLOAD_CONCURRENCY='{}' is not a valid u32, ignoring", v);
+                warn!(
+                    "CHBACKUP_BACKUP_UPLOAD_CONCURRENCY='{}' is not a valid u32, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY") {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.download_concurrency = n;
             } else {
-                warn!("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY='{}' is not a valid u32, ignoring", v);
+                warn!(
+                    "CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY='{}' is not a valid u32, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_RETRIES_ON_FAILURE") {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.retries_on_failure = n;
             } else {
-                warn!("CHBACKUP_BACKUP_RETRIES_ON_FAILURE='{}' is not a valid u32, ignoring", v);
+                warn!(
+                    "CHBACKUP_BACKUP_RETRIES_ON_FAILURE='{}' is not a valid u32, ignoring",
+                    v
+                );
             }
         }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_RETRIES_DURATION") {
@@ -1132,7 +1171,10 @@ impl Config {
             if let Ok(n) = v.parse::<u64>() {
                 self.backup.streaming_upload_threshold = n;
             } else {
-                warn!("CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD='{}' is not a valid u64, ignoring", v);
+                warn!(
+                    "CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD='{}' is not a valid u64, ignoring",
+                    v
+                );
             }
         }
 
@@ -1157,7 +1199,10 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.api.create_integration_tables = b;
             } else {
-                warn!("API_CREATE_INTEGRATION_TABLES='{}' is not a valid bool, ignoring", v);
+                warn!(
+                    "API_CREATE_INTEGRATION_TABLES='{}' is not a valid bool, ignoring",
+                    v
+                );
             }
         }
 
@@ -1179,7 +1224,10 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.watch.max_consecutive_errors = n;
             } else {
-                warn!("WATCH_MAX_CONSECUTIVE_ERRORS='{}' is not a valid u32, ignoring", v);
+                warn!(
+                    "WATCH_MAX_CONSECUTIVE_ERRORS='{}' is not a valid u32, ignoring",
+                    v
+                );
             }
         }
     }
@@ -2340,7 +2388,10 @@ mod tests {
     fn test_default_yaml_contains_sections() {
         let yaml = Config::default_yaml().unwrap();
         // Should contain all 7 sections
-        assert!(yaml.contains("general:"), "YAML should have general section");
+        assert!(
+            yaml.contains("general:"),
+            "YAML should have general section"
+        );
         assert!(
             yaml.contains("clickhouse:"),
             "YAML should have clickhouse section"
@@ -2703,18 +2754,9 @@ s3:
 
     #[test]
     fn test_env_key_to_dot_notation_s3_keys() {
-        assert_eq!(
-            env_key_to_dot_notation("S3_REGION"),
-            Some("s3.region")
-        );
-        assert_eq!(
-            env_key_to_dot_notation("S3_ENDPOINT"),
-            Some("s3.endpoint")
-        );
-        assert_eq!(
-            env_key_to_dot_notation("S3_PREFIX"),
-            Some("s3.prefix")
-        );
+        assert_eq!(env_key_to_dot_notation("S3_REGION"), Some("s3.region"));
+        assert_eq!(env_key_to_dot_notation("S3_ENDPOINT"), Some("s3.endpoint"));
+        assert_eq!(env_key_to_dot_notation("S3_PREFIX"), Some("s3.prefix"));
         assert_eq!(
             env_key_to_dot_notation("S3_ACCESS_KEY"),
             Some("s3.access_key")
@@ -2791,10 +2833,7 @@ s3:
 
     #[test]
     fn test_env_key_to_dot_notation_api_keys() {
-        assert_eq!(
-            env_key_to_dot_notation("API_LISTEN"),
-            Some("api.listen")
-        );
+        assert_eq!(env_key_to_dot_notation("API_LISTEN"), Some("api.listen"));
         assert_eq!(
             env_key_to_dot_notation("API_CREATE_INTEGRATION_TABLES"),
             Some("api.create_integration_tables")

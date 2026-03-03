@@ -227,11 +227,10 @@ impl ChClient {
             let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
             http.enforce_http(false);
             let connector = hyper_tls::HttpsConnector::from((http, tls.into()));
-            let hyper_client = hyper_util::client::legacy::Client::builder(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .pool_idle_timeout(Duration::from_millis(2_500))
-            .build(connector);
+            let hyper_client =
+                hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                    .pool_idle_timeout(Duration::from_millis(2_500))
+                    .build(connector);
 
             clickhouse::Client::with_http_client(hyper_client)
                 .with_url(&url)
@@ -249,7 +248,10 @@ impl ChClient {
 
         let timeout_secs = crate::config::parse_duration_secs(&config.timeout).unwrap_or(300);
         client = client.with_option("max_execution_time", timeout_secs.to_string());
-        debug!(timeout_secs = timeout_secs, "Applied max_execution_time setting to ClickHouse client");
+        debug!(
+            timeout_secs = timeout_secs,
+            "Applied max_execution_time setting to ClickHouse client"
+        );
 
         if config.debug {
             info!("ClickHouse debug mode enabled: all queries will be logged at info level");
@@ -531,12 +533,7 @@ impl ChClient {
                               FROM system.disks";
         debug!("remote_path column not available, trying query with object_storage_type only");
 
-        if let Ok(rows) = self
-            .inner
-            .query(sql_no_remote)
-            .fetch_all::<DiskRow>()
-            .await
-        {
+        if let Ok(rows) = self.inner.query(sql_no_remote).fetch_all::<DiskRow>().await {
             return Ok(rows);
         }
 
@@ -1529,7 +1526,8 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
          compressed_size UInt64, \
          required String\
          ) ENGINE = URL('http://{}:{}/api/v1/list', 'JSONEachRow')",
-        escape_sql_string(api_host), port
+        escape_sql_string(api_host),
+        port
     );
 
     let actions_ddl = format!(
@@ -1540,7 +1538,8 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
          status String, \
          error String\
          ) ENGINE = URL('http://{}:{}/api/v1/actions', 'JSONEachRow')",
-        escape_sql_string(api_host), port
+        escape_sql_string(api_host),
+        port
     );
 
     (list_ddl, actions_ddl)
@@ -1556,12 +1555,11 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
 /// `remote_path` in `system.disks`. The endpoint URL format is
 /// `https://s3.region.amazonaws.com/bucket/prefix/` which can be
 /// converted to an S3 URI `s3://bucket/prefix/` for CopyObject.
-pub fn discover_s3_disk_endpoints(
-    config_dir: &str,
-) -> std::collections::BTreeMap<String, String> {
+pub fn discover_s3_disk_endpoints(config_dir: &str) -> std::collections::BTreeMap<String, String> {
     use std::path::Path;
 
-    let mut endpoints: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut endpoints: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
 
     let config_path = Path::new(config_dir);
     let mut xml_files: Vec<std::path::PathBuf> = Vec::new();
@@ -1645,10 +1643,11 @@ fn parse_s3_disks_from_xml(
 
         // Extract tag name
         let tag_name_start = tag_start + 1;
-        let tag_name_end = match disks_xml[tag_name_start..].find(|c: char| c == '>' || c.is_whitespace()) {
-            Some(i) => tag_name_start + i,
-            None => break,
-        };
+        let tag_name_end =
+            match disks_xml[tag_name_start..].find(|c: char| c == '>' || c.is_whitespace()) {
+                Some(i) => tag_name_start + i,
+                None => break,
+            };
 
         // Skip closing tags
         if disks_xml[tag_name_start..].starts_with('/') {
@@ -1675,11 +1674,10 @@ fn parse_s3_disks_from_xml(
         let disk_content = &disks_xml[disk_content_start..disk_content_end];
 
         // Check if this is an S3 disk
-        let is_s3 = extract_xml_section(disk_content, "type")
-            .is_some_and(|t| {
-                let trimmed = t.trim().to_ascii_lowercase();
-                trimmed == "s3" || trimmed == "object_storage"
-            });
+        let is_s3 = extract_xml_section(disk_content, "type").is_some_and(|t| {
+            let trimmed = t.trim().to_ascii_lowercase();
+            trimmed == "s3" || trimmed == "object_storage"
+        });
 
         if is_s3 {
             if let Some(endpoint) = extract_xml_section(disk_content, "endpoint") {
@@ -1720,7 +1718,13 @@ fn endpoint_url_to_s3_uri(endpoint: &str) -> String {
 
     // Path-style: https://s3.region.amazonaws.com/bucket/prefix/
     // The bucket is the first path component, rest is prefix
-    if host.starts_with("s3.") || host.contains(".amazonaws.com") && !host.split('.').next().is_some_and(|first| first != "s3" && first.len() > 3) {
+    if host.starts_with("s3.")
+        || host.contains(".amazonaws.com")
+            && !host
+                .split('.')
+                .next()
+                .is_some_and(|first| first != "s3" && first.len() > 3)
+    {
         // Path-style URL
         let (bucket, prefix) = match path.find('/') {
             Some(i) => (&path[..i], &path[i + 1..]),
@@ -1765,10 +1769,7 @@ mod tests {
         assert_eq!(escape_sql_string("it's"), "it''s");
         assert_eq!(escape_sql_string("a''b"), "a''''b");
         assert_eq!(escape_sql_string(""), "");
-        assert_eq!(
-            escape_sql_string("O'Brien's data"),
-            "O''Brien''s data"
-        );
+        assert_eq!(escape_sql_string("O'Brien's data"), "O''Brien''s data");
     }
 
     #[test]
@@ -1853,10 +1854,7 @@ mod tests {
     #[test]
     fn test_drop_table_sql_with_backtick_in_name() {
         let sql = drop_table_sql("my`db", "my`table", None);
-        assert_eq!(
-            sql,
-            "DROP TABLE IF EXISTS `my``db`.`my``table` SYNC"
-        );
+        assert_eq!(sql, "DROP TABLE IF EXISTS `my``db`.`my``table` SYNC");
     }
 
     #[test]
@@ -2335,7 +2333,7 @@ mod tests {
             sql,
             "ALTER TABLE `logs`.`events` UPDATE status = 'archived' WHERE ts < '2024-01-01' SETTINGS mutations_sync=2"
         );
-    
+
         // MATERIALIZE mutation
         let sql = execute_mutation_sql("default", "trades", "MATERIALIZE COLUMN new_col");
         assert_eq!(
@@ -2389,7 +2387,7 @@ mod tests {
         assert_eq!(sql, "");
     }
 
-        // -- Phase 4f: JSON/Object column detection tests --
+    // -- Phase 4f: JSON/Object column detection tests --
 
     #[test]
     fn test_json_column_row_struct() {
@@ -2462,14 +2460,8 @@ mod tests {
     #[test]
     fn test_extract_xml_section() {
         let xml = "<root><name>test</name><value>42</value></root>";
-        assert_eq!(
-            extract_xml_section(xml, "name"),
-            Some("test".to_string())
-        );
-        assert_eq!(
-            extract_xml_section(xml, "value"),
-            Some("42".to_string())
-        );
+        assert_eq!(extract_xml_section(xml, "name"), Some("test".to_string()));
+        assert_eq!(extract_xml_section(xml, "value"), Some("42".to_string()));
         assert_eq!(extract_xml_section(xml, "missing"), None);
     }
 

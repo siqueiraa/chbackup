@@ -1711,20 +1711,12 @@ mod tests {
     #[test]
     fn test_parse_replicated_params_non_replicated_returns_none() {
         // Various non-Replicated engines
-        assert!(
-            parse_replicated_params(
-                "CREATE TABLE t (id UInt64) ENGINE = MergeTree ORDER BY id"
-            )
-            .is_none()
-        );
         assert!(parse_replicated_params(
-            "CREATE TABLE t (id UInt64) ENGINE = Memory"
+            "CREATE TABLE t (id UInt64) ENGINE = MergeTree ORDER BY id"
         )
         .is_none());
-        assert!(
-            parse_replicated_params("CREATE TABLE t (id UInt64) ENGINE = Log")
-                .is_none()
-        );
+        assert!(parse_replicated_params("CREATE TABLE t (id UInt64) ENGINE = Memory").is_none());
+        assert!(parse_replicated_params("CREATE TABLE t (id UInt64) ENGINE = Log").is_none());
     }
 
     #[test]
@@ -1959,7 +1951,10 @@ mod tests {
         // Covers line 631: Replicated found but no opening paren
         let ddl = "CREATE TABLE db.t (col Int32) ENGINE = ReplicatedMergeTree ORDER BY col";
         let result = rewrite_replicated_zk_path(ddl, "newdb", "newt", "/zk/{database}/{table}");
-        assert_eq!(result, ddl, "Should return unchanged when no paren after Replicated");
+        assert_eq!(
+            result, ddl,
+            "Should return unchanged when no paren after Replicated"
+        );
     }
 
     #[test]
@@ -1967,7 +1962,10 @@ mod tests {
         // Covers line 638: Replicated( found but no single quote inside
         let ddl = "CREATE TABLE db.t (col Int32) ENGINE = ReplicatedMergeTree() ORDER BY col";
         let result = rewrite_replicated_zk_path(ddl, "newdb", "newt", "/zk/{database}/{table}");
-        assert_eq!(result, ddl, "Should return unchanged when no quotes in parens");
+        assert_eq!(
+            result, ddl,
+            "Should return unchanged when no quotes in parens"
+        );
     }
 
     #[test]
@@ -1975,7 +1973,10 @@ mod tests {
         // Covers line 644: opening quote found but no closing quote
         let ddl = "CREATE TABLE db.t (col Int32) ENGINE = ReplicatedMergeTree('/zk/path";
         let result = rewrite_replicated_zk_path(ddl, "newdb", "newt", "/zk/{database}/{table}");
-        assert_eq!(result, ddl, "Should return unchanged when quote is unclosed");
+        assert_eq!(
+            result, ddl,
+            "Should return unchanged when quote is unclosed"
+        );
     }
 
     #[test]
@@ -2011,8 +2012,7 @@ mod tests {
         // Covers line 681: Distributed found but no paren
         // (handled via find_distributed_engine returning None)
         let ddl = "CREATE TABLE db.t (col Int32) ENGINE = MergeTree ORDER BY col";
-        let result =
-            rewrite_distributed_engine(ddl, "db", "t", "newdb", "newt");
+        let result = rewrite_distributed_engine(ddl, "db", "t", "newdb", "newt");
         assert_eq!(result, ddl);
     }
 
@@ -2020,19 +2020,19 @@ mod tests {
     fn test_rewrite_distributed_engine_no_closing_paren() {
         // Covers line 693: find_matching_paren returns None
         let ddl = "CREATE TABLE db.t (col Int32) ENGINE = Distributed('cluster', 'db', 't'";
-        let result =
-            rewrite_distributed_engine(ddl, "db", "t", "newdb", "newt");
+        let result = rewrite_distributed_engine(ddl, "db", "t", "newdb", "newt");
         assert_eq!(result, ddl, "Should return unchanged when no closing paren");
     }
 
     #[test]
     fn test_rewrite_distributed_engine_too_few_args() {
         // Covers line 701: fewer than 3 args
-        let ddl =
-            "CREATE TABLE db.t (col Int32) ENGINE = Distributed('cluster', 'db')";
-        let result =
-            rewrite_distributed_engine(ddl, "db", "t", "newdb", "newt");
-        assert_eq!(result, ddl, "Should return unchanged when fewer than 3 args");
+        let ddl = "CREATE TABLE db.t (col Int32) ENGINE = Distributed('cluster', 'db')";
+        let result = rewrite_distributed_engine(ddl, "db", "t", "newdb", "newt");
+        assert_eq!(
+            result, ddl,
+            "Should return unchanged when fewer than 3 args"
+        );
     }
 
     #[test]
@@ -2093,7 +2093,10 @@ mod tests {
         // ALTER TABLE is not in the supported prefixes, should fall through
         let ddl = "ALTER TABLE db.t ADD COLUMN x UInt64";
         let result = add_on_cluster_clause(ddl, "mycluster");
-        assert_eq!(result, ddl, "ALTER TABLE should not get ON CLUSTER injected");
+        assert_eq!(
+            result, ddl,
+            "ALTER TABLE should not get ON CLUSTER injected"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2148,7 +2151,8 @@ mod tests {
         // Actually this is covered by find_distributed_engine returning None
         // because it checks for '(' after "Distributed"
         // Let's test with Distributed appearing but not as engine
-        let ddl = "CREATE TABLE t ENGINE = MergeTree ORDER BY col COMMENT 'uses Distributed approach'";
+        let ddl =
+            "CREATE TABLE t ENGINE = MergeTree ORDER BY col COMMENT 'uses Distributed approach'";
         let result = rewrite_distributed_cluster(ddl, "new_cluster");
         assert_eq!(result, ddl);
     }
@@ -2158,7 +2162,10 @@ mod tests {
         // Covers line 532: Distributed( found but no single quotes
         let ddl = "CREATE TABLE t ENGINE = Distributed(cluster, db, t)";
         let result = rewrite_distributed_cluster(ddl, "new_cluster");
-        assert_eq!(result, ddl, "Should return unchanged when no quoted cluster");
+        assert_eq!(
+            result, ddl,
+            "Should return unchanged when no quoted cluster"
+        );
     }
 
     #[test]
@@ -2179,17 +2186,15 @@ mod tests {
     #[test]
     fn test_find_distributed_engine_not_followed_by_paren() {
         // Covers lines 764, 766: "Distributed" appears but next non-whitespace is not '('
-        let result = find_distributed_engine(
-            "CREATE TABLE t ENGINE = MergeTree COMMENT 'Distributed data'"
-        );
+        let result =
+            find_distributed_engine("CREATE TABLE t ENGINE = MergeTree COMMENT 'Distributed data'");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_find_distributed_engine_with_paren() {
-        let result = find_distributed_engine(
-            "CREATE TABLE t ENGINE = Distributed('cluster', 'db', 't')"
-        );
+        let result =
+            find_distributed_engine("CREATE TABLE t ENGINE = Distributed('cluster', 'db', 't')");
         assert!(result.is_some());
     }
 

@@ -576,9 +576,6 @@ mod tests {
         assert!(loaded.named_collections);
         assert_eq!(loaded.partitions, Some("202401".to_string()));
         assert!(loaded.skip_empty_tables);
-        assert_eq!(
-            loaded.database_mapping.get("src_db").unwrap(),
-            "dst_db"
-        );
+        assert_eq!(loaded.database_mapping.get("src_db").unwrap(), "dst_db");
     }
 }

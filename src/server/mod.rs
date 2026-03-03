@@ -58,10 +58,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/download/:name", post(routes::download_backup))
         .route("/api/v1/restore/:name", post(routes::restore_backup))
         .route("/api/v1/create_remote", post(routes::create_remote))
-        .route(
-            "/api/v1/restore_remote/:name",
-            post(routes::restore_remote),
-        )
+        .route("/api/v1/restore_remote/:name", post(routes::restore_remote))
         // Delete endpoints
         .route(
             "/api/v1/delete/:location/:name",
@@ -701,7 +698,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let json = body_json(resp.into_body()).await;
         assert!(
-            json["error"].as_str().unwrap().contains("invalid backup name"),
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid backup name"),
             "Error should mention invalid backup name"
         );
     }
@@ -799,10 +799,7 @@ mod tests {
         // Unknown command should return 400
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let json = body_json(resp.into_body()).await;
-        assert!(json["error"]
-            .as_str()
-            .unwrap()
-            .contains("unknown command"));
+        assert!(json["error"].as_str().unwrap().contains("unknown command"));
     }
 
     #[tokio::test]

@@ -1607,9 +1607,7 @@ mod tests {
         tables.insert(
             "default.trades".to_string(),
             TableManifest::test_new("MergeTree")
-                .with_ddl(
-                    "CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id",
-                )
+                .with_ddl("CREATE TABLE default.trades (id UInt64) ENGINE = MergeTree ORDER BY id")
                 .with_total_bytes(1_000_000),
         );
 
@@ -2119,8 +2117,7 @@ mod tests {
                         backup_key: "daily/objects/store/abc/def/index.bin".to_string(),
                     },
                 ]);
-                p.backup_key =
-                    "daily/data/default/trades/s3disk/202403_1_1_0.tar.lz4".to_string();
+                p.backup_key = "daily/data/default/trades/s3disk/202403_1_1_0.tar.lz4".to_string();
                 p
             }],
         );
@@ -2299,14 +2296,11 @@ mod tests {
         let mut parts = BTreeMap::new();
         parts.insert(
             "default".to_string(),
-            vec![
-                PartInfo::new("all_0_0_0", 100, 0),
-                {
-                    let mut p = PartInfo::new("all_1_1_0", 100, 0);
-                    p.source = "carried:base-backup".to_string();
-                    p
-                },
-            ],
+            vec![PartInfo::new("all_0_0_0", 100, 0), {
+                let mut p = PartInfo::new("all_1_1_0", 100, 0);
+                p.source = "carried:base-backup".to_string();
+                p
+            }],
         );
         tables.insert(
             "db.table".to_string(),
@@ -3095,8 +3089,10 @@ mod tests {
 
     #[test]
     fn test_broken_summary_structure() {
-        let summary =
-            broken_summary("bad-backup".to_string(), "metadata.json not found".to_string());
+        let summary = broken_summary(
+            "bad-backup".to_string(),
+            "metadata.json not found".to_string(),
+        );
         assert_eq!(summary.name, "bad-backup");
         assert!(summary.is_broken);
         assert_eq!(
@@ -3223,11 +3219,14 @@ mod tests {
         use crate::manifest::{PartInfo, TableManifest};
 
         let mut parts = BTreeMap::new();
-        parts.insert("default".to_string(), vec![{
-            let mut p = PartInfo::new("all_0_0_0", 100, 0);
-            p.source = "carried:base-full-backup".to_string();
-            p
-        }]);
+        parts.insert(
+            "default".to_string(),
+            vec![{
+                let mut p = PartInfo::new("all_0_0_0", 100, 0);
+                p.source = "carried:base-full-backup".to_string();
+                p
+            }],
+        );
 
         let mut tables = BTreeMap::new();
         tables.insert(
@@ -3681,10 +3680,7 @@ mod tests {
 
     #[test]
     fn test_strip_s3_prefix_with_trailing_slash() {
-        assert_eq!(
-            strip_s3_prefix("prefix/key.json", "prefix/"),
-            "key.json"
-        );
+        assert_eq!(strip_s3_prefix("prefix/key.json", "prefix/"), "key.json");
     }
 
     #[test]

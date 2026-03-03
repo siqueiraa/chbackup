@@ -68,7 +68,11 @@ fn paginate<T>(
         items.into_iter().skip(offset).take(limit).collect()
     } else {
         if offset > 0 {
-            info!(offset = offset, total = total_count, "{label}: offset applied");
+            info!(
+                offset = offset,
+                total = total_count,
+                "{label}: offset applied"
+            );
         }
         items.into_iter().skip(offset).collect()
     };
@@ -366,8 +370,7 @@ pub async fn post_actions(
             // as shortcut inputs that get resolved at runtime.
             if matches!(op_name, "create" | "create_remote") {
                 if let Some(name) = parts.get(1) {
-                    reject_reserved_backup_name(name)
-                        .map_err(|e| validation_error(name, e))?;
+                    reject_reserved_backup_name(name).map_err(|e| validation_error(name, e))?;
                 }
             }
 
@@ -1464,11 +1467,7 @@ async fn reload_config_and_clients(
 ///
 /// In-flight operations hold permits against the old `Semaphore` instance and
 /// are unaffected. Shared by `reload()` and `restart()`.
-fn maybe_rebuild_semaphore(
-    state: &AppState,
-    new_config: &crate::config::Config,
-    caller: &str,
-) {
+fn maybe_rebuild_semaphore(state: &AppState, new_config: &crate::config::Config, caller: &str) {
     let old_allow_parallel = state.config.load().api.allow_parallel;
     if old_allow_parallel != new_config.api.allow_parallel {
         let new_permits = if new_config.api.allow_parallel {
@@ -1482,17 +1481,15 @@ fn maybe_rebuild_semaphore(
         info!(
             old = old_allow_parallel,
             new = new_config.api.allow_parallel,
-            "{}: op_semaphore rebuilt (allow_parallel changed)", caller
+            "{}: op_semaphore rebuilt (allow_parallel changed)",
+            caller
         );
     }
 }
 
 /// Update `ManifestCache` TTL after config reload/restart so the cache picks
 /// up any change to `general.remote_cache_ttl_secs`.
-async fn update_manifest_cache_ttl(
-    state: &AppState,
-    new_config: &crate::config::Config,
-) {
+async fn update_manifest_cache_ttl(state: &AppState, new_config: &crate::config::Config) {
     let ttl = std::time::Duration::from_secs(new_config.general.remote_cache_ttl_secs);
     state.manifest_cache.lock().await.set_ttl(ttl);
 }
@@ -2771,8 +2768,8 @@ mod tests {
             "configs": true,
             "named_collections": false
         }"#;
-        let req: RestoreRemoteRequest = serde_json::from_str(json)
-            .expect("Should parse RestoreRemoteRequest with all fields");
+        let req: RestoreRemoteRequest =
+            serde_json::from_str(json).expect("Should parse RestoreRemoteRequest with all fields");
         assert_eq!(req.rm, Some(true));
         assert_eq!(req.rbac, Some(true));
         assert_eq!(req.configs, Some(true));

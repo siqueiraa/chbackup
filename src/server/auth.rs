@@ -189,10 +189,7 @@ mod tests {
         let www_auth = headers
             .get(header::WWW_AUTHENTICATE)
             .expect("Should have WWW-Authenticate header");
-        assert_eq!(
-            www_auth.to_str().unwrap(),
-            "Basic realm=\"chbackup\""
-        );
+        assert_eq!(www_auth.to_str().unwrap(), "Basic realm=\"chbackup\"");
     }
 
     #[test]
