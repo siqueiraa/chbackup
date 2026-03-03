@@ -408,8 +408,8 @@ pub fn list_local(data_path: &str) -> Result<Vec<BackupSummary>> {
         summaries.push(summary);
     }
 
-    // Sort by name (chronological if names are date-based)
-    summaries.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sort by timestamp (falling back to name for broken backups with None timestamp)
+    summaries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.name.cmp(&b.name)));
 
     info!(count = summaries.len(), "Listed local backups");
     Ok(summaries)
@@ -480,8 +480,8 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
         }
     }
 
-    // Sort by name
-    summaries.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sort by timestamp (falling back to name for broken backups with None timestamp)
+    summaries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.name.cmp(&b.name)));
 
     info!(count = summaries.len(), "Listed remote backups");
     Ok(summaries)
@@ -1576,7 +1576,7 @@ mod tests {
         let summaries = list_local(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(summaries.len(), 2);
 
-        // Results are sorted by name
+        // Results are sorted by timestamp (name used as tiebreaker)
         let broken = summaries
             .iter()
             .find(|s| s.name == "broken-backup")
@@ -3460,16 +3460,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_list_local_sorted_by_name() {
+    fn test_list_local_sorted_by_timestamp() {
+        use chrono::TimeZone;
+
         let dir = tempfile::tempdir().unwrap();
         let backup_base = dir.path().join("backup");
         std::fs::create_dir_all(&backup_base).unwrap();
 
-        // Create backups in non-alphabetical order
-        for name in &["zebra", "alpha", "middle"] {
+        // Create backups with explicit timestamps where name order differs from timestamp order
+        let cases = [
+            ("zebra", chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+            ("alpha", chrono::Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap()),
+            ("middle", chrono::Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap()),
+        ];
+        for (name, ts) in &cases {
             let backup_dir = backup_base.join(name);
             std::fs::create_dir_all(&backup_dir).unwrap();
-            let manifest = BackupManifest::test_new(*name);
+            let mut manifest = BackupManifest::test_new(*name);
+            manifest.timestamp = *ts;
             manifest
                 .save_to_file(&backup_dir.join("metadata.json"))
                 .unwrap();
@@ -3477,10 +3485,10 @@ mod tests {
 
         let summaries = list_local(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(summaries.len(), 3);
-        // Should be sorted alphabetically by name
-        assert_eq!(summaries[0].name, "alpha");
-        assert_eq!(summaries[1].name, "middle");
-        assert_eq!(summaries[2].name, "zebra");
+        // Should be sorted by timestamp, not name
+        assert_eq!(summaries[0].name, "zebra");  // oldest: 2024-01-01
+        assert_eq!(summaries[1].name, "middle"); // middle: 2024-03-01
+        assert_eq!(summaries[2].name, "alpha");  // newest: 2024-06-01
     }
 
     // -----------------------------------------------------------------------
@@ -3913,5 +3921,65 @@ mod tests {
             header_cols, data_cols
         );
         assert_eq!(header_cols, 12, "Should have 12 columns");
+    }
+
+    #[test]
+    fn test_list_sort_by_timestamp_not_name() {
+        use chrono::TimeZone;
+
+        // Build summaries where name order differs from timestamp order
+        let mut summaries = [
+            BackupSummary {
+                name: "z-old".to_string(),
+                timestamp: Some(chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+            BackupSummary {
+                name: "a-new".to_string(),
+                timestamp: Some(chrono::Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap()),
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: false,
+                broken_reason: None,
+            },
+            // Broken backup with None timestamp — should sort first (None < Some)
+            BackupSummary {
+                name: "m-broken".to_string(),
+                timestamp: None,
+                size: 0,
+                compressed_size: 0,
+                table_count: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                object_disk_size: 0,
+                required: String::new(),
+                is_broken: true,
+                broken_reason: Some("missing metadata".to_string()),
+            },
+        ];
+
+        // Apply the same sort used by list_local / list_remote
+        summaries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.name.cmp(&b.name)));
+
+        // None timestamps sort first, then ascending by timestamp
+        assert_eq!(summaries[0].name, "m-broken", "Broken (None ts) should be first");
+        assert_eq!(summaries[1].name, "z-old", "Oldest timestamp should be second");
+        assert_eq!(summaries[2].name, "a-new", "Newest timestamp should be last");
     }
 }

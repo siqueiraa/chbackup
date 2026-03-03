@@ -628,7 +628,11 @@ pub async fn post_actions(
                                     Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
                                 })
                             }
-                            _ => list::delete_remote(&s3, &name).await,
+                            "remote" => list::delete_remote(&s3, &name).await,
+                            _ => Err(anyhow::anyhow!(
+                                "delete: invalid location '{}' (must be 'local' or 'remote')",
+                                loc,
+                            )),
                         }
                     }
                     "clean_broken" => {
@@ -788,9 +792,12 @@ pub async fn list_backups(
         }
     }
 
-    // Apply desc parameter: reverse sort if desc=true (newest first)
+    // Sort by created timestamp (RFC3339 strings sort lexicographically correctly).
+    // Default is ascending (oldest first); desc=true gives newest first.
     if params.desc.unwrap_or(false) {
-        results.reverse();
+        results.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.name.cmp(&a.name)));
+    } else {
+        results.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.name.cmp(&b.name)));
     }
 
     let (header, results) = paginate(results, params.offset, params.limit, "list");
@@ -2792,5 +2799,98 @@ mod tests {
         assert_eq!(req.rbac, Some(true));
         assert_eq!(req.configs, Some(false));
         assert_eq!(req.named_collections, Some(true));
+    }
+
+    #[test]
+    fn test_post_actions_delete_invalid_location() {
+        // Simulate the post_actions delete command parsing with a typo ("loacl")
+        let command = "delete loacl my_backup";
+        let parts_owned: Vec<String> = command.split_whitespace().map(String::from).collect();
+
+        let (loc, name) = if parts_owned.len() >= 3 {
+            (parts_owned[1].as_str().to_string(), parts_owned[2].clone())
+        } else {
+            ("remote".to_string(), parts_owned.get(1).cloned().unwrap_or_default())
+        };
+
+        // The match should now reject unknown locations instead of falling through to remote
+        let result: Result<(), anyhow::Error> = match loc.as_str() {
+            "local" => Ok(()),
+            "remote" => Ok(()),
+            _ => Err(anyhow::anyhow!(
+                "delete: invalid location '{}' (must be 'local' or 'remote')",
+                loc,
+            )),
+        };
+
+        assert!(result.is_err(), "Typo 'loacl' should be rejected, not fall through to remote");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid location"),
+            "Error should mention 'invalid location', got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("loacl"),
+            "Error should include the typo'd value, got: {err_msg}"
+        );
+        assert_eq!(name, "my_backup");
+    }
+
+    #[test]
+    fn test_list_desc_sorts_by_created_not_name() {
+        // Construct ListResponses where name order differs from created order
+        let mut results = [
+            ListResponse {
+                name: "z-oldest".to_string(),
+                created: "2024-01-01T00:00:00+00:00".to_string(),
+                location: "local".to_string(),
+                size: 0,
+                data_size: 0,
+                object_disk_size: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                compressed_size: 0,
+                required: String::new(),
+            },
+            ListResponse {
+                name: "a-newest".to_string(),
+                created: "2024-06-01T00:00:00+00:00".to_string(),
+                location: "local".to_string(),
+                size: 0,
+                data_size: 0,
+                object_disk_size: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                compressed_size: 0,
+                required: String::new(),
+            },
+            ListResponse {
+                name: "m-middle".to_string(),
+                created: "2024-03-15T00:00:00+00:00".to_string(),
+                location: "local".to_string(),
+                size: 0,
+                data_size: 0,
+                object_disk_size: 0,
+                metadata_size: 0,
+                rbac_size: 0,
+                config_size: 0,
+                compressed_size: 0,
+                required: String::new(),
+            },
+        ];
+
+        // Ascending sort (default)
+        results.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.name.cmp(&b.name)));
+        assert_eq!(results[0].name, "z-oldest");
+        assert_eq!(results[1].name, "m-middle");
+        assert_eq!(results[2].name, "a-newest");
+
+        // Descending sort (desc=true)
+        results.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.name.cmp(&a.name)));
+        assert_eq!(results[0].name, "a-newest");
+        assert_eq!(results[1].name, "m-middle");
+        assert_eq!(results[2].name, "z-oldest");
     }
 }
