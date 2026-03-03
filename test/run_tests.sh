@@ -135,6 +135,33 @@ reseed_data() {
     clickhouse-client --multiquery < /test/fixtures/seed_data.sql
 }
 
+# poll_action_completion <max_wait> — poll /api/v1/actions until terminal state
+poll_action_completion() {
+    local max_wait="${1:-60}"
+    for i in $(seq 1 "$max_wait"); do
+        ACTIONS=$(curl -s http://localhost:7171/api/v1/actions 2>/dev/null || echo "[]")
+        LAST_STATUS=$(echo "$ACTIONS" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+if data:
+    print(data[-1].get('status', 'unknown'))
+else:
+    print('unknown')
+" 2>/dev/null || echo "unknown")
+        if [[ "$LAST_STATUS" == "completed" ]]; then
+            echo "completed"
+            return 0
+        fi
+        if [[ "$LAST_STATUS" == "failed" ]]; then
+            echo "failed"
+            return 1
+        fi
+        sleep 1
+    done
+    echo "timeout"
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Validate required env vars
 # ---------------------------------------------------------------------------
@@ -2306,35 +2333,6 @@ wait_for_server() {
         sleep 1
     done
     echo "Server failed to start within ${max_wait}s"
-    return 1
-}
-
-# ===========================================================================
-# Helper: poll_action_completion (wait for last action to reach terminal state)
-# ===========================================================================
-poll_action_completion() {
-    local max_wait="${1:-60}"
-    for i in $(seq 1 "$max_wait"); do
-        ACTIONS=$(curl -s http://localhost:7171/api/v1/actions 2>/dev/null || echo "[]")
-        LAST_STATUS=$(echo "$ACTIONS" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-if data:
-    print(data[-1].get('status', 'unknown'))
-else:
-    print('unknown')
-" 2>/dev/null || echo "unknown")
-        if [[ "$LAST_STATUS" == "completed" ]]; then
-            echo "completed"
-            return 0
-        fi
-        if [[ "$LAST_STATUS" == "failed" ]]; then
-            echo "failed"
-            return 1
-        fi
-        sleep 1
-    done
-    echo "timeout"
     return 1
 }
 
