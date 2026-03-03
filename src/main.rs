@@ -87,7 +87,7 @@ async fn run() -> Result<()> {
         Command::PrintConfig => {
             let config_path = Path::new(&cli.config);
             let config = Config::load(config_path, &cli.env_overrides)?;
-            let yaml = serde_yaml::to_string(&config)?;
+            let yaml = config.redacted_yaml()?;
             print!("{yaml}");
             return Ok(());
         }

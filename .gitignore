@@ -3,3 +3,4 @@
 /coverage/
 tarpaulin-report.json
 cobertura.xml
+.env

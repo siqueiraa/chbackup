@@ -93,32 +93,61 @@ chbackup MUST have filesystem access to `/var/lib/clickhouse/` (FREEZE creates h
 #### 1.4.1 Test Dockerfile
 
 ```dockerfile
-# Dockerfile.test
-# All-in-one: ClickHouse server + chbackup binary in same container
-ARG CH_VERSION=24.8
-FROM clickhouse/clickhouse-server:${CH_VERSION}
-USER root
+# Dockerfile.test — Multi-stage build: source compile + Altinity ClickHouse runtime
+ARG CH_VERSION=25.3.8.10041.altinitystable
+
+# --- Stage 1: Build static binary from source ---
+FROM rust:1.93-alpine AS builder
+
+RUN apk add --no-cache musl-dev perl make cmake g++ linux-headers openssl-dev openssl-libs-static pkgconfig
+
+WORKDIR /build
+
+# Cache dependencies: copy manifests first, do a dummy build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
+    && cargo build --release 2>/dev/null || true \
+    && rm -rf src target/release/chbackup target/release/deps/chbackup-* target/release/deps/libchbackup-*
+
+# Copy real source and build
+COPY src/ src/
+RUN cargo build --release
+
+# --- Stage 2: Test runtime ---
+ARG CH_VERSION
+FROM altinity/clickhouse-server:${CH_VERSION}
 
 # Install test dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl jq netcat-openbsd \
+    ca-certificates curl jq netcat-openbsd python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy chbackup binary (pre-built static binary)
-COPY target/x86_64-unknown-linux-musl/release/chbackup /bin/chbackup
-RUN chmod +x /bin/chbackup
+# Copy built binary from builder stage
+COPY --from=builder /build/target/release/chbackup /usr/local/bin/chbackup
+RUN chmod +x /usr/local/bin/chbackup
 
-# Copy test configs and fixtures
-COPY test/configs/ /etc/clickhouse-server/config.d/
+# Copy test configs
+COPY test/configs/clickhouse-config.xml /etc/clickhouse-server/config.d/test.xml
+COPY test/configs/chbackup-test.yml /etc/chbackup/config.yml
+
+# Copy S3 disk config generator (runs before ClickHouse starts)
+COPY test/configs/generate-s3-disk-config.sh /usr/local/bin/generate-s3-disk-config.sh
+RUN chmod +x /usr/local/bin/generate-s3-disk-config.sh
+
+# Wrap entrypoint to generate S3 disk config before ClickHouse starts
+RUN printf '#!/bin/bash\n/usr/local/bin/generate-s3-disk-config.sh\nexec /entrypoint.sh "$@"\n' \
+    > /custom-entrypoint.sh && chmod +x /custom-entrypoint.sh
+ENTRYPOINT ["/custom-entrypoint.sh"]
+
+# Copy test fixtures and runner
 COPY test/fixtures/ /test/fixtures/
 COPY test/run_tests.sh /test/run_tests.sh
 RUN chmod +x /test/run_tests.sh
 
-# ClickHouse data stays local — no volumes needed, FREEZE hardlinks work natively
 EXPOSE 8123 9000 7171
 ```
 
-Key design: based on the official `clickhouse-server` image, so we inherit its entrypoint, init scripts, and correct user/permission setup. chbackup binary is copied in with direct filesystem access to `/var/lib/clickhouse/` — no volume sharing needed.
+Key design: two-stage build — `rust:1.93-alpine` compiles the static binary, then `altinity/clickhouse-server` provides the runtime with S3 disk support. A custom entrypoint runs `generate-s3-disk-config.sh` (which writes S3 disk XML from env vars) before delegating to the stock ClickHouse entrypoint. No pre-built binary required; `docker compose up --build` compiles from source.
 
 #### 1.4.2 docker-compose.test.yml
 
@@ -126,10 +155,13 @@ Key design: based on the official `clickhouse-server` image, so we inherit its e
 services:
   zookeeper:
     image: zookeeper:3.8
-    hostname: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOO_4LW_COMMANDS_WHITELIST: "ruok,srvr,stat"
     healthcheck:
-      test: echo ruok | nc 127.0.0.1 2181 | grep imok
-      interval: 1s
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 5s
+      timeout: 3s
       retries: 10
 
   chbackup-test:
@@ -137,36 +169,32 @@ services:
       context: .
       dockerfile: Dockerfile.test
       args:
-        CH_VERSION: ${CH_VERSION:-24.8}
-    hostname: chbackup-test
+        CH_VERSION: ${CH_VERSION:-25.3.8.10041.altinitystable}
     depends_on:
-      zookeeper: { condition: service_healthy }
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+      - "7171:7171"
     environment:
-      # ClickHouse
-      CLICKHOUSE_HOST: localhost
-      CLICKHOUSE_PORT: 9000
-      # S3 — real bucket, no MinIO
-      S3_BUCKET: ${S3_BUCKET}
+      # S3 credentials (required — compose fails fast if unset)
+      S3_BUCKET: ${S3_BUCKET:?S3_BUCKET is required}
       S3_REGION: ${S3_REGION:-us-east-1}
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
-      S3_SECRET_KEY: ${S3_SECRET_KEY}
-      S3_PATH: chbackup-test/${CH_VERSION:-24.8}/${RUN_ID:-local}
-      # Test behavior
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is required}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY is required}
+      S3_PREFIX: ${S3_PATH:-chbackup-test/${CH_VERSION:-25.3.8.10041.altinitystable}/${RUN_ID:-local}}
+      # chbackup settings
+      CHBACKUP_CONFIG: /etc/chbackup/config.yml
       LOG_LEVEL: ${LOG_LEVEL:-debug}
+      # Test runner settings
       TEST_FILTER: ${TEST_FILTER:-}
+      RUN_ID: ${RUN_ID:-local}
     healthcheck:
-      test: clickhouse-client -q "SELECT 1"
-      interval: 1s
+      test: ["CMD-SHELL", "clickhouse-client -q 'SELECT 1'"]
+      interval: 5s
+      timeout: 3s
       retries: 30
-    # Override entrypoint to start CH server in background + keep alive
-    entrypoint:
-      - /bin/bash
-      - -c
-      - |
-        /entrypoint.sh &
-        until clickhouse-client -q "SELECT 1" 2>/dev/null; do sleep 0.5; done
-        echo "ClickHouse ready"
-        sleep infinity
 ```
 
 #### 1.4.3 Test Execution
@@ -174,22 +202,22 @@ services:
 ```bash
 # Run full test suite (builds from source automatically)
 export S3_BUCKET=my-test-bucket S3_ACCESS_KEY=xxx S3_SECRET_KEY=xxx
-docker compose -f docker-compose.test.yml up -d --build
-docker compose exec chbackup-test /test/run_tests.sh
-docker compose down -v
+docker compose -f docker-compose.test.yml up -d --build --wait
+docker compose -f docker-compose.test.yml exec -T chbackup-test /test/run_tests.sh
+docker compose -f docker-compose.test.yml down -v
 
 # Run specific test
-docker compose exec chbackup-test /test/run_tests.sh --filter "test_diff_from_crc64"
+docker compose -f docker-compose.test.yml exec -T chbackup-test /test/run_tests.sh --filter "test_diff_from_crc64"
 
 # Interactive debugging — shell into the container
-docker compose exec chbackup-test bash
+docker compose -f docker-compose.test.yml exec chbackup-test bash
 # Now you have: clickhouse-client, chbackup, and full /var/lib/clickhouse access
 
 # Matrix: test across multiple ClickHouse versions
 for ver in 23.8 24.3 24.8 25.1; do
   CH_VERSION=$ver docker compose -f docker-compose.test.yml up -d --build --wait
-  docker compose exec chbackup-test /test/run_tests.sh
-  docker compose down -v
+  docker compose -f docker-compose.test.yml exec -T chbackup-test /test/run_tests.sh
+  docker compose -f docker-compose.test.yml down -v
 done
 ```
 

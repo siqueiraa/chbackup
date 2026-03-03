@@ -55,10 +55,8 @@ run_cmd() {
     local label="$1"; shift
     if "$@" 2>&1; then
         pass "$label"
-        return 0
     else
         fail "$label"
-        return 1
     fi
 }
 
@@ -281,6 +279,14 @@ fi
 if should_run "smoke_config"; then
     info "Smoke test: chbackup print-config"
     run_cmd "chbackup print-config" chbackup print-config
+
+    # Verify print-config redacts secrets (P1 audit fix)
+    output=$(RUST_LOG=error chbackup print-config 2>/dev/null)
+    if echo "$output" | grep -q "\[REDACTED\]"; then
+        pass "print-config redacts secrets"
+    else
+        fail "print-config should show [REDACTED] for set credentials"
+    fi
 fi
 
 if should_run "smoke_list"; then

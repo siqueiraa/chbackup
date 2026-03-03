@@ -869,6 +869,21 @@ impl Config {
         serde_yaml::to_string(&config).context("Failed to serialize default config to YAML")
     }
 
+    /// Serialize config to YAML with sensitive fields redacted.
+    ///
+    /// Replaces non-empty credential fields with `[REDACTED]` so that
+    /// `print-config` never leaks secrets. File paths (TLS certs, KMS key IDs,
+    /// ARNs) are left visible since they are identifiers, not credentials.
+    pub fn redacted_yaml(&self) -> Result<String> {
+        let mut c = self.clone();
+        redact_if_set(&mut c.clickhouse.password);
+        redact_if_set(&mut c.s3.access_key);
+        redact_if_set(&mut c.s3.secret_key);
+        redact_if_set(&mut c.api.username);
+        redact_if_set(&mut c.api.password);
+        serde_yaml::to_string(&c).context("Failed to serialize redacted config to YAML")
+    }
+
     /// Apply environment variable overlay. Maps well-known env vars to config fields.
     /// Every config parameter can be overridden via an environment variable (design doc §2).
     fn apply_env_overlay(&mut self) {
@@ -1838,6 +1853,13 @@ pub fn apply_jitter(base_delay_ms: u64, jitter_factor: f64) -> u64 {
     let random_fraction = (seed % 1_000_000_000) as f64 / 1_000_000_000.0;
     let jittered = base_delay_ms as f64 * (1.0 + random_fraction * jitter_factor);
     jittered as u64
+}
+
+/// Replace a non-empty string with `[REDACTED]`.
+fn redact_if_set(s: &mut String) {
+    if !s.is_empty() {
+        *s = "[REDACTED]".to_string();
+    }
 }
 
 #[cfg(test)]
@@ -2879,5 +2901,28 @@ s3:
         // API section defaults
         assert!(config.api.username.is_empty());
         assert!(config.api.password.is_empty());
+    }
+
+    #[test]
+    fn test_redacted_yaml_hides_secrets() {
+        let mut c = Config::default();
+        c.clickhouse.password = "hunter2".into();
+        c.s3.access_key = "AKIAXXXXXXXX".into();
+        c.s3.secret_key = "secret123".into();
+        c.api.username = "admin".into();
+        c.api.password = "apipass".into();
+        let yaml = c.redacted_yaml().unwrap();
+        assert!(yaml.contains("[REDACTED]"));
+        assert!(!yaml.contains("hunter2"));
+        assert!(!yaml.contains("AKIAXXXXXXXX"));
+        assert!(!yaml.contains("secret123"));
+        assert!(!yaml.contains("apipass"));
+    }
+
+    #[test]
+    fn test_redacted_yaml_skips_empty_fields() {
+        let c = Config::default();
+        let yaml = c.redacted_yaml().unwrap();
+        assert!(!yaml.contains("[REDACTED]"));
     }
 }

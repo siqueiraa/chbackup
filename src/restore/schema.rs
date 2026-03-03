@@ -145,6 +145,83 @@ async fn create_database_with_cluster(
 }
 
 // ---------------------------------------------------------------------------
+// Retry loop bookkeeping (shared by drop_tables and create_ddl_objects)
+// ---------------------------------------------------------------------------
+
+/// Manages retry-loop bookkeeping for DDL operations that may have
+/// inter-dependencies requiring multiple passes (e.g., DROP TABLE with
+/// foreign-key-like constraints, or CREATE with unresolved references).
+pub(crate) struct RetryLoopState {
+    pub pending: Vec<String>,
+    max_rounds: usize,
+}
+
+/// Result of a single retry round.
+#[derive(Debug)]
+pub(crate) enum RetryAction {
+    /// All items succeeded — loop should break.
+    Done,
+    /// Some items failed but progress was made — continue retrying.
+    Continue,
+}
+
+impl RetryLoopState {
+    pub fn new(items: Vec<String>, max_rounds: usize) -> Self {
+        Self {
+            pending: items,
+            max_rounds,
+        }
+    }
+
+    /// Process results of one retry round. Returns `Done` when all succeeded,
+    /// `Continue` when there are retryable failures, or `Err` when stuck
+    /// (zero progress after the first round).
+    pub fn finish_round(
+        &mut self,
+        failed: Vec<(String, String)>,
+        progress: u32,
+        round: usize,
+        op_name: &str,
+    ) -> Result<RetryAction> {
+        if failed.is_empty() {
+            self.pending.clear();
+            return Ok(RetryAction::Done);
+        }
+        if progress == 0 && round > 0 {
+            let failed_keys: Vec<&str> = failed.iter().map(|(k, _)| k.as_str()).collect();
+            anyhow::bail!(
+                "Failed to {} {} items after {} retry rounds: {:?}. Last errors: {}",
+                op_name,
+                failed.len(),
+                round + 1,
+                failed_keys,
+                failed
+                    .iter()
+                    .map(|(k, e)| format!("{}: {}", k, e))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+        self.pending = failed.into_iter().map(|(k, _)| k).collect();
+        Ok(RetryAction::Continue)
+    }
+
+    /// Call after the for loop exits normally (exhausted max_rounds).
+    /// Returns an error if there are still pending items.
+    pub fn check_exhausted(&self) -> Result<()> {
+        if !self.pending.is_empty() {
+            anyhow::bail!(
+                "Failed to process {} items after {} rounds: {:?}",
+                self.pending.len(),
+                self.max_rounds,
+                self.pending.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mode A (--rm): DROP phase
 // ---------------------------------------------------------------------------
 
@@ -176,14 +253,14 @@ pub async fn drop_tables(
 
     info!(count = sorted.len(), "Phase 0: Dropping tables (Mode A)");
 
-    let mut pending = sorted;
     let max_rounds = 10;
+    let mut state = RetryLoopState::new(sorted, max_rounds);
 
     for round in 0..max_rounds {
         let mut failed: Vec<(String, String)> = Vec::new();
         let mut dropped_this_round = 0u32;
 
-        for table_key in &pending {
+        for table_key in &state.pending {
             let (src_db, src_table) = table_key.split_once('.').unwrap_or(("default", table_key));
 
             // Determine destination db/table (may be remapped)
@@ -222,44 +299,19 @@ pub async fn drop_tables(
             }
         }
 
-        if failed.is_empty() {
-            pending.clear();
-            break;
+        match state.finish_round(failed, dropped_this_round, round, "drop")? {
+            RetryAction::Done => break,
+            RetryAction::Continue => {
+                info!(
+                    round = round,
+                    dropped = dropped_this_round,
+                    remaining = state.pending.len(),
+                    "DROP TABLE retry round"
+                );
+            }
         }
-
-        if dropped_this_round == 0 && round > 0 {
-            let failed_keys: Vec<&str> = failed.iter().map(|(k, _)| k.as_str()).collect();
-            anyhow::bail!(
-                "Failed to drop {} tables after {} retry rounds: {:?}. Last errors: {}",
-                failed.len(),
-                round + 1,
-                failed_keys,
-                failed
-                    .iter()
-                    .map(|(k, e)| format!("{}: {}", k, e))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            );
-        }
-
-        info!(
-            round = round,
-            dropped = dropped_this_round,
-            remaining = failed.len(),
-            "DROP TABLE retry round"
-        );
-
-        pending = failed.into_iter().map(|(k, _)| k).collect();
     }
-
-    if !pending.is_empty() {
-        anyhow::bail!(
-            "Failed to process {} items after {} rounds: {:?}",
-            pending.len(),
-            max_rounds,
-            pending.iter().take(5).collect::<Vec<_>>()
-        );
-    }
+    state.check_exhausted()?;
 
     info!(count = table_keys.len(), "Table drop phase complete");
     Ok(())
@@ -617,14 +669,14 @@ pub async fn create_ddl_objects(
         return Ok(());
     }
 
-    let mut pending: Vec<String> = ddl_keys.to_vec();
     let max_rounds = 10;
+    let mut state = RetryLoopState::new(ddl_keys.to_vec(), max_rounds);
 
     for round in 0..max_rounds {
         let mut failed: Vec<(String, String)> = Vec::new(); // (key, error_msg)
         let mut created_this_round = 0u32;
 
-        for table_key in &pending {
+        for table_key in &state.pending {
             let table_manifest = match manifest.tables.get(table_key) {
                 Some(tm) => tm,
                 None => continue,
@@ -697,45 +749,19 @@ pub async fn create_ddl_objects(
             }
         }
 
-        if failed.is_empty() {
-            pending.clear();
-            break;
+        match state.finish_round(failed, created_this_round, round, "create")? {
+            RetryAction::Done => break,
+            RetryAction::Continue => {
+                info!(
+                    round = round,
+                    created = created_this_round,
+                    remaining = state.pending.len(),
+                    "DDL creation retry round"
+                );
+            }
         }
-
-        if created_this_round == 0 && round > 0 {
-            // No progress this round -- give up
-            let failed_keys: Vec<&str> = failed.iter().map(|(k, _)| k.as_str()).collect();
-            anyhow::bail!(
-                "Failed to create {} DDL-only objects after {} retry rounds: {:?}. Last errors: {}",
-                failed.len(),
-                round + 1,
-                failed_keys,
-                failed
-                    .iter()
-                    .map(|(k, e)| format!("{}: {}", k, e))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            );
-        }
-
-        info!(
-            round = round,
-            created = created_this_round,
-            remaining = failed.len(),
-            "DDL creation retry round"
-        );
-
-        pending = failed.into_iter().map(|(k, _)| k).collect();
     }
-
-    if !pending.is_empty() {
-        anyhow::bail!(
-            "Failed to process {} items after {} rounds: {:?}",
-            pending.len(),
-            max_rounds,
-            pending.iter().take(5).collect::<Vec<_>>()
-        );
-    }
+    state.check_exhausted()?;
 
     info!(count = ddl_keys.len(), "DDL-only objects created");
     Ok(())
@@ -1292,123 +1318,66 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Regression: retry loop must clear pending on success (commit e35d2e57)
+    // RetryLoopState — exercises the production helper used by drop_tables()
+    // and create_ddl_objects() (regression coverage for commit e35d2e57)
     // -----------------------------------------------------------------------
-    // Both drop_tables() and create_ddl_objects() use a retry loop pattern:
-    //
-    //   for round in 0..max_rounds {
-    //       let mut failed = Vec::new();
-    //       for item in &pending { ... push to failed on error ... }
-    //       if failed.is_empty() { pending.clear(); break; }
-    //       ...
-    //       pending = failed.into_iter()...;
-    //   }
-    //   if !pending.is_empty() { bail!(...) }
-    //
-    // Without pending.clear() before break, the post-loop check would bail
-    // even when all items succeeded on the first round.
 
-    /// Verify the retry loop pattern: all items succeed on round 0.
-    /// Before the fix, this would fail because pending wasn't cleared.
+    /// All items succeed on the first round → Done, pending cleared.
     #[test]
     fn test_retry_loop_clears_pending_on_first_round_success() {
-        let items = vec![
-            "default.t1".to_string(),
-            "default.t2".to_string(),
-            "default.t3".to_string(),
-        ];
-        let mut pending = items;
-        let max_rounds = 10;
-
-        for _round in 0..max_rounds {
-            let failed: Vec<(String, String)> = Vec::new();
-            // Simulate: all items succeed (nothing pushed to failed)
-
-            if failed.is_empty() {
-                pending.clear(); // The fix — was missing before e35d2e57
-                break;
-            }
-
-            pending = failed.into_iter().map(|(k, _)| k).collect();
-        }
-
-        // This assertion failed before the pending.clear() fix
-        assert!(
-            pending.is_empty(),
-            "pending must be empty after all items succeed on round 0"
+        let mut state = RetryLoopState::new(
+            vec!["t1".into(), "t2".into(), "t3".into()],
+            10,
         );
+        let result = state.finish_round(vec![], 3, 0, "test");
+        assert!(matches!(result.unwrap(), RetryAction::Done));
+        assert!(state.pending.is_empty());
+        assert!(state.check_exhausted().is_ok());
     }
 
-    /// Verify the retry loop pattern: some items fail then succeed on retry.
+    /// Some items fail then succeed on retry → Continue then Done.
     #[test]
     fn test_retry_loop_clears_pending_after_retry_success() {
-        let items = vec![
-            "default.t1".to_string(),
-            "default.t2".to_string(),
-            "default.t3".to_string(),
-        ];
-        let mut pending = items;
-        let max_rounds = 10;
-
-        for round in 0..max_rounds {
-            let mut failed: Vec<(String, String)> = Vec::new();
-
-            for key in &pending {
-                // Simulate: t2 fails on round 0, succeeds on round 1
-                if key == "default.t2" && round == 0 {
-                    failed.push((key.clone(), "dependency error".to_string()));
-                }
-            }
-
-            if failed.is_empty() {
-                pending.clear();
-                break;
-            }
-
-            pending = failed.into_iter().map(|(k, _)| k).collect();
-        }
-
-        assert!(
-            pending.is_empty(),
-            "pending must be empty after all items eventually succeed"
+        let mut state = RetryLoopState::new(
+            vec!["t1".into(), "t2".into(), "t3".into()],
+            10,
         );
+        // Round 0: t2 fails, 2 succeeded
+        let failed = vec![("t2".into(), "dependency error".into())];
+        let result = state.finish_round(failed, 2, 0, "test");
+        assert!(matches!(result.unwrap(), RetryAction::Continue));
+        assert_eq!(state.pending, vec!["t2".to_string()]);
+
+        // Round 1: all succeed
+        let result = state.finish_round(vec![], 1, 1, "test");
+        assert!(matches!(result.unwrap(), RetryAction::Done));
+        assert!(state.pending.is_empty());
     }
 
-    /// Verify the retry loop pattern: persistent failure bails correctly.
+    /// Zero progress after round 0 → error.
     #[test]
     fn test_retry_loop_bails_on_no_progress() {
-        let items = vec!["default.t1".to_string()];
-        let mut pending = items;
-        let max_rounds = 10;
-        let mut bailed = false;
+        let mut state = RetryLoopState::new(vec!["t1".into()], 10);
+        // Round 0: t1 fails
+        let failed = vec![("t1".into(), "permanent error".into())];
+        let result = state.finish_round(failed, 0, 0, "drop");
+        assert!(matches!(result.unwrap(), RetryAction::Continue));
 
-        for round in 0..max_rounds {
-            let mut failed: Vec<(String, String)> = Vec::new();
-            let progress = 0u32;
+        // Round 1: t1 fails again, zero progress
+        let failed = vec![("t1".into(), "permanent error".into())];
+        let result = state.finish_round(failed, 0, 1, "drop");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to drop"));
+        assert!(err_msg.contains("t1"));
+    }
 
-            for key in &pending {
-                // Simulate: t1 always fails
-                failed.push((key.clone(), "permanent error".to_string()));
-            }
-
-            if failed.is_empty() {
-                pending.clear();
-                break;
-            }
-
-            if progress == 0 && round > 0 {
-                // This is the bail path — no progress after round 0
-                bailed = true;
-                break;
-            }
-
-            pending = failed.into_iter().map(|(k, _)| k).collect();
-        }
-
-        assert!(bailed, "should bail when no progress is made after round 0");
-        assert!(
-            !pending.is_empty(),
-            "pending should still contain the failed item"
-        );
+    /// check_exhausted catches items still pending after max_rounds.
+    #[test]
+    fn test_retry_loop_check_exhausted_with_remaining() {
+        let state = RetryLoopState::new(vec!["t1".into(), "t2".into()], 3);
+        let result = state.check_exhausted();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("2 items"));
     }
 }
