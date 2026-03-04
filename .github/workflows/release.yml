@@ -84,6 +84,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE_NAME }}
+          short-description: "ClickHouse backup & restore to S3. Static Rust binary, K8s sidecar, incremental, resumable."
+          readme-filepath: ./README.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

@@ -32,9 +32,17 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 # Stage 2: Minimal Alpine runtime
 FROM alpine:3.21
 ARG VERSION=dev
+ARG BUILD_DATE
+ARG VCS_REF
 LABEL org.opencontainers.image.title="chbackup"
-LABEL org.opencontainers.image.description="Fast ClickHouse backup and restore"
+LABEL org.opencontainers.image.description="ClickHouse backup and restore to S3. Single static binary, Kubernetes sidecar, incremental, resumable."
 LABEL org.opencontainers.image.version=${VERSION}
+LABEL org.opencontainers.image.created=${BUILD_DATE}
+LABEL org.opencontainers.image.revision=${VCS_REF}
+LABEL org.opencontainers.image.source="https://github.com/siqueiraa/chbackup"
+LABEL org.opencontainers.image.documentation="https://github.com/siqueiraa/chbackup/tree/master/docs"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.vendor="Rafael Siqueira"
 
 # Create clickhouse user/group with uid/gid 101 for file ownership compatibility
 # with the official ClickHouse Docker image.
