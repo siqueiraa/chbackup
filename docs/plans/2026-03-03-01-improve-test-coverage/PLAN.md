@@ -122,11 +122,11 @@ Group C (Sequential -- depends on A+B):
 
 **TDD Steps (genuinely new edge cases only):**
 1. Write test `test_is_benign_type_enum16_with_many_values` -- `is_benign_type("Enum16('active' = 1, 'deleted' = 2, 'pending' = 3, 'archived' = 4)")` returns `true` (Enum16 not covered by existing test which only uses Enum8)
-2. Write test `test_is_benign_type_nested_nullable_array_tuple` -- `is_benign_type("Nullable(Array(Tuple(x Int32, y Int32)))")` returns `true` (deeper nesting not covered)
+2. Write test `test_is_benign_type_nested_nullable_array_tuple_is_false` -- `is_benign_type("Nullable(Array(Tuple(x Int32, y Int32)))")` returns `false` (current implementation only matches `Nullable(Enum` and `Nullable(Tuple` prefixes, NOT `Nullable(Array(Tuple`)
 3. Write test `test_is_benign_type_map_type` -- `is_benign_type("Map(String, UInt64)")` returns `false` (Map is not benign)
-4. Write test `test_is_benign_type_lowertuple` -- `is_benign_type("tuple(a UInt64)")` returns `false` (case-sensitive check)
-5. Write test `test_normalize_uuid_whitespace` -- `normalize_uuid(" ")` returns `None` (whitespace-only)
-6. Write test `test_normalize_uuid_partial_zeros` -- `normalize_uuid("00000000-0000-0000-0000-000000000001")` returns `Some(...)` (not nil)
+4. Write test `test_is_benign_type_lowertuple` -- `is_benign_type("tuple(a UInt64)")` returns `false` (case-sensitive: starts_with("Tuple") not "tuple")
+5. Write test `test_normalize_uuid_whitespace_is_some` -- `normalize_uuid(" ")` returns `Some(" ")` (current implementation only checks empty string and nil UUID, whitespace is treated as a valid non-empty UUID)
+6. Write test `test_normalize_uuid_partial_zeros` -- `normalize_uuid("00000000-0000-0000-0000-000000000001")` returns `Some(...)` (not nil -- differs in last digit)
 7. Write test `test_filter_benign_type_drift_mixed_keeps_only_non_benign` -- vec with 3 entries: one all-benign, one all-non-benign, one mixed (benign+non-benign types in same ColumnInconsistency); result keeps the 2 non-all-benign entries
 8. Verify: `cargo test --lib -- backup::tests`
 

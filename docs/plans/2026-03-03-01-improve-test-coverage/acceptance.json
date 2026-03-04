@@ -1,7 +1,7 @@
 {
   "plan": "2026-03-03-01-improve-test-coverage",
   "status": {"pass": 0, "fail": 5, "total": 5},
-  "last_updated": "2026-03-03T20:50:00Z",
+  "last_updated": "2026-03-04T12:00:00Z",
   "features": [
     {
       "id": "F001",
@@ -25,9 +25,11 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1 | tee /dev/stderr | grep -oP '\\d+ passed' | grep -oP '\\d+'",
-            "expected_minimum": 20,
-            "fail_message": "Expected at least 20 main.rs tests to pass (got fewer or zero)"
+            "command": "cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1 | tail -3",
+            "expected_contains": "0 failed",
+            "expected_minimum_passed": 20,
+            "verification_script": "OUTPUT=$(cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; echo \"passed=$PASSED failed=$FAILED\"; test \"$FAILED\" = \"0\" && test \"$PASSED\" -ge 20",
+            "fail_message": "Expected at least 20 main.rs tests to pass with 0 failures"
           },
           {
             "name": "runtime",
@@ -51,7 +53,7 @@
         "layers": [
           {
             "name": "structural",
-            "command": "grep -c 'test_is_benign_type_enum16\\|test_is_benign_type_nested\\|test_is_benign_type_map\\|test_is_benign_type_lowertuple\\|test_normalize_uuid_whitespace\\|test_normalize_uuid_partial\\|test_filter_benign_type_drift_mixed_keeps' src/backup/mod.rs",
+            "command": "grep -c 'test_is_benign_type_enum16\\|test_is_benign_type_nested_nullable_array_tuple_is_false\\|test_is_benign_type_map\\|test_is_benign_type_lowertuple\\|test_normalize_uuid_whitespace_is_some\\|test_normalize_uuid_partial\\|test_filter_benign_type_drift_mixed_keeps' src/backup/mod.rs",
             "expected_minimum": 7,
             "fail_message": "Expected at least 7 NEW test functions (not counting pre-existing ones)"
           },
@@ -63,9 +65,8 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --lib -- backup::tests::test_is_benign_type_enum16 backup::tests::test_normalize_uuid_whitespace backup::tests::test_filter_benign_type_drift_mixed_keeps 2>&1 | tee /dev/stderr | grep -oP '\\d+ passed' | grep -oP '\\d+'",
-            "expected_minimum": 3,
-            "fail_message": "Expected at least 3 NEW backup/mod.rs tests to pass"
+            "verification_script": "OUTPUT=$(cargo test --lib -- backup::tests::test_is_benign_type_enum16 backup::tests::test_is_benign_type_nested_nullable_array_tuple_is_false backup::tests::test_is_benign_type_map backup::tests::test_is_benign_type_lowertuple backup::tests::test_normalize_uuid_whitespace_is_some backup::tests::test_normalize_uuid_partial backup::tests::test_filter_benign_type_drift_mixed_keeps 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; echo \"passed=$PASSED failed=$FAILED\"; test \"$FAILED\" = \"0\" && test \"$PASSED\" -ge 7",
+            "fail_message": "Expected at least 7 NEW backup/mod.rs tests to pass with 0 failures"
           },
           {
             "name": "runtime",
@@ -101,9 +102,8 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --lib -- download::tests::test_sanitize_relative_path 2>&1 | tee /dev/stderr | grep -oP '\\d+ passed' | grep -oP '\\d+'",
-            "expected_minimum": 6,
-            "fail_message": "Expected at least 6 sanitize_relative_path tests to pass (got fewer or zero)"
+            "verification_script": "OUTPUT=$(cargo test --lib -- download::tests::test_sanitize_relative_path 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; echo \"passed=$PASSED failed=$FAILED\"; test \"$FAILED\" = \"0\" && test \"$PASSED\" -ge 6",
+            "fail_message": "Expected at least 6 sanitize_relative_path tests to pass with 0 failures"
           },
           {
             "name": "runtime",
@@ -139,9 +139,8 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --lib -- restore::attach::tests::test_is_attach_warning 2>&1 | tee /dev/stderr | grep -oP '\\d+ passed' | grep -oP '\\d+'",
-            "expected_minimum": 8,
-            "fail_message": "Expected at least 8 is_attach_warning tests to pass (got fewer or zero)"
+            "verification_script": "OUTPUT=$(cargo test --lib -- restore::attach::tests::test_is_attach_warning 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; echo \"passed=$PASSED failed=$FAILED\"; test \"$FAILED\" = \"0\" && test \"$PASSED\" -ge 8",
+            "fail_message": "Expected at least 8 is_attach_warning tests to pass with 0 failures"
           },
           {
             "name": "runtime",
@@ -177,9 +176,8 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test 2>&1 | tail -5 | grep -c 'test result: ok'",
-            "expected_minimum": 1,
-            "fail_message": "Some tests failed after all changes"
+            "verification_script": "cargo test 2>&1; EXIT=$?; test $EXIT -eq 0",
+            "fail_message": "Full test suite has failures (non-zero exit code)"
           },
           {
             "name": "runtime",

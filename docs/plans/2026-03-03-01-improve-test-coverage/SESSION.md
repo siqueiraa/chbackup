@@ -95,9 +95,9 @@ Group A (Sequential -- main.rs tests):
   - Task 1: Add #[cfg(test)] mod tests to main.rs with tests for all pure helpers
 
 Group B (Independent -- can run in parallel with A):
-  - Task 2: Add tests for normalize_uuid and is_benign_type in backup/mod.rs
+  - Task 2: Add NEW edge-case tests for backup/mod.rs (no duplicates of existing tests)
   - Task 3: Add tests for sanitize_relative_path in download/mod.rs
-  - Task 4: Add tests for is_attach_warning and additional edge cases in restore/attach.rs
+  - Task 4: Add tests for is_attach_warning in restore/attach.rs (no duplicates)
 
 Group C (Sequential -- depends on A+B):
   - Task 5: Raise CI coverage gate from 35% to 55%
@@ -110,9 +110,9 @@ Group C (Sequential -- depends on A+B):
 | Task | Description | Status | Commit | Acceptance |
 |------|-------------|--------|--------|------------|
 | 1 | Add unit tests for pure helper functions in main.rs | pending | - | F001 |
-| 2 | Add tests for normalize_uuid and is_benign_type in backup/mod.rs | pending | - | F002 |
+| 2 | Add NEW edge-case tests for backup/mod.rs (enum16, nested, map, whitespace uuid, mixed drift) | pending | - | F002 |
 | 3 | Add tests for sanitize_relative_path in download/mod.rs | pending | - | F003 |
-| 4 | Add tests for is_attach_warning and edge cases in restore/attach.rs | pending | - | F004 |
+| 4 | Add tests for is_attach_warning in restore/attach.rs (8 new tests, no duplicates) | pending | - | F004 |
 | 5 | Raise CI coverage gate from 35% to 55% | pending | - | F005 |
 
 **Status values:** pending, in_progress, fixing, done
@@ -182,7 +182,7 @@ Planning complete. Ready for validation and execution.
 ## Notes
 
 - Baseline: 66.68% line coverage, 1049 tests, CI gate at 35%
-- Target: ~68-70% coverage, ~1100 tests, CI gate at 55%
+- Target: ~67-69% coverage, ~1100 tests, CI gate at 55%
 - All tasks add ONLY test code (#[cfg(test)] blocks) -- no production code changes
 - Phase 4.5 skipped: no new production code to type-check
 - Phase 4.6 skipped: no CLAUDE.md updates needed for test-only changes
