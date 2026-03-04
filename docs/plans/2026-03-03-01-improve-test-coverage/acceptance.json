@@ -1,7 +1,7 @@
 {
   "plan": "2026-03-03-01-improve-test-coverage",
   "status": {"pass": 0, "fail": 5, "total": 5},
-  "last_updated": "2026-03-04T12:00:00Z",
+  "last_updated": "2026-03-04T14:00:00Z",
   "features": [
     {
       "id": "F001",
@@ -25,10 +25,8 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1 | tail -3",
-            "expected_contains": "0 failed",
-            "expected_minimum_passed": 20,
-            "verification_script": "OUTPUT=$(cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; echo \"passed=$PASSED failed=$FAILED\"; test \"$FAILED\" = \"0\" && test \"$PASSED\" -ge 20",
+            "command": "OUTPUT=$(cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; if [ \"$FAILED\" = \"0\" ] && [ \"$PASSED\" -ge 20 ] 2>/dev/null; then echo \"PASS: $PASSED passed, 0 failed\"; else echo \"FAIL: passed=$PASSED failed=$FAILED\"; exit 1; fi",
+            "expected_contains": "PASS:",
             "fail_message": "Expected at least 20 main.rs tests to pass with 0 failures"
           },
           {
@@ -36,7 +34,10 @@
             "status": "not_applicable",
             "justification": "Test-only code, no runtime binary behavior change",
             "covered_by": ["F005"],
-            "alternative_verification": "N/A"
+            "alternative_verification": {
+              "command": "cargo test --bin chbackup 2>&1 | tail -1",
+              "expected": "test result: ok"
+            }
           }
         ]
       },
@@ -65,7 +66,8 @@
           },
           {
             "name": "behavioral",
-            "verification_script": "OUTPUT=$(cargo test --lib -- backup::tests::test_is_benign_type_enum16 backup::tests::test_is_benign_type_nested_nullable_array_tuple_is_false backup::tests::test_is_benign_type_map backup::tests::test_is_benign_type_lowertuple backup::tests::test_normalize_uuid_whitespace_is_some backup::tests::test_normalize_uuid_partial backup::tests::test_filter_benign_type_drift_mixed_keeps 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; echo \"passed=$PASSED failed=$FAILED\"; test \"$FAILED\" = \"0\" && test \"$PASSED\" -ge 7",
+            "command": "OUTPUT=$(cargo test --lib -- backup::tests::test_is_benign_type_enum16 backup::tests::test_is_benign_type_nested_nullable_array_tuple_is_false backup::tests::test_is_benign_type_map backup::tests::test_is_benign_type_lowertuple backup::tests::test_normalize_uuid_whitespace_is_some backup::tests::test_normalize_uuid_partial backup::tests::test_filter_benign_type_drift_mixed_keeps 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; if [ \"$FAILED\" = \"0\" ] && [ \"$PASSED\" -ge 7 ] 2>/dev/null; then echo \"PASS: $PASSED passed, 0 failed\"; else echo \"FAIL: passed=$PASSED failed=$FAILED\"; exit 1; fi",
+            "expected_contains": "PASS:",
             "fail_message": "Expected at least 7 NEW backup/mod.rs tests to pass with 0 failures"
           },
           {
@@ -73,7 +75,10 @@
             "status": "not_applicable",
             "justification": "Test-only code, no runtime binary behavior change",
             "covered_by": ["F005"],
-            "alternative_verification": "N/A"
+            "alternative_verification": {
+              "command": "cargo test --lib -- backup::tests 2>&1 | tail -1",
+              "expected": "test result: ok"
+            }
           }
         ]
       },
@@ -102,7 +107,8 @@
           },
           {
             "name": "behavioral",
-            "verification_script": "OUTPUT=$(cargo test --lib -- download::tests::test_sanitize_relative_path 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; echo \"passed=$PASSED failed=$FAILED\"; test \"$FAILED\" = \"0\" && test \"$PASSED\" -ge 6",
+            "command": "OUTPUT=$(cargo test --lib -- download::tests::test_sanitize_relative_path 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; if [ \"$FAILED\" = \"0\" ] && [ \"$PASSED\" -ge 6 ] 2>/dev/null; then echo \"PASS: $PASSED passed, 0 failed\"; else echo \"FAIL: passed=$PASSED failed=$FAILED\"; exit 1; fi",
+            "expected_contains": "PASS:",
             "fail_message": "Expected at least 6 sanitize_relative_path tests to pass with 0 failures"
           },
           {
@@ -110,7 +116,10 @@
             "status": "not_applicable",
             "justification": "Test-only code, no runtime binary behavior change",
             "covered_by": ["F005"],
-            "alternative_verification": "N/A"
+            "alternative_verification": {
+              "command": "cargo test --lib -- download::tests 2>&1 | tail -1",
+              "expected": "test result: ok"
+            }
           }
         ]
       },
@@ -139,7 +148,8 @@
           },
           {
             "name": "behavioral",
-            "verification_script": "OUTPUT=$(cargo test --lib -- restore::attach::tests::test_is_attach_warning 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; echo \"passed=$PASSED failed=$FAILED\"; test \"$FAILED\" = \"0\" && test \"$PASSED\" -ge 8",
+            "command": "OUTPUT=$(cargo test --lib -- restore::attach::tests::test_is_attach_warning 2>&1); PASSED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) passed.*/\\1/p' | tail -1); FAILED=$(echo \"$OUTPUT\" | sed -n 's/.*\\([0-9][0-9]*\\) failed.*/\\1/p' | tail -1); FAILED=${FAILED:-0}; if [ \"$FAILED\" = \"0\" ] && [ \"$PASSED\" -ge 8 ] 2>/dev/null; then echo \"PASS: $PASSED passed, 0 failed\"; else echo \"FAIL: passed=$PASSED failed=$FAILED\"; exit 1; fi",
+            "expected_contains": "PASS:",
             "fail_message": "Expected at least 8 is_attach_warning tests to pass with 0 failures"
           },
           {
@@ -147,7 +157,10 @@
             "status": "not_applicable",
             "justification": "Test-only code, no runtime binary behavior change",
             "covered_by": ["F005"],
-            "alternative_verification": "N/A"
+            "alternative_verification": {
+              "command": "cargo test --lib -- restore::attach::tests 2>&1 | tail -1",
+              "expected": "test result: ok"
+            }
           }
         ]
       },
@@ -176,15 +189,19 @@
           },
           {
             "name": "behavioral",
-            "verification_script": "cargo test 2>&1; EXIT=$?; test $EXIT -eq 0",
+            "command": "cargo test 2>&1; RESULT=$?; if [ $RESULT -eq 0 ]; then echo 'PASS: full suite green'; else echo 'FAIL: cargo test exit code '$RESULT; exit 1; fi",
+            "expected_contains": "PASS:",
             "fail_message": "Full test suite has failures (non-zero exit code)"
           },
           {
             "name": "runtime",
             "status": "not_applicable",
-            "justification": "This plan modifies only test code and a CI threshold. There is no runtime binary behavior change. The behavioral layer already runs the full test suite and verifies all tests pass.",
+            "justification": "This plan modifies only test code and a CI threshold. There is no runtime binary behavior change.",
             "covered_by": ["F001", "F002", "F003", "F004"],
-            "alternative_verification": "N/A"
+            "alternative_verification": {
+              "command": "cargo test 2>&1 | tail -1",
+              "expected": "test result: ok"
+            }
           }
         ]
       },
