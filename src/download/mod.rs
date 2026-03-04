@@ -121,7 +121,7 @@ fn check_disk_space(backup_dir: &Path, required_bytes: u64) -> Result<()> {
     match nix::sys::statvfs::statvfs(&check_path) {
         Ok(stat) => {
             let block_size = stat.block_size();
-            let available_blocks: u64 = stat.blocks_available().into();
+            let available_blocks: u64 = stat.blocks_available() as u64;
             // Use saturating_mul to prevent theoretical overflow on exotic
             // filesystems with very large block_size * blocks_available.
             let available_bytes = block_size.saturating_mul(available_blocks);
