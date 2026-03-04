@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "generated_at": "2026-02-24T00:00:00Z",
+  "verified_symbols": {
+    "LockScope": {
+      "import": "crate::lock::LockScope",
+      "kind": "enum",
+      "variants": ["Backup(String)", "Global", "None"],
+      "location": "src/lock.rs:125"
+    },
+    "PidLock": {
+      "import": "crate::lock::PidLock",
+      "kind": "struct",
+      "fields": ["path: PathBuf"],
+      "location": "src/lock.rs:28"
+    },
+    "lock_for_command": {
+      "import": "crate::lock::lock_for_command",
+      "kind": "function",
+      "signature": "fn(command: &str, backup_name: Option<&str>) -> LockScope",
+      "location": "src/lock.rs:140"
+    },
+    "lock_path_for_scope": {
+      "import": "crate::lock::lock_path_for_scope",
+      "kind": "function",
+      "signature": "fn(scope: &LockScope) -> Option<PathBuf>",
+      "location": "src/lock.rs:157"
+    },
+    "validate_backup_name": {
+      "import": "crate::server::state::validate_backup_name",
+      "kind": "function",
+      "signature": "fn(name: &str) -> Result<(), &'static str>",
+      "location": "src/server/state.rs:389"
+    },
+    "backup_name_from_command": {
+      "import": "main::backup_name_from_command",
+      "kind": "function",
+      "signature": "fn(cmd: &Command) -> Option<&str>",
+      "location": "src/main.rs:45"
+    },
+    "resolve_backup_name": {
+      "import": "main::resolve_backup_name",
+      "kind": "function",
+      "signature": "fn(name: Option<String>) -> Result<String>",
+      "location": "src/main.rs:683"
+    },
+    "backup_name_required": {
+      "import": "main::backup_name_required",
+      "kind": "function",
+      "signature": "fn(name: Option<String>, command: &str) -> Result<String>",
+      "location": "src/main.rs:696"
+    },
+    "resolve_local_shortcut": {
+      "import": "main::resolve_local_shortcut",
+      "kind": "function",
+      "signature": "fn(name: &str, data_path: &str) -> Result<String>",
+      "location": "src/main.rs:730"
+    },
+    "resolve_remote_shortcut": {
+      "import": "main::resolve_remote_shortcut",
+      "kind": "function",
+      "signature": "async fn(name: &str, s3: &S3Client) -> Result<String>",
+      "location": "src/main.rs:745"
+    },
+    "resolve_backup_shortcut": {
+      "import": "crate::list::resolve_backup_shortcut",
+      "kind": "function",
+      "signature": "fn(name: &str, backups: &[BackupSummary]) -> Result<String>",
+      "location": "src/list.rs:312"
+    },
+    "BackupSummary": {
+      "import": "crate::list::BackupSummary",
+      "kind": "struct",
+      "fields": ["name: String", "timestamp: Option<DateTime<Utc>>", "size: u64", "compressed_size: u64", "table_count: usize", "metadata_size: u64", "rbac_size: u64", "config_size: u64", "object_disk_size: u64", "required: String", "is_broken: bool", "broken_reason: Option<String>"],
+      "location": "src/list.rs:46"
+    },
+    "list_local": {
+      "import": "crate::list::list_local",
+      "kind": "function",
+      "signature": "fn(data_path: &str) -> Result<Vec<BackupSummary>>",
+      "location": "src/list.rs:339"
+    },
+    "list_remote": {
+      "import": "crate::list::list_remote",
+      "kind": "function",
+      "signature": "async fn(s3: &S3Client) -> Result<Vec<BackupSummary>>",
+      "location": "src/list.rs:383"
+    },
+    "Location": {
+      "import": "crate::list::Location",
+      "kind": "enum",
+      "variants": ["Local", "Remote"],
+      "location": "src/list.rs:23"
+    },
+    "Command": {
+      "import": "cli::Command",
+      "kind": "enum",
+      "variants": ["Create", "Upload", "Download", "Restore", "CreateRemote", "RestoreRemote", "List", "Tables", "Delete", "Clean", "CleanBroken", "DefaultConfig", "PrintConfig", "Watch", "Server"],
+      "location": "src/cli.rs:49"
+    },
+    "encode_path_component": {
+      "import": "crate::path_encoding::encode_path_component",
+      "kind": "function",
+      "signature": "fn(s: &str) -> String",
+      "location": "src/path_encoding.rs:29"
+    },
+    "sanitize_path_component": {
+      "import": "crate::path_encoding::sanitize_path_component",
+      "kind": "function",
+      "signature": "fn(s: &str) -> String",
+      "location": "src/path_encoding.rs:61"
+    },
+    "ManifestCache": {
+      "import": "crate::list::ManifestCache",
+      "kind": "struct",
+      "fields": ["summaries: Option<Vec<BackupSummary>>", "populated_at: Option<Instant>", "ttl: Duration"],
+      "location": "src/list.rs:80"
+    },
+    "backup_create": {
+      "import": "crate::backup::create",
+      "kind": "function",
+      "signature": "async fn(config, ch, backup_name, table_pattern, schema_only, diff_from, partitions, skip_check_parts_columns, rbac, configs, named_collections, skip_projections) -> Result<BackupManifest>",
+      "location": "src/backup/mod.rs:93"
+    },
+    "restore_restore": {
+      "import": "crate::restore::restore",
+      "kind": "function",
+      "signature": "async fn(config, ch, backup_name, table_pattern, schema_only, data_only, rm, resume, rename_as, database_mapping, rbac_restore, configs_restore, named_collections_restore, partitions, skip_empty_tables) -> Result<()>",
+      "location": "src/restore/mod.rs:80"
+    }
+  },
+  "constraints": [
+    "zero_warnings_policy",
+    "conventional_commits",
+    "no_kameo_actors",
+    "static_musl_binary"
+  ]
+}

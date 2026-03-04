@@ -51,6 +51,16 @@
 - No ChClient/S3Client dependencies in any target function
 - Current coverage: 66.68%, target CI gate: 55% (safe headroom)
 
+### Commits
+
+| Task | Commit | Description |
+|------|--------|-------------|
+| 1 | 599ee5c6 | test(main): add unit tests for pure helper functions |
+| 2 | 9eb6bde5 | test(backup): edge-case tests for is_benign_type, normalize_uuid, filter_benign_type_drift |
+| 3 | a9b16e41 | test(download): security-critical tests for sanitize_relative_path |
+| 4 | c1c876ee | test(restore): tests for is_attach_warning idempotent attach handling |
+| 5 | 249edfd9 | chore(ci): raise coverage gate from 35% to 55% |
+
 ### Related Documentation
 - `context/symbols.md` -- Complete function signature verification table
 - `context/knowledge_graph.json` -- Machine-readable symbol lookup
