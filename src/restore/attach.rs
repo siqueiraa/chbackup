@@ -1625,4 +1625,56 @@ mod tests {
             "root content"
         );
     }
+
+    // ---- is_attach_warning tests ----
+
+    #[test]
+    fn test_is_attach_warning_duplicate_data_part() {
+        let err = anyhow::anyhow!(
+            "Code: 232. DB::Exception: Unexpected part all_1_1_0 already exists. DUPLICATE_DATA_PART"
+        );
+        assert!(is_attach_warning(&err));
+    }
+
+    #[test]
+    fn test_is_attach_warning_part_temporarily_locked() {
+        let err = anyhow::anyhow!("Code: 233. PART_IS_TEMPORARILY_LOCKED");
+        assert!(is_attach_warning(&err));
+    }
+
+    #[test]
+    fn test_is_attach_warning_no_such_data_part() {
+        let err = anyhow::anyhow!("NO_SUCH_DATA_PART in table");
+        assert!(is_attach_warning(&err));
+    }
+
+    #[test]
+    fn test_is_attach_warning_code_232_only() {
+        let err = anyhow::anyhow!("Code: 232");
+        assert!(is_attach_warning(&err));
+    }
+
+    #[test]
+    fn test_is_attach_warning_code_233_only() {
+        let err = anyhow::anyhow!("Code: 233");
+        assert!(is_attach_warning(&err));
+    }
+
+    #[test]
+    fn test_is_attach_warning_other_error() {
+        let err = anyhow::anyhow!("Code: 60. UNKNOWN_TABLE");
+        assert!(!is_attach_warning(&err));
+    }
+
+    #[test]
+    fn test_is_attach_warning_connection_error() {
+        let err = anyhow::anyhow!("Connection refused");
+        assert!(!is_attach_warning(&err));
+    }
+
+    #[test]
+    fn test_is_attach_warning_empty_error() {
+        let err = anyhow::anyhow!("");
+        assert!(!is_attach_warning(&err));
+    }
 }
