@@ -64,7 +64,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ## Requirements
 
-- **ClickHouse 21.8+** -- uses `ALTER TABLE FREEZE WITH NAME`
+- **ClickHouse 23.8+** -- uses `ALTER TABLE FREEZE WITH NAME`
 - **S3-compatible storage** -- AWS S3, MinIO, Ceph, Cloudflare R2
 - **Same host as ClickHouse** -- FREEZE creates hardlinks that need local filesystem access to `/var/lib/clickhouse/`
 
@@ -73,7 +73,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 | chbackup | ClickHouse | Status |
 |----------|------------|--------|
 | 0.1.x | 23.8, 24.3, 24.8, 25.1 | Tested in CI |
-| 0.1.x | 21.8 -- 23.7 | Supported, not in CI matrix |
+| 0.1.x | 21.8 -- 23.7 | Untested and unsupported |
 
 ## Documentation
 

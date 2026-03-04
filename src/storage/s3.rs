@@ -604,9 +604,9 @@ impl S3Client {
                     ObjectIdentifier::builder()
                         .key(full_key)
                         .build()
-                        .expect("ObjectIdentifier key is required")
+                        .context("Failed to build ObjectIdentifier")
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             let delete = Delete::builder()
                 .set_objects(Some(identifiers))

@@ -65,10 +65,55 @@ jobs:
 
       - name: Unit test coverage gate
         run: |
-          cargo llvm-cov test --all --all-features --summary-only 2>&1 | tee cov-summary.txt
-          LINE_PCT=$(grep 'TOTAL' cov-summary.txt | awk '{print $10}' | tr -d '%')
+          set -euo pipefail
+          cargo llvm-cov test --all --all-features 2>&1 | tee cov-full.txt
+          test "${PIPESTATUS[0]}" -eq 0 || exit 1
+          LINE_PCT=$(grep '^TOTAL' cov-full.txt | grep -oE '[0-9]+\.[0-9]+%' | sed -n '3p' | tr -d '%')
           echo "Unit coverage: ${LINE_PCT}%"
           python3 -c "assert float('${LINE_PCT}') >= 55, f'Coverage ${LINE_PCT}% < 55%'"
+
+      - name: Per-module coverage gates
+        run: |
+          python3 -c "
+          import re, sys
+          # Module filename -> minimum Lines Cover %
+          gates = {
+              'storage/s3.rs': 25,
+              'restore/mod.rs': 25,
+              'upload/mod.rs': 35,
+              'server/routes.rs': 40,
+              'list.rs': 50,
+          }
+          failed, matched = [], set()
+          with open('cov-full.txt') as f:
+              for line in f:
+                  for mod_path, threshold in gates.items():
+                      if not line.lstrip().startswith(mod_path):
+                          continue
+                      # Extract all percentages from the line
+                      pcts = re.findall(r'(\d+\.\d+)%', line)
+                      if len(pcts) >= 3:
+                          line_cov = float(pcts[2])  # 3rd pct = Lines Cover
+                      elif len(pcts) >= 1:
+                          line_cov = float(pcts[-1])
+                      else:
+                          continue
+                      matched.add(mod_path)
+                      if line_cov < threshold:
+                          failed.append(f'{mod_path}: {line_cov}% < {threshold}%')
+                      else:
+                          print(f'  OK: {mod_path} = {line_cov}% (>= {threshold}%)')
+          missing = set(gates.keys()) - matched
+          if missing:
+              print(f'FAIL: modules not found in coverage output: {missing}')
+              sys.exit(1)
+          if failed:
+              print('Per-module coverage gates FAILED:')
+              for f in failed:
+                  print(f'  FAIL: {f}')
+              sys.exit(1)
+          print('All per-module coverage gates passed')
+          "
 
   # ---------------------------------------------------------------------------
   # Job 2: Integration tests with ClickHouse version matrix
