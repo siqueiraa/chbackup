@@ -27,6 +27,7 @@ use crate::backup::checksum::compute_crc64;
 use crate::backup::collect::per_disk_backup_dir;
 use crate::concurrency::{effective_download_concurrency, effective_download_rate_limit};
 use crate::config::Config;
+use crate::error::ChBackupError;
 use crate::manifest::{BackupManifest, PartInfo};
 use crate::object_disk::is_s3_disk;
 use crate::path_encoding::{encode_path_component, validate_disk_path};
@@ -339,7 +340,20 @@ pub async fn download(
     let manifest_bytes = s3
         .get_object(&manifest_key)
         .await
-        .with_context(|| format!("Failed to download manifest for backup '{}'", backup_name))?;
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.contains("NoSuchKey") || msg.contains("404") || msg.contains("not found") {
+                anyhow::Error::new(ChBackupError::BackupNotFound(format!(
+                    "backup '{}' not found in S3 (key: {})",
+                    backup_name, manifest_key
+                )))
+            } else {
+                e.context(format!(
+                    "Failed to download manifest for backup '{}'",
+                    backup_name
+                ))
+            }
+        })?;
 
     let manifest = BackupManifest::from_json_bytes(&manifest_bytes)
         .with_context(|| format!("Failed to parse manifest for backup '{}'", backup_name))?;

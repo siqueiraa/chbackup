@@ -41,6 +41,7 @@ use crate::concurrency::{
     effective_max_connections, effective_object_disk_server_side_copy_concurrency,
 };
 use crate::config::Config;
+use crate::error::ChBackupError;
 use crate::manifest::BackupManifest;
 use crate::object_disk::is_s3_disk;
 use crate::resume::{compute_params_hash, load_state_file, save_state_file, RestoreState};
@@ -110,6 +111,14 @@ pub async fn restore(
 
     // 1. Read manifest
     let manifest_path = backup_dir.join("metadata.json");
+    if !manifest_path.exists() {
+        return Err(ChBackupError::BackupNotFound(format!(
+            "backup '{}' not found (no metadata.json at {})",
+            backup_name,
+            manifest_path.display()
+        ))
+        .into());
+    }
     let manifest = BackupManifest::load_from_file(&manifest_path).with_context(|| {
         format!(
             "Failed to load manifest for backup '{}' at {}",

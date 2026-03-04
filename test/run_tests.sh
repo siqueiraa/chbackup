@@ -1434,6 +1434,30 @@ if should_run "test_exit_codes"; then
         fail "restore nonexistent exit code ${EC} (expected 3)"
     fi
 
+    # Test 2b: Upload nonexistent backup (exit code 3 = not found)
+    info "  Test 2b: Upload nonexistent backup"
+    set +e
+    chbackup upload "nonexistent_backup_12345_$$" 2>&1
+    EC=$?
+    set -e
+    if [[ "$EC" -eq 3 ]]; then
+        pass "upload nonexistent exit code 3 (not found)"
+    else
+        fail "upload nonexistent exit code ${EC} (expected 3)"
+    fi
+
+    # Test 2c: Download nonexistent backup (exit code 3 = not found)
+    info "  Test 2c: Download nonexistent backup"
+    set +e
+    chbackup download "nonexistent_backup_12345_$$" 2>&1
+    EC=$?
+    set -e
+    if [[ "$EC" -eq 3 ]]; then
+        pass "download nonexistent exit code 3 (not found)"
+    else
+        fail "download nonexistent exit code ${EC} (expected 3)"
+    fi
+
     # Test 3: Invalid backup name (exit code 1 = validation error)
     info "  Test 3: Invalid backup name"
     set +e
@@ -1446,18 +1470,24 @@ if should_run "test_exit_codes"; then
         fail "create '../bad_name' exit code ${EC} (expected 1)"
     fi
 
-    # Test 4: Lock conflict (exit code 4)
+    # Test 4: Lock conflict (exit code 4) -- deterministic synthetic lock
     info "  Test 4: Lock conflict"
     LOCK_NAME="lock_test_$$"
-    # Start a backup in the background
-    chbackup create "$LOCK_NAME" &
-    BG_PID=$!
-    sleep 1  # let it acquire the lock
+    LOCK_FILE="/tmp/chbackup.${LOCK_NAME}.pid"
+    # Create a synthetic lock file with current shell PID (guaranteed alive)
+    cat > "$LOCK_FILE" <<LOCKEOF
+{
+  "pid": $$,
+  "command": "create",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+LOCKEOF
     set +e
     chbackup create "$LOCK_NAME" 2>&1
     EC=$?
     set -e
-    wait "$BG_PID" 2>/dev/null || true
+    rm -f "$LOCK_FILE"
+    # Also clean up any backup dir that might have been partially created
     chbackup delete local "$LOCK_NAME" 2>/dev/null || true
     if [[ "$EC" -eq 4 ]]; then
         pass "lock conflict exit code 4"

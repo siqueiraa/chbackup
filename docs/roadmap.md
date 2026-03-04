@@ -471,7 +471,7 @@ kill -HUP $(pidof chbackup)
 
 ### Tests
 
-Test coverage for Phase 4 features in `test/run_tests.sh` (62 tests total, T4-T62 + smoke/round-trip):
+Test coverage for Phase 4 features in `test/run_tests.sh` (65 tests total):
 
 - [done] T28: RBAC backup + restore round-trip with `--rbac` flag
 - [done] T6/T25: Partition-level backup/restore with `--partitions`

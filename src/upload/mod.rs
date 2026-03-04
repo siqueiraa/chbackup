@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -31,6 +31,7 @@ use crate::concurrency::{
     effective_upload_rate_limit,
 };
 use crate::config::Config;
+use crate::error::ChBackupError;
 use crate::manifest::{BackupManifest, PartInfo, S3ObjectInfo};
 use crate::object_disk::is_s3_disk;
 use crate::path_encoding::encode_path_component;
@@ -163,10 +164,12 @@ pub async fn upload(
     // 1. Read manifest from local backup directory
     let manifest_path = backup_dir.join("metadata.json");
     if !manifest_path.exists() {
-        bail!(
-            "Manifest not found at {}. Run 'create' before 'upload'.",
+        return Err(ChBackupError::BackupNotFound(format!(
+            "backup '{}' not found (no metadata.json at {}). Run 'create' before 'upload'.",
+            backup_name,
             manifest_path.display()
-        );
+        ))
+        .into());
     }
 
     let mut manifest = BackupManifest::load_from_file(&manifest_path)
