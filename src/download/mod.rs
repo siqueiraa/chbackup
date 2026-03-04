@@ -1750,6 +1750,73 @@ mod tests {
         assert_eq!(result.unwrap(), legacy_part);
     }
 
+    // ---- sanitize_relative_path tests (SECURITY-CRITICAL) ----
+
+    #[test]
+    fn test_sanitize_relative_path_normal() {
+        assert_eq!(
+            sanitize_relative_path("metadata/db/table.json"),
+            PathBuf::from("metadata/db/table.json")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_parent_traversal() {
+        // Strips .. components
+        assert_eq!(
+            sanitize_relative_path("../../etc/passwd"),
+            PathBuf::from("etc/passwd")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_absolute() {
+        // Strips root prefix
+        assert_eq!(
+            sanitize_relative_path("/etc/passwd"),
+            PathBuf::from("etc/passwd")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_curdir() {
+        // Strips . components
+        assert_eq!(
+            sanitize_relative_path("./some/./path"),
+            PathBuf::from("some/path")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_mixed_attack() {
+        assert_eq!(
+            sanitize_relative_path("/../../../tmp/evil"),
+            PathBuf::from("tmp/evil")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_empty() {
+        assert_eq!(sanitize_relative_path(""), PathBuf::from(""));
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_single_normal() {
+        assert_eq!(
+            sanitize_relative_path("file.txt"),
+            PathBuf::from("file.txt")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_double_dot_in_name() {
+        // "..hidden" is a Normal component, not ParentDir (only bare ".." is ParentDir)
+        assert_eq!(
+            sanitize_relative_path("dir/..hidden/file"),
+            PathBuf::from("dir/..hidden/file")
+        );
+    }
+
     #[test]
     fn test_hardlink_existing_part() {
         let dir = tempfile::tempdir().unwrap();
