@@ -86,7 +86,43 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/restart", post(routes::restart))
         // Tables endpoint
         .route("/api/v1/tables", get(routes::tables))
-        .route("/metrics", get(routes::metrics));
+        .route("/metrics", get(routes::metrics))
+        // -----------------------------------------------------------------
+        // Go-compatible /backup/* routes (drop-in parity with clickhouse-backup)
+        // -----------------------------------------------------------------
+        .route("/backup/list", get(routes::go_list_backups))
+        .route("/backup/list/:where", get(routes::go_list_by_location))
+        .route(
+            "/backup/actions",
+            get(routes::go_get_actions).post(routes::post_actions),
+        )
+        .route("/backup/create", post(routes::go_create_backup))
+        .route("/backup/create_remote", post(routes::go_create_remote))
+        .route("/backup/upload/:name", post(routes::go_upload_backup))
+        .route("/backup/download/:name", post(routes::go_download_backup))
+        .route("/backup/restore/:name", post(routes::go_restore_backup))
+        .route(
+            "/backup/restore_remote/:name",
+            post(routes::go_restore_remote),
+        )
+        .route(
+            "/backup/delete/:where/:name",
+            post(routes::go_delete_backup),
+        )
+        .route("/backup/clean", post(routes::go_clean))
+        .route(
+            "/backup/clean/remote_broken",
+            post(routes::go_clean_remote_broken),
+        )
+        .route(
+            "/backup/clean/local_broken",
+            post(routes::go_clean_local_broken),
+        )
+        .route("/backup/status", get(routes::status))
+        .route("/backup/kill", post(routes::kill_op))
+        .route("/backup/tables", get(routes::tables))
+        .route("/backup/tables/all", get(routes::go_tables_all))
+        .route("/backup/version", get(routes::version));
 
     // Always apply auth middleware unconditionally. The middleware itself
     // reads live config on every request and passes through when credentials

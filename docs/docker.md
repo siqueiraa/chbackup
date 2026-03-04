@@ -19,6 +19,7 @@ Ready-to-use compose files are in [`examples/docker/`](../examples/docker/):
 - [Multi-container setup (separate containers)](#multi-container-setup-separate-containers)
 - [Building the chbackup image](#building-the-chbackup-image)
 - [Environment variables reference](#environment-variables-reference)
+- [Migrating from Go clickhouse-backup](#migrating-from-go-clickhouse-backup)
 - [Troubleshooting](#troubleshooting)
 
 ## How it works in Docker
@@ -552,3 +553,30 @@ If using MinIO, verify:
 2. `S3_FORCE_PATH_STYLE` is `true`
 3. The MinIO container is on the same Docker network
 4. MinIO is healthy: `docker compose exec minio mc ready local`
+
+## Migrating from Go clickhouse-backup
+
+chbackup is a drop-in replacement for `altinity/clickhouse-backup`. To swap the image:
+
+1. **Replace the image**: Change `altinity/clickhouse-backup:latest` to `siqueiraa/chbackup:latest`
+2. **Keep your env vars**: Go env vars like `S3_PATH`, `LOG_LEVEL`, `BACKUPS_TO_KEEP_LOCAL`, `S3_UPLOAD_CONCURRENCY`, `S3_DOWNLOAD_CONCURRENCY`, `BACKUPS_TO_KEEP_REMOTE`, `CLICKHOUSE_FREEZE_BY_PART`, and `ALLOW_EMPTY_BACKUPS` are accepted as fallbacks
+3. **Config path**: `CLICKHOUSE_BACKUP_CONFIG` and `/etc/clickhouse-backup/config.yml` are auto-detected
+4. **Port remap**: If you have `CLICKHOUSE_PORT=9000` (Go uses native TCP), chbackup auto-remaps to 8123 (HTTP)
+5. **API routes**: Both `/backup/*` (Go) and `/api/v1/*` (chbackup) routes work. Existing CronJobs and URL engine tables need no changes
+6. **`REMOTE_STORAGE`**: Accepted but ignored (chbackup is S3-only). A warning is logged if set to anything other than `"s3"` or empty
+
+Example docker-compose change:
+
+```yaml
+services:
+  clickhouse-backup:
+-   image: altinity/clickhouse-backup:latest
++   image: siqueiraa/chbackup:latest
+    environment:
+      # These Go env vars work as-is:
+      S3_BUCKET: my-backups
+      S3_PATH: clickhouse/  # mapped to s3.prefix
+      LOG_LEVEL: info
+      BACKUPS_TO_KEEP_REMOTE: "7"
+      CLICKHOUSE_PORT: "8123"
+```

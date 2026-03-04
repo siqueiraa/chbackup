@@ -19,16 +19,24 @@ chbackup reads configuration from a YAML file, environment variables, and CLI fl
 
 ## Config file location
 
-Default: `/etc/chbackup/config.yml`
+chbackup resolves the config file using this fallback chain:
 
-Override with:
+1. `-c` / `--config` CLI flag (error if file missing)
+2. `CHBACKUP_CONFIG` environment variable
+3. `CLICKHOUSE_BACKUP_CONFIG` environment variable (Go clickhouse-backup compatibility)
+4. `/etc/chbackup/config.yml` (if exists)
+5. `/etc/clickhouse-backup/config.yml` (Go clickhouse-backup compatibility, if exists)
+6. Default: `/etc/chbackup/config.yml` (empty config with defaults)
 
 ```bash
-# CLI flag
+# CLI flag (highest priority)
 chbackup -c /path/to/config.yml create
 
 # Environment variable
 CHBACKUP_CONFIG=/path/to/config.yml chbackup create
+
+# Go clickhouse-backup compatible env var
+CLICKHOUSE_BACKUP_CONFIG=/etc/clickhouse-backup/config.yml chbackup create
 ```
 
 Generate a config file with all defaults:
@@ -333,6 +341,33 @@ The most common config parameters can be overridden via environment variables. O
 | `FULL_INTERVAL` | `watch.full_interval` |
 | `WATCH_ENABLED` | `watch.enabled` |
 | `WATCH_MAX_CONSECUTIVE_ERRORS` | `watch.max_consecutive_errors` |
+
+## Go clickhouse-backup compatibility
+
+chbackup accepts Go clickhouse-backup environment variable names as fallbacks. The chbackup-native name always takes precedence.
+
+| Go env var | chbackup env var | Config field |
+|---|---|---|
+| `LOG_LEVEL` | `CHBACKUP_LOG_LEVEL` | `general.log_level` |
+| `BACKUPS_TO_KEEP_LOCAL` | `CHBACKUP_BACKUPS_TO_KEEP_LOCAL` | `general.backups_to_keep_local` |
+| `BACKUPS_TO_KEEP_REMOTE` | `CHBACKUP_BACKUPS_TO_KEEP_REMOTE` | `general.backups_to_keep_remote` |
+| `S3_PATH` | `S3_PREFIX` | `s3.prefix` |
+| `S3_UPLOAD_CONCURRENCY` | `CHBACKUP_BACKUP_UPLOAD_CONCURRENCY` | `backup.upload_concurrency` |
+| `S3_DOWNLOAD_CONCURRENCY` | `CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY` | `backup.download_concurrency` |
+| `CLICKHOUSE_FREEZE_BY_PART` | — | `clickhouse.freeze_by_part` |
+| `ALLOW_EMPTY_BACKUPS` | — | `backup.allow_empty_backups` |
+
+### Port remap
+
+Go clickhouse-backup uses the native TCP protocol (port 9000) while chbackup uses the HTTP protocol (port 8123). When `CLICKHOUSE_PORT=9000` is detected, chbackup automatically remaps it to 8123 with a warning. Set `CLICKHOUSE_PORT=8123` explicitly to suppress the warning.
+
+### REMOTE_STORAGE
+
+The `REMOTE_STORAGE` env var is accepted for compatibility. If set to `"s3"` or empty, it's a no-op. Any other value logs a warning since chbackup only supports S3 storage.
+
+### Config path fallback
+
+See [Config file location](#config-file-location) above for the `CLICKHOUSE_BACKUP_CONFIG` env var and `/etc/clickhouse-backup/config.yml` path fallbacks.
 
 ## CLI --env overrides
 

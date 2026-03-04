@@ -769,51 +769,8 @@ pub async fn list_backups(
         }
     }
 
-    let config = state.config.load();
-    let data_path = &config.clickhouse.data_path;
-    let mut results = Vec::new();
-
-    let show_local = params.location.is_none() || params.location.as_deref() == Some("local");
-    let show_remote = params.location.is_none() || params.location.as_deref() == Some("remote");
-
-    if show_local {
-        let dp = data_path.to_string();
-        match tokio::task::spawn_blocking(move || list::list_local(&dp)).await {
-            Ok(Ok(summaries)) => {
-                for s in summaries {
-                    results.push(summary_to_list_response(s, "local"));
-                }
-            }
-            Ok(Err(e)) => {
-                warn!(error = %e, "Failed to list local backups");
-            }
-            Err(e) => {
-                warn!(error = %e, "spawn_blocking panicked for list_local");
-            }
-        }
-    }
-
-    if show_remote {
-        let s3 = state.s3.load();
-        match list::list_remote_cached(&s3, &state.manifest_cache).await {
-            Ok(summaries) => {
-                for s in summaries {
-                    results.push(summary_to_list_response(s, "remote"));
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to list remote backups");
-            }
-        }
-    }
-
-    // Sort by created timestamp (RFC3339 strings sort lexicographically correctly).
-    // Default is ascending (oldest first); desc=true gives newest first.
-    if params.desc.unwrap_or(false) {
-        results.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.name.cmp(&a.name)));
-    } else {
-        results.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.name.cmp(&b.name)));
-    }
+    let results =
+        build_list_data(&state, params.location.as_deref(), params.desc.unwrap_or(false)).await;
 
     let (header, results) = paginate(results, params.offset, params.limit, "list");
 
@@ -1931,6 +1888,370 @@ fn format_duration(d: std::time::Duration) -> String {
     } else {
         format!("{}s", seconds)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Go-compatible /backup/* wrapper handlers
+// ---------------------------------------------------------------------------
+
+/// Response for Go-compatible mutation endpoints (create, upload, etc.).
+/// Go returns `{"status":"acknowledged","operation":"<cmd>"}`.
+#[derive(Debug, Serialize)]
+pub struct GoOperationResponse {
+    pub status: String,
+    pub operation: String,
+}
+
+/// Go-compatible list response with additional `desc` and `location` fields.
+/// Extends ListResponse with fields Go clients expect.
+#[derive(Debug, Serialize)]
+pub struct GoListResponse {
+    pub name: String,
+    pub created: String,
+    pub size: i64,
+    pub location: String,
+    pub required: String,
+    pub desc: String,
+    // chbackup extras (Go ignores unmatched fields)
+    pub data_size: u64,
+    pub object_disk_size: u64,
+    pub metadata_size: u64,
+    pub rbac_size: u64,
+    pub config_size: u64,
+    pub compressed_size: u64,
+}
+
+/// Go-compatible action response with status/timestamp mapping.
+#[derive(Debug, Serialize)]
+pub struct GoActionResponse {
+    pub command: String,
+    pub start: String,
+    pub finish: String,
+    pub status: String,
+    pub error: String,
+}
+
+/// Format a chrono DateTime as "YYYY-MM-DD HH:MM:SS" (Go format, no T, no timezone).
+fn format_go_timestamp(rfc3339: &str) -> String {
+    if rfc3339.is_empty() {
+        return String::new();
+    }
+    // Parse RFC3339 and reformat
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        rfc3339.to_string()
+    }
+}
+
+/// Map chbackup status to Go status values.
+fn map_go_status(status: &str) -> &'static str {
+    match status {
+        "running" => "in progress",
+        "completed" => "success",
+        "failed" => "error",
+        "killed" => "cancel",
+        _ => "error",
+    }
+}
+
+/// Build the core list data (shared between /api/v1/list and /backup/list).
+async fn build_list_data(
+    state: &AppState,
+    location: Option<&str>,
+    desc: bool,
+) -> Vec<ListResponse> {
+    let config = state.config.load();
+    let data_path = &config.clickhouse.data_path;
+    let mut results = Vec::new();
+
+    let show_local = location.is_none() || location == Some("local");
+    let show_remote = location.is_none() || location == Some("remote");
+
+    if show_local {
+        let dp = data_path.to_string();
+        match tokio::task::spawn_blocking(move || list::list_local(&dp)).await {
+            Ok(Ok(summaries)) => {
+                for s in summaries {
+                    results.push(summary_to_list_response(s, "local"));
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "Failed to list local backups");
+            }
+            Err(e) => {
+                warn!(error = %e, "spawn_blocking panicked for list_local");
+            }
+        }
+    }
+
+    if show_remote {
+        let s3 = state.s3.load();
+        match list::list_remote_cached(&s3, &state.manifest_cache).await {
+            Ok(summaries) => {
+                for s in summaries {
+                    results.push(summary_to_list_response(s, "remote"));
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to list remote backups");
+            }
+        }
+    }
+
+    if desc {
+        results.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.name.cmp(&a.name)));
+    } else {
+        results.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.name.cmp(&b.name)));
+    }
+
+    results
+}
+
+/// GET /backup/list -- Go-compatible list (JSONEachRow format).
+pub async fn go_list_backups(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> (
+    StatusCode,
+    [(axum::http::header::HeaderName, &'static str); 1],
+    String,
+) {
+    let results = build_list_data(&state, params.location.as_deref(), params.desc.unwrap_or(false)).await;
+
+    let go_results: Vec<GoListResponse> = results
+        .into_iter()
+        .map(|r| {
+            let desc = if r.required.is_empty() {
+                "tar, regular".to_string()
+            } else {
+                "tar, incremental".to_string()
+            };
+            GoListResponse {
+                name: r.name,
+                created: format_go_timestamp(&r.created),
+                size: r.size.min(i64::MAX as u64) as i64,
+                location: r.location,
+                required: r.required,
+                desc,
+                data_size: r.data_size,
+                object_disk_size: r.object_disk_size,
+                metadata_size: r.metadata_size,
+                rbac_size: r.rbac_size,
+                config_size: r.config_size,
+                compressed_size: r.compressed_size,
+            }
+        })
+        .collect();
+
+    // JSONEachRow: one JSON object per line
+    let body = go_results
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = if body.is_empty() { body } else { body + "\n" };
+
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=UTF-8",
+        )],
+        body,
+    )
+}
+
+/// GET /backup/list/:where -- Go-compatible list filtered by location.
+pub async fn go_list_by_location(
+    State(state): State<AppState>,
+    Path(location): Path<String>,
+) -> (
+    StatusCode,
+    [(axum::http::header::HeaderName, &'static str); 1],
+    String,
+) {
+    if location != "local" && location != "remote" {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json; charset=UTF-8",
+            )],
+            "{\"error\":\"Invalid location: must be 'local' or 'remote'\"}\n".to_string(),
+        );
+    }
+    let params = ListParams {
+        location: Some(location),
+        desc: None,
+        offset: None,
+        limit: None,
+        format: None,
+    };
+    go_list_backups(State(state), Query(params)).await
+}
+
+/// GET /backup/actions -- Go-compatible actions (JSONEachRow format with Go status mapping).
+pub async fn go_get_actions(State(state): State<AppState>) -> impl IntoResponse {
+    let log = state.action_log.lock().await;
+    let entries: Vec<GoActionResponse> = log
+        .entries()
+        .iter()
+        .map(|e| {
+            let (status_str, error_str) = match &e.status {
+                ActionStatus::Running => ("running", String::new()),
+                ActionStatus::Completed => ("completed", String::new()),
+                ActionStatus::Failed(err) => ("failed", err.clone()),
+                ActionStatus::Killed => ("killed", String::new()),
+            };
+
+            GoActionResponse {
+                command: e.command.clone(),
+                start: format_go_timestamp(&e.start.to_rfc3339()),
+                finish: e
+                    .finish
+                    .map(|f| format_go_timestamp(&f.to_rfc3339()))
+                    .unwrap_or_default(),
+                status: map_go_status(status_str).to_string(),
+                error: error_str,
+            }
+        })
+        .collect();
+
+    let body = entries
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = if body.is_empty() { body } else { body + "\n" };
+
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=UTF-8",
+        )],
+        body,
+    )
+}
+
+/// Wrap a chbackup mutation response into a Go-compatible acknowledged response.
+fn go_operation_response(
+    operation: &str,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    Ok(Json(GoOperationResponse {
+        status: "acknowledged".to_string(),
+        operation: operation.to_string(),
+    }))
+}
+
+/// POST /backup/create -- Go-compatible create (returns acknowledged format).
+pub async fn go_create_backup(
+    State(state): State<AppState>,
+    body: Option<Json<CreateRequest>>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = create_backup(State(state), body).await?;
+    go_operation_response("create")
+}
+
+/// POST /backup/upload/:name -- Go-compatible upload.
+pub async fn go_upload_backup(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<UploadRequest>>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = upload_backup(State(state), Path(name), body).await?;
+    go_operation_response("upload")
+}
+
+/// POST /backup/download/:name -- Go-compatible download.
+pub async fn go_download_backup(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<DownloadRequest>>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = download_backup(State(state), Path(name), body).await?;
+    go_operation_response("download")
+}
+
+/// POST /backup/restore/:name -- Go-compatible restore.
+pub async fn go_restore_backup(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<RestoreRequest>>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = restore_backup(State(state), Path(name), body).await?;
+    go_operation_response("restore")
+}
+
+/// POST /backup/create_remote -- Go-compatible create_remote.
+pub async fn go_create_remote(
+    State(state): State<AppState>,
+    body: Option<Json<CreateRemoteRequest>>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = create_remote(State(state), body).await?;
+    go_operation_response("create_remote")
+}
+
+/// POST /backup/restore_remote/:name -- Go-compatible restore_remote.
+pub async fn go_restore_remote(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<RestoreRemoteRequest>>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = restore_remote(State(state), Path(name), body).await?;
+    go_operation_response("restore_remote")
+}
+
+/// POST /backup/delete/:where/:name -- Go-compatible delete (POST instead of DELETE).
+pub async fn go_delete_backup(
+    State(state): State<AppState>,
+    Path((location, name)): Path<(String, String)>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = delete_backup(State(state), Path((location, name))).await?;
+    go_operation_response("delete")
+}
+
+/// POST /backup/clean -- Go-compatible clean (shadow dirs).
+pub async fn go_clean(
+    State(state): State<AppState>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = clean(State(state)).await?;
+    go_operation_response("clean")
+}
+
+/// POST /backup/clean/remote_broken -- Go-compatible clean remote broken.
+pub async fn go_clean_remote_broken(
+    State(state): State<AppState>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = clean_remote_broken(State(state)).await?;
+    go_operation_response("clean_remote_broken")
+}
+
+/// POST /backup/clean/local_broken -- Go-compatible clean local broken (not in Go, but for symmetry).
+pub async fn go_clean_local_broken(
+    State(state): State<AppState>,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _ = clean_local_broken(State(state)).await?;
+    go_operation_response("clean_local_broken")
+}
+
+/// GET /backup/tables/all -- Go-compatible tables with all=true.
+pub async fn go_tables_all(
+    State(state): State<AppState>,
+    Query(mut params): Query<TablesParams>,
+) -> Result<
+    (
+        [(
+            axum::http::header::HeaderName,
+            axum::http::header::HeaderValue,
+        ); 1],
+        Json<Vec<TablesResponseEntry>>,
+    ),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    params.all = Some(true);
+    tables(State(state), Query(params)).await
 }
 
 /// GET /metrics -- Prometheus metrics endpoint

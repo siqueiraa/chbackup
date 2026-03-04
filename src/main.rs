@@ -1,6 +1,6 @@
 mod cli;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -84,8 +84,8 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Command::PrintConfig => {
-            let config_path = Path::new(&cli.config);
-            let config = Config::load(config_path, &cli.env_overrides)?;
+            let config_path = resolve_config_path(cli.config.as_deref())?;
+            let config = Config::load(&config_path, &cli.env_overrides)?;
             let yaml = config.redacted_yaml()?;
             print!("{yaml}");
             return Ok(());
@@ -98,8 +98,8 @@ async fn run() -> Result<()> {
     // -----------------------------------------------------------------------
 
     // 1. Load config (with env overlay and CLI --env overrides).
-    let config_path = Path::new(&cli.config);
-    let config = Config::load(config_path, &cli.env_overrides)?;
+    let config_path = resolve_config_path(cli.config.as_deref())?;
+    let config = Config::load(&config_path, &cli.env_overrides)?;
 
     // 2. Init logging.
     let is_server = matches!(&cli.command, Command::Server { .. });
@@ -625,7 +625,7 @@ async fn run() -> Result<()> {
             #[cfg(unix)]
             chbackup::spawn_sigquit_handler();
 
-            let config_path = PathBuf::from(&cli.config);
+            let config_path = resolve_config_path(cli.config.as_deref())?;
             let ctx = chbackup::watch::WatchContext {
                 config: Arc::new(config),
                 ch,
@@ -681,7 +681,7 @@ async fn run() -> Result<()> {
             config.validate()?;
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
-            let config_path = PathBuf::from(&cli.config);
+            let config_path = resolve_config_path(cli.config.as_deref())?;
             chbackup::server::start_server(Arc::new(config), ch, s3, watch, config_path).await?;
         }
 
@@ -788,6 +788,55 @@ fn merge_skip_projections(cli_flag: Option<&str>, config_list: &[String]) -> Vec
             .collect(),
         None => config_list.to_vec(),
     }
+}
+
+/// Resolve the config file path using the following fallback chain:
+/// 1. CLI `-c` flag (explicit)
+/// 2. `CHBACKUP_CONFIG` env var
+/// 3. `CLICKHOUSE_BACKUP_CONFIG` env var (Go compat)
+/// 4. `/etc/chbackup/config.yml` (if exists)
+/// 5. `/etc/clickhouse-backup/config.yml` (Go compat, if exists)
+/// 6. Default path `/etc/chbackup/config.yml` (Config::load will create default config)
+fn resolve_config_path(cli_config: Option<&str>) -> anyhow::Result<PathBuf> {
+    // 1. CLI flag takes priority — error if file doesn't exist
+    if let Some(path) = cli_config {
+        let p = PathBuf::from(path);
+        anyhow::ensure!(
+            p.exists(),
+            "Config file not found: {} (specified via -c flag)",
+            p.display()
+        );
+        return Ok(p);
+    }
+
+    // 2. CHBACKUP_CONFIG env var
+    if let Ok(path) = std::env::var("CHBACKUP_CONFIG") {
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    // 3. CLICKHOUSE_BACKUP_CONFIG env var (Go compat)
+    if let Ok(path) = std::env::var("CLICKHOUSE_BACKUP_CONFIG") {
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    // 4. Default chbackup path
+    let chbackup_path = PathBuf::from("/etc/chbackup/config.yml");
+    if chbackup_path.exists() {
+        return Ok(chbackup_path);
+    }
+
+    // 5. Go clickhouse-backup path (compat)
+    let go_path = PathBuf::from("/etc/clickhouse-backup/config.yml");
+    if go_path.exists() {
+        return Ok(go_path);
+    }
+
+    // 6. Empty path — Config::load will create default config
+    Ok(PathBuf::from("/etc/chbackup/config.yml"))
 }
 
 #[cfg(test)]

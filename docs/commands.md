@@ -1,6 +1,6 @@
 # CLI Command Reference
 
-All commands accept a global `-c` / `--config` flag to specify the config file path (default: `/etc/chbackup/config.yml`).
+All commands accept a global `-c` / `--config` flag to specify the config file path. When not provided, chbackup checks `CHBACKUP_CONFIG`, then `CLICKHOUSE_BACKUP_CONFIG` (Go compat), then `/etc/chbackup/config.yml`, then `/etc/clickhouse-backup/config.yml` (Go compat). See [Configuration > Config file location](configuration.md#config-file-location) for the full fallback chain.
 
 ```bash
 chbackup -c /path/to/config.yml <command> [options]

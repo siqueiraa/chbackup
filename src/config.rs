@@ -897,13 +897,17 @@ impl Config {
     /// Every config parameter can be overridden via an environment variable (design doc §2).
     fn apply_env_overlay(&mut self) {
         // General
-        if let Ok(v) = std::env::var("CHBACKUP_LOG_LEVEL") {
+        if let Ok(v) = std::env::var("CHBACKUP_LOG_LEVEL")
+            .or_else(|_| std::env::var("LOG_LEVEL"))
+        {
             self.general.log_level = v;
         }
         if let Ok(v) = std::env::var("CHBACKUP_LOG_FORMAT") {
             self.general.log_format = v;
         }
-        if let Ok(v) = std::env::var("CHBACKUP_BACKUPS_TO_KEEP_LOCAL") {
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUPS_TO_KEEP_LOCAL")
+            .or_else(|_| std::env::var("BACKUPS_TO_KEEP_LOCAL"))
+        {
             if let Ok(n) = v.parse::<i32>() {
                 self.general.backups_to_keep_local = n;
             } else {
@@ -913,7 +917,9 @@ impl Config {
                 );
             }
         }
-        if let Ok(v) = std::env::var("CHBACKUP_BACKUPS_TO_KEEP_REMOTE") {
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUPS_TO_KEEP_REMOTE")
+            .or_else(|_| std::env::var("BACKUPS_TO_KEEP_REMOTE"))
+        {
             if let Ok(n) = v.parse::<i32>() {
                 self.general.backups_to_keep_remote = n;
             } else {
@@ -973,7 +979,16 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_PORT") {
             if let Ok(port) = v.parse::<u16>() {
-                self.clickhouse.port = port;
+                if port == 9000 {
+                    warn!(
+                        "CLICKHOUSE_PORT=9000 detected — Go clickhouse-backup uses native TCP \
+                         but chbackup uses HTTP. Remapping to 8123. \
+                         Set CLICKHOUSE_PORT=8123 to suppress."
+                    );
+                    self.clickhouse.port = 8123;
+                } else {
+                    self.clickhouse.port = port;
+                }
             } else {
                 warn!("CLICKHOUSE_PORT='{}' is not a valid u16, ignoring", v);
             }
@@ -1084,6 +1099,16 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        if let Ok(v) = std::env::var("CLICKHOUSE_FREEZE_BY_PART") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.clickhouse.freeze_by_part = b;
+            } else {
+                warn!(
+                    "CLICKHOUSE_FREEZE_BY_PART='{}' is not a valid bool, ignoring",
+                    v
+                );
+            }
+        }
 
         // S3
         if let Ok(v) = std::env::var("S3_BUCKET") {
@@ -1095,7 +1120,9 @@ impl Config {
         if let Ok(v) = std::env::var("S3_ENDPOINT") {
             self.s3.endpoint = v;
         }
-        if let Ok(v) = std::env::var("S3_PREFIX") {
+        if let Ok(v) = std::env::var("S3_PREFIX")
+            .or_else(|_| std::env::var("S3_PATH"))
+        {
             self.s3.prefix = v;
         }
         if let Ok(v) = std::env::var("S3_ACCESS_KEY") {
@@ -1158,7 +1185,9 @@ impl Config {
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_COMPRESSION") {
             self.backup.compression = v;
         }
-        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_UPLOAD_CONCURRENCY") {
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_UPLOAD_CONCURRENCY")
+            .or_else(|_| std::env::var("S3_UPLOAD_CONCURRENCY"))
+        {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.upload_concurrency = n;
             } else {
@@ -1168,7 +1197,9 @@ impl Config {
                 );
             }
         }
-        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY") {
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY")
+            .or_else(|_| std::env::var("S3_DOWNLOAD_CONCURRENCY"))
+        {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.download_concurrency = n;
             } else {
@@ -1209,6 +1240,23 @@ impl Config {
                     "CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD='{}' is not a valid u64, ignoring",
                     v
                 );
+            }
+        }
+        if let Ok(v) = std::env::var("ALLOW_EMPTY_BACKUPS") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.backup.allow_empty_backups = b;
+            } else {
+                warn!(
+                    "ALLOW_EMPTY_BACKUPS='{}' is not a valid bool, ignoring",
+                    v
+                );
+            }
+        }
+
+        // Go compat: silently accept REMOTE_STORAGE=s3 or empty; warn on anything else
+        if let Ok(v) = std::env::var("REMOTE_STORAGE") {
+            if !v.is_empty() && v != "s3" {
+                warn!("chbackup only supports S3 storage; REMOTE_STORAGE='{}' ignored", v);
             }
         }
 
@@ -1787,6 +1835,16 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "API_USERNAME" => Some("api.username"),
         "API_PASSWORD" => Some("api.password"),
         "API_CREATE_INTEGRATION_TABLES" => Some("api.create_integration_tables"),
+
+        // Go-compatible aliases
+        "LOG_LEVEL" => Some("general.log_level"),
+        "BACKUPS_TO_KEEP_LOCAL" => Some("general.backups_to_keep_local"),
+        "BACKUPS_TO_KEEP_REMOTE" => Some("general.backups_to_keep_remote"),
+        "S3_PATH" => Some("s3.prefix"),
+        "S3_UPLOAD_CONCURRENCY" => Some("backup.upload_concurrency"),
+        "S3_DOWNLOAD_CONCURRENCY" => Some("backup.download_concurrency"),
+        "CLICKHOUSE_FREEZE_BY_PART" => Some("clickhouse.freeze_by_part"),
+        "ALLOW_EMPTY_BACKUPS" => Some("backup.allow_empty_backups"),
 
         // Watch
         "WATCH_INTERVAL" => Some("watch.watch_interval"),

@@ -22,6 +22,7 @@ The server listens on `localhost:7171` by default. Change with `api.listen` conf
 - [Configuration management](#configuration-management)
 - [Metrics](#metrics)
 - [Command dispatcher](#command-dispatcher)
+- [Legacy Go compatibility (`/backup/*` routes)](#legacy-go-compatibility-backup-routes)
 - [Error responses](#error-responses)
 
 ## Authentication
@@ -406,6 +407,66 @@ curl -X POST http://localhost:7171/api/v1/actions \
 The body also accepts a JSON array (`[{"command":"..."}]`) or JSONEachRow format (one JSON object per line) for ClickHouse URL engine compatibility.
 
 Supported commands: `create`, `upload`, `download`, `restore`, `create_remote`, `restore_remote`, `delete`, `clean_broken`.
+
+## Legacy Go compatibility (`/backup/*` routes)
+
+chbackup exposes a second set of API routes under `/backup/*` that match the Go clickhouse-backup API. This allows existing ClickHouse URL engine integration tables (e.g., `system.backup_list`, `system.backup_actions`) and CronJob scripts to work without modification after swapping the Docker image.
+
+### Response format differences
+
+The `/backup/*` routes return **JSONEachRow** (newline-delimited JSON objects) instead of JSON arrays:
+
+```
+{"name":"backup1","created":"2024-03-01 12:34:56","size":828848,"location":"remote","required":"","desc":"tar, regular"}
+{"name":"backup2","created":"2024-03-02 15:45:30","size":1048576,"location":"local","required":"backup1","desc":"tar, incremental"}
+```
+
+Mutation endpoints return Go-style acknowledgment:
+
+```json
+{"status": "acknowledged", "operation": "create"}
+```
+
+### Status value mapping
+
+| chbackup status | Go `/backup/*` status |
+|---|---|
+| `running` | `in progress` |
+| `completed` | `success` |
+| `failed` | `error` |
+| `killed` | `cancel` |
+
+### Timestamp format
+
+Go routes use `YYYY-MM-DD HH:MM:SS` (no `T` separator, no timezone) instead of RFC 3339.
+
+### Available routes
+
+| Route | Method | Equivalent chbackup endpoint |
+|---|---|---|
+| `/backup/list` | GET | `/api/v1/list` (JSONEachRow output) |
+| `/backup/list/:where` | GET | `/api/v1/list?location=:where` |
+| `/backup/actions` | GET | `/api/v1/actions` (JSONEachRow output) |
+| `/backup/actions` | POST | `/api/v1/actions` |
+| `/backup/create` | POST | `/api/v1/create` |
+| `/backup/create_remote` | POST | `/api/v1/create_remote` |
+| `/backup/upload/:name` | POST | `/api/v1/upload/:name` |
+| `/backup/download/:name` | POST | `/api/v1/download/:name` |
+| `/backup/restore/:name` | POST | `/api/v1/restore/:name` |
+| `/backup/restore_remote/:name` | POST | `/api/v1/restore_remote/:name` |
+| `/backup/delete/:where/:name` | POST | `DELETE /api/v1/delete/:where/:name` |
+| `/backup/clean` | POST | `/api/v1/clean` |
+| `/backup/clean/remote_broken` | POST | `/api/v1/clean/remote_broken` |
+| `/backup/clean/local_broken` | POST | `/api/v1/clean/local_broken` |
+| `/backup/status` | GET | `/api/v1/status` |
+| `/backup/kill` | POST | `/api/v1/kill` |
+| `/backup/tables` | GET | `/api/v1/tables` |
+| `/backup/tables/all` | GET | `/api/v1/tables?all=true` |
+| `/backup/version` | GET | `/api/v1/version` |
+
+### Integration table compatibility
+
+Existing ClickHouse URL engine tables created by Go clickhouse-backup that point to `/backup/list` or `/backup/actions` will work automatically — no need to DROP and recreate them.
 
 ## Error responses
 

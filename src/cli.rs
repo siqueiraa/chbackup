@@ -22,14 +22,8 @@ pub enum ListFormat {
 #[command(name = "chbackup", version, about)]
 pub struct Cli {
     /// Config file path
-    #[arg(
-        short = 'c',
-        long = "config",
-        default_value = "/etc/chbackup/config.yml",
-        env = "CHBACKUP_CONFIG",
-        global = true
-    )]
-    pub config: String,
+    #[arg(short = 'c', long = "config", global = true)]
+    pub config: Option<String>,
 
     /// Override config params via CLI: --env KEY=VALUE
     #[arg(long = "env", global = true)]

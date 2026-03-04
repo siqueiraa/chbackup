@@ -1,8 +1,8 @@
 # =============================================================================
 # Dockerfile -- Production chbackup image
 # =============================================================================
-# Multi-stage build: Rust cross-compilation to static musl binary, then
-# Alpine runtime. Produces a minimal image (~25MB) with zero runtime deps.
+# Multi-stage build: Rust compilation to static musl binary, then Alpine
+# runtime. Produces a minimal image (~25MB) with zero runtime deps.
 #
 # Build:
 #   docker build -t chbackup:latest --build-arg VERSION=0.1.0 .
@@ -14,8 +14,8 @@
 # =============================================================================
 
 # Stage 1: Build static binary
-FROM rust:1.82-alpine AS builder
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
+FROM rust:1.91-alpine AS builder
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig gcc
 WORKDIR /src
 
 # Dependency caching: copy manifests first, build with dummy main.rs,
@@ -23,11 +23,11 @@ WORKDIR /src
 # happens when Cargo.toml or Cargo.lock change.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs \
-    && cargo build --release --target x86_64-unknown-linux-musl \
+    && cargo build --release \
     && rm -rf src
 
 COPY src/ src/
-RUN cargo build --release --target x86_64-unknown-linux-musl
+RUN cargo build --release
 
 # Stage 2: Minimal Alpine runtime
 FROM alpine:3.21
@@ -52,7 +52,7 @@ RUN addgroup -S -g 101 clickhouse \
     && apk add --no-cache ca-certificates tzdata bash \
     && update-ca-certificates
 
-COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/chbackup /bin/chbackup
+COPY --from=builder /src/target/release/chbackup /bin/chbackup
 
 ENTRYPOINT ["/bin/chbackup"]
 CMD ["--help"]

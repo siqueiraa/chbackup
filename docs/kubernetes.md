@@ -18,6 +18,7 @@ A ready-to-use sidecar manifest is in [`examples/kubernetes/sidecar.yaml`](../ex
 - [Resource sizing](#resource-sizing)
 - [Graceful shutdown](#graceful-shutdown)
 - [Multiple shards](#multiple-shards)
+- [Migrating from Go clickhouse-backup](#migrating-from-go-clickhouse-backup)
 - [Troubleshooting](#troubleshooting)
 
 ## How it works
@@ -524,3 +525,45 @@ chbackup stores local backup data in `/var/lib/clickhouse/backup/`. If the volum
 1. Set `watch.delete_local_after_upload: true` (default) to remove local copies after upload
 2. Set `general.backups_to_keep_local: 1` to keep only one local backup
 3. Use `general.backups_to_keep_local: -1` to delete immediately after upload
+
+## Migrating from Go clickhouse-backup
+
+chbackup is a drop-in replacement for `altinity/clickhouse-backup` in Kubernetes. Swap the sidecar image with minimal changes:
+
+### Step 1: Replace the image
+
+```yaml
+containers:
+  - name: clickhouse-backup
+-   image: altinity/clickhouse-backup:latest
++   image: siqueiraa/chbackup:latest
+```
+
+### Step 2: Keep existing env vars
+
+Go environment variables are accepted as fallbacks:
+
+| Go env var | Effect |
+|---|---|
+| `LOG_LEVEL` | Mapped to `general.log_level` |
+| `BACKUPS_TO_KEEP_LOCAL` | Mapped to `general.backups_to_keep_local` |
+| `BACKUPS_TO_KEEP_REMOTE` | Mapped to `general.backups_to_keep_remote` |
+| `S3_PATH` | Mapped to `s3.prefix` |
+| `S3_UPLOAD_CONCURRENCY` | Mapped to `backup.upload_concurrency` |
+| `S3_DOWNLOAD_CONCURRENCY` | Mapped to `backup.download_concurrency` |
+| `CLICKHOUSE_FREEZE_BY_PART` | Mapped to `clickhouse.freeze_by_part` |
+| `ALLOW_EMPTY_BACKUPS` | Mapped to `backup.allow_empty_backups` |
+| `CLICKHOUSE_BACKUP_CONFIG` | Config file path fallback |
+| `REMOTE_STORAGE` | Accepted but ignored (S3-only) |
+
+### Step 3: Port remap (if needed)
+
+If your config has `CLICKHOUSE_PORT=9000` (Go uses native TCP protocol), chbackup auto-remaps to 8123 (HTTP). Set `CLICKHOUSE_PORT=8123` explicitly to suppress the warning.
+
+### Step 4: API and integration tables
+
+Both `/backup/*` (Go-compatible) and `/api/v1/*` (chbackup native) API routes work. Existing:
+- CronJobs calling `/backup/create`, `/backup/upload/:name`, etc.
+- ClickHouse URL engine tables (`system.backup_list`, `system.backup_actions`) pointing to `/backup/list` or `/backup/actions`
+
+All continue working without changes. See [API docs > Legacy Go compatibility](api.md#legacy-go-compatibility-backup-routes) for response format details.
