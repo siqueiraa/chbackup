@@ -901,6 +901,19 @@ pub async fn restore(
         );
     }
 
+    // Return error if parts were skipped so callers get exit code 3.
+    // Do NOT persist completion state on partial restore — the per-part
+    // incremental state saved during the attach loop is already correct
+    // and sufficient for resume. Writing all manifest parts here would
+    // cause the next --resume to skip parts that were never attached.
+    if total_skipped > 0 {
+        bail!(crate::error::ChBackupError::PartialRestore {
+            attached: total_attached,
+            skipped: total_skipped,
+            total: total_attached + total_skipped,
+        });
+    }
+
     // Save completion state with all manifest part names, so a subsequent
     // --resume is a no-op. ClickHouse reassigns block numbers on ATTACH PART,
     // so after merges, active part names differ from manifest names. Persisting
@@ -933,15 +946,6 @@ pub async fn restore(
     if resume {
         let params_path = crate::resume::restore_params_path(&backup_dir);
         let _ = std::fs::remove_file(&params_path); // non-fatal
-    }
-
-    // Return error if parts were skipped so callers get exit code 3
-    if total_skipped > 0 {
-        bail!(crate::error::ChBackupError::PartialRestore {
-            attached: total_attached,
-            skipped: total_skipped,
-            total: total_attached + total_skipped,
-        });
     }
 
     Ok(())

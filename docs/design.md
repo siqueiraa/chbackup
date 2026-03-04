@@ -224,12 +224,12 @@ done
 #### 1.4.4 Test Suite Structure
 
 All integration tests are bash-based, running inside a Docker container with real
-ClickHouse and S3 backends. There are no Rust integration test files -- all 62 tests
-(T1-T62) live in `test/run_tests.sh`.
+ClickHouse and S3 backends. There are no Rust integration test files -- all 63 tests
+(T1-T63) live in `test/run_tests.sh`.
 
 ```
 test/
-├── run_tests.sh                  # Integration test runner with 62 tests (T1-T62)
+├── run_tests.sh                  # Integration test runner with 63 tests (T1-T63)
 ├── clean-s3.sh                   # S3 test data cleanup script (--dry-run supported)
 ├── configs/
 │   ├── clickhouse-config.xml     # ZK connection, multi-disk, replicated settings
