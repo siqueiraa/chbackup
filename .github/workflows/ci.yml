@@ -68,7 +68,7 @@ jobs:
           cargo llvm-cov test --all --all-features --summary-only 2>&1 | tee cov-summary.txt
           LINE_PCT=$(grep 'TOTAL' cov-summary.txt | awk '{print $10}' | tr -d '%')
           echo "Unit coverage: ${LINE_PCT}%"
-          python3 -c "assert float('${LINE_PCT}') >= 35, f'Coverage ${LINE_PCT}% < 35%'"
+          python3 -c "assert float('${LINE_PCT}') >= 55, f'Coverage ${LINE_PCT}% < 55%'"
 
   # ---------------------------------------------------------------------------
   # Job 2: Integration tests with ClickHouse version matrix
