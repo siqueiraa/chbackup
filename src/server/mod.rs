@@ -196,19 +196,7 @@ pub async fn start_server(
 
         // Spawn SIGHUP handler for config reload (Unix only)
         #[cfg(unix)]
-        {
-            let reload_tx_clone = reload_tx.clone();
-            tokio::spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut sighup =
-                    signal(SignalKind::hangup()).expect("failed to register SIGHUP handler");
-                loop {
-                    sighup.recv().await;
-                    info!("SIGHUP received, triggering config reload");
-                    reload_tx_clone.send(true).ok();
-                }
-            });
-        }
+        crate::spawn_sighup_handler(reload_tx.clone());
 
         info!("Watch loop started");
 
@@ -220,21 +208,7 @@ pub async fn start_server(
 
     // Spawn SIGQUIT handler for stack dump (Unix only)
     #[cfg(unix)]
-    {
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigquit =
-                signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
-            loop {
-                sigquit.recv().await;
-                info!("SIGQUIT received, dumping stack trace to stderr");
-                let bt = std::backtrace::Backtrace::force_capture();
-                eprintln!("=== SIGQUIT stack dump ===");
-                eprintln!("{bt}");
-                eprintln!("=== end stack dump ===");
-            }
-        });
-    }
+    crate::spawn_sigquit_handler();
 
     let router = build_router(state.clone());
 

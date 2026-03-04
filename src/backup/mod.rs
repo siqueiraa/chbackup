@@ -279,10 +279,7 @@ pub async fn create(
     // 6. Check for pending mutations (design 3.1)
     let mutation_wait_secs =
         crate::config::parse_duration_secs(&config.clickhouse.mutation_wait_timeout)
-            .unwrap_or_else(|e| {
-                warn!(error = %e, "Failed to parse mutation_wait_timeout, defaulting to 0");
-                0
-            });
+            .expect("validated in Config::validate()");
 
     let all_mutations = mutations::check_mutations(
         ch,

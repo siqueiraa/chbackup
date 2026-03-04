@@ -1619,6 +1619,10 @@ impl Config {
             return Err(anyhow::anyhow!("s3.max_parts_count must be > 0"));
         }
 
+        // Validate mutation_wait_timeout parses as a duration
+        parse_duration_secs(&self.clickhouse.mutation_wait_timeout)
+            .context("Invalid clickhouse.mutation_wait_timeout duration")?;
+
         // Watch interval validation: full_interval must be greater than watch_interval.
         // Always validate regardless of watch.enabled -- watch can be started via CLI
         // --watch flag, `chbackup watch` command, or API without setting watch.enabled=true.

@@ -478,7 +478,7 @@ Test coverage for Phase 4 features in `test/run_tests.sh` (62 tests total, T4-T6
 - [done] T12: Incremental backup/restore with S3 disk tables
 - [done] T56: Configs backup + restore with `--configs` flag
 - [done] Replicated tables + ZK path conflict (`resolve_zk_conflict()` in restore/schema.rs)
-- TODO: Streaming engine postponed activation (requires Kafka/NATS broker in test environment)
+- [deferred] Streaming engine activation test (requires Kafka/NATS broker in CI — infrastructure change out of scope)
 - [done] ON CLUSTER restore (`add_on_cluster_clause()` in restore/schema.rs)
 - [done] DatabaseReplicated engine (`query_database_engine()` in clickhouse/client.rs)
 

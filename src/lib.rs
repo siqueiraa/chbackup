@@ -26,6 +26,37 @@ pub fn generate_backup_name() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H%M%S%.3f").to_string()
 }
 
+/// Spawn a SIGHUP handler that sends `true` on `reload_tx` for config reload.
+#[cfg(unix)]
+pub fn spawn_sighup_handler(reload_tx: tokio::sync::watch::Sender<bool>) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sighup = signal(SignalKind::hangup()).expect("failed to register SIGHUP handler");
+        loop {
+            sighup.recv().await;
+            tracing::info!("SIGHUP received, triggering config reload");
+            reload_tx.send(true).ok();
+        }
+    });
+}
+
+/// Spawn a SIGQUIT handler that dumps the stack trace to stderr.
+#[cfg(unix)]
+pub fn spawn_sigquit_handler() {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigquit = signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
+        loop {
+            sigquit.recv().await;
+            tracing::info!("SIGQUIT received, dumping stack trace to stderr");
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("=== SIGQUIT stack dump ===");
+            eprintln!("{bt}");
+            eprintln!("=== end stack dump ===");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     //! Compile-time verification that all Phase 2c public types and functions
