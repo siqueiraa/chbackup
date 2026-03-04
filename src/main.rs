@@ -789,3 +789,308 @@ fn merge_skip_projections(cli_flag: Option<&str>, config_list: &[String]) -> Vec
         None => config_list.to_vec(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // backup_name_from_command tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backup_name_from_command_create() {
+        let cmd = Command::Create {
+            backup_name: Some("daily".to_string()),
+            tables: None,
+            partitions: None,
+            diff_from: None,
+            skip_projections: None,
+            schema: false,
+            rbac: false,
+            configs: false,
+            named_collections: false,
+            skip_check_parts_columns: false,
+        };
+        assert_eq!(backup_name_from_command(&cmd), Some("daily"));
+    }
+
+    #[test]
+    fn test_backup_name_from_command_create_none() {
+        let cmd = Command::Create {
+            backup_name: None,
+            tables: None,
+            partitions: None,
+            diff_from: None,
+            skip_projections: None,
+            schema: false,
+            rbac: false,
+            configs: false,
+            named_collections: false,
+            skip_check_parts_columns: false,
+        };
+        assert_eq!(backup_name_from_command(&cmd), None);
+    }
+
+    #[test]
+    fn test_backup_name_from_command_upload() {
+        let cmd = Command::Upload {
+            backup_name: Some("upload-2024".to_string()),
+            delete_local: false,
+            diff_from_remote: None,
+            resume: false,
+        };
+        assert_eq!(backup_name_from_command(&cmd), Some("upload-2024"));
+    }
+
+    #[test]
+    fn test_backup_name_from_command_download() {
+        let cmd = Command::Download {
+            backup_name: Some("dl-backup".to_string()),
+            hardlink_exists_files: false,
+            resume: false,
+        };
+        assert_eq!(backup_name_from_command(&cmd), Some("dl-backup"));
+    }
+
+    #[test]
+    fn test_backup_name_from_command_restore() {
+        let cmd = Command::Restore {
+            backup_name: Some("restore-test".to_string()),
+            tables: None,
+            rename_as: None,
+            database_mapping: None,
+            partitions: None,
+            schema: false,
+            data_only: false,
+            rm: false,
+            resume: false,
+            rbac: false,
+            configs: false,
+            named_collections: false,
+            skip_empty_tables: false,
+        };
+        assert_eq!(backup_name_from_command(&cmd), Some("restore-test"));
+    }
+
+    #[test]
+    fn test_backup_name_from_command_create_remote() {
+        let cmd = Command::CreateRemote {
+            backup_name: Some("cr-backup".to_string()),
+            tables: None,
+            diff_from_remote: None,
+            delete_source: false,
+            rbac: false,
+            configs: false,
+            named_collections: false,
+            skip_check_parts_columns: false,
+            skip_projections: None,
+            resume: false,
+        };
+        assert_eq!(backup_name_from_command(&cmd), Some("cr-backup"));
+    }
+
+    #[test]
+    fn test_backup_name_from_command_restore_remote() {
+        let cmd = Command::RestoreRemote {
+            backup_name: Some("rr-backup".to_string()),
+            tables: None,
+            rename_as: None,
+            database_mapping: None,
+            rm: false,
+            rbac: false,
+            configs: false,
+            named_collections: false,
+            skip_empty_tables: false,
+            resume: false,
+        };
+        assert_eq!(backup_name_from_command(&cmd), Some("rr-backup"));
+    }
+
+    #[test]
+    fn test_backup_name_from_command_delete() {
+        let cmd = Command::Delete {
+            backup_name: Some("del-backup".to_string()),
+            location: cli::Location::Local,
+        };
+        assert_eq!(backup_name_from_command(&cmd), Some("del-backup"));
+    }
+
+    #[test]
+    fn test_backup_name_from_command_list_returns_none() {
+        let cmd = Command::List {
+            location: None,
+            format: cli::ListFormat::Default,
+        };
+        assert_eq!(backup_name_from_command(&cmd), None);
+    }
+
+    #[test]
+    fn test_backup_name_from_command_tables_returns_none() {
+        let cmd = Command::Tables {
+            tables: None,
+            all: false,
+            remote_backup: None,
+        };
+        assert_eq!(backup_name_from_command(&cmd), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_backup_name tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_backup_name_with_valid_name() {
+        let result = resolve_backup_name(Some("daily-2024".to_string()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "daily-2024");
+    }
+
+    #[test]
+    fn test_resolve_backup_name_generates_when_none() {
+        let result = resolve_backup_name(None);
+        assert!(result.is_ok());
+        let name = result.unwrap();
+        assert!(!name.is_empty(), "Generated name should not be empty");
+    }
+
+    #[test]
+    fn test_resolve_backup_name_rejects_latest() {
+        let result = resolve_backup_name(Some("latest".to_string()));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("reserved"),
+            "Error should mention 'reserved', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_resolve_backup_name_rejects_previous() {
+        let result = resolve_backup_name(Some("previous".to_string()));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("reserved"),
+            "Error should mention 'reserved', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_resolve_backup_name_rejects_path_traversal() {
+        let result = resolve_backup_name(Some("../evil".to_string()));
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // backup_name_required tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backup_name_required_with_name() {
+        let result = backup_name_required(Some("daily".to_string()), "upload");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "daily");
+    }
+
+    #[test]
+    fn test_backup_name_required_none_fails() {
+        let result = backup_name_required(None, "upload");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("required"),
+            "Error should mention 'required', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_backup_name_required_rejects_invalid() {
+        let result = backup_name_required(Some("../bad".to_string()), "upload");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // map_cli_location tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_cli_location_local() {
+        assert_eq!(map_cli_location(cli::Location::Local), list::Location::Local);
+    }
+
+    #[test]
+    fn test_map_cli_location_remote() {
+        assert_eq!(
+            map_cli_location(cli::Location::Remote),
+            list::Location::Remote
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // map_cli_list_format tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_cli_list_format_all_variants() {
+        assert_eq!(
+            map_cli_list_format(cli::ListFormat::Default),
+            list::ListFormat::Default
+        );
+        assert_eq!(
+            map_cli_list_format(cli::ListFormat::Json),
+            list::ListFormat::Json
+        );
+        assert_eq!(
+            map_cli_list_format(cli::ListFormat::Yaml),
+            list::ListFormat::Yaml
+        );
+        assert_eq!(
+            map_cli_list_format(cli::ListFormat::Csv),
+            list::ListFormat::Csv
+        );
+        assert_eq!(
+            map_cli_list_format(cli::ListFormat::Tsv),
+            list::ListFormat::Tsv
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_skip_projections tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_skip_projections_cli_takes_precedence() {
+        let config_list = vec!["c".to_string()];
+        let result = merge_skip_projections(Some("a,b"), &config_list);
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_merge_skip_projections_falls_back_to_config() {
+        let config_list = vec!["x".to_string()];
+        let result = merge_skip_projections(None, &config_list);
+        assert_eq!(result, vec!["x"]);
+    }
+
+    #[test]
+    fn test_merge_skip_projections_empty() {
+        let result = merge_skip_projections(None, &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_merge_skip_projections_trims_whitespace() {
+        let result = merge_skip_projections(Some(" a , b "), &[]);
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_merge_skip_projections_filters_empty_parts() {
+        let result = merge_skip_projections(Some("a,,b,"), &[]);
+        assert_eq!(result, vec!["a", "b"]);
+    }
+}
