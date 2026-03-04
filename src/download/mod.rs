@@ -337,23 +337,20 @@ pub async fn download(
 
     // 1. Download manifest from S3
     let manifest_key = format!("{}/metadata.json", backup_name);
-    let manifest_bytes = s3
-        .get_object(&manifest_key)
-        .await
-        .map_err(|e| {
-            let msg = format!("{e:#}");
-            if msg.contains("NoSuchKey") || msg.contains("404") || msg.contains("not found") {
-                anyhow::Error::new(ChBackupError::BackupNotFound(format!(
-                    "backup '{}' not found in S3 (key: {})",
-                    backup_name, manifest_key
-                )))
-            } else {
-                e.context(format!(
-                    "Failed to download manifest for backup '{}'",
-                    backup_name
-                ))
-            }
-        })?;
+    let manifest_bytes = s3.get_object(&manifest_key).await.map_err(|e| {
+        let msg = format!("{e:#}");
+        if msg.contains("NoSuchKey") || msg.contains("404") || msg.contains("not found") {
+            anyhow::Error::new(ChBackupError::BackupNotFound(format!(
+                "backup '{}' not found in S3 (key: {})",
+                backup_name, manifest_key
+            )))
+        } else {
+            e.context(format!(
+                "Failed to download manifest for backup '{}'",
+                backup_name
+            ))
+        }
+    })?;
 
     let manifest = BackupManifest::from_json_bytes(&manifest_bytes)
         .with_context(|| format!("Failed to parse manifest for backup '{}'", backup_name))?;

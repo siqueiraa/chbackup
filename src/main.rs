@@ -792,6 +792,10 @@ fn merge_skip_projections(cli_flag: Option<&str>, config_list: &[String]) -> Vec
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::TimeZone;
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -1095,5 +1099,96 @@ mod tests {
     fn test_merge_skip_projections_filters_empty_parts() {
         let result = merge_skip_projections(Some("a,,b,"), &[]);
         assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_acquire_lock_read_only_command_returns_none() {
+        let guard = acquire_lock("list", None).expect("acquire_lock should not fail");
+        assert!(guard.is_none(), "read-only command should not acquire lock");
+    }
+
+    #[test]
+    fn test_acquire_lock_scopes_to_backup_name() {
+        let name = format!("main-test-lock-{}", std::process::id());
+        let guard = acquire_lock("create", Some(&name))
+            .expect("acquire_lock should succeed")
+            .expect("create command should acquire a lock");
+
+        let path = guard.path().to_path_buf();
+        assert!(
+            path.to_string_lossy()
+                .ends_with(&format!("/tmp/chbackup.{name}.pid")),
+            "unexpected lock path: {}",
+            path.display()
+        );
+        assert!(path.exists(), "lock file should exist while guard is held");
+
+        drop(guard);
+        assert!(!path.exists(), "lock file should be removed on drop");
+    }
+
+    fn write_local_manifest(
+        data_path: &std::path::Path,
+        backup_name: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+    ) {
+        let manifest = BackupManifest {
+            manifest_version: 1,
+            name: backup_name.to_string(),
+            timestamp: chrono::Utc
+                .with_ymd_and_hms(year, month, day, 12, 0, 0)
+                .single()
+                .expect("valid timestamp"),
+            clickhouse_version: "25.1".to_string(),
+            chbackup_version: env!("CARGO_PKG_VERSION").to_string(),
+            data_format: "lz4".to_string(),
+            compressed_size: 0,
+            metadata_size: 0,
+            disks: BTreeMap::new(),
+            disk_types: BTreeMap::new(),
+            disk_remote_paths: BTreeMap::new(),
+            tables: BTreeMap::new(),
+            databases: Vec::new(),
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+            rbac_size: 0,
+            config_size: 0,
+        };
+
+        let metadata_path = data_path
+            .join("backup")
+            .join(backup_name)
+            .join("metadata.json");
+        manifest
+            .save_to_file(&metadata_path)
+            .expect("manifest should be written");
+    }
+
+    #[test]
+    fn test_resolve_local_shortcut_passthrough_for_explicit_name() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let resolved = resolve_local_shortcut("explicit-backup", tmp.path().to_str().unwrap())
+            .expect("shortcut resolution should succeed");
+        assert_eq!(resolved, "explicit-backup");
+    }
+
+    #[test]
+    fn test_resolve_local_shortcut_latest_and_previous() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let data_path = tmp.path();
+
+        write_local_manifest(data_path, "daily-older", 2025, 1, 1);
+        write_local_manifest(data_path, "daily-newer", 2025, 1, 2);
+
+        let latest = resolve_local_shortcut("latest", data_path.to_str().unwrap())
+            .expect("latest shortcut should resolve");
+        assert_eq!(latest, "daily-newer");
+
+        let previous = resolve_local_shortcut("previous", data_path.to_str().unwrap())
+            .expect("previous shortcut should resolve");
+        assert_eq!(previous, "daily-older");
     }
 }
