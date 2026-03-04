@@ -638,7 +638,13 @@ pub async fn delete_remote(s3: &S3Client, backup_name: &str) -> Result<()> {
         "Deleting remote backup objects"
     );
 
-    s3.delete_objects(keys).await?;
+    let failed = s3.delete_objects(keys).await?;
+    if failed > 0 {
+        warn!(
+            failed_count = failed,
+            "Some S3 objects failed to delete, will be retried on next GC"
+        );
+    }
 
     info!(backup = %backup_name, "Remote backup deleted");
     Ok(())
@@ -1059,12 +1065,18 @@ pub async fn gc_delete_backup(
 
     // Delete unreferenced data keys first
     if !unreferenced_keys.is_empty() {
-        s3.delete_objects(unreferenced_keys).await?;
+        let failed = s3.delete_objects(unreferenced_keys).await?;
+        if failed > 0 {
+            warn!(
+                failed_count = failed,
+                "Some S3 objects failed to delete, will be retried on next GC"
+            );
+        }
     }
 
     // Delete the manifest key last (makes the backup "broken" first, then gone)
     if let Some(mk) = manifest_key {
-        s3.delete_objects(vec![mk]).await?;
+        let _failed = s3.delete_objects(vec![mk]).await?;
     }
 
     info!(backup = %backup_name, "gc: remote backup deleted");

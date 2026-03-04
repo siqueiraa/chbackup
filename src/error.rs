@@ -31,6 +31,14 @@ pub enum ChBackupError {
     #[error("Backup not found: {0}")]
     BackupNotFound(String),
 
+    /// Restore completed but some parts were skipped. Maps to exit code 3.
+    #[error("Restore completed with {skipped} parts skipped out of {total} ({attached} attached successfully)")]
+    PartialRestore {
+        attached: u64,
+        skipped: u64,
+        total: u64,
+    },
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 }
@@ -50,6 +58,7 @@ impl ChBackupError {
         match self {
             ChBackupError::LockError(_) => 4,
             ChBackupError::BackupNotFound(_) => 3,
+            ChBackupError::PartialRestore { .. } => 3,
             _ => 1,
         }
     }
@@ -131,5 +140,39 @@ mod tests {
     fn test_exit_code_backup_not_found_via_anyhow() {
         let err: anyhow::Error = ChBackupError::BackupNotFound("my-backup".to_string()).into();
         assert_eq!(exit_code_from_error(&err), 3);
+    }
+
+    #[test]
+    fn test_exit_code_partial_restore() {
+        let err = ChBackupError::PartialRestore {
+            attached: 8,
+            skipped: 2,
+            total: 10,
+        };
+        assert_eq!(err.exit_code(), 3);
+    }
+
+    #[test]
+    fn test_exit_code_partial_restore_via_anyhow() {
+        let err: anyhow::Error = ChBackupError::PartialRestore {
+            attached: 5,
+            skipped: 1,
+            total: 6,
+        }
+        .into();
+        assert_eq!(exit_code_from_error(&err), 3);
+    }
+
+    #[test]
+    fn test_partial_restore_error_message() {
+        let err = ChBackupError::PartialRestore {
+            attached: 8,
+            skipped: 2,
+            total: 10,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Restore completed with 2 parts skipped out of 10 (8 attached successfully)"
+        );
     }
 }

@@ -8,7 +8,7 @@ Drop-in replacement for Altinity/clickhouse-backup. Single static binary, ~40 co
 
 MUST run on the same host/pod as ClickHouse with filesystem access to `/var/lib/clickhouse/`. FREEZE creates hardlinks requiring local access. Cannot run remotely.
 
-**Supported ClickHouse versions**: 21.8+ (ALTER TABLE FREEZE WITH NAME was added in this release). Older versions are not supported. Some features require newer versions: `system.parts_columns` (column type check) needs 22.3+, `DatabaseReplicated` needs 22.6+, `--skip-projections` needs projection support in FREEZE (23.3+).
+**Supported ClickHouse versions**: 23.8+ (CI-tested version matrix: 23.8, 24.3, 24.8, 25.1). Runtime graceful degradation may work on 21.8–23.7 (ALTER TABLE FREEZE WITH NAME was added in 21.8), but these versions are untested and unsupported. Some features require newer versions: `system.parts_columns` (column type check) needs 22.3+, `DatabaseReplicated` needs 22.6+, `--skip-projections` needs projection support in FREEZE (23.3+).
 
 **Streaming by default**: chbackup always uploads and downloads by individual data part (no full-backup archive mode). This means each part is independently compressed and uploaded as a separate S3 object. Benefits: parallel upload/download, resumable per-part, no need to assemble a giant archive. The Go tool's `upload_by_part` / `download_by_part` flags default to true since v1.3.0 — we make this the only mode.
 

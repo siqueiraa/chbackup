@@ -439,6 +439,9 @@ pub async fn post_actions(
                 let s3 = state_clone.s3.load();
                 let start_time = std::time::Instant::now();
 
+                // NOTE: post_actions uses string-based dispatch with no typed body
+                // per-action, so `resume` always uses the config default here.
+                // Use the dedicated /api/v1/{command}/{name} endpoints to override.
                 let result: Result<(), anyhow::Error> = match op {
                     "create" => {
                         crate::backup::create(
@@ -1155,7 +1158,7 @@ pub async fn create_remote(
                 .join("backup")
                 .join(&backup_name);
 
-            let effective_resume = config.general.use_resumable_state;
+            let effective_resume = req.resume.unwrap_or(config.general.use_resumable_state);
             let stats = crate::upload::upload(
                 &config,
                 &s3,
@@ -1204,6 +1207,8 @@ pub struct CreateRemoteRequest {
     pub named_collections: Option<bool>,
     /// Override config.backup.skip_projections for this request.
     pub skip_projections: Option<Vec<String>>,
+    /// Override config.general.use_resumable_state for this request.
+    pub resume: Option<bool>,
 }
 
 /// POST /api/v1/restore_remote/{name} -- download then restore
@@ -1242,7 +1247,7 @@ pub async fn restore_remote(
         move |config, ch, s3, cancel| async move {
             info!(backup_name = %name, "Starting restore_remote operation");
 
-            let effective_resume = config.general.use_resumable_state;
+            let effective_resume = req.resume.unwrap_or(config.general.use_resumable_state);
 
             // Step 1: Download from S3
             crate::download::download(&config, &s3, &name, effective_resume, false, cancel.clone())
@@ -1293,6 +1298,8 @@ pub struct RestoreRemoteRequest {
     pub configs: Option<bool>,
     pub named_collections: Option<bool>,
     pub skip_empty_tables: Option<bool>,
+    /// Override config.general.use_resumable_state for this request.
+    pub resume: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2924,5 +2931,49 @@ mod tests {
         assert_eq!(results[0].name, "a-newest");
         assert_eq!(results[1].name, "m-middle");
         assert_eq!(results[2].name, "z-oldest");
+    }
+
+    // ---- Request struct deserialization tests for resume field ----
+
+    #[test]
+    fn test_create_remote_request_resume_true() {
+        let json = r#"{"resume": true}"#;
+        let req: CreateRemoteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.resume, Some(true));
+    }
+
+    #[test]
+    fn test_create_remote_request_resume_false() {
+        let json = r#"{"resume": false}"#;
+        let req: CreateRemoteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.resume, Some(false));
+    }
+
+    #[test]
+    fn test_create_remote_request_resume_missing() {
+        let json = r#"{}"#;
+        let req: CreateRemoteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.resume, None);
+    }
+
+    #[test]
+    fn test_restore_remote_request_resume_true() {
+        let json = r#"{"resume": true}"#;
+        let req: RestoreRemoteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.resume, Some(true));
+    }
+
+    #[test]
+    fn test_restore_remote_request_resume_false() {
+        let json = r#"{"resume": false}"#;
+        let req: RestoreRemoteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.resume, Some(false));
+    }
+
+    #[test]
+    fn test_restore_remote_request_resume_missing() {
+        let json = r#"{}"#;
+        let req: RestoreRemoteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.resume, None);
     }
 }

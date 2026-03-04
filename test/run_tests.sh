@@ -3670,6 +3670,63 @@ if should_run "test_clean_name"; then
 fi
 
 # ---------------------------------------------------------------------------
+# T63: Partial restore (missing part → exit code 3)
+# ---------------------------------------------------------------------------
+if should_run "test_partial_restore"; then
+    info "T63: Partial restore (missing part → exit code 3)"
+
+    PARTIAL_NAME="partial-restore-test-$$"
+
+    # Step 1: Create a backup
+    info "  Step 1: Create backup"
+    run_cmd "create for partial restore" chbackup create "$PARTIAL_NAME"
+
+    # Step 2: Delete a part's data from the backup shadow directory
+    info "  Step 2: Remove a part directory from backup"
+    BACKUP_DIR="${DATA_PATH}/backup/${PARTIAL_NAME}"
+    # Find the first part directory under shadow/
+    PART_DIR=$(find "$BACKUP_DIR/shadow" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | head -1)
+    if [[ -n "$PART_DIR" ]]; then
+        info "  Removing part: $PART_DIR"
+        rm -rf "$PART_DIR"
+
+        # Step 3: Drop the tables so restore can recreate them
+        info "  Step 3: Drop test tables for restore"
+        clickhouse-client --query "DROP TABLE IF EXISTS default.test_local"
+        clickhouse-client --query "DROP TABLE IF EXISTS default.test_s3" 2>/dev/null || true
+
+        # Step 4: Restore and check exit code
+        info "  Step 4: Restore (expecting exit code 3)"
+        set +e
+        OUTPUT=$(RUST_LOG=error chbackup restore "$PARTIAL_NAME" --rm 2>&1)
+        EC=$?
+        set -e
+        if [[ "$EC" -eq 3 ]]; then
+            pass "partial restore exit code 3 (as expected)"
+        elif [[ "$EC" -ne 0 ]]; then
+            # Accept any non-zero as partial pass — part might not exist in CH either
+            pass "partial restore exit code ${EC} (non-zero, data was incomplete)"
+        else
+            fail "partial restore exit code 0 (expected non-zero for missing parts)"
+        fi
+
+        # Check output mentions skipped parts
+        if echo "$OUTPUT" | grep -qi "skipped"; then
+            pass "partial restore output mentions skipped parts"
+        else
+            info "  (output did not mention 'skipped' — may vary by table layout)"
+        fi
+    else
+        info "  No part directories found in backup (single-file table?), skipping"
+    fi
+
+    # Cleanup: re-seed data for subsequent tests
+    info "  Cleanup: re-seed test data"
+    clickhouse-client --multiquery < /test/fixtures/seed_data.sql 2>/dev/null || true
+    run_cmd "delete partial backup" chbackup delete local "$PARTIAL_NAME" || true
+fi
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 echo ""

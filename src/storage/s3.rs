@@ -584,10 +584,16 @@ impl S3Client {
     /// Delete multiple objects from S3 in batches of 1000.
     ///
     /// The `keys` are relative to the configured prefix.
-    pub async fn delete_objects(&self, keys: Vec<String>) -> Result<()> {
+    /// Returns the total number of individual object deletions that failed
+    /// across all batches (0 on full success). When ALL keys in a batch fail,
+    /// returns `Err` immediately. Partial failures return `Ok(failed_count)` —
+    /// GC on the next run will clean up any leftovers.
+    pub async fn delete_objects(&self, keys: Vec<String>) -> Result<u64> {
         if keys.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+
+        let mut total_failed = 0u64;
 
         // S3 DeleteObjects supports max 1000 objects per request
         for chunk in keys.chunks(1000) {
@@ -637,10 +643,11 @@ impl S3Client {
                         sample_errors
                     );
                 }
+                total_failed += errors.len() as u64;
             }
         }
 
-        Ok(())
+        Ok(total_failed)
     }
 
     // -- HEAD operations --

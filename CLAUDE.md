@@ -23,7 +23,7 @@
 - **Must run on same host as ClickHouse** — FREEZE creates hardlinks requiring local filesystem access
 - **Streaming by default** — upload/download by individual data part, no full-archive mode
 - **S3-only storage** — no GCS, Azure, or local-only backup mode
-- **ClickHouse 21.8+** required (ALTER TABLE FREEZE WITH NAME)
+- **ClickHouse 23.8+** required (CI-tested: 23.8, 24.3, 24.8, 25.1; 21.8-23.7 untested)
 - **Static musl binary** — zero runtime dependencies, ~15MB
 
 ## Tech Stack (from §11.3)

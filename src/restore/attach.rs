@@ -177,7 +177,7 @@ struct S3RestoreParams<'a> {
 /// but restored objects must go to the ClickHouse data disk's S3 prefix (e.g.,
 /// `clickhouse-disks/`). We create a data-disk-targeted S3Client per disk to
 /// handle the prefix difference correctly.
-async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
+async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
     let s3 = p.s3;
     let db = p.db;
     let table = p.table;
@@ -194,6 +194,7 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
 
     let semaphore = Arc::new(Semaphore::new(p.concurrency));
     let detached_dir = p.table_data_path.join("detached");
+    let mut skipped_count = 0u64;
 
     let url_src_db = encode_path_component(p.source_db);
     let url_src_table = encode_path_component(p.source_table);
@@ -222,21 +223,27 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
         let disk_remote_path = match p.disk_remote_paths.get(disk_name) {
             Some(path) => path.clone(),
             None => {
+                let disk_parts_count = parts.len() as u64;
                 warn!(
                     disk = %disk_name,
+                    parts_skipped = disk_parts_count,
                     "No remote_path found for S3 disk, cannot restore S3 disk parts"
                 );
+                skipped_count += disk_parts_count;
                 continue;
             }
         };
 
         let (data_bucket, data_prefix) = parse_s3_uri(&disk_remote_path);
         if data_bucket.is_empty() {
+            let disk_parts_count = parts.len() as u64;
             warn!(
                 disk = %disk_name,
                 remote_path = %disk_remote_path,
+                parts_skipped = disk_parts_count,
                 "Failed to parse S3 URI from disk remote_path, cannot restore S3 disk parts"
             );
+            skipped_count += disk_parts_count;
             continue;
         }
 
@@ -502,14 +509,16 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(skipped_count)
 }
 
 /// Attach parts for a single table using owned parameters.
 ///
 /// Handles both local disk parts (hardlink) and S3 disk parts (CopyObject +
 /// metadata rewrite) before delegating to the internal attach logic.
-pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
+pub(crate) async fn attach_parts_owned(params: OwnedAttachParams) -> Result<AttachResult> {
+    let mut s3_skipped = 0u64;
+
     // Handle S3 disk parts first (CopyObject + metadata rewrite)
     let has_s3_client = params.s3_client.is_some();
     let has_table_uuid = params.table_uuid.is_some();
@@ -596,7 +605,7 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
                 source_table: &params.source_table,
                 disk_remote_paths: &params.disk_remote_paths,
             };
-            restore_s3_disk_parts(&s3_params).await?;
+            s3_skipped = restore_s3_disk_parts(&s3_params).await?;
         }
     }
 
@@ -617,12 +626,17 @@ pub async fn attach_parts_owned(params: OwnedAttachParams) -> Result<u64> {
         parts_by_disk: &params.parts_by_disk,
     };
 
-    attach_parts_inner(
+    let inner_result = attach_parts_inner(
         &attach_params,
         &params.engine,
         params.attach_semaphore.as_ref(),
     )
-    .await
+    .await?;
+
+    Ok(AttachResult {
+        attached: inner_result.attached,
+        skipped: inner_result.skipped + s3_skipped,
+    })
 }
 
 /// Internal attach implementation with engine-aware routing.
@@ -636,7 +650,7 @@ async fn attach_parts_inner(
     params: &AttachParams<'_>,
     engine: &str,
     attach_semaphore: Option<&Arc<Semaphore>>,
-) -> Result<u64> {
+) -> Result<AttachResult> {
     let db = params.db;
     let table = params.table;
 
@@ -646,7 +660,10 @@ async fn attach_parts_inner(
             table = %table,
             "No parts to attach"
         );
-        return Ok(0);
+        return Ok(AttachResult {
+            attached: 0,
+            skipped: 0,
+        });
     }
 
     let sequential = needs_sequential_attach(engine) || engine.is_empty();
@@ -718,6 +735,9 @@ async fn attach_parts_inner(
     // Prepare each part: hardlink/copy to detached/
     // This is done sequentially because it's filesystem I/O (not network)
     // and benefits from sequential disk access patterns.
+    // Track parts with missing source dirs so they are excluded from ATTACH.
+    let mut missing_source_parts: HashSet<String> = HashSet::new();
+
     for part in &work_parts {
         let dest_dir = detached_dir.join(&part.name);
 
@@ -764,33 +784,42 @@ async fn attach_parts_inner(
                         source_table = %params.source_table,
                         "Part source directory not found, skipping"
                     );
+                    missing_source_parts.insert(part.name.clone());
                 }
             }
         }
     }
 
+    // Filter out parts with missing source dirs before ATTACH phase
+    if !missing_source_parts.is_empty() {
+        work_parts.retain(|part| !missing_source_parts.contains(&part.name));
+    }
+
     // ATTACH PART phase: sequential for dedup engines, parallel otherwise
-    let attached_count = if let (false, Some(global_sem)) = (sequential, attach_semaphore) {
-        // Parallel ATTACH for non-dedup engines.
-        // Each part's ATTACH is spawned as a tokio task with a semaphore permit.
-        let sem = global_sem.clone();
-        let ch_clone = params.ch.clone();
-        let db_owned = db.to_string();
-        let table_owned = table.to_string();
-        let resume_key_owned = resume_table_key.clone();
-        let resume_state_clone = params.resume_state.cloned();
+    // Each branch returns (attached_count, attach_skipped_count).
+    // attach_skipped tracks NO_SUCH_DATA_PART errors (source existed but CH can't find it).
+    let (attached_count, attach_skipped) =
+        if let (false, Some(global_sem)) = (sequential, attach_semaphore) {
+            // Parallel ATTACH for non-dedup engines.
+            // Each part's ATTACH is spawned as a tokio task with a semaphore permit.
+            let sem = global_sem.clone();
+            let ch_clone = params.ch.clone();
+            let db_owned = db.to_string();
+            let table_owned = table.to_string();
+            let resume_key_owned = resume_table_key.clone();
+            let resume_state_clone = params.resume_state.cloned();
 
-        let mut handles = Vec::with_capacity(work_parts.len());
-        for part in &work_parts {
-            let sem = sem.clone();
-            let ch = ch_clone.clone();
-            let db = db_owned.clone();
-            let table = table_owned.clone();
-            let part_name = part.name.clone();
-            let resume_key = resume_key_owned.clone();
-            let resume_state = resume_state_clone.clone();
+            let mut handles = Vec::with_capacity(work_parts.len());
+            for part in &work_parts {
+                let sem = sem.clone();
+                let ch = ch_clone.clone();
+                let db = db_owned.clone();
+                let table = table_owned.clone();
+                let part_name = part.name.clone();
+                let resume_key = resume_key_owned.clone();
+                let resume_state = resume_state_clone.clone();
 
-            handles.push(tokio::spawn(async move {
+                handles.push(tokio::spawn(async move {
                 let _permit = sem
                     .acquire()
                     .await
@@ -811,16 +840,24 @@ async fn attach_parts_inner(
                             let state_path = guard.1.clone();
                             save_state_graceful(&state_path, &guard.0);
                         }
-                        Ok(true)
+                        // (attached=true, skipped=false)
+                        Ok((true, false))
                     }
                     Err(e) => {
-                        if is_attach_warning(&e) {
+                        if is_benign_attach_error(&e) {
                             warn!(
                                 db = %db, table = %table, part = %part_name,
                                 error = %format!("{:#}", e),
                                 "Part already exists or overlaps, skipping"
                             );
-                            Ok(false)
+                            Ok((false, false))
+                        } else if is_missing_part_error(&e) {
+                            warn!(
+                                db = %db, table = %table, part = %part_name,
+                                error = %format!("{:#}", e),
+                                "NO_SUCH_DATA_PART during ATTACH, counting as skipped"
+                            );
+                            Ok((false, true))
                         } else {
                             Err(e).with_context(|| {
                                 format!("Failed to ATTACH PART '{}' to {}.{}", part_name, db, table)
@@ -829,67 +866,80 @@ async fn attach_parts_inner(
                     }
                 }
             }));
-        }
-
-        let results = try_join_all(handles)
-            .await
-            .context("ATTACH task panicked")?;
-        let mut count = 0u64;
-        for result in results {
-            if result? {
-                count += 1;
             }
-        }
-        count
-    } else {
-        // Sequential ATTACH: one part at a time (for dedup engines or no semaphore)
-        let mut count = 0u64;
-        for part in &work_parts {
-            // Acquire global permit if semaphore is provided
-            let _permit = if let Some(sem) = attach_semaphore {
-                Some(
-                    sem.acquire()
-                        .await
-                        .map_err(|_| anyhow::anyhow!("Semaphore closed"))?,
-                )
-            } else {
-                None
-            };
 
-            debug!(db = %db, table = %table, part = %part.name, "Attaching part");
-
-            match params.ch.attach_part(db, table, &part.name).await {
-                Ok(()) => {
+            let results = try_join_all(handles)
+                .await
+                .context("ATTACH task panicked")?;
+            let mut count = 0u64;
+            let mut skip_count = 0u64;
+            for result in results {
+                let (attached, skipped) = result?;
+                if attached {
                     count += 1;
-                    if let Some(state_mutex) = &params.resume_state {
-                        let mut guard = state_mutex.lock().await;
-                        guard
-                            .0
-                            .attached_parts
-                            .entry(resume_table_key.clone())
-                            .or_default()
-                            .push(part.name.clone());
-                        let state_path = guard.1.clone();
-                        save_state_graceful(&state_path, &guard.0);
-                    }
                 }
-                Err(e) => {
-                    if is_attach_warning(&e) {
-                        warn!(
-                            db = %db, table = %table, part = %part.name,
-                            error = %format!("{:#}", e),
-                            "Part already exists or overlaps, skipping"
-                        );
-                    } else {
-                        return Err(e).with_context(|| {
-                            format!("Failed to ATTACH PART '{}' to {}.{}", part.name, db, table)
-                        });
+                if skipped {
+                    skip_count += 1;
+                }
+            }
+            (count, skip_count)
+        } else {
+            // Sequential ATTACH: one part at a time (for dedup engines or no semaphore)
+            let mut count = 0u64;
+            let mut skip_count = 0u64;
+            for part in &work_parts {
+                // Acquire global permit if semaphore is provided
+                let _permit = if let Some(sem) = attach_semaphore {
+                    Some(
+                        sem.acquire()
+                            .await
+                            .map_err(|_| anyhow::anyhow!("Semaphore closed"))?,
+                    )
+                } else {
+                    None
+                };
+
+                debug!(db = %db, table = %table, part = %part.name, "Attaching part");
+
+                match params.ch.attach_part(db, table, &part.name).await {
+                    Ok(()) => {
+                        count += 1;
+                        if let Some(state_mutex) = &params.resume_state {
+                            let mut guard = state_mutex.lock().await;
+                            guard
+                                .0
+                                .attached_parts
+                                .entry(resume_table_key.clone())
+                                .or_default()
+                                .push(part.name.clone());
+                            let state_path = guard.1.clone();
+                            save_state_graceful(&state_path, &guard.0);
+                        }
+                    }
+                    Err(e) => {
+                        if is_benign_attach_error(&e) {
+                            warn!(
+                                db = %db, table = %table, part = %part.name,
+                                error = %format!("{:#}", e),
+                                "Part already exists or overlaps, skipping"
+                            );
+                        } else if is_missing_part_error(&e) {
+                            warn!(
+                                db = %db, table = %table, part = %part.name,
+                                error = %format!("{:#}", e),
+                                "NO_SUCH_DATA_PART during ATTACH, counting as skipped"
+                            );
+                            skip_count += 1;
+                        } else {
+                            return Err(e).with_context(|| {
+                                format!("Failed to ATTACH PART '{}' to {}.{}", part.name, db, table)
+                            });
+                        }
                     }
                 }
             }
-        }
-        count
-    };
+            (count, skip_count)
+        };
 
     if skipped_resume > 0 {
         info!(
@@ -900,25 +950,53 @@ async fn attach_parts_inner(
         );
     }
 
+    let total_skipped = missing_source_parts.len() as u64 + attach_skipped;
+
     info!(
         db = %db,
         table = %table,
         attached = attached_count,
+        skipped = total_skipped,
         total = sorted_parts.len(),
         "Parts attached"
     );
 
-    Ok(attached_count)
+    Ok(AttachResult {
+        attached: attached_count,
+        skipped: total_skipped,
+    })
 }
 
-/// Check if an ATTACH PART error is a non-fatal warning (232/233 overlap/duplicate).
-fn is_attach_warning(e: &anyhow::Error) -> bool {
+/// Result from attaching parts to a single table.
+///
+/// Tracks both successfully attached and skipped parts so the caller
+/// can detect partial restores.
+pub(crate) struct AttachResult {
+    /// Number of parts successfully attached.
+    pub attached: u64,
+    /// Number of parts skipped (missing source, NO_SUCH_DATA_PART, missing S3 remote_path).
+    pub skipped: u64,
+}
+
+/// Check if an ATTACH PART error is a benign warning (232/233 overlap/duplicate).
+///
+/// These errors mean the part already exists or is temporarily locked,
+/// and can be safely skipped without counting as a "skipped" part.
+fn is_benign_attach_error(e: &anyhow::Error) -> bool {
     let err_str = format!("{:#}", e);
     err_str.contains("DUPLICATE_DATA_PART")
         || err_str.contains("PART_IS_TEMPORARILY_LOCKED")
-        || err_str.contains("NO_SUCH_DATA_PART")
         || err_str.contains("Code: 232")
         || err_str.contains("Code: 233")
+}
+
+/// Check if an ATTACH PART error indicates a missing part.
+///
+/// NO_SUCH_DATA_PART means the source existed but ClickHouse couldn't find
+/// the data part during ATTACH. This counts as a "skipped" part.
+fn is_missing_part_error(e: &anyhow::Error) -> bool {
+    let err_str = format!("{:#}", e);
+    err_str.contains("NO_SUCH_DATA_PART")
 }
 
 /// Hardlink all files from source directory to destination directory.
@@ -1626,55 +1704,76 @@ mod tests {
         );
     }
 
-    // ---- is_attach_warning tests ----
+    // ---- is_benign_attach_error tests ----
 
     #[test]
-    fn test_is_attach_warning_duplicate_data_part() {
+    fn test_is_benign_attach_error_duplicate_data_part() {
         let err = anyhow::anyhow!(
             "Code: 232. DB::Exception: Unexpected part all_1_1_0 already exists. DUPLICATE_DATA_PART"
         );
-        assert!(is_attach_warning(&err));
+        assert!(is_benign_attach_error(&err));
     }
 
     #[test]
-    fn test_is_attach_warning_part_temporarily_locked() {
+    fn test_is_benign_attach_error_part_temporarily_locked() {
         let err = anyhow::anyhow!("Code: 233. PART_IS_TEMPORARILY_LOCKED");
-        assert!(is_attach_warning(&err));
+        assert!(is_benign_attach_error(&err));
     }
 
     #[test]
-    fn test_is_attach_warning_no_such_data_part() {
+    fn test_is_benign_attach_error_no_such_data_part_not_benign() {
+        // NO_SUCH_DATA_PART is NOT benign -- it's a missing part error
         let err = anyhow::anyhow!("NO_SUCH_DATA_PART in table");
-        assert!(is_attach_warning(&err));
+        assert!(!is_benign_attach_error(&err));
     }
 
     #[test]
-    fn test_is_attach_warning_code_232_only() {
+    fn test_is_benign_attach_error_code_232_only() {
         let err = anyhow::anyhow!("Code: 232");
-        assert!(is_attach_warning(&err));
+        assert!(is_benign_attach_error(&err));
     }
 
     #[test]
-    fn test_is_attach_warning_code_233_only() {
+    fn test_is_benign_attach_error_code_233_only() {
         let err = anyhow::anyhow!("Code: 233");
-        assert!(is_attach_warning(&err));
+        assert!(is_benign_attach_error(&err));
     }
 
     #[test]
-    fn test_is_attach_warning_other_error() {
+    fn test_is_benign_attach_error_other_error() {
         let err = anyhow::anyhow!("Code: 60. UNKNOWN_TABLE");
-        assert!(!is_attach_warning(&err));
+        assert!(!is_benign_attach_error(&err));
     }
 
     #[test]
-    fn test_is_attach_warning_connection_error() {
+    fn test_is_benign_attach_error_connection_error() {
         let err = anyhow::anyhow!("Connection refused");
-        assert!(!is_attach_warning(&err));
+        assert!(!is_benign_attach_error(&err));
     }
 
     #[test]
-    fn test_is_attach_warning_empty_error() {
+    fn test_is_benign_attach_error_empty_error() {
         let err = anyhow::anyhow!("");
-        assert!(!is_attach_warning(&err));
+        assert!(!is_benign_attach_error(&err));
+    }
+
+    // ---- is_missing_part_error tests ----
+
+    #[test]
+    fn test_is_missing_part_error_no_such_data_part() {
+        let err = anyhow::anyhow!("NO_SUCH_DATA_PART in table");
+        assert!(is_missing_part_error(&err));
+    }
+
+    #[test]
+    fn test_is_missing_part_error_other_error() {
+        let err = anyhow::anyhow!("Code: 232. DUPLICATE_DATA_PART");
+        assert!(!is_missing_part_error(&err));
+    }
+
+    #[test]
+    fn test_is_missing_part_error_connection_error() {
+        let err = anyhow::anyhow!("Connection refused");
+        assert!(!is_missing_part_error(&err));
     }
 }

@@ -668,7 +668,7 @@ pub async fn restore(
 
     // 5b. ATTACH TABLE mode: for Replicated tables when restore_as_attach is enabled
     let restore_as_attach = config.clickhouse.restore_as_attach;
-    let mut attach_table_results: Vec<(String, u64)> = Vec::new();
+    let mut attach_table_results: Vec<(String, u64, u64)> = Vec::new();
 
     if restore_as_attach {
         let mut normal_items: Vec<(String, OwnedAttachParams)> = Vec::new();
@@ -717,7 +717,7 @@ pub async fn restore(
                 {
                     Ok(true) => {
                         let count = params.parts.len() as u64;
-                        attach_table_results.push((table_key, count));
+                        attach_table_results.push((table_key, count, 0));
                     }
                     Ok(false) => {
                         // Not eligible -- fall back to normal attach
@@ -766,21 +766,21 @@ pub async fn restore(
 
         let handle = tokio::spawn(async move {
             if cancel_clone.is_cancelled() {
-                return Ok((table_key, 0u64));
+                return Ok((table_key, 0u64, 0u64));
             }
 
-            let attached = attach_parts_owned(params)
+            let result = attach_parts_owned(params)
                 .await
                 .with_context(|| format!("Failed to attach parts for table {}", table_key))?;
 
-            Ok::<(String, u64), anyhow::Error>((table_key, attached))
+            Ok::<(String, u64, u64), anyhow::Error>((table_key, result.attached, result.skipped))
         });
 
         handles.push(handle);
     }
 
     // Await all restore tasks
-    let mut results: Vec<(String, u64)> = try_join_all(handles)
+    let mut results: Vec<(String, u64, u64)> = try_join_all(handles)
         .await
         .context("A restore task panicked")?
         .into_iter()
@@ -798,9 +798,11 @@ pub async fn restore(
 
     // 7. Tally totals
     let mut total_attached = 0u64;
+    let mut total_skipped = 0u64;
     let tables_restored = results.len() as u64;
-    for (_table_key, attached) in &results {
+    for (_table_key, attached, skipped) in &results {
         total_attached += attached;
+        total_skipped += skipped;
     }
 
     // Phase 2.5: Mutation re-apply (after all data is attached, before Phase 2b)
@@ -881,12 +883,23 @@ pub async fn restore(
         rbac::execute_restart_commands(ch, &config.clickhouse.restart_command).await?;
     }
 
-    info!(
-        backup_name = %backup_name,
-        tables = tables_restored,
-        parts = total_attached,
-        "Restore complete"
-    );
+    if total_skipped > 0 {
+        warn!(
+            backup_name = %backup_name,
+            tables = tables_restored,
+            attached = total_attached,
+            skipped = total_skipped,
+            total = total_attached + total_skipped,
+            "Restore completed with skipped parts"
+        );
+    } else {
+        info!(
+            backup_name = %backup_name,
+            tables = tables_restored,
+            parts = total_attached,
+            "Restore complete"
+        );
+    }
 
     // Save completion state with all manifest part names, so a subsequent
     // --resume is a no-op. ClickHouse reassigns block numbers on ATTACH PART,
@@ -922,6 +935,15 @@ pub async fn restore(
         let _ = std::fs::remove_file(&params_path); // non-fatal
     }
 
+    // Return error if parts were skipped so callers get exit code 3
+    if total_skipped > 0 {
+        bail!(crate::error::ChBackupError::PartialRestore {
+            attached: total_attached,
+            skipped: total_skipped,
+            total: total_attached + total_skipped,
+        });
+    }
+
     Ok(())
 }
 
@@ -936,10 +958,10 @@ pub async fn restore(
 async fn reapply_pending_mutations(
     ch: &ChClient,
     manifest: &BackupManifest,
-    restored_tables: &[(String, u64)],
+    restored_tables: &[(String, u64, u64)],
     remap: Option<&RemapConfig>,
 ) {
-    for (table_key, _count) in restored_tables {
+    for (table_key, _count, _skipped) in restored_tables {
         let table_manifest = match manifest.tables.get(table_key) {
             Some(tm) => tm,
             None => continue,
