@@ -41,18 +41,35 @@ Credentials can come from the config file, environment variables (`S3_ACCESS_KEY
 
 ## Installation
 
-**Static binary** (no dependencies):
+**Kubernetes** (recommended):
 
-```bash
-curl -L -o /usr/local/bin/chbackup \
-  https://github.com/user/chbackup/releases/latest/download/chbackup-linux-amd64
-chmod +x /usr/local/bin/chbackup
+chbackup runs as a sidecar alongside ClickHouse in `server --watch` mode. See the [Kubernetes guide](docs/kubernetes.md) and the ready-to-use [sidecar manifest](examples/kubernetes/sidecar.yaml).
+
+```yaml
+# Add chbackup as a sidecar to your ClickHouse pod
+containers:
+  - name: chbackup
+    image: siqueiraa/chbackup:latest
+    args: ["server", "--watch"]
+    volumeMounts:
+      - name: clickhouse-data
+        mountPath: /var/lib/clickhouse
 ```
 
 **Docker**:
 
 ```bash
-docker pull ghcr.io/user/chbackup:latest
+docker pull siqueiraa/chbackup:latest
+```
+
+See the [Docker guide](docs/docker.md) and [docker-compose examples](examples/docker/).
+
+**Static binary** (no dependencies):
+
+```bash
+curl -L -o /usr/local/bin/chbackup \
+  https://github.com/siqueiraa/chbackup/releases/latest/download/chbackup-linux-amd64
+chmod +x /usr/local/bin/chbackup
 ```
 
 **Build from source** (requires Rust 1.82+):
