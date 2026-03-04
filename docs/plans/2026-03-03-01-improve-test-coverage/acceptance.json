@@ -19,7 +19,7 @@
           },
           {
             "name": "compilation",
-            "command": "cargo check --bin chbackup --tests 2>&1 | grep -c '^error' || echo 0",
+            "command": "ERRS=$(cargo check --bin chbackup --tests 2>&1 | grep -c '^error'); echo ${ERRS:-0}",
             "expected": "0",
             "fail_message": "main.rs tests have compilation errors"
           },
@@ -60,7 +60,7 @@
           },
           {
             "name": "compilation",
-            "command": "cargo check --lib --tests 2>&1 | grep -c '^error' || echo 0",
+            "command": "ERRS=$(cargo check --lib --tests 2>&1 | grep -c '^error'); echo ${ERRS:-0}",
             "expected": "0",
             "fail_message": "backup/mod.rs tests have compilation errors"
           },
@@ -101,7 +101,7 @@
           },
           {
             "name": "compilation",
-            "command": "cargo check --lib --tests 2>&1 | grep -c '^error' || echo 0",
+            "command": "ERRS=$(cargo check --lib --tests 2>&1 | grep -c '^error'); echo ${ERRS:-0}",
             "expected": "0",
             "fail_message": "download/mod.rs tests have compilation errors"
           },
@@ -142,7 +142,7 @@
           },
           {
             "name": "compilation",
-            "command": "cargo check --lib --tests 2>&1 | grep -c '^error' || echo 0",
+            "command": "ERRS=$(cargo check --lib --tests 2>&1 | grep -c '^error'); echo ${ERRS:-0}",
             "expected": "0",
             "fail_message": "restore/attach.rs tests have compilation errors"
           },
@@ -183,7 +183,7 @@
           },
           {
             "name": "compilation",
-            "command": "cargo check --all-targets 2>&1 | grep -c '^error' || echo 0",
+            "command": "ERRS=$(cargo check --all-targets 2>&1 | grep -c '^error'); echo ${ERRS:-0}",
             "expected": "0",
             "fail_message": "Compilation errors after all changes"
           },

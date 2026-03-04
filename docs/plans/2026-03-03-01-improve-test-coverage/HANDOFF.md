@@ -33,9 +33,9 @@
 
 ### Files Being Modified
 - `src/main.rs` -- Adding `#[cfg(test)] mod tests` block with ~20 tests for pure helper functions (backup_name_from_command, resolve_backup_name, backup_name_required, map_cli_location, map_cli_list_format, merge_skip_projections)
-- `src/backup/mod.rs` -- Extending existing test module with ~12 tests for normalize_uuid, is_benign_type, filter_benign_type_drift
-- `src/download/mod.rs` -- Extending existing test module with ~8 tests for sanitize_relative_path (SECURITY-CRITICAL)
-- `src/restore/attach.rs` -- Extending existing test module with ~12 tests for is_attach_warning, uuid_s3_prefix edge cases, filesystem helpers
+- `src/backup/mod.rs` -- Extending existing test module with ~7 NEW edge-case tests (is_benign_type_enum16, nested_nullable_array_tuple_is_false, map_type, lowertuple, normalize_uuid_whitespace_is_some, partial_zeros, filter_mixed_keeps). NOT duplicating existing normalize_uuid/is_benign_type tests.
+- `src/download/mod.rs` -- Extending existing test module with ~8 tests for sanitize_relative_path (SECURITY-CRITICAL, currently 0 tests)
+- `src/restore/attach.rs` -- Extending existing test module with ~8 tests for is_attach_warning only (currently 0 tests). NOT duplicating existing hardlink/ownership/uuid tests.
 - `.github/workflows/ci.yml` -- Raising coverage gate threshold from 35% to 55%
 
 ### Test Patterns

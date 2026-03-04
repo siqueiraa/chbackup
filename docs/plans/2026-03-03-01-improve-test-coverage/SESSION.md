@@ -170,12 +170,12 @@ Planning complete. Ready for validation and execution.
 | Feature | Category | Expected | Actual | Status |
 |---------|----------|----------|--------|--------|
 | F001 | test | FAIL | FAIL (0 matches) | PASS -- main.rs has no test module yet |
-| F002 | test | FAIL | PASS (5 matches) | WARN -- existing tests already match grep pattern |
+| F002 | test | FAIL | FAIL (0 matches) | PASS -- structural grep uses new unique test names (enum16, nested, map, lowertuple, whitespace_is_some, partial, mixed_keeps) |
 | F003 | test | FAIL | FAIL (0 matches) | PASS -- no sanitize_relative_path tests exist |
 | F004 | test | FAIL | PASS (1 match) | OK -- 1 match < expected_minimum 4, so criteria would fail |
 | F005 | feature | FAIL | FAIL (0 matches) | PASS -- CI gate still at 35% |
 
-**F002 Red State Note:** The structural check for F002 uses a grep pattern (`test_normalize_uuid|test_is_benign_type`) that matches 5 existing test functions. The `expected_minimum: 4` means the structural check already passes before this plan executes. This is because F002 adds ADDITIONAL tests to supplement existing ones. The behavioral layer (running specific new test names) provides the actual verification. Not blocking.
+**F002 Red State Note:** Structural check now uses unique new test names (test_is_benign_type_enum16, test_normalize_uuid_whitespace_is_some, etc.) that do not match any pre-existing tests. All layers correctly start in FAIL state.
 
 ---
 
