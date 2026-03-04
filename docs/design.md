@@ -2357,7 +2357,7 @@ SIGTERM received in server mode:
 | 0 | Success |
 | 1 | General error (configuration, connection, S3 failure) |
 | 2 | Usage error (invalid flags, unknown command) |
-| 3 | Backup not found (for restore/download/delete of non-existent backup) |
+| 3 | Backup not found, or partial restore (some parts skipped) |
 | 4 | Lock conflict (another operation on same backup name in progress) |
 | 130 | Interrupted by SIGINT (Ctrl+C) |
 | 143 | Interrupted by SIGTERM |

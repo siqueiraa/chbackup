@@ -49,7 +49,7 @@ pub enum ChBackupError {
 /// - 0: success
 /// - 1: general error
 /// - 2: usage error (handled by clap before `main()` runs)
-/// - 3: backup/manifest not found
+/// - 3: backup/manifest not found, or partial restore
 /// - 4: lock conflict
 /// - 130: SIGINT (Ctrl+C)
 /// - 143: SIGTERM

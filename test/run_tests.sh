@@ -1428,10 +1428,10 @@ if should_run "test_exit_codes"; then
     chbackup restore "nonexistent_backup_12345_$$" 2>&1
     EC=$?
     set -e
-    if [[ "$EC" -ne 0 ]]; then
-        pass "restore nonexistent exit code ${EC} (non-zero as expected)"
+    if [[ "$EC" -eq 3 ]]; then
+        pass "restore nonexistent exit code 3 (not found)"
     else
-        fail "restore nonexistent returned exit code 0 (should have failed)"
+        fail "restore nonexistent exit code ${EC} (expected 3)"
     fi
 
     # Test 3: Invalid backup name (exit code 1 = validation error)
@@ -1440,10 +1440,29 @@ if should_run "test_exit_codes"; then
     chbackup create "../bad_name" 2>&1
     EC=$?
     set -e
-    if [[ "$EC" -ne 0 ]]; then
-        pass "create '../bad_name' exit code ${EC} (non-zero as expected)"
+    if [[ "$EC" -eq 1 ]]; then
+        pass "create '../bad_name' exit code 1 (validation error)"
     else
-        fail "create '../bad_name' returned exit code 0 (should have failed)"
+        fail "create '../bad_name' exit code ${EC} (expected 1)"
+    fi
+
+    # Test 4: Lock conflict (exit code 4)
+    info "  Test 4: Lock conflict"
+    LOCK_NAME="lock_test_$$"
+    # Start a backup in the background
+    chbackup create "$LOCK_NAME" &
+    BG_PID=$!
+    sleep 1  # let it acquire the lock
+    set +e
+    chbackup create "$LOCK_NAME" 2>&1
+    EC=$?
+    set -e
+    wait "$BG_PID" 2>/dev/null || true
+    chbackup delete local "$LOCK_NAME" 2>/dev/null || true
+    if [[ "$EC" -eq 4 ]]; then
+        pass "lock conflict exit code 4"
+    else
+        fail "lock conflict exit code ${EC} (expected 4)"
     fi
 fi
 
@@ -3677,9 +3696,9 @@ if should_run "test_partial_restore"; then
 
     PARTIAL_NAME="partial-restore-test-$$"
 
-    # Step 1: Create a backup
-    info "  Step 1: Create backup"
-    run_cmd "create for partial restore" chbackup create "$PARTIAL_NAME"
+    # Step 1: Create a backup of local-disk table only (avoid S3 disk complications)
+    info "  Step 1: Create backup (default.trades only)"
+    run_cmd "create for partial restore" chbackup create "$PARTIAL_NAME" -t 'default.trades'
 
     # Step 2: Delete a part's data from the backup shadow directory
     info "  Step 2: Remove a part directory from backup"
@@ -3690,9 +3709,9 @@ if should_run "test_partial_restore"; then
         info "  Removing part: $PART_DIR"
         rm -rf "$PART_DIR"
 
-        # Step 3: Drop the tables so restore can recreate them
-        info "  Step 3: Drop test tables for restore"
-        drop_all_tables
+        # Step 3: Drop only the table we're restoring
+        info "  Step 3: Drop default.trades for restore"
+        clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
 
         # Step 4: Restore and check exit code
         info "  Step 4: Restore (expecting exit code 3)"
@@ -3716,7 +3735,7 @@ if should_run "test_partial_restore"; then
         info "  No part directories found in backup (single-file table?), skipping"
     fi
 
-    # Cleanup: re-seed data for subsequent tests
+    # Cleanup: re-seed default.trades for subsequent tests
     info "  Cleanup: re-seed test data"
     clickhouse-client --multiquery < /test/fixtures/seed_data.sql 2>/dev/null || true
     run_cmd "delete partial backup" chbackup delete local "$PARTIAL_NAME" || true

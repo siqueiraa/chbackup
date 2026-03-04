@@ -16,6 +16,16 @@ use anyhow::{Context, Result};
 use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
+
+/// Check if an S3 error is a NoSuchKey / 404 (missing source object).
+///
+/// The AWS SDK CopyObject error contains "NoSuchKey" in its Display output
+/// when the source object doesn't exist. We use string matching on the error
+/// chain (same approach as CH error code detection elsewhere in the codebase).
+fn is_s3_not_found(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("NoSuchKey") || msg.contains("404") || msg.contains("not found")
+}
 use walkdir::WalkDir;
 
 use crate::backup::collect::resolve_shadow_part_path;
@@ -349,7 +359,7 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
 
                     // Copy from backup bucket (absolute source key) to data disk
                     // bucket (dest_key relative to data disk prefix).
-                    data_s3_clone
+                    match data_s3_clone
                         .copy_object_with_retry_jitter(
                             &backup_bucket_clone,
                             &source_key,
@@ -358,23 +368,59 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
                             jitter_factor,
                         )
                         .await
-                        .with_context(|| {
-                            format!("Failed to copy S3 object: {} -> {}", source_key, dest_key)
-                        })?;
-
-                    Ok::<(), anyhow::Error>(())
+                    {
+                        Ok(()) => Ok(true),
+                        Err(e) => {
+                            if is_s3_not_found(&e) {
+                                warn!(
+                                    source = %source_key,
+                                    dest = %dest_key,
+                                    "S3 object not found (NoSuchKey), will skip part"
+                                );
+                                Ok(false)
+                            } else {
+                                Err(e).with_context(|| {
+                                    format!(
+                                        "Failed to copy S3 object: {} -> {}",
+                                        source_key, dest_key
+                                    )
+                                })
+                            }
+                        }
+                    }
                 });
 
                 copy_handles.push(handle);
             }
 
-            // Await all copy tasks for this part
+            // Await all copy tasks for this part.
+            // Use join_all (not try_join_all) so all tasks complete even if
+            // one fails — avoids leaving abandoned tasks.
             if !copy_handles.is_empty() {
-                let results = try_join_all(copy_handles)
-                    .await
-                    .context("S3 copy task panicked")?;
-                for result in results {
-                    result?;
+                let results = futures::future::join_all(copy_handles).await;
+                let mut part_has_missing = false;
+                for join_result in &results {
+                    match join_result {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => part_has_missing = true,
+                        Ok(Err(e)) => {
+                            return Err(anyhow::anyhow!("{e:#}"))
+                                .context("Fatal S3 CopyObject error");
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("S3 copy task panicked: {e}"));
+                        }
+                    }
+                }
+                if part_has_missing {
+                    warn!(
+                        part = %part.name,
+                        db = %db,
+                        table = %table,
+                        "Skipping part: some S3 objects missing (NoSuchKey)"
+                    );
+                    skipped_count += 1;
+                    continue;
                 }
             }
 
