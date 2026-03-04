@@ -6,7 +6,7 @@ Add unit tests for untested pure functions across the codebase (main.rs, backup/
 
 ## Architecture Overview
 
-This plan adds ONLY test code (`#[cfg(test)]` modules) to existing source files and changes a single numeric threshold in CI. No production code is modified. All target functions are pure (no I/O, no async, no external dependencies) and can be tested with simple input/output assertions.
+This plan adds ONLY test code (`#[cfg(test)]` modules) to existing source files and changes a single numeric threshold in CI. No production code is modified. Target functions are either pure (no I/O, no async, no external dependencies) or use only local filesystem operations (tempdir-testable). All can be tested with simple input/output assertions.
 
 **Source files being modified:**
 - `src/main.rs` -- Add new `#[cfg(test)] mod tests` block (file has none currently)
@@ -61,9 +61,9 @@ Group A (Sequential -- main.rs tests):
   - Task 1: Add #[cfg(test)] mod tests to main.rs with tests for all pure helpers
 
 Group B (Independent -- can run in parallel with A):
-  - Task 2: Add tests for normalize_uuid and is_benign_type in backup/mod.rs
+  - Task 2: Add NEW edge-case tests for backup/mod.rs (no duplicates of existing tests)
   - Task 3: Add tests for sanitize_relative_path in download/mod.rs
-  - Task 4: Add tests for is_attach_warning and additional edge cases in restore/attach.rs
+  - Task 4: Add tests for is_attach_warning in restore/attach.rs (no duplicates)
 
 Group C (Sequential -- depends on A+B):
   - Task 5: Raise CI coverage gate from 35% to 55%
@@ -113,33 +113,29 @@ Group C (Sequential -- depends on A+B):
 - The `validate_backup_name` function is imported from `crate::server::state` via `use chbackup::server::state::validate_backup_name;` at the top of main.rs.
 - `map_cli_location` and `map_cli_list_format` need `cli::Location` and `cli::ListFormat` from the private `cli` module -- accessible via `use super::*;` because `mod cli;` is declared in main.rs.
 
-### Task 2: Add tests for normalize_uuid and is_benign_type in backup/mod.rs
+### Task 2: Add NEW edge-case tests for backup/mod.rs (no duplicates)
 
-**TDD Steps:**
-1. Write test `test_normalize_uuid_valid` -- `normalize_uuid("abc-123-def")` returns `Some("abc-123-def")`
-2. Write test `test_normalize_uuid_empty` -- `normalize_uuid("")` returns `None`
-3. Write test `test_normalize_uuid_all_zeros` -- `normalize_uuid("00000000-0000-0000-0000-000000000000")` returns `None`
-4. Write test `test_normalize_uuid_non_zero` -- `normalize_uuid("5f3a7b2c-1234-5678-9abc-def012345678")` returns `Some(...)`
-5. Write test `test_is_benign_type_enum_variants` -- `is_benign_type("Enum8('a' = 1)")` returns `true`
-6. Write test `test_is_benign_type_enum16` -- `is_benign_type("Enum16('active' = 1, 'deleted' = 2)")` returns `true`
-7. Write test `test_is_benign_type_tuple` -- `is_benign_type("Tuple(a Int32, b String)")` returns `true`
-8. Write test `test_is_benign_type_nullable_enum` -- `is_benign_type("Nullable(Enum8('a' = 1))")` returns `true`
-9. Write test `test_is_benign_type_nullable_tuple` -- `is_benign_type("Nullable(Tuple(x Int32))")` returns `true`
-10. Write test `test_is_benign_type_array_tuple` -- `is_benign_type("Array(Tuple(a Int32, b Int32))")` returns `true`
-11. Write test `test_is_benign_type_non_benign` -- `is_benign_type("Int32")` returns `false`
-12. Write test `test_is_benign_type_non_benign_string` -- `is_benign_type("String")` returns `false`
-13. Write test `test_is_benign_type_non_benign_nullable_int` -- `is_benign_type("Nullable(Int32)")` returns `false`
-14. Write test `test_filter_benign_type_drift_removes_all_benign` -- vec with all benign types filtered to empty
-15. Write test `test_filter_benign_type_drift_keeps_non_benign` -- vec with `["Int32", "String"]` types kept
-16. Write test `test_filter_benign_type_drift_mixed` -- vec with one benign-only and one mixed, keeps only mixed
-17. Verify: `cargo test --lib -- backup::tests`
+**Pre-existing tests (DO NOT recreate -- these already exist):**
+- `test_normalize_uuid_valid` (line 1370), `test_normalize_uuid_empty` (line 1365), `test_normalize_uuid_nil` (line 1360), `test_normalize_uuid_undashed` (line 1378)
+- `test_is_benign_type_variants` (line 1435) -- already covers Enum8, Tuple, Nullable(Enum8), Nullable(Tuple), Array(Tuple), and negative cases (UInt64, String, Float64, Decimal, Array(UInt64), Nullable(UInt64))
+- `test_filter_benign_type_drift_all_benign` (line 1453), `test_filter_benign_type_drift_none_benign` (line 1479), `test_filter_benign_type_drift_empty` (line 1491)
+
+**TDD Steps (genuinely new edge cases only):**
+1. Write test `test_is_benign_type_enum16_with_many_values` -- `is_benign_type("Enum16('active' = 1, 'deleted' = 2, 'pending' = 3, 'archived' = 4)")` returns `true` (Enum16 not covered by existing test which only uses Enum8)
+2. Write test `test_is_benign_type_nested_nullable_array_tuple` -- `is_benign_type("Nullable(Array(Tuple(x Int32, y Int32)))")` returns `true` (deeper nesting not covered)
+3. Write test `test_is_benign_type_map_type` -- `is_benign_type("Map(String, UInt64)")` returns `false` (Map is not benign)
+4. Write test `test_is_benign_type_lowertuple` -- `is_benign_type("tuple(a UInt64)")` returns `false` (case-sensitive check)
+5. Write test `test_normalize_uuid_whitespace` -- `normalize_uuid(" ")` returns `None` (whitespace-only)
+6. Write test `test_normalize_uuid_partial_zeros` -- `normalize_uuid("00000000-0000-0000-0000-000000000001")` returns `Some(...)` (not nil)
+7. Write test `test_filter_benign_type_drift_mixed_keeps_only_non_benign` -- vec with 3 entries: one all-benign, one all-non-benign, one mixed (benign+non-benign types in same ColumnInconsistency); result keeps the 2 non-all-benign entries
+8. Verify: `cargo test --lib -- backup::tests`
 
 **Files:** `src/backup/mod.rs`
 **Acceptance:** F002
 
 **Implementation Notes:**
-- `ColumnInconsistency` is imported from `crate::clickhouse::client::ColumnInconsistency` (already in scope via `use super::*;` since `mod.rs` imports from `crate::clickhouse`).
-- Existing tests already construct `ColumnInconsistency` directly (see lines ~1060 in existing test module). Follow same pattern.
+- `ColumnInconsistency` is imported from `crate::clickhouse::client::ColumnInconsistency` (already in scope via `use super::*;`).
+- Follow the exact same construction pattern used by existing tests at lines ~1060 and ~1453.
 - `is_benign_type` and `filter_benign_type_drift` are private functions accessible via `use super::*;`.
 
 ### Task 3: Add tests for sanitize_relative_path in download/mod.rs (SECURITY-CRITICAL)
@@ -164,31 +160,31 @@ Group C (Sequential -- depends on A+B):
 - The function uses `Path::components()` filter for `Component::Normal` only.
 - `"..hidden"` is parsed as a `Normal` component by Rust's `Path`, not as `ParentDir` (only bare `..` is `ParentDir`).
 
-### Task 4: Add tests for is_attach_warning and edge cases in restore/attach.rs
+### Task 4: Add tests for is_attach_warning in restore/attach.rs (no duplicates)
 
-**TDD Steps:**
-1. Write test `test_is_attach_warning_duplicate_data_part` -- `anyhow::anyhow!("Code: 232. DUPLICATE_DATA_PART")` returns `true`
-2. Write test `test_is_attach_warning_part_temporarily_locked` -- `anyhow::anyhow!("PART_IS_TEMPORARILY_LOCKED")` returns `true`
-3. Write test `test_is_attach_warning_no_such_data_part` -- `anyhow::anyhow!("NO_SUCH_DATA_PART")` returns `true`
-4. Write test `test_is_attach_warning_code_232` -- `anyhow::anyhow!("Code: 232")` returns `true`
-5. Write test `test_is_attach_warning_code_233` -- `anyhow::anyhow!("Code: 233")` returns `true`
+**Pre-existing tests (DO NOT recreate -- these already exist):**
+- `test_hardlink_or_copy_dir_empty_src` (line 1562), `test_hardlink_or_copy_dir` (line 1102), `test_hardlink_or_copy_dir_nonexistent_src` (line 1574), `test_hardlink_or_copy_dir_multiple_subdirs` (line 1585), `test_hardlink_or_copy_dir_deeply_nested` (line 1606)
+- `test_detect_clickhouse_ownership_existing_dir` (line 1531), `test_detect_clickhouse_ownership_existing_file` (line 1542), `test_detect_clickhouse_ownership_nonexistent` (line 1162)
+- `test_restore_s3_uuid_path_short_uuid` (line 1190), `test_restore_s3_uuid_path_derivation` (line 1173), `test_restore_s3_uuid_path_full_path` (line 1198)
+
+**TDD Steps (genuinely new -- is_attach_warning has ZERO tests):**
+1. Write test `test_is_attach_warning_duplicate_data_part` -- `anyhow::anyhow!("Code: 232. DB::Exception: Unexpected part ... DUPLICATE_DATA_PART")` returns `true`
+2. Write test `test_is_attach_warning_part_temporarily_locked` -- `anyhow::anyhow!("Code: 233. PART_IS_TEMPORARILY_LOCKED")` returns `true`
+3. Write test `test_is_attach_warning_no_such_data_part` -- `anyhow::anyhow!("NO_SUCH_DATA_PART in table")` returns `true`
+4. Write test `test_is_attach_warning_code_232_only` -- `anyhow::anyhow!("Code: 232")` returns `true`
+5. Write test `test_is_attach_warning_code_233_only` -- `anyhow::anyhow!("Code: 233")` returns `true`
 6. Write test `test_is_attach_warning_other_error` -- `anyhow::anyhow!("Code: 60. UNKNOWN_TABLE")` returns `false`
 7. Write test `test_is_attach_warning_connection_error` -- `anyhow::anyhow!("Connection refused")` returns `false`
 8. Write test `test_is_attach_warning_empty_error` -- `anyhow::anyhow!("")` returns `false`
-9. Write test `test_uuid_s3_prefix_short_uuid` -- `uuid_s3_prefix("ab")` returns `"store/ab/ab"` (short hex, < 3 chars)
-10. Write test `test_uuid_s3_prefix_no_dashes` -- `uuid_s3_prefix("5f3a7b2c123456789abcdef012345678")` returns `"store/5f3/5f3a7b2c123456789abcdef012345678"` (preserves original, prefix from hex-only)
-11. Write test `test_detect_clickhouse_ownership_tempdir` -- create tempdir, call `detect_clickhouse_ownership`, verify returns `Some(uid)` and `Some(gid)` for existing dir
-12. Write test `test_hardlink_or_copy_dir_empty_src` -- create empty src dir, verify hardlink_or_copy_dir succeeds with empty dst
-13. Verify: `cargo test --lib -- restore::attach::tests`
+9. Verify: `cargo test --lib -- restore::attach::tests::test_is_attach_warning`
 
 **Files:** `src/restore/attach.rs`
 **Acceptance:** F004
 
 **Implementation Notes:**
 - `is_attach_warning` takes `&anyhow::Error`. Construct errors with `anyhow::anyhow!("message")` and pass `&error`.
-- `uuid_s3_prefix` is `pub fn` -- already has 1 test but edge cases (short UUID, no dashes) are not covered.
-- `detect_clickhouse_ownership` test should use `tempfile::tempdir()` and verify uid/gid are `Some` values.
-- The existing test for `detect_clickhouse_ownership_nonexistent` covers the None case (line 1162).
+- This function has ZERO existing tests despite being critical for idempotent restore behavior.
+- Uses "Code: 232"/"Code: 233" prefix matching (per M2 fix from round 4 review).
 
 ### Task 5: Raise CI coverage gate from 35% to 55%
 
@@ -225,14 +221,14 @@ Interface skeleton simulation (Phase 4.5) is skipped because this plan creates N
 ### Phase 4.6 CLAUDE.md Skip Justification
 CLAUDE.md update task is skipped because all changes are test-only additions inside existing `#[cfg(test)] mod tests` blocks and a CI threshold change. No CLAUDE.md files need creation or update per `context/affected-modules.json`.
 
-### Coverage Impact Estimate
-| File | Before | After (est.) | New Tests |
-|------|--------|--------------|-----------|
-| main.rs | 0% | ~8-12% | ~20 tests |
-| backup/mod.rs | 46.41% | ~48-50% | ~12 tests |
-| download/mod.rs | 44.27% | ~46-48% | ~8 tests |
-| restore/attach.rs | 45.95% | ~48-50% | ~12 tests |
-| Overall | 66.68% | ~68-70% | ~52 tests |
+### Coverage Impact Estimate (revised after dedup)
+| File | Before | After (est.) | New Tests | Notes |
+|------|--------|--------------|-----------|-------|
+| main.rs | 0% | ~8-12% | ~27 tests | New #[cfg(test)] module from scratch |
+| backup/mod.rs | 46.41% | ~47-48% | ~7 tests | Edge cases only; most functions already tested |
+| download/mod.rs | 44.27% | ~46-48% | ~8 tests | sanitize_relative_path entirely untested |
+| restore/attach.rs | 45.95% | ~47-48% | ~8 tests | is_attach_warning entirely untested |
+| Overall | 66.68% | ~67-69% | ~50 tests | Conservative; main.rs has modest LOC impact |
 
 ### Anti-Overengineering
 - No test helpers, no test fixtures, no abstractions. Each test is a simple function with arrange/act/assert.

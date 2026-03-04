@@ -25,19 +25,16 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1 | grep -c 'test result: ok'",
-            "expected": "1",
-            "fail_message": "main.rs unit tests failed"
+            "command": "cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1 | tee /dev/stderr | grep -oP '\\d+ passed' | grep -oP '\\d+'",
+            "expected_minimum": 20,
+            "fail_message": "Expected at least 20 main.rs tests to pass (got fewer or zero)"
           },
           {
             "name": "runtime",
             "status": "not_applicable",
             "justification": "Test-only code, no runtime binary behavior change",
             "covered_by": ["F005"],
-            "alternative_verification": {
-              "command": "cargo test --bin chbackup -- test_backup_name_from_command test_resolve_backup_name test_backup_name_required test_map_cli_location test_map_cli_list_format test_merge_skip_projections 2>&1 | grep 'test result: ok'",
-              "expected": "test result: ok"
-            }
+            "alternative_verification": "N/A"
           }
         ]
       },
@@ -47,16 +44,16 @@
     {
       "id": "F002",
       "category": "test",
-      "description": "Unit tests for normalize_uuid and is_benign_type in backup/mod.rs",
+      "description": "NEW edge-case tests for backup/mod.rs (is_benign_type_enum16, nested types, normalize_uuid whitespace/partial, mixed drift filter)",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
         "layers": [
           {
             "name": "structural",
-            "command": "grep -c 'test_normalize_uuid\\|test_is_benign_type' src/backup/mod.rs",
-            "expected_minimum": 4,
-            "fail_message": "Expected at least 4 new test functions for normalize_uuid and is_benign_type"
+            "command": "grep -c 'test_is_benign_type_enum16\\|test_is_benign_type_nested\\|test_is_benign_type_map\\|test_is_benign_type_lowertuple\\|test_normalize_uuid_whitespace\\|test_normalize_uuid_partial\\|test_filter_benign_type_drift_mixed_keeps' src/backup/mod.rs",
+            "expected_minimum": 7,
+            "fail_message": "Expected at least 7 NEW test functions (not counting pre-existing ones)"
           },
           {
             "name": "compilation",
@@ -66,19 +63,16 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --lib -- backup::tests::test_normalize_uuid backup::tests::test_is_benign_type backup::tests::test_filter_benign_type_drift 2>&1 | grep -c 'test result: ok'",
-            "expected": "1",
-            "fail_message": "backup/mod.rs unit tests failed"
+            "command": "cargo test --lib -- backup::tests::test_is_benign_type_enum16 backup::tests::test_normalize_uuid_whitespace backup::tests::test_filter_benign_type_drift_mixed_keeps 2>&1 | tee /dev/stderr | grep -oP '\\d+ passed' | grep -oP '\\d+'",
+            "expected_minimum": 3,
+            "fail_message": "Expected at least 3 NEW backup/mod.rs tests to pass"
           },
           {
             "name": "runtime",
             "status": "not_applicable",
             "justification": "Test-only code, no runtime binary behavior change",
             "covered_by": ["F005"],
-            "alternative_verification": {
-              "command": "cargo test --lib -- backup::tests::test_normalize_uuid backup::tests::test_is_benign_type 2>&1 | grep 'test result: ok'",
-              "expected": "test result: ok"
-            }
+            "alternative_verification": "N/A"
           }
         ]
       },
@@ -107,19 +101,16 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --lib -- download::tests::test_sanitize_relative_path 2>&1 | grep -c 'test result: ok'",
-            "expected": "1",
-            "fail_message": "download/mod.rs sanitize_relative_path tests failed"
+            "command": "cargo test --lib -- download::tests::test_sanitize_relative_path 2>&1 | tee /dev/stderr | grep -oP '\\d+ passed' | grep -oP '\\d+'",
+            "expected_minimum": 6,
+            "fail_message": "Expected at least 6 sanitize_relative_path tests to pass (got fewer or zero)"
           },
           {
             "name": "runtime",
             "status": "not_applicable",
             "justification": "Test-only code, no runtime binary behavior change",
             "covered_by": ["F005"],
-            "alternative_verification": {
-              "command": "cargo test --lib -- download::tests::test_sanitize_relative_path 2>&1 | grep 'test result: ok'",
-              "expected": "test result: ok"
-            }
+            "alternative_verification": "N/A"
           }
         ]
       },
@@ -129,16 +120,16 @@
     {
       "id": "F004",
       "category": "test",
-      "description": "Unit tests for is_attach_warning, uuid_s3_prefix edge cases, and filesystem helpers in restore/attach.rs",
+      "description": "Unit tests for is_attach_warning in restore/attach.rs (8 new tests, no duplicates of existing hardlink/ownership/uuid tests)",
       "status": "fail",
       "verification": {
         "type": "multi_layer",
         "layers": [
           {
             "name": "structural",
-            "command": "grep -c 'test_is_attach_warning\\|test_uuid_s3_prefix_short\\|test_uuid_s3_prefix_no_dashes\\|test_detect_clickhouse_ownership_tempdir\\|test_hardlink_or_copy_dir_empty' src/restore/attach.rs",
-            "expected_minimum": 4,
-            "fail_message": "Expected at least 4 new test functions in restore/attach.rs"
+            "command": "grep -c 'test_is_attach_warning' src/restore/attach.rs",
+            "expected_minimum": 8,
+            "fail_message": "Expected at least 8 test_is_attach_warning test functions"
           },
           {
             "name": "compilation",
@@ -148,19 +139,16 @@
           },
           {
             "name": "behavioral",
-            "command": "cargo test --lib -- restore::attach::tests::test_is_attach_warning restore::attach::tests::test_uuid_s3_prefix_short restore::attach::tests::test_uuid_s3_prefix_no_dashes restore::attach::tests::test_detect_clickhouse_ownership_tempdir restore::attach::tests::test_hardlink_or_copy_dir_empty 2>&1 | grep -c 'test result: ok'",
-            "expected": "1",
-            "fail_message": "restore/attach.rs unit tests failed"
+            "command": "cargo test --lib -- restore::attach::tests::test_is_attach_warning 2>&1 | tee /dev/stderr | grep -oP '\\d+ passed' | grep -oP '\\d+'",
+            "expected_minimum": 8,
+            "fail_message": "Expected at least 8 is_attach_warning tests to pass (got fewer or zero)"
           },
           {
             "name": "runtime",
             "status": "not_applicable",
             "justification": "Test-only code, no runtime binary behavior change",
             "covered_by": ["F005"],
-            "alternative_verification": {
-              "command": "cargo test --lib -- restore::attach::tests::test_is_attach_warning 2>&1 | grep 'test result: ok'",
-              "expected": "test result: ok"
-            }
+            "alternative_verification": "N/A"
           }
         ]
       },
@@ -195,17 +183,10 @@
           },
           {
             "name": "runtime",
-            "binary": "chbackup",
-            "build_command": "cargo build --release",
-            "wait_seconds": 0,
-            "patterns": ["test result: ok"],
-            "forbidden": ["test result: FAILED"],
-            "cleanup_markers": false,
-            "fail_message": "Full test suite regression",
-            "alternative_verification": {
-              "command": "cargo test 2>&1 | grep 'test result' | head -1",
-              "expected": "test result: ok"
-            }
+            "status": "not_applicable",
+            "justification": "This plan modifies only test code and a CI threshold. There is no runtime binary behavior change. The behavioral layer already runs the full test suite and verifies all tests pass.",
+            "covered_by": ["F001", "F002", "F003", "F004"],
+            "alternative_verification": "N/A"
           }
         ]
       },
