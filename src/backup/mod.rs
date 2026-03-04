@@ -1494,6 +1494,84 @@ mod tests {
     }
 
     #[test]
+    fn test_is_benign_type_enum16_with_many_values() {
+        assert!(is_benign_type(
+            "Enum16('active' = 1, 'deleted' = 2, 'pending' = 3, 'archived' = 4)"
+        ));
+    }
+
+    #[test]
+    fn test_is_benign_type_nested_nullable_array_tuple_is_false() {
+        // Nullable(Array(Tuple(...))) does NOT match: implementation only checks
+        // Nullable(Enum and Nullable(Tuple prefixes, not Nullable(Array(Tuple
+        assert!(!is_benign_type(
+            "Nullable(Array(Tuple(x Int32, y Int32)))"
+        ));
+    }
+
+    #[test]
+    fn test_is_benign_type_map_type() {
+        // Map is not a benign drift type
+        assert!(!is_benign_type("Map(String, UInt64)"));
+    }
+
+    #[test]
+    fn test_is_benign_type_lowertuple() {
+        // Case-sensitive: starts_with("Tuple") not "tuple"
+        assert!(!is_benign_type("tuple(a UInt64)"));
+    }
+
+    #[test]
+    fn test_normalize_uuid_whitespace_is_some() {
+        // Whitespace is treated as a valid non-empty UUID (not nil, not empty)
+        assert_eq!(normalize_uuid(" "), Some(" ".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_uuid_partial_zeros() {
+        // Not nil -- differs in last digit
+        assert_eq!(
+            normalize_uuid("00000000-0000-0000-0000-000000000001"),
+            Some("00000000-0000-0000-0000-000000000001".to_string())
+        );
+    }
+
+    #[test]
+    fn test_filter_benign_type_drift_mixed_keeps_only_non_benign() {
+        // 3 entries: one all-benign, one all-non-benign, one mixed (benign + non-benign)
+        let all_benign = ColumnInconsistency {
+            database: "db1".to_string(),
+            table: "t1".to_string(),
+            column: "c1".to_string(),
+            types: vec![
+                "Enum8('a' = 1)".to_string(),
+                "Enum8('a' = 1, 'b' = 2)".to_string(),
+            ],
+        };
+        let all_non_benign = ColumnInconsistency {
+            database: "db2".to_string(),
+            table: "t2".to_string(),
+            column: "c2".to_string(),
+            types: vec!["UInt64".to_string(), "Int64".to_string()],
+        };
+        let mixed = ColumnInconsistency {
+            database: "db3".to_string(),
+            table: "t3".to_string(),
+            column: "c3".to_string(),
+            types: vec![
+                "Enum8('x' = 1)".to_string(),
+                "String".to_string(),
+            ],
+        };
+
+        let result = filter_benign_type_drift(vec![all_benign, all_non_benign, mixed]);
+        // all_benign is filtered out (all types benign), the other two remain
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].column, "c2");
+        assert_eq!(result[1].column, "c3");
+    }
+
+    #[test]
     fn test_create_backup_dir_succeeds_when_new() {
         // Verify that creating a backup directory succeeds when it does not exist.
         let tmp = tempfile::tempdir().unwrap();
