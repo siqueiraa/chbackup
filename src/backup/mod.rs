@@ -1504,9 +1504,7 @@ mod tests {
     fn test_is_benign_type_nested_nullable_array_tuple_is_false() {
         // Nullable(Array(Tuple(...))) does NOT match: implementation only checks
         // Nullable(Enum and Nullable(Tuple prefixes, not Nullable(Array(Tuple
-        assert!(!is_benign_type(
-            "Nullable(Array(Tuple(x Int32, y Int32)))"
-        ));
+        assert!(!is_benign_type("Nullable(Array(Tuple(x Int32, y Int32)))"));
     }
 
     #[test]
@@ -1558,10 +1556,7 @@ mod tests {
             database: "db3".to_string(),
             table: "t3".to_string(),
             column: "c3".to_string(),
-            types: vec![
-                "Enum8('x' = 1)".to_string(),
-                "String".to_string(),
-            ],
+            types: vec!["Enum8('x' = 1)".to_string(), "String".to_string()],
         };
 
         let result = filter_benign_type_drift(vec![all_benign, all_non_benign, mixed]);

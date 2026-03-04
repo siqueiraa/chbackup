@@ -1019,7 +1019,10 @@ mod tests {
 
     #[test]
     fn test_map_cli_location_local() {
-        assert_eq!(map_cli_location(cli::Location::Local), list::Location::Local);
+        assert_eq!(
+            map_cli_location(cli::Location::Local),
+            list::Location::Local
+        );
     }
 
     #[test]
