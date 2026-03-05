@@ -85,6 +85,147 @@ fn paginate<T>(
 }
 
 // ---------------------------------------------------------------------------
+// ActionFlags parsing for POST /api/v1/actions
+// ---------------------------------------------------------------------------
+
+/// Parsed flags from a command string dispatched via POST /api/v1/actions.
+///
+/// Go clickhouse-backup and chbackup CLI flags are extracted so that
+/// `post_actions()` can pass them into the underlying command functions.
+struct ActionFlags {
+    /// First positional (non-flag) argument after the operation name.
+    backup_name: Option<String>,
+    /// --table / -t flag value.
+    table_pattern: Option<String>,
+    /// --restore-table-mapping flag value (converted to db.table format).
+    rename_as: Option<String>,
+    /// --diff-from-remote flag value.
+    diff_from_remote: Option<String>,
+    /// --rbac flag.
+    rbac: bool,
+    /// --configs flag.
+    configs: bool,
+    /// --rm / --drop flag.
+    rm: bool,
+}
+
+/// Parse flags from command parts (everything after the operation name).
+///
+/// Handles both `--flag=VALUE` and `--flag VALUE` forms.
+/// The first non-flag token is treated as the backup name.
+fn parse_action_flags(parts: &[&str]) -> ActionFlags {
+    let args: Vec<&str> = if parts.len() > 1 {
+        parts[1..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let mut backup_name: Option<String> = None;
+    let mut table_pattern: Option<String> = None;
+    let mut rename_as: Option<String> = None;
+    let mut diff_from_remote: Option<String> = None;
+    let mut rbac = false;
+    let mut configs = false;
+    let mut rm = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+
+        if let Some(val) = arg
+            .strip_prefix("--table=")
+            .or_else(|| arg.strip_prefix("-t="))
+        {
+            table_pattern = Some(val.to_string());
+        } else if arg == "--table" || arg == "-t" {
+            i += 1;
+            if i < args.len() {
+                table_pattern = Some(args[i].to_string());
+            }
+        } else if let Some(val) = arg.strip_prefix("--restore-table-mapping=") {
+            rename_as = Some(val.to_string());
+        } else if arg == "--restore-table-mapping" {
+            i += 1;
+            if i < args.len() {
+                rename_as = Some(args[i].to_string());
+            }
+        } else if let Some(val) = arg.strip_prefix("--diff-from-remote=") {
+            diff_from_remote = Some(val.to_string());
+        } else if arg == "--diff-from-remote" {
+            i += 1;
+            if i < args.len() {
+                diff_from_remote = Some(args[i].to_string());
+            }
+        } else if arg == "--rbac" {
+            rbac = true;
+        } else if arg == "--configs" {
+            configs = true;
+        } else if arg == "--rm" || arg == "--drop" {
+            rm = true;
+        } else if !arg.starts_with('-') {
+            // First positional argument = backup name
+            if backup_name.is_none() {
+                backup_name = Some(arg.to_string());
+            }
+        }
+        // Unknown flags starting with -- are silently ignored
+
+        i += 1;
+    }
+
+    // Infer database prefix for --restore-table-mapping from --table if needed.
+    // Go format: `transactions:transactions_DR` (table-only)
+    // chbackup: `events.transactions:events.transactions_DR` (db.table)
+    if let (Some(ref mapping), Some(ref table)) = (&rename_as, &table_pattern) {
+        // Only infer when --table is a single concrete table (no wildcards)
+        if !table.contains('*')
+            && !table.contains('?')
+            && !table.contains(',')
+            && table.contains('.')
+        {
+            let db = table.split('.').next().unwrap_or("");
+            if !db.is_empty() {
+                // Process each mapping pair (comma-separated for multi-table)
+                let expanded: Vec<String> = mapping
+                    .split(',')
+                    .map(|pair| {
+                        let parts: Vec<&str> = pair.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            let src = parts[0].trim();
+                            let dst = parts[1].trim();
+                            let src_expanded = if !src.contains('.') {
+                                format!("{}.{}", db, src)
+                            } else {
+                                src.to_string()
+                            };
+                            let dst_expanded = if !dst.contains('.') {
+                                format!("{}.{}", db, dst)
+                            } else {
+                                dst.to_string()
+                            };
+                            format!("{}:{}", src_expanded, dst_expanded)
+                        } else {
+                            pair.to_string()
+                        }
+                    })
+                    .collect();
+                rename_as = Some(expanded.join(","));
+            }
+        }
+    }
+
+    ActionFlags {
+        backup_name,
+        table_pattern,
+        rename_as,
+        diff_from_remote,
+        rbac,
+        configs,
+        rm,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Response / Request types
 // ---------------------------------------------------------------------------
 
@@ -148,6 +289,11 @@ pub struct ListResponse {
     pub config_size: u64,
     pub compressed_size: u64,
     pub required: String,
+    // Internal fields for Go-compat layer (not in integration table columns)
+    #[serde(skip_serializing)]
+    pub is_broken: bool,
+    #[serde(skip_serializing)]
+    pub broken_reason: Option<String>,
 }
 
 /// Query params for GET /api/v1/tables
@@ -337,10 +483,23 @@ pub async fn post_actions(
     match op_name {
         "create" | "upload" | "download" | "restore" | "create_remote" | "restore_remote"
         | "delete" | "clean_broken" => {
+            // Parse flags from command parts (skip for delete/clean_broken which have positional format)
+            let flags = if matches!(op_name, "delete" | "clean_broken") {
+                ActionFlags {
+                    backup_name: parts.get(1).map(|s| s.to_string()),
+                    table_pattern: None,
+                    rename_as: None,
+                    diff_from_remote: None,
+                    rbac: false,
+                    configs: false,
+                    rm: false,
+                }
+            } else {
+                parse_action_flags(&parts)
+            };
+
             // Validate backup name if explicitly provided in the command.
-            // For most commands the name is parts[1]; for "delete <location> <name>"
-            // the location is parts[1] and the backup name is parts[2].
-            if let Some(name) = parts.get(1) {
+            if let Some(ref name) = flags.backup_name {
                 validate_backup_name(name).map_err(|e| validation_error(name, e))?;
             }
             if op_name == "delete" {
@@ -369,7 +528,7 @@ pub async fn post_actions(
             // Other commands (upload, download, restore) accept "latest"/"previous"
             // as shortcut inputs that get resolved at runtime.
             if matches!(op_name, "create" | "create_remote") {
-                if let Some(name) = parts.get(1) {
+                if let Some(ref name) = flags.backup_name {
                     reject_reserved_backup_name(name).map_err(|e| validation_error(name, e))?;
                 }
             }
@@ -381,7 +540,7 @@ pub async fn post_actions(
             let conflict_backup_name: Option<String> = if op_name == "delete" {
                 parts.get(2).or_else(|| parts.get(1)).map(|s| s.to_string())
             } else {
-                parts.get(1).map(|s| s.to_string())
+                flags.backup_name.clone()
             };
 
             let (id, token) = state
@@ -411,9 +570,7 @@ pub async fn post_actions(
                     }
                     _ = async {
                 tracing::info!(command = %command, "Action dispatched from POST /api/v1/actions");
-                let backup_name = parts_owned
-                    .get(1)
-                    .cloned()
+                let backup_name = flags.backup_name
                     .unwrap_or_else(crate::generate_backup_name);
 
                 let op = parts_owned[0].as_str();
@@ -448,13 +605,13 @@ pub async fn post_actions(
                             &config,
                             &ch,
                             &backup_name,
-                            None,  // table_pattern
+                            flags.table_pattern.as_deref(),
                             false, // schema_only
                             None,  // diff_from
                             None,  // partitions
                             false, // skip_check_parts_columns
-                            false, // rbac
-                            false, // configs
+                            flags.rbac,
+                            flags.configs,
                             false, // named_collections
                             &config.backup.skip_projections,
                             cancel_for_ops.clone(),
@@ -473,7 +630,7 @@ pub async fn post_actions(
                             &backup_name,
                             &backup_dir,
                             false, // delete_local
-                            None,  // diff_from_remote
+                            flags.diff_from_remote.as_deref(),
                             effective_resume,
                             cancel_for_ops.clone(),
                         )
@@ -514,15 +671,15 @@ pub async fn post_actions(
                             &config,
                             &ch,
                             &backup_name,
-                            None,  // table_pattern
+                            flags.table_pattern.as_deref(),
                             false, // schema_only
                             false, // data_only
-                            false, // rm
+                            flags.rm,
                             effective_resume,
-                            None,  // rename_as
+                            flags.rename_as.as_deref(),
                             None,  // database_mapping
-                            false, // rbac
-                            false, // configs
+                            flags.rbac,
+                            flags.configs,
                             false, // named_collections
                             None,  // partitions
                             false, // skip_empty_tables
@@ -535,13 +692,13 @@ pub async fn post_actions(
                             &config,
                             &ch,
                             &backup_name,
-                            None,  // table_pattern
+                            flags.table_pattern.as_deref(),
                             false, // schema_only
                             None,  // diff_from
                             None,  // partitions
                             false, // skip_check_parts_columns
-                            false, // rbac
-                            false, // configs
+                            flags.rbac,
+                            flags.configs,
                             false, // named_collections
                             &config.backup.skip_projections,
                             cancel_for_ops.clone(),
@@ -560,7 +717,7 @@ pub async fn post_actions(
                                     &backup_name,
                                     &backup_dir,
                                     false, // delete_local
-                                    None,  // diff_from_remote
+                                    flags.diff_from_remote.as_deref(),
                                     effective_resume,
                                     cancel_for_ops.clone(),
                                 )
@@ -603,15 +760,15 @@ pub async fn post_actions(
                                     &config,
                                     &ch,
                                     &backup_name,
-                                    None,  // table_pattern
+                                    flags.table_pattern.as_deref(),
                                     false, // schema_only
                                     false, // data_only
-                                    false, // rm
+                                    flags.rm,
                                     effective_resume,
-                                    None,  // rename_as
+                                    flags.rename_as.as_deref(),
                                     None,  // database_mapping
-                                    false, // rbac
-                                    false, // configs
+                                    flags.rbac,
+                                    flags.configs,
                                     false, // named_collections
                                     None,  // partitions
                                     false, // skip_empty_tables
@@ -795,6 +952,8 @@ fn summary_to_list_response(s: list::BackupSummary, location: &str) -> ListRespo
         config_size: s.config_size,
         compressed_size: s.compressed_size,
         required: s.required,
+        is_broken: s.is_broken,
+        broken_reason: s.broken_reason,
     }
 }
 
@@ -2031,7 +2190,12 @@ pub async fn go_list_backups(
     let go_results: Vec<GoListResponse> = results
         .into_iter()
         .map(|r| {
-            let desc = if r.required.is_empty() {
+            let desc = if r.is_broken {
+                format!(
+                    "broken: {}",
+                    r.broken_reason.as_deref().unwrap_or("unknown")
+                )
+            } else if r.required.is_empty() {
                 "tar, regular".to_string()
             } else {
                 "tar, incremental".to_string()
@@ -2377,10 +2541,12 @@ mod tests {
             config_size: 0,
             compressed_size: 512,
             required: String::new(),
+            is_broken: false,
+            broken_reason: None,
         };
 
         let json = serde_json::to_string(&response).expect("ListResponse should serialize");
-        // Verify all required columns are present
+        // Verify all required columns are present (is_broken/broken_reason are skip_serializing)
         assert!(json.contains("\"name\""));
         assert!(json.contains("\"created\""));
         assert!(json.contains("\"location\""));
@@ -3221,6 +3387,8 @@ mod tests {
                 config_size: 0,
                 compressed_size: 0,
                 required: String::new(),
+                is_broken: false,
+                broken_reason: None,
             },
             ListResponse {
                 name: "a-newest".to_string(),
@@ -3234,6 +3402,8 @@ mod tests {
                 config_size: 0,
                 compressed_size: 0,
                 required: String::new(),
+                is_broken: false,
+                broken_reason: None,
             },
             ListResponse {
                 name: "m-middle".to_string(),
@@ -3247,6 +3417,8 @@ mod tests {
                 config_size: 0,
                 compressed_size: 0,
                 required: String::new(),
+                is_broken: false,
+                broken_reason: None,
             },
         ];
 
@@ -3305,5 +3477,118 @@ mod tests {
         let json = r#"{}"#;
         let req: RestoreRemoteRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.resume, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_action_flags() tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_action_flags_restore_with_table_and_mapping() {
+        let parts = vec![
+            "restore",
+            "--table=events.t",
+            "--restore-table-mapping",
+            "t:t_DR",
+            "backup",
+        ];
+        let flags = parse_action_flags(&parts);
+        assert_eq!(flags.backup_name.as_deref(), Some("backup"));
+        assert_eq!(flags.table_pattern.as_deref(), Some("events.t"));
+        // db should be inferred from --table
+        assert_eq!(flags.rename_as.as_deref(), Some("events.t:events.t_DR"));
+        assert!(!flags.rbac);
+        assert!(!flags.configs);
+        assert!(!flags.rm);
+    }
+
+    #[test]
+    fn test_parse_action_flags_create_with_diff_and_rbac() {
+        let parts = vec![
+            "create",
+            "--diff-from-remote=base",
+            "--rbac",
+            "--configs",
+            "backup",
+        ];
+        let flags = parse_action_flags(&parts);
+        assert_eq!(flags.backup_name.as_deref(), Some("backup"));
+        assert_eq!(flags.diff_from_remote.as_deref(), Some("base"));
+        assert!(flags.rbac);
+        assert!(flags.configs);
+        assert!(!flags.rm);
+    }
+
+    #[test]
+    fn test_parse_action_flags_no_flags() {
+        let parts = vec!["create", "backup_name"];
+        let flags = parse_action_flags(&parts);
+        assert_eq!(flags.backup_name.as_deref(), Some("backup_name"));
+        assert!(flags.table_pattern.is_none());
+        assert!(flags.rename_as.is_none());
+        assert!(flags.diff_from_remote.is_none());
+        assert!(!flags.rbac);
+        assert!(!flags.configs);
+        assert!(!flags.rm);
+    }
+
+    #[test]
+    fn test_parse_action_flags_table_space_separated() {
+        let parts = vec!["restore", "--table", "db.t", "backup"];
+        let flags = parse_action_flags(&parts);
+        assert_eq!(flags.table_pattern.as_deref(), Some("db.t"));
+        assert_eq!(flags.backup_name.as_deref(), Some("backup"));
+    }
+
+    #[test]
+    fn test_parse_action_flags_mapping_with_db() {
+        let parts = vec![
+            "restore",
+            "--table=db.t",
+            "--restore-table-mapping=db.t:db.t_DR",
+            "backup",
+        ];
+        let flags = parse_action_flags(&parts);
+        // Already has db prefix, should pass through unchanged
+        assert_eq!(flags.rename_as.as_deref(), Some("db.t:db.t_DR"));
+    }
+
+    #[test]
+    fn test_parse_action_flags_mapping_infers_db() {
+        let parts = vec![
+            "restore",
+            "--table=mydb.users",
+            "--restore-table-mapping=users:users_DR",
+            "backup",
+        ];
+        let flags = parse_action_flags(&parts);
+        assert_eq!(
+            flags.rename_as.as_deref(),
+            Some("mydb.users:mydb.users_DR")
+        );
+    }
+
+    #[test]
+    fn test_parse_action_flags_mapping_wildcard_no_infer() {
+        let parts = vec![
+            "restore",
+            "--table=db.*",
+            "--restore-table-mapping=t:t_DR",
+            "backup",
+        ];
+        let flags = parse_action_flags(&parts);
+        // Wildcard in --table, should not infer db
+        assert_eq!(flags.rename_as.as_deref(), Some("t:t_DR"));
+    }
+
+    #[test]
+    fn test_parse_action_flags_rm_and_drop() {
+        let parts = vec!["restore", "--rm", "backup"];
+        let flags = parse_action_flags(&parts);
+        assert!(flags.rm);
+
+        let parts = vec!["restore", "--drop", "backup"];
+        let flags = parse_action_flags(&parts);
+        assert!(flags.rm);
     }
 }
