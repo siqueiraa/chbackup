@@ -83,7 +83,7 @@ chbackup server --watch
 
 Weekly full backups limit how many incrementals depend on a single base — if a full backup is lost, every incremental in that chain is unusable. Adjust `full_interval` based on your data size and recovery requirements.
 
-> **Need exact clock-time scheduling?** Use crontab instead — see [examples/crontab/](examples/crontab/) for a ready-to-use weekly full + daily incremental setup.
+> **Need exact clock-time scheduling?** Use a Kubernetes CronJob instead — see [examples/kubernetes/cronjob.yaml](examples/kubernetes/cronjob.yaml) for a ready-to-use weekly full + daily incremental setup that dispatches commands via `system.backup_actions`.
 
 chbackup reads its config from `/etc/chbackup/config.yml`. Override with `-c path` or the `CHBACKUP_CONFIG` env var. A minimal config:
 
@@ -178,8 +178,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 | Example | Description |
 |---------|-------------|
 | [examples/docker/](examples/docker/) | Docker Compose files for AWS S3, MinIO, and server mode |
-| [examples/kubernetes/](examples/kubernetes/) | Kubernetes sidecar Deployment manifest |
-| [examples/crontab/](examples/crontab/) | Cron-based scheduling with weekly full + daily incremental |
+| [examples/kubernetes/](examples/kubernetes/) | Kubernetes sidecar Deployment + CronJob for scheduled backups |
 
 ## Roadmap
 

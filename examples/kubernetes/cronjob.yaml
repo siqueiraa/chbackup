@@ -1,0 +1,177 @@
+# =============================================================================
+# cronjob.yaml -- Kubernetes CronJob for scheduled ClickHouse backups
+# =============================================================================
+# Dispatches backup commands to the chbackup sidecar via ClickHouse's
+# system.backup_actions URL engine table (INSERT triggers API calls).
+#
+# Prerequisites:
+#   - chbackup sidecar running in the ClickHouse pod (see sidecar.yaml)
+#   - api.create_integration_tables: true (creates system.backup_list/actions)
+#   - clickhouse-client available in the CronJob image
+#
+# For most deployments, watch mode (server --watch) is simpler.
+# Use CronJob when you need:
+#   - Full/incremental strategy with weekday-based logic
+#   - Multi-server backup orchestration (iterate CLICKHOUSE_SERVICES)
+#   - Custom retry/timeout logic per action
+#   - Integration with external monitoring (CronJob status)
+# =============================================================================
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: clickhouse-backup
+  namespace: clickhouse
+spec:
+  schedule: "0 2 * * *"
+  suspend: false
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          containers:
+          - name: backup
+            image: clickhouse/clickhouse-server:24.8
+            env:
+              # -- Comma-separated ClickHouse service names (one per replica) --
+              - name: CLICKHOUSE_SERVICES
+                value: "chi-ch-cluster-ch-deployment-0-0"
+              - name: CLICKHOUSE_PORT
+                value: "9000"
+              - name: BACKUP_USER
+                value: "default"
+              - name: BACKUP_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: clickhouse-default-user
+                    key: password
+              # -- Backup strategy --
+              - name: MAKE_INCREMENT_BACKUP
+                value: "1"
+              - name: FULL_BACKUP_DAY
+                value: "7"             # 1=Mon..7=Sun; force full on this day
+              - name: WAIT_TIMEOUT_SEC
+                value: "21600"         # 6h per action (large backups)
+              - name: POLL_INTERVAL_SEC
+                value: "5"
+            command:
+            - bash
+            - -ec
+            - |
+              set -Eeuo pipefail
+              IFS=$' \t\n'
+              log() { printf '%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$*"; }
+              on_err(){ log "[ERROR] line $1 exited with status $2"; }
+              trap 'on_err $LINENO $?' ERR
+
+              SCRIPT_START=$(date +%s)
+
+              CLICKHOUSE_SERVICES="$(tr ',' ' ' <<< "${CLICKHOUSE_SERVICES:-}")"
+              [[ -z "$CLICKHOUSE_SERVICES" ]] && { log "[ERROR] CLICKHOUSE_SERVICES is empty"; exit 1; }
+              BACKUP_DATE=$(date +%Y-%m-%d-%H-%M-%S)
+              declare -A BACKUP_NAMES
+              declare -A DIFF_FROM
+              PASSWORD_ARGS=()
+              [[ -n "${BACKUP_PASSWORD:-}" ]] && PASSWORD_ARGS=(--password="$BACKUP_PASSWORD")
+
+              weekday=$(date +%u)
+
+              # --------- Decide full vs incremental per server ----------
+              for SERVER in $CLICKHOUSE_SERVICES; do
+                DIFF_FROM[$SERVER]=""
+                PREV_REMOTE=""
+                if [[ "${MAKE_INCREMENT_BACKUP:-0}" == "1" ]]; then
+                  PREV_REMOTE=$(clickhouse-client -q "
+                    SELECT name
+                    FROM system.backup_list
+                    WHERE location='remote'
+                      AND name LIKE '${SERVER}-%'
+                      AND desc NOT LIKE 'broken%'
+                    ORDER BY created DESC
+                    LIMIT 1
+                    FORMAT TabSeparatedRaw
+                  " --host="$SERVER" --port="$CLICKHOUSE_PORT" --user="$BACKUP_USER" "${PASSWORD_ARGS[@]}" || true)
+                fi
+
+                if [[ "$weekday" == "$FULL_BACKUP_DAY" || -z "$PREV_REMOTE" ]]; then
+                  BACKUP_NAMES[$SERVER]="full-${BACKUP_DATE}"
+                  DIFF_FROM[$SERVER]=""
+                else
+                  BACKUP_NAMES[$SERVER]="increment-${BACKUP_DATE}"
+                  DIFF_FROM[$SERVER]="--diff-from-remote=${PREV_REMOTE}"
+                fi
+                log "[$SERVER] backup plan: ${BACKUP_NAMES[$SERVER]} ${DIFF_FROM[$SERVER]:-(full)}"
+              done
+
+              # Helper: wait for an action to complete in system.backup_actions
+              wait_action() {
+                local server="$1" cmd="$2" start_ts now status
+                start_ts=$(date +%s)
+                while true; do
+                  status=$(clickhouse-client -mn -q "
+                    SELECT status
+                    FROM system.backup_actions
+                    WHERE command=${cmd}
+                    ORDER BY start DESC
+                    LIMIT 1
+                    FORMAT TabSeparatedRaw
+                  " --host="$server" --port="$CLICKHOUSE_PORT" --user="$BACKUP_USER" "${PASSWORD_ARGS[@]}" || true)
+
+                  [[ "$status" != "in progress" && -n "$status" ]] && break
+
+                  now=$(date +%s)
+                  if (( now - start_ts > WAIT_TIMEOUT_SEC )); then
+                    log "[$server] timeout waiting for action ${cmd}"
+                    clickhouse-client -mn --echo -q "
+                      SELECT status,error FROM system.backup_actions WHERE command=${cmd} ORDER BY start DESC LIMIT 1
+                    " --host="$server" --port="$CLICKHOUSE_PORT" --user="$BACKUP_USER" "${PASSWORD_ARGS[@]}" || true
+                    exit 1
+                  fi
+                  sleep "$POLL_INTERVAL_SEC"
+                done
+
+                if [[ "$status" != "success" ]]; then
+                  log "[$server] action failed for ${cmd}"
+                  clickhouse-client -mn --echo -q "
+                    SELECT status,error FROM system.backup_actions WHERE command=${cmd} ORDER BY start DESC LIMIT 1
+                  " --host="$server" --port="$CLICKHOUSE_PORT" --user="$BACKUP_USER" "${PASSWORD_ARGS[@]}" || true
+                  exit 1
+                fi
+              }
+
+              # ---------- Step 1: Create local backup, then upload ----------
+              for SERVER in $CLICKHOUSE_SERVICES; do
+                if [[ -n "${DIFF_FROM[$SERVER]}" ]]; then
+                  CMD_STR="create ${DIFF_FROM[$SERVER]} ${SERVER}-${BACKUP_NAMES[$SERVER]}"
+                else
+                  CMD_STR="create ${SERVER}-${BACKUP_NAMES[$SERVER]}"
+                fi
+                log "[$SERVER] enqueue: ${CMD_STR}"
+                clickhouse-client --echo -mn -q "
+                  INSERT INTO system.backup_actions(command) VALUES('$CMD_STR')
+                " --host="$SERVER" --port="$CLICKHOUSE_PORT" --user="$BACKUP_USER" "${PASSWORD_ARGS[@]}"
+
+                wait_action "$SERVER" "'$CMD_STR'"
+              done
+
+              # ---------- Step 2: Upload to remote storage ----------
+              for SERVER in $CLICKHOUSE_SERVICES; do
+                CMD_STR="upload ${SERVER}-${BACKUP_NAMES[$SERVER]}"
+                log "[$SERVER] enqueue: ${CMD_STR}"
+                clickhouse-client --echo -mn -q "
+                  INSERT INTO system.backup_actions(command) VALUES('$CMD_STR')
+                " --host="$SERVER" --port="$CLICKHOUSE_PORT" --user="$BACKUP_USER" "${PASSWORD_ARGS[@]}"
+
+                wait_action "$SERVER" "'$CMD_STR'"
+              done
+
+              TOTAL_ELAPSED=$(( $(date +%s) - SCRIPT_START ))
+              log "BACKUP COMPLETE (elapsed ${TOTAL_ELAPSED}s)"
+          restartPolicy: OnFailure
+          serviceAccountName: rootz-data-platform-clickhouse
