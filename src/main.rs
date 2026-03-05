@@ -127,6 +127,7 @@ async fn run() -> Result<()> {
             tables,
             partitions,
             diff_from,
+            diff_from_remote,
             skip_projections,
             schema,
             rbac,
@@ -138,6 +139,13 @@ async fn run() -> Result<()> {
             let name = resolve_backup_name(backup_name)?;
             let _lock = acquire_lock("create", Some(&name))?;
             let ch = ChClient::new(&config.clickhouse)?;
+
+            // Construct S3 client only when diff-from-remote is needed
+            let s3 = if diff_from_remote.is_some() {
+                Some(S3Client::new(&config.s3).await?)
+            } else {
+                None
+            };
 
             // Merge CLI --skip-projections with config.backup.skip_projections
             let effective_skip_projections = merge_skip_projections(
@@ -152,6 +160,8 @@ async fn run() -> Result<()> {
                 tables.as_deref(),
                 schema,
                 diff_from.as_deref(),
+                diff_from_remote.as_deref(),
+                s3.as_ref(),
                 partitions.as_deref(),
                 skip_check_parts_columns,
                 rbac,
@@ -299,15 +309,17 @@ async fn run() -> Result<()> {
                 &config.backup.skip_projections,
             );
 
-            // Step 1: Create local backup (no local diff-from for create_remote)
+            // Step 1: Create local backup (pass diff_from_remote for create-time diff)
             let _manifest = backup::create(
                 &config,
                 &ch,
                 &name,
                 tables.as_deref(),
                 false, // schema_only
-                None,  // diff_from (create_remote uses diff_from_remote on upload side)
-                None,  // partitions (create_remote doesn't support --partitions)
+                None,  // diff_from (create_remote uses diff_from_remote)
+                diff_from_remote.as_deref(),
+                Some(&s3),
+                None, // partitions (create_remote doesn't support --partitions)
                 skip_check_parts_columns,
                 rbac,
                 configs,
@@ -858,6 +870,7 @@ mod tests {
             tables: None,
             partitions: None,
             diff_from: None,
+            diff_from_remote: None,
             skip_projections: None,
             schema: false,
             rbac: false,
@@ -875,6 +888,7 @@ mod tests {
             tables: None,
             partitions: None,
             diff_from: None,
+            diff_from_remote: None,
             skip_projections: None,
             schema: false,
             rbac: false,

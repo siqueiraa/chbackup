@@ -56,6 +56,10 @@ pub enum Command {
         #[arg(long = "diff-from")]
         diff_from: Option<String>,
 
+        /// Remote incremental base backup name (downloads manifest from S3)
+        #[arg(long = "diff-from-remote", conflicts_with = "diff_from")]
+        diff_from_remote: Option<String>,
+
         /// Glob patterns for projections to skip
         #[arg(long = "skip-projections")]
         skip_projections: Option<String>,
@@ -388,6 +392,48 @@ mod tests {
     fn test_restore_data_only_alone_ok() {
         let result = Cli::try_parse_from(["chbackup", "restore", "--data-only", "test-backup"]);
         assert!(result.is_ok(), "Expected --data-only alone to be accepted");
+    }
+
+    #[test]
+    fn test_create_diff_from_remote_flag() {
+        let cli = Cli::try_parse_from([
+            "chbackup",
+            "create",
+            "--diff-from-remote",
+            "base-backup",
+            "my-backup",
+        ])
+        .expect("Should parse create with --diff-from-remote");
+
+        match cli.command {
+            Command::Create {
+                diff_from,
+                diff_from_remote,
+                ..
+            } => {
+                assert!(diff_from.is_none());
+                assert_eq!(diff_from_remote.as_deref(), Some("base-backup"));
+            }
+            _ => panic!("Expected Command::Create"),
+        }
+    }
+
+    #[test]
+    fn test_create_diff_from_and_diff_from_remote_conflict() {
+        // --diff-from and --diff-from-remote are mutually exclusive
+        let result = Cli::try_parse_from([
+            "chbackup",
+            "create",
+            "--diff-from",
+            "local-base",
+            "--diff-from-remote",
+            "remote-base",
+            "my-backup",
+        ]);
+        assert!(
+            result.is_err(),
+            "Expected error when both --diff-from and --diff-from-remote are passed"
+        );
     }
 
     #[test]

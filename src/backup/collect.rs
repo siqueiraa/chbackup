@@ -23,6 +23,12 @@ use crate::object_disk;
 use crate::path_encoding::encode_path_component;
 use crate::table_filter::is_disk_excluded;
 
+/// Lookup map for remote base parts: (table_key, disk_name, part_name) -> (crc64, size).
+///
+/// Used by `--diff-from-remote` to skip hardlinking parts that match the remote base
+/// during `collect_parts()`.
+pub type BasePartsMap = HashMap<(String, String, String), (u64, u64)>;
+
 /// Compute the per-disk backup directory for a given disk.
 ///
 /// Returns `{disk_path}/backup/{backup_name}`. For the default disk where
@@ -175,6 +181,7 @@ pub fn collect_parts(
     skip_disks: &[String],
     skip_disk_types: &[String],
     skip_projections: &[String],
+    base_parts: Option<&BasePartsMap>,
 ) -> Result<HashMap<String, Vec<CollectedPart>>> {
     let uuid_map = build_uuid_map(tables);
     let mut result: HashMap<String, Vec<CollectedPart>> = HashMap::new();
@@ -316,6 +323,47 @@ pub fn collect_parts(
                             full_table_name, part_name
                         )
                     })?;
+
+                    // Check if this part matches the remote base (skip hardlink for carried parts)
+                    let carried_from_base = base_parts
+                        .and_then(|bp| {
+                            bp.get(&(
+                                full_table_name.clone(),
+                                disk_name.clone(),
+                                part_name.clone(),
+                            ))
+                        })
+                        .filter(|(base_crc, _)| *base_crc == crc64);
+
+                    if let Some(&(_, base_size)) = carried_from_base {
+                        // Part matches base -- skip hardlink, use base size for accurate reporting
+                        // DEBUG_MARKER:F001 - verify carried part skip during diff-from-remote
+                        info!(
+                            table = %full_table_name,
+                            part = %part_name,
+                            disk = %disk_name,
+                            "Skipping hardlink for carried part (matches remote base)"
+                        );
+                        // END_DEBUG_MARKER:F001
+
+                        let mut part_info = PartInfo::new(part_name, base_size, crc64);
+                        // For S3 disk parts, we still need the object refs from shadow
+                        if is_s3 {
+                            let (s3_objects, _) =
+                                collect_s3_part_metadata(&part_entry.path())?;
+                            part_info = part_info.with_s3_objects(s3_objects);
+                        }
+                        result
+                            .entry(full_table_name.clone())
+                            .or_default()
+                            .push(CollectedPart {
+                                database: db.clone(),
+                                table: table.clone(),
+                                part_info,
+                                disk_name: disk_name.clone(),
+                            });
+                        continue; // Skip to next part -- no hardlink needed
+                    }
 
                     if is_s3 {
                         // S3 disk part: parse metadata files to extract object references
@@ -717,6 +765,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         )
         .unwrap();
 
@@ -800,6 +849,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         )
         .unwrap();
 
@@ -975,6 +1025,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         )
         .unwrap();
 

@@ -579,6 +579,8 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             tables_filter.as_deref(),
             false, // schema_only
             None,  // diff_from: watch uses diff_from_remote in upload; local base may be deleted
+            None,  // diff_from_remote: watch uses diff_from_remote in upload step
+            None,  // s3: not needed without diff-from-remote
             None,  // partitions
             false, // skip_check_parts_columns (let config.clickhouse.check_parts_columns control)
             false, // rbac (watch mode does not support RBAC backup)

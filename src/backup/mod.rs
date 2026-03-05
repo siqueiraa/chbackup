@@ -98,6 +98,10 @@ fn is_ignorable_freeze_error(err_msg: &str) -> bool {
 /// for incremental comparison. Parts matching by name+CRC64 are carried
 /// forward (referencing the base backup's S3 key) instead of being re-uploaded.
 ///
+/// If `diff_from_remote` is provided (mutually exclusive with `diff_from`),
+/// the remote manifest is downloaded from S3 and used as the incremental base.
+/// Parts matching by name+CRC64 skip hardlinking during collection.
+///
 /// If `partitions` is provided (comma-separated partition IDs), only those
 /// partitions are frozen via FREEZE PARTITION instead of whole-table FREEZE.
 ///
@@ -111,6 +115,8 @@ pub async fn create(
     table_pattern: Option<&str>,
     schema_only: bool,
     diff_from: Option<&str>,
+    diff_from_remote: Option<&str>,
+    s3: Option<&crate::storage::S3Client>,
     partitions: Option<&str>,
     skip_check_parts_columns: bool,
     rbac: bool,
@@ -163,6 +169,56 @@ pub async fn create(
         .collect();
     let disk_remote_paths =
         object_disk::build_disk_remote_paths(&disks, &config.clickhouse.config_dir);
+
+    // 2b. Download remote base manifest for --diff-from-remote
+    let remote_base: Option<BackupManifest> = if let Some(remote_name) = diff_from_remote {
+        if let Some(s3_client) = s3 {
+            info!(base = %remote_name, "Downloading remote manifest for --diff-from-remote");
+            let manifest_key = format!("{}/metadata.json", remote_name);
+            match s3_client.get_object(&manifest_key).await {
+                Ok(data) => match BackupManifest::from_json_bytes(&data) {
+                    Ok(m) => {
+                        info!(
+                            base = %remote_name,
+                            tables = m.tables.len(),
+                            "Remote base manifest loaded for diff-from-remote"
+                        );
+                        Some(m)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, base = %remote_name, "Failed to parse remote manifest, falling back to full backup");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(error = %e, base = %remote_name, "Failed to download remote manifest, falling back to full backup");
+                    None
+                }
+            }
+        } else {
+            warn!("--diff-from-remote specified but no S3 client available, falling back to full backup");
+            None
+        }
+    } else {
+        None
+    };
+
+    // Build base_parts lookup from remote manifest for skipping hardlinks during collect
+    let base_parts: Option<Arc<collect::BasePartsMap>> = remote_base.as_ref().map(|base| {
+            let mut map = HashMap::new();
+            for (table_key, tm) in &base.tables {
+                for (disk_name, parts) in &tm.parts {
+                    for part in parts {
+                        map.insert(
+                            (table_key.clone(), disk_name.clone(), part.name.clone()),
+                            (part.checksum_crc64, part.size),
+                        );
+                    }
+                }
+            }
+            info!(entries = map.len(), "Built base_parts lookup for diff-from-remote");
+            Arc::new(map)
+        });
 
     // 3. List all user tables
     let all_tables = ch.list_tables().await?;
@@ -424,6 +480,7 @@ pub async fn create(
         let freeze_by_part = config.clickhouse.freeze_by_part;
         let freeze_by_part_where = config.clickhouse.freeze_by_part_where.clone();
         let frozen_so_far_clone = frozen_so_far.clone();
+        let base_parts_clone = base_parts.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -570,6 +627,9 @@ pub async fn create(
                     &skip_disks_clone,
                     &skip_disk_types_clone,
                     &skip_projections_clone,
+                    base_parts_clone
+                        .as_ref()
+                        .map(|arc| arc.as_ref()),
                 )
             })
             .await
@@ -811,16 +871,24 @@ pub async fn create(
         "Computed RBAC and config sizes"
     );
 
-    // 13b. Apply incremental diff if --diff-from is specified
-    if let Some(base_name) = diff_from {
+    // 13b. Apply incremental diff if --diff-from or --diff-from-remote is specified
+    let effective_base: Option<BackupManifest> = if let Some(ref base) = remote_base {
+        // diff-from-remote: already downloaded
+        Some(base.clone())
+    } else if let Some(base_name) = diff_from {
         info!(base = %base_name, "Loading base manifest for diff-from");
         let base_manifest_path = PathBuf::from(&config.clickhouse.data_path)
             .join("backup")
             .join(base_name)
             .join("metadata.json");
-        let base = BackupManifest::load_from_file(&base_manifest_path).with_context(|| {
+        Some(BackupManifest::load_from_file(&base_manifest_path).with_context(|| {
             format!("Failed to load base backup '{}' for --diff-from", base_name)
-        })?;
+        })?)
+    } else {
+        None
+    };
+
+    if let Some(base) = effective_base {
         let result = diff_parts(&mut manifest, &base);
         info!(
             carried = result.carried,

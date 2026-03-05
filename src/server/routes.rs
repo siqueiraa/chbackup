@@ -608,6 +608,8 @@ pub async fn post_actions(
                             flags.table_pattern.as_deref(),
                             false, // schema_only
                             None,  // diff_from
+                            flags.diff_from_remote.as_deref(),
+                            Some(&*s3),
                             None,  // partitions
                             false, // skip_check_parts_columns
                             flags.rbac,
@@ -695,6 +697,8 @@ pub async fn post_actions(
                             flags.table_pattern.as_deref(),
                             false, // schema_only
                             None,  // diff_from
+                            flags.diff_from_remote.as_deref(),
+                            Some(&*s3),
                             None,  // partitions
                             false, // skip_check_parts_columns
                             flags.rbac,
@@ -997,6 +1001,8 @@ pub async fn create_backup(
                 req.tables.as_deref(),
                 req.schema.unwrap_or(false),
                 req.diff_from.as_deref(),
+                None, // diff_from_remote - typed create endpoint doesn't use this
+                None, // s3 - not needed without diff-from-remote
                 req.partitions.as_deref(),
                 req.skip_check_parts_columns.unwrap_or(false),
                 req.rbac.unwrap_or(false),
@@ -1253,15 +1259,17 @@ pub async fn create_remote(
         move |config, ch, s3, cancel| async move {
             info!(backup_name = %backup_name, "Starting create_remote operation");
 
-            // Step 1: Create local backup
+            // Step 1: Create local backup (with optional diff-from-remote)
             let manifest = crate::backup::create(
                 &config,
                 &ch,
                 &backup_name,
                 req.tables.as_deref(),
                 false, // schema_only
-                None,  // diff_from (create_remote uses diff_from_remote on upload side)
-                None,  // partitions (create_remote doesn't support --partitions)
+                None,  // diff_from (create_remote uses diff_from_remote)
+                req.diff_from_remote.as_deref(),
+                Some(&*s3),
+                None, // partitions (create_remote doesn't support --partitions)
                 req.skip_check_parts_columns.unwrap_or(false),
                 req.rbac.unwrap_or(false),
                 req.configs.unwrap_or(false),
