@@ -897,9 +897,7 @@ impl Config {
     /// Every config parameter can be overridden via an environment variable (design doc §2).
     fn apply_env_overlay(&mut self) {
         // General
-        if let Ok(v) = std::env::var("CHBACKUP_LOG_LEVEL")
-            .or_else(|_| std::env::var("LOG_LEVEL"))
-        {
+        if let Ok(v) = std::env::var("CHBACKUP_LOG_LEVEL").or_else(|_| std::env::var("LOG_LEVEL")) {
             self.general.log_level = v;
         }
         if let Ok(v) = std::env::var("CHBACKUP_LOG_FORMAT") {
@@ -1120,9 +1118,7 @@ impl Config {
         if let Ok(v) = std::env::var("S3_ENDPOINT") {
             self.s3.endpoint = v;
         }
-        if let Ok(v) = std::env::var("S3_PREFIX")
-            .or_else(|_| std::env::var("S3_PATH"))
-        {
+        if let Ok(v) = std::env::var("S3_PREFIX").or_else(|_| std::env::var("S3_PATH")) {
             self.s3.prefix = v;
         }
         if let Ok(v) = std::env::var("S3_ACCESS_KEY") {
@@ -1246,17 +1242,17 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.backup.allow_empty_backups = b;
             } else {
-                warn!(
-                    "ALLOW_EMPTY_BACKUPS='{}' is not a valid bool, ignoring",
-                    v
-                );
+                warn!("ALLOW_EMPTY_BACKUPS='{}' is not a valid bool, ignoring", v);
             }
         }
 
         // Go compat: silently accept REMOTE_STORAGE=s3 or empty; warn on anything else
         if let Ok(v) = std::env::var("REMOTE_STORAGE") {
             if !v.is_empty() && v != "s3" {
-                warn!("chbackup only supports S3 storage; REMOTE_STORAGE='{}' ignored", v);
+                warn!(
+                    "chbackup only supports S3 storage; REMOTE_STORAGE='{}' ignored",
+                    v
+                );
             }
         }
 

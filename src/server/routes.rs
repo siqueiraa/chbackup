@@ -769,8 +769,12 @@ pub async fn list_backups(
         }
     }
 
-    let results =
-        build_list_data(&state, params.location.as_deref(), params.desc.unwrap_or(false)).await;
+    let results = build_list_data(
+        &state,
+        params.location.as_deref(),
+        params.desc.unwrap_or(false),
+    )
+    .await;
 
     let (header, results) = paginate(results, params.offset, params.limit, "list");
 
@@ -2017,7 +2021,12 @@ pub async fn go_list_backups(
     [(axum::http::header::HeaderName, &'static str); 1],
     String,
 ) {
-    let results = build_list_data(&state, params.location.as_deref(), params.desc.unwrap_or(false)).await;
+    let results = build_list_data(
+        &state,
+        params.location.as_deref(),
+        params.desc.unwrap_or(false),
+    )
+    .await;
 
     let go_results: Vec<GoListResponse> = results
         .into_iter()
