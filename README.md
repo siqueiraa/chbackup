@@ -72,7 +72,13 @@ curl -L -o /usr/local/bin/chbackup \
 chmod +x /usr/local/bin/chbackup
 ```
 
-**Build from source** (requires Rust 1.82+):
+**Build from source** (requires Rust 1.85+):
+
+```bash
+cargo build --release
+```
+
+For a static musl binary (Linux):
 
 ```bash
 rustup target add x86_64-unknown-linux-musl  # one-time setup
