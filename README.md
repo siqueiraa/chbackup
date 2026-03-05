@@ -47,12 +47,14 @@ chbackup list
 ```text
 $ chbackup list
 Local backups:
-  2025-06-01T00:00:00Z   2025-06-01 00:00:00 UTC   1.2 GiB   890 MiB   12 tables
-  2025-06-02T00:00:00Z   2025-06-02 00:00:00 UTC   48 MiB    32 MiB    12 tables
+  # name                  created                  size      compressed  tables
+  2025-06-01T00:00:00Z    2025-06-01 00:00:00 UTC  1.2 GiB   890 MiB    12 tables
+  2025-06-02T00:00:00Z    2025-06-02 00:00:00 UTC  48 MiB    32 MiB     12 tables
 
 Remote backups:
-  2025-06-01T00:00:00Z   2025-06-01 00:00:00 UTC   1.2 GiB   890 MiB   12 tables
-  2025-06-02T00:00:00Z   2025-06-02 00:00:00 UTC   48 MiB    32 MiB    12 tables
+  # name                  created                  size      compressed  tables
+  2025-06-01T00:00:00Z    2025-06-01 00:00:00 UTC  1.2 GiB   890 MiB    12 tables
+  2025-06-02T00:00:00Z    2025-06-02 00:00:00 UTC  48 MiB    32 MiB     12 tables
 ```
 
 ### Scheduling backups
