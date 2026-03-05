@@ -151,13 +151,6 @@ cargo build --release --target x86_64-unknown-linux-musl
 - **S3-compatible storage** -- AWS S3, MinIO, Ceph, Cloudflare R2
 - **Same host as ClickHouse** -- FREEZE creates hardlinks that need local filesystem access to `/var/lib/clickhouse/`
 
-### Compatibility matrix
-
-| chbackup | ClickHouse | Status |
-|----------|------------|--------|
-| 0.1.x | 23.8, 24.3, 24.8, 25.1 | Tested in CI |
-| 0.1.x | 21.8 -- 23.7 | Untested and unsupported |
-
 ## Documentation
 
 | Topic | Description |
