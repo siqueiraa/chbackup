@@ -544,7 +544,7 @@ pub async fn post_actions(
             };
 
             let (id, token) = state
-                .try_start_op(op_name, conflict_backup_name)
+                .try_start_op(&request.command, conflict_backup_name)
                 .await
                 .map_err(|e| {
                     (

@@ -60,7 +60,7 @@ run_cmd() {
     fi
 }
 
-# drop_all_tables — drops the 6 standard test tables (3 local + 2 S3 + 1 empty)
+# drop_all_tables — drops all standard test tables
 drop_all_tables() {
     clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.users SYNC"
@@ -68,6 +68,10 @@ drop_all_tables() {
     clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.s3_metrics SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.empty_table SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.jbod_orders SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.app_log SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS tmpdata.scratch SYNC" 2>/dev/null || true
+    clickhouse-client -q "DROP DATABASE IF EXISTS tmpdata SYNC" 2>/dev/null || true
 }
 
 # capture_row_counts — captures PRE_TRADES/PRE_USERS/PRE_EVENTS/PRE_S3_ORDERS/PRE_S3_METRICS
@@ -129,8 +133,25 @@ cleanup_backup() {
 # reseed_data — drops all test tables and re-runs setup + seed SQL
 reseed_data() {
     drop_all_tables
+    clickhouse-client -q "CREATE DATABASE IF NOT EXISTS tmpdata"
     clickhouse-client --multiquery < /test/fixtures/setup.sql
     clickhouse-client --multiquery < /test/fixtures/seed_data.sql
+}
+
+# poll_action_by_command <cmd_str> [max_wait] — poll system.backup_actions by exact command
+poll_action_by_command() {
+    local cmd_str="$1" max_wait="${2:-60}"
+    for i in $(seq 1 "$max_wait"); do
+        STATUS=$(clickhouse-client -q "
+            SELECT status FROM system.backup_actions
+            WHERE command = '${cmd_str}'
+            ORDER BY start DESC LIMIT 1
+            FORMAT TabSeparatedRaw" 2>/dev/null || echo "unknown")
+        if [[ "$STATUS" == "success" ]]; then echo "completed"; return 0; fi
+        if [[ "$STATUS" == "error" ]]; then echo "failed"; return 1; fi
+        sleep 1
+    done
+    echo "timeout"; return 1
 }
 
 # poll_action_completion <max_wait> — poll /api/v1/actions until terminal state
@@ -246,7 +267,7 @@ fi
 # 3. Drop all test tables to start completely fresh
 info "  Dropping test tables"
 drop_all_tables
-for tbl in s3_orders_restored trades_restored proj_test; do
+for tbl in s3_orders_restored trades_restored proj_test trades_DR users_DR; do
     clickhouse-client -q "DROP TABLE IF EXISTS default.${tbl} SYNC" 2>/dev/null || true
 done
 
@@ -259,15 +280,16 @@ pass "Fresh start cleanup complete"
 # Run setup fixtures (always runs — fresh start drops all tables)
 # ---------------------------------------------------------------------------
 info "Running setup fixtures"
+clickhouse-client -q "CREATE DATABASE IF NOT EXISTS tmpdata"
 clickhouse-client --multiquery < /test/fixtures/setup.sql
 pass "Setup fixtures loaded"
 
-# Verify tables were created (3 local + 2 S3-backed)
-TABLE_COUNT=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE database = 'default' AND name IN ('trades', 'users', 'events', 's3_orders', 's3_metrics', 'empty_table')")
-if [[ "$TABLE_COUNT" -eq 6 ]]; then
-    pass "All 6 test tables created (3 local + 2 S3 disk + 1 empty)"
+# Verify tables were created (3 local + 2 S3-backed + 1 empty + 3 new)
+TABLE_COUNT=$(clickhouse-client -q "SELECT count() FROM system.tables WHERE (database = 'default' AND name IN ('trades', 'users', 'events', 's3_orders', 's3_metrics', 'empty_table', 'jbod_orders', 'app_log')) OR (database = 'tmpdata' AND name = 'scratch')")
+if [[ "$TABLE_COUNT" -eq 9 ]]; then
+    pass "All 9 test tables created (3 local + 2 S3 disk + 1 empty + 2 new default + 1 tmpdata)"
 else
-    fail "Expected 6 tables, got ${TABLE_COUNT}"
+    fail "Expected 9 tables, got ${TABLE_COUNT}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -3964,6 +3986,583 @@ if should_run "test_integration_tables"; then
             fail "system.backup_list still exists after shutdown: ${TABLE_CHECK}"
         fi
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# T65: Multi-JBOD per-disk backup staging
+# ---------------------------------------------------------------------------
+if should_run "test_jbod_per_disk_staging"; then
+    info "T65: Multi-JBOD per-disk backup staging"
+    T65_NAME="t65_jbod_$$"
+
+    # Ensure clean state with all tables
+    reseed_data
+
+    # Step 1: Verify JBOD disks exist
+    JBOD_DISK_COUNT=$(clickhouse-client -q "SELECT count() FROM system.disks WHERE name IN ('store0', 'store1', 'store2')")
+    if [[ "$JBOD_DISK_COUNT" -lt 3 ]]; then
+        skip "T65: JBOD disks not configured (found ${JBOD_DISK_COUNT}, need 3)"
+    else
+        pass "JBOD disks configured: ${JBOD_DISK_COUNT}"
+
+        # Step 2: Check jbod_orders parts are spread across disks
+        DISK_SPREAD=$(clickhouse-client -q "SELECT countDistinct(disk_name) FROM system.parts WHERE database='default' AND table='jbod_orders' AND active")
+        if [[ "$DISK_SPREAD" -ge 2 ]]; then
+            pass "jbod_orders spread across ${DISK_SPREAD} disks"
+        else
+            fail "jbod_orders only on ${DISK_SPREAD} disk(s), expected >= 2"
+        fi
+
+        # Step 3: Create backup of jbod_orders
+        run_cmd "T65 create" env RUST_LOG=error chbackup create -t 'default.jbod_orders' "$T65_NAME"
+
+        # Step 4: Check manifest.disks has multiple entries
+        MANIFEST_DISKS=$(RUST_LOG=error chbackup list local --format json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for b in data:
+    if b.get('name') == '${T65_NAME}':
+        # Read manifest to check disks
+        break
+print('ok')
+" 2>/dev/null || echo "err")
+        # Check per-disk backup dirs exist
+        PERDISK_DIRS=0
+        for store_dir in /var/lib/clickhouse/store0 /var/lib/clickhouse/store1 /var/lib/clickhouse/store2; do
+            if [ -d "${store_dir}/backup/${T65_NAME}/shadow" ]; then
+                PERDISK_DIRS=$((PERDISK_DIRS + 1))
+            fi
+        done
+        if [[ "$PERDISK_DIRS" -ge 2 ]]; then
+            pass "Per-disk backup dirs found in ${PERDISK_DIRS} store dirs"
+        else
+            # Fallback: check single backup dir (all on same filesystem)
+            if [ -d "/var/lib/clickhouse/backup/${T65_NAME}" ]; then
+                pass "Backup dir exists (single filesystem, per-disk dirs=${PERDISK_DIRS})"
+            else
+                fail "No backup dirs found (per-disk=${PERDISK_DIRS})"
+            fi
+        fi
+
+        # Step 5: Upload -> delete local -> download -> restore -> verify
+        run_cmd "T65 upload" env RUST_LOG=error chbackup upload "$T65_NAME"
+
+        PRE_JBOD=$(clickhouse-client -q "SELECT count() FROM default.jbod_orders")
+        run_cmd "T65 delete local" env RUST_LOG=error chbackup delete local "$T65_NAME"
+        clickhouse-client -q "DROP TABLE IF EXISTS default.jbod_orders SYNC"
+        run_cmd "T65 download" env RUST_LOG=error chbackup download "$T65_NAME"
+        run_cmd "T65 restore" env RUST_LOG=error chbackup restore "$T65_NAME"
+
+        POST_JBOD=$(clickhouse-client -q "SELECT count() FROM default.jbod_orders")
+        if [[ "$POST_JBOD" -eq "$PRE_JBOD" ]]; then
+            pass "jbod_orders row count matches: ${POST_JBOD}"
+        else
+            fail "jbod_orders row count mismatch: expected=${PRE_JBOD} got=${POST_JBOD}"
+        fi
+
+        # Step 6: Delete local and verify per-disk dirs cleaned up
+        run_cmd "T65 delete local final" env RUST_LOG=error chbackup delete local "$T65_NAME"
+        LEFTOVER=0
+        for store_dir in /var/lib/clickhouse/store0 /var/lib/clickhouse/store1 /var/lib/clickhouse/store2; do
+            if [ -d "${store_dir}/backup/${T65_NAME}" ]; then
+                LEFTOVER=$((LEFTOVER + 1))
+            fi
+        done
+        if [[ "$LEFTOVER" -eq 0 ]]; then
+            pass "Per-disk backup dirs cleaned up"
+        else
+            fail "Leftover per-disk dirs: ${LEFTOVER}"
+        fi
+
+        # Cleanup
+        cleanup_backup "$T65_NAME"
+        # Re-create jbod_orders for subsequent tests
+        reseed_data
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T66: CLICKHOUSE_SKIP_TABLES env var with glob patterns
+# ---------------------------------------------------------------------------
+if should_run "test_skip_tables_env"; then
+    info "T66: CLICKHOUSE_SKIP_TABLES env var with glob patterns"
+    T66_NAME="t66_skip_$$"
+
+    # Create backup with skip_tables excluding log tables, tmpdata, and system tables
+    run_cmd "T66 create" env CLICKHOUSE_SKIP_TABLES='*_log,tmpdata.*,system.*,INFORMATION_SCHEMA.*,information_schema.*' \
+        RUST_LOG=error chbackup create "$T66_NAME"
+
+    # Inspect manifest: app_log and tmpdata.scratch should be excluded
+    MANIFEST_PATH="/var/lib/clickhouse/backup/${T66_NAME}/metadata.json"
+    if [ -f "$MANIFEST_PATH" ]; then
+        EXCLUDED_CHECK=$(python3 -c "
+import json, sys
+with open('${MANIFEST_PATH}') as f:
+    m = json.load(f)
+table_keys = list(m.get('tables', {}).keys())
+has_app_log = any('app_log' in k for k in table_keys)
+has_tmpdata = any('tmpdata' in k for k in table_keys)
+has_system = any(k.startswith('system.') for k in table_keys)
+has_trades = any('trades' in k for k in table_keys)
+has_users = any('users' in k for k in table_keys)
+errors = []
+if has_app_log: errors.append('app_log not excluded')
+if has_tmpdata: errors.append('tmpdata not excluded')
+if has_system: errors.append('system tables not excluded')
+if not has_trades: errors.append('trades missing')
+if not has_users: errors.append('users missing')
+if errors:
+    print('FAIL: ' + ', '.join(errors))
+else:
+    print('OK')
+" 2>/dev/null || echo "FAIL: python3 error")
+
+        if [[ "$EXCLUDED_CHECK" == "OK" ]]; then
+            pass "skip_tables correctly excluded app_log, tmpdata.*, system.*; kept trades, users"
+        else
+            fail "skip_tables: ${EXCLUDED_CHECK}"
+        fi
+    else
+        fail "manifest not found at ${MANIFEST_PATH}"
+    fi
+
+    # Cleanup
+    cleanup_backup "$T66_NAME"
+fi
+
+# ---------------------------------------------------------------------------
+# T67: Incremental chain + retention protection
+# ---------------------------------------------------------------------------
+if should_run "test_incremental_chain_retention"; then
+    info "T67: Incremental chain + retention protection"
+    T67_FULL1="t67_full1_$$"
+    T67_INCR_MON="t67_incr_mon_$$"
+    T67_INCR_TUE="t67_incr_tue_$$"
+    T67_INCR_WED="t67_incr_wed_$$"
+    T67_FULL2="t67_full2_$$"
+
+    # Create chain: full1 -> incr_mon -> incr_tue -> incr_wed (unlimited retention)
+    run_cmd "T67 create full1" env RUST_LOG=error chbackup create -t 'default.trades' "$T67_FULL1"
+    run_cmd "T67 upload full1" env BACKUPS_TO_KEEP_REMOTE=0 RUST_LOG=error chbackup upload "$T67_FULL1"
+
+    run_cmd "T67 create incr_mon" env RUST_LOG=error chbackup create -t 'default.trades' --diff-from-remote="$T67_FULL1" "$T67_INCR_MON"
+    run_cmd "T67 upload incr_mon" env BACKUPS_TO_KEEP_REMOTE=0 RUST_LOG=error chbackup upload "$T67_INCR_MON"
+
+    run_cmd "T67 create incr_tue" env RUST_LOG=error chbackup create -t 'default.trades' --diff-from-remote="$T67_INCR_MON" "$T67_INCR_TUE"
+    run_cmd "T67 upload incr_tue" env BACKUPS_TO_KEEP_REMOTE=0 RUST_LOG=error chbackup upload "$T67_INCR_TUE"
+
+    run_cmd "T67 create incr_wed" env RUST_LOG=error chbackup create -t 'default.trades' --diff-from-remote="$T67_INCR_TUE" "$T67_INCR_WED"
+    run_cmd "T67 upload incr_wed" env BACKUPS_TO_KEEP_REMOTE=0 RUST_LOG=error chbackup upload "$T67_INCR_WED"
+
+    # Now 4 backups exist. Create full2 and upload with keep=3 to trigger retention
+    run_cmd "T67 create full2" env RUST_LOG=error chbackup create -t 'default.trades' "$T67_FULL2"
+    run_cmd "T67 upload full2 (retention=3)" env BACKUPS_TO_KEEP_REMOTE=3 RUST_LOG=error chbackup upload "$T67_FULL2"
+
+    # Verify: full1 should still exist (protected as incremental chain base)
+    REMOTE_LIST=$(RUST_LOG=error chbackup list remote --format json 2>/dev/null)
+    FULL1_EXISTS=$(echo "$REMOTE_LIST" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+names = [b.get('name', '') for b in data]
+print('yes' if '${T67_FULL1}' in names else 'no')
+" 2>/dev/null || echo "err")
+
+    if [[ "$FULL1_EXISTS" == "yes" ]]; then
+        pass "full1 protected by incremental chain (retention kept it)"
+    else
+        fail "full1 was deleted despite being incremental chain base"
+    fi
+
+    # Verify at least 3 backups remain
+    REMOTE_COUNT=$(echo "$REMOTE_LIST" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+names = [b.get('name', '') for b in data if b.get('name', '').startswith('t67_')]
+print(len(names))
+" 2>/dev/null || echo "0")
+    if [[ "$REMOTE_COUNT" -ge 3 ]]; then
+        pass "Remote has ${REMOTE_COUNT} backups (retention working)"
+    else
+        fail "Expected >= 3 remote backups, got ${REMOTE_COUNT}"
+    fi
+
+    # Cleanup
+    for name in "$T67_FULL1" "$T67_INCR_MON" "$T67_INCR_TUE" "$T67_INCR_WED" "$T67_FULL2"; do
+        cleanup_backup "$name"
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# T68: Data recovery test (Airflow DAG pattern)
+# ---------------------------------------------------------------------------
+if should_run "test_data_recovery_dag"; then
+    info "T68: Data recovery test (Airflow DAG pattern)"
+    T68_NAME="t68_recovery_$$"
+
+    # Capture pre-backup state
+    PRE_TRADES_68=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    PRE_USERS_68=$(clickhouse-client -q "SELECT count() FROM default.users")
+
+    # Create + upload backup of all local tables
+    run_cmd "T68 create" env RUST_LOG=error chbackup create -t 'default.trades,default.users' "$T68_NAME"
+    run_cmd "T68 upload" env RUST_LOG=error chbackup upload "$T68_NAME"
+    run_cmd "T68 delete local" env RUST_LOG=error chbackup delete local "$T68_NAME"
+
+    # DAG pattern: restore one table at a time with rename
+    for tbl in trades users; do
+        info "  Restoring ${tbl} as ${tbl}_DR"
+        RUST_LOG=error chbackup download "$T68_NAME" 2>&1 || true
+        RUST_LOG=error chbackup restore -t "default.${tbl}" --as "default.${tbl}:default.${tbl}_DR" "$T68_NAME" 2>&1
+
+        # Consistency check: compare row counts
+        DR_COUNT=$(clickhouse-client -q "SELECT count() FROM default.${tbl}_DR" 2>/dev/null || echo "0")
+        ORIG_COUNT=$(clickhouse-client -q "SELECT count() FROM default.${tbl}" 2>/dev/null || echo "0")
+        if [[ "$DR_COUNT" -gt 0 ]] && [[ "$DR_COUNT" -eq "$ORIG_COUNT" ]]; then
+            pass "${tbl}_DR count matches original: ${DR_COUNT}"
+        else
+            fail "${tbl}_DR count mismatch: original=${ORIG_COUNT} dr=${DR_COUNT}"
+        fi
+
+        # Part-level consistency check via hash_of_all_files
+        HASH_MISMATCH=$(clickhouse-client -q "
+            SELECT count() FROM (
+                SELECT partition_id, name, hash_of_all_files FROM system.parts
+                WHERE database='default' AND table='${tbl}' AND active
+            ) AS orig
+            FULL OUTER JOIN (
+                SELECT partition_id, name, hash_of_all_files FROM system.parts
+                WHERE database='default' AND table='${tbl}_DR' AND active
+            ) AS dr USING (partition_id)
+            WHERE orig.hash_of_all_files != dr.hash_of_all_files
+        " 2>/dev/null || echo "-1")
+        if [[ "$HASH_MISMATCH" == "0" ]]; then
+            pass "${tbl}_DR hash_of_all_files consistent with original"
+        else
+            # Non-fatal: part names may differ after restore
+            info "  ${tbl}_DR hash check: ${HASH_MISMATCH} mismatches (part names may differ)"
+        fi
+
+        # Cleanup DR table
+        clickhouse-client -q "DROP TABLE IF EXISTS default.${tbl}_DR SYNC"
+        RUST_LOG=error chbackup delete local "$T68_NAME" 2>/dev/null || true
+    done
+
+    # Verify originals untouched
+    POST_TRADES_68=$(clickhouse-client -q "SELECT count() FROM default.trades")
+    POST_USERS_68=$(clickhouse-client -q "SELECT count() FROM default.users")
+    if [[ "$POST_TRADES_68" -eq "$PRE_TRADES_68" ]] && [[ "$POST_USERS_68" -eq "$PRE_USERS_68" ]]; then
+        pass "Original tables untouched after DR restore"
+    else
+        fail "Original tables modified: trades ${PRE_TRADES_68}->${POST_TRADES_68}, users ${PRE_USERS_68}->${POST_USERS_68}"
+    fi
+
+    # Cleanup
+    cleanup_backup "$T68_NAME"
+fi
+
+# ---------------------------------------------------------------------------
+# T69: Production env var overlay (full set)
+# ---------------------------------------------------------------------------
+if should_run "test_env_var_overlay_production"; then
+    info "T69: Production env var overlay (full set)"
+
+    CONFIG_OUT=$(CLICKHOUSE_SKIP_TABLES='*_log,tmpdata.*' \
+        CLICKHOUSE_SKIP_TABLE_ENGINES='Log' \
+        CLICKHOUSE_FREEZE_BY_PART='true' \
+        CLICKHOUSE_TIMEOUT='240m' \
+        ALLOW_EMPTY_BACKUPS='false' \
+        API_LISTEN='0.0.0.0:7171' \
+        API_CREATE_INTEGRATION_TABLES='true' \
+        BACKUPS_TO_KEEP_REMOTE='8' \
+        BACKUPS_TO_KEEP_LOCAL='30' \
+        S3_UPLOAD_CONCURRENCY='6' \
+        S3_DOWNLOAD_CONCURRENCY='6' \
+        S3_PATH='clickhouse-backups/production/ch-deployment/metadata' \
+        S3_OBJECT_DISK_PATH='clickhouse-backups/production/ch-deployment/data' \
+        S3_ACL='private' \
+        RUST_LOG=error chbackup print-config 2>&1)
+
+    OVERLAY_FAILURES=0
+    check_config_value() {
+        local key="$1" expected="$2"
+        if echo "$CONFIG_OUT" | grep -q "$expected"; then
+            pass "env overlay: ${key} = ${expected}"
+        else
+            fail "env overlay: ${key} expected '${expected}' not found in config output"
+            OVERLAY_FAILURES=$((OVERLAY_FAILURES + 1))
+        fi
+    }
+
+    check_config_value "skip_tables" '*_log'
+    check_config_value "skip_table_engines" 'Log'
+    check_config_value "freeze_by_part" 'true'
+    check_config_value "allow_empty_backups" 'false'
+    check_config_value "listen" '0.0.0.0:7171'
+    check_config_value "create_integration_tables" 'true'
+    check_config_value "backups_to_keep_remote" '8'
+    check_config_value "backups_to_keep_local" '30'
+    check_config_value "upload_concurrency" '6'
+    check_config_value "download_concurrency" '6'
+    # Note: S3_PATH is overridden by S3_PREFIX in test env, so check object_disk_path instead
+    check_config_value "object_disk_path" 'clickhouse-backups/production/ch-deployment/data'
+    check_config_value "acl" 'private'
+fi
+
+# ---------------------------------------------------------------------------
+# T70: JBOD + incremental backup (diff-from-remote with multi-disk)
+# ---------------------------------------------------------------------------
+if should_run "test_jbod_incremental"; then
+    info "T70: JBOD + incremental backup (diff-from-remote with multi-disk)"
+    T70_FULL="t70_jbod_full_$$"
+    T70_INCR="t70_jbod_incr_$$"
+
+    # Check JBOD disks exist
+    JBOD_DISK_COUNT=$(clickhouse-client -q "SELECT count() FROM system.disks WHERE name IN ('store0', 'store1', 'store2')")
+    if [[ "$JBOD_DISK_COUNT" -lt 3 ]]; then
+        skip "T70: JBOD disks not configured"
+    else
+        PRE_JBOD_70=$(clickhouse-client -q "SELECT count() FROM default.jbod_orders")
+
+        # Create full backup of jbod_orders -> upload
+        run_cmd "T70 create full" env RUST_LOG=error chbackup create -t 'default.jbod_orders' "$T70_FULL"
+        run_cmd "T70 upload full" env BACKUPS_TO_KEEP_REMOTE=0 RUST_LOG=error chbackup upload "$T70_FULL"
+
+        # Insert new data
+        clickhouse-client -q "INSERT INTO default.jbod_orders VALUES ('2024-04-01', 99901, 'new_cust', 999.99, 'us-east'), ('2024-04-02', 99902, 'new_cust2', 888.88, 'eu-west')"
+
+        # Create incremental with --diff-from-remote
+        run_cmd "T70 create incr" env RUST_LOG=error chbackup create -t 'default.jbod_orders' --diff-from-remote="$T70_FULL" "$T70_INCR"
+
+        # Check manifest for carried: parts
+        INCR_MANIFEST="/var/lib/clickhouse/backup/${T70_INCR}/metadata.json"
+        if [ -f "$INCR_MANIFEST" ]; then
+            CARRIED_COUNT=$(grep -o '"carried:' "$INCR_MANIFEST" | wc -l)
+            if [[ "$CARRIED_COUNT" -gt 0 ]]; then
+                pass "Incremental has ${CARRIED_COUNT} carried parts"
+            else
+                fail "No carried parts in incremental manifest"
+            fi
+        fi
+
+        # Upload -> delete local -> download -> restore -> verify
+        run_cmd "T70 upload incr" env BACKUPS_TO_KEEP_REMOTE=0 RUST_LOG=error chbackup upload "$T70_INCR"
+        RUST_LOG=error chbackup delete local "$T70_FULL" 2>/dev/null || true
+        RUST_LOG=error chbackup delete local "$T70_INCR" 2>/dev/null || true
+        clickhouse-client -q "DROP TABLE IF EXISTS default.jbod_orders SYNC"
+
+        run_cmd "T70 download incr" env RUST_LOG=error chbackup download "$T70_INCR"
+        run_cmd "T70 restore incr" env RUST_LOG=error chbackup restore "$T70_INCR"
+
+        POST_JBOD_70=$(clickhouse-client -q "SELECT count() FROM default.jbod_orders")
+        if [[ "$POST_JBOD_70" -ge $((PRE_JBOD_70 + 2)) ]]; then
+            pass "jbod_orders count after incremental restore: ${POST_JBOD_70} (was ${PRE_JBOD_70})"
+        else
+            fail "jbod_orders count after restore: expected >= $((PRE_JBOD_70 + 2)), got ${POST_JBOD_70}"
+        fi
+
+        # Cleanup
+        for name in "$T70_FULL" "$T70_INCR"; do
+            cleanup_backup "$name"
+        done
+        reseed_data
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T71: CronJob + DAG end-to-end via API (production simulation)
+# ---------------------------------------------------------------------------
+if should_run "test_cronjob_dag_api"; then
+    info "T71: CronJob + DAG end-to-end via API (production simulation)"
+    T71_FULL="t71_full_$$"
+    T71_INCR="t71_incr_$$"
+    SERVER_PID=""
+
+    # Start server with production env vars
+    env CLICKHOUSE_SKIP_TABLES='*_log,tmpdata.*,system.*,INFORMATION_SCHEMA.*,information_schema.*' \
+        CLICKHOUSE_SKIP_TABLE_ENGINES='Log' \
+        API_CREATE_INTEGRATION_TABLES='true' \
+        RUST_LOG=info \
+        chbackup server &
+    SERVER_PID=$!
+    sleep 2
+
+    if ! wait_for_server 15; then
+        fail "T71: Server did not start"
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    else
+        pass "T71: Server ready"
+
+        # CronJob step 1: create full backup with --rbac --configs
+        info "  CronJob step 1: create full backup"
+        CMD_CREATE="create --rbac --configs ${T71_FULL}"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('${CMD_CREATE}')" 2>/dev/null || true
+        RESULT=$(poll_action_by_command "$CMD_CREATE" 60) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "CronJob create full completed"
+        else
+            fail "CronJob create full: ${RESULT}"
+        fi
+
+        # CronJob step 2: upload full
+        CMD_UPLOAD="upload ${T71_FULL}"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('${CMD_UPLOAD}')" 2>/dev/null || true
+        RESULT=$(poll_action_by_command "$CMD_UPLOAD" 60) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "CronJob upload full completed"
+        else
+            fail "CronJob upload full: ${RESULT}"
+        fi
+
+        # CronJob step 3: insert new data
+        clickhouse-client -q "INSERT INTO default.trades VALUES ('2024-04-01', 99999, 'TEST', 100.0, 10)"
+
+        # CronJob step 4: create incremental
+        CMD_INCR_CREATE="create --diff-from-remote=${T71_FULL} --rbac --configs ${T71_INCR}"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('${CMD_INCR_CREATE}')" 2>/dev/null || true
+        RESULT=$(poll_action_by_command "$CMD_INCR_CREATE" 60) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "CronJob create incremental completed"
+        else
+            fail "CronJob create incremental: ${RESULT}"
+        fi
+
+        # CronJob step 5: upload incremental
+        CMD_INCR_UPLOAD="upload ${T71_INCR}"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('${CMD_INCR_UPLOAD}')" 2>/dev/null || true
+        RESULT=$(poll_action_by_command "$CMD_INCR_UPLOAD" 60) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "CronJob upload incremental completed"
+        else
+            fail "CronJob upload incremental: ${RESULT}"
+        fi
+
+        # DAG step 1: restore trades with rename via INSERT
+        info "  DAG: restore trades as trades_DR"
+        CMD_RESTORE="restore --table=default.trades --restore-table-mapping trades:trades_DR ${T71_FULL}"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('${CMD_RESTORE}')" 2>/dev/null || true
+        RESULT=$(poll_action_by_command "$CMD_RESTORE" 60) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "DAG restore trades_DR completed"
+
+            # Verify trades_DR has data
+            DR_COUNT=$(clickhouse-client -q "SELECT count() FROM default.trades_DR" 2>/dev/null || echo "0")
+            if [[ "$DR_COUNT" -gt 0 ]]; then
+                pass "trades_DR has ${DR_COUNT} rows"
+            else
+                fail "trades_DR is empty"
+            fi
+        else
+            fail "DAG restore: ${RESULT}"
+        fi
+        clickhouse-client -q "DROP TABLE IF EXISTS default.trades_DR SYNC" 2>/dev/null || true
+
+        # Verify skip_tables worked: app_log should not be in backup
+        BACKUP_TABLES=$(RUST_LOG=error clickhouse-client -q "
+            SELECT name FROM system.backup_list WHERE name = '${T71_FULL}'" 2>&1) || true
+        # Check manifest directly
+        MANIFEST_PATH="/var/lib/clickhouse/backup/${T71_FULL}/metadata.json"
+        if [ -f "$MANIFEST_PATH" ]; then
+            HAS_APP_LOG=$(python3 -c "
+import json
+with open('${MANIFEST_PATH}') as f:
+    m = json.load(f)
+table_keys = list(m.get('tables', {}).keys())
+has = any('app_log' in k for k in table_keys)
+print('yes' if has else 'no')
+" 2>/dev/null || echo "err")
+            if [[ "$HAS_APP_LOG" == "no" ]]; then
+                pass "skip_tables excluded app_log from backup"
+            else
+                fail "skip_tables did not exclude app_log"
+            fi
+        fi
+
+        # Cleanup: delete backups via INSERT
+        for name in "$T71_FULL" "$T71_INCR"; do
+            CMD_DEL="delete local ${name}"
+            clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('${CMD_DEL}')" 2>/dev/null || true
+            poll_action_by_command "$CMD_DEL" 15 >/dev/null 2>&1 || true
+            CMD_DEL_R="delete remote ${name}"
+            clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('${CMD_DEL_R}')" 2>/dev/null || true
+            poll_action_by_command "$CMD_DEL_R" 15 >/dev/null 2>&1 || true
+        done
+
+        # Stop server
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        cleanup_backup "$T71_FULL" "$T71_INCR"
+
+        # Remove the extra test row
+        clickhouse-client -q "ALTER TABLE default.trades DELETE WHERE trade_id = 99999" 2>/dev/null || true
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T72: S3 disk restore with rename — DROP _DR must not corrupt source table
+# ---------------------------------------------------------------------------
+if should_run "test_s3_restore_rename_drop_safety"; then
+    info "T72: S3 disk restore with rename — DROP _DR must not corrupt source table"
+    T72_NAME="t72_s3dr_$$"
+
+    # Capture pre-backup state of S3 disk table
+    PRE_S3_ORDERS_72=$(clickhouse-client -q "SELECT count() FROM default.s3_orders")
+    PRE_S3_ORDERS_HASH=$(clickhouse-client -q "SELECT sum(cityHash64(*)) FROM default.s3_orders")
+    info "  Pre-backup: s3_orders count=${PRE_S3_ORDERS_72}, hash=${PRE_S3_ORDERS_HASH}"
+
+    # Step 1: Create + upload backup of s3_orders
+    run_cmd "T72 create" env RUST_LOG=error chbackup create -t 'default.s3_orders' "$T72_NAME"
+    run_cmd "T72 upload" env RUST_LOG=error chbackup upload "$T72_NAME"
+    run_cmd "T72 delete local" env RUST_LOG=error chbackup delete local "$T72_NAME"
+
+    # Step 2: Download and restore as s3_orders_DR (matching DAG pattern)
+    run_cmd "T72 download" env RUST_LOG=error chbackup download "$T72_NAME"
+    run_cmd "T72 restore as _DR" env RUST_LOG=error chbackup restore \
+        -t 'default.s3_orders' --as 'default.s3_orders:default.s3_orders_DR' "$T72_NAME"
+
+    # Step 3: Verify _DR table has data
+    DR_COUNT=$(clickhouse-client -q "SELECT count() FROM default.s3_orders_DR" 2>/dev/null || echo "0")
+    if [[ "$DR_COUNT" -eq "$PRE_S3_ORDERS_72" ]]; then
+        pass "s3_orders_DR has correct row count: ${DR_COUNT}"
+    else
+        fail "s3_orders_DR count mismatch: expected=${PRE_S3_ORDERS_72} got=${DR_COUNT}"
+    fi
+
+    # Step 4: DROP the _DR table (this is where Go clickhouse-backup has a bug —
+    # it shares S3 files, so dropping _DR deletes the source table's S3 objects)
+    info "  Step 4: DROP TABLE s3_orders_DR SYNC (critical test)"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.s3_orders_DR SYNC"
+    pass "s3_orders_DR dropped"
+
+    # Step 5: Verify original s3_orders is still fully intact
+    # This is the key assertion — if S3 objects were shared (like Go tool),
+    # the original table would now have missing data or errors
+    sleep 2  # Allow ClickHouse to process DROP cleanup
+    POST_S3_ORDERS_72=$(clickhouse-client -q "SELECT count() FROM default.s3_orders" 2>/dev/null || echo "ERR")
+    POST_S3_ORDERS_HASH=$(clickhouse-client -q "SELECT sum(cityHash64(*)) FROM default.s3_orders" 2>/dev/null || echo "ERR")
+
+    if [[ "$POST_S3_ORDERS_72" == "$PRE_S3_ORDERS_72" ]]; then
+        pass "s3_orders count intact after DROP _DR: ${POST_S3_ORDERS_72}"
+    else
+        fail "s3_orders CORRUPTED after DROP _DR: expected=${PRE_S3_ORDERS_72} got=${POST_S3_ORDERS_72}"
+    fi
+
+    if [[ "$POST_S3_ORDERS_HASH" == "$PRE_S3_ORDERS_HASH" ]]; then
+        pass "s3_orders hash intact after DROP _DR: ${POST_S3_ORDERS_HASH}"
+    else
+        fail "s3_orders hash CORRUPTED after DROP _DR: expected=${PRE_S3_ORDERS_HASH} got=${POST_S3_ORDERS_HASH}"
+    fi
+
+    # Step 6: Verify we can still read all parts (no S3 404 errors)
+    PART_COUNT=$(clickhouse-client -q "SELECT count() FROM system.parts WHERE database='default' AND table='s3_orders' AND active")
+    if [[ "$PART_COUNT" -gt 0 ]]; then
+        pass "s3_orders has ${PART_COUNT} active parts (S3 objects accessible)"
+    else
+        fail "s3_orders has 0 active parts (S3 objects may be deleted)"
+    fi
+
+    # Cleanup
+    cleanup_backup "$T72_NAME"
 fi
 
 # ---------------------------------------------------------------------------

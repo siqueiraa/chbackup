@@ -100,6 +100,45 @@ INSERT INTO default.s3_metrics VALUES
     ('2024-02-01', 3, 'cpu_usage', 38.5, '{"host":"srv2"}'),
     ('2024-02-15', 4, 'disk_io', 91.0, '{"host":"srv2"}');
 
+-- Database for skip_tables testing (T66: CLICKHOUSE_SKIP_TABLES env var)
+CREATE DATABASE IF NOT EXISTS tmpdata;
+
+-- JBOD MergeTree on jbod_policy (T65: multi-JBOD per-disk backup staging)
+CREATE TABLE IF NOT EXISTS default.jbod_orders
+(
+    order_date Date,
+    order_id   UInt64,
+    customer   String,
+    amount     Float64,
+    region     String
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(order_date)
+ORDER BY (customer, order_id)
+SETTINGS storage_policy = 'jbod_policy';
+
+-- Log table matching .*_log skip pattern (T66)
+CREATE TABLE IF NOT EXISTS default.app_log
+(
+    log_date  Date,
+    log_id    UInt64,
+    level     String,
+    message   String
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(log_date)
+ORDER BY (level, log_id);
+
+-- Scratch table in tmpdata database matching tmpdata.* skip pattern (T66)
+CREATE TABLE IF NOT EXISTS tmpdata.scratch
+(
+    id    UInt64,
+    data  String,
+    ts    DateTime
+)
+ENGINE = MergeTree()
+ORDER BY id;
+
 -- Empty MergeTree table (T18: --skip-empty-tables flag)
 CREATE TABLE IF NOT EXISTS default.empty_table
 (

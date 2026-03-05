@@ -69,6 +69,10 @@ RUN chmod +x /usr/local/bin/chbackup
 COPY test/configs/clickhouse-config.xml /etc/clickhouse-server/config.d/test.xml
 COPY test/configs/chbackup-test.yml /etc/chbackup/config.yml
 
+# Create JBOD directories for multi-disk testing
+RUN mkdir -p /var/lib/clickhouse/store0 /var/lib/clickhouse/store1 /var/lib/clickhouse/store2 \
+    && chown clickhouse:clickhouse /var/lib/clickhouse/store0 /var/lib/clickhouse/store1 /var/lib/clickhouse/store2
+
 # Copy S3 disk config generator (runs before ClickHouse starts)
 COPY test/configs/generate-s3-disk-config.sh /usr/local/bin/generate-s3-disk-config.sh
 RUN chmod +x /usr/local/bin/generate-s3-disk-config.sh

@@ -33,6 +33,15 @@ cat > /etc/clickhouse-server/config.d/s3-storage.xml <<EOF
                 <secret_access_key>${S3_SECRET_KEY}</secret_access_key>
                 <region>${S3_REGION}</region>
             </s3disk>
+            <store0>
+                <path>/var/lib/clickhouse/store0/</path>
+            </store0>
+            <store1>
+                <path>/var/lib/clickhouse/store1/</path>
+            </store1>
+            <store2>
+                <path>/var/lib/clickhouse/store2/</path>
+            </store2>
         </disks>
         <policies>
             <s3_policy>
@@ -42,9 +51,19 @@ cat > /etc/clickhouse-server/config.d/s3-storage.xml <<EOF
                     </s3_volume>
                 </volumes>
             </s3_policy>
+            <jbod_policy>
+                <volumes>
+                    <jbod_volume>
+                        <disk>store0</disk>
+                        <disk>store1</disk>
+                        <disk>store2</disk>
+                    </jbod_volume>
+                </volumes>
+            </jbod_policy>
         </policies>
     </storage_configuration>
 </clickhouse>
 EOF
 
 echo "Generated S3 disk config: endpoint=${S3_ENDPOINT}"
+echo "Generated JBOD policy: store0, store1, store2"
