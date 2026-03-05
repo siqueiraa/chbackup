@@ -15,7 +15,7 @@ chbackup reads configuration from a YAML file, environment variables, and CLI fl
 - [Watch](#watch)
 - [API](#api)
 - [All environment variables](#all-environment-variables)
-- [CLI --env overrides](#cli---env-overrides)
+- [CLI --env overrides](#cli-env-overrides)
 
 ## Config file location
 
@@ -203,6 +203,8 @@ Special values:
 - `-1` (local only) -- delete local backup immediately after successful upload
 
 Remote deletion uses garbage collection: only S3 keys not referenced by surviving backups are removed. Incremental base backups are protected from deletion as long as any backup references them.
+
+For a detailed explanation of the retention flow, GC mechanics, and override priority, see [Backup Guide > Retention](backup.md#retention).
 
 ## Watch
 

@@ -1,5 +1,9 @@
 # chbackup
 
+[![CI](https://github.com/siqueiraa/chbackup/actions/workflows/ci.yml/badge.svg)](https://github.com/siqueiraa/chbackup/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docker Image](https://img.shields.io/docker/v/siqueiraa/chbackup?label=Docker&sort=semver)](https://hub.docker.com/r/siqueiraa/chbackup)
+
 Drop-in Rust replacement for [Altinity/clickhouse-backup](https://github.com/Altinity/clickhouse-backup). Single static binary (~15 MB), S3-only storage, non-destructive restore.
 
 ## Why chbackup
@@ -12,18 +16,72 @@ Drop-in Rust replacement for [Altinity/clickhouse-backup](https://github.com/Alt
 - **Kubernetes-native** -- runs as a sidecar with an HTTP API, Prometheus metrics, and scheduled watch mode
 - **Drop-in compatible** -- same CLI commands and config format as clickhouse-backup
 
+> **Switching from clickhouse-backup?** Same config file, same CLI, same S3 layout — just swap the binary.
+
+### How it compares
+
+| | chbackup | clickhouse-backup |
+|---|---|---|
+| Language | Rust | Go |
+| Binary size | ~15 MB (static musl) | ~80 MB |
+| Storage backends | S3 only | S3, GCS, Azure, SFTP, FTP, ... |
+| Runtime dependencies | None | None |
+
 ## Quick start
 
 ```bash
-# Create a backup and upload it to S3
-chbackup create_remote
+# One-step backup and restore (recommended)
+chbackup create_remote my_backup
+chbackup restore_remote my_backup
 
+# Equivalent two-step
+chbackup create my_backup && chbackup upload my_backup
+chbackup download my_backup && chbackup restore my_backup
+```
+
+```bash
 # List all backups
 chbackup list
-
-# Download and restore from S3
-chbackup restore_remote latest
 ```
+
+```text
+$ chbackup list
+Local backups:
+  2025-06-01T00:00:00Z   2025-06-01 00:00:00 UTC   1.2 GiB   890 MiB   12 tables
+  2025-06-02T00:00:00Z   2025-06-02 00:00:00 UTC   48 MiB    32 MiB    12 tables
+
+Remote backups:
+  2025-06-01T00:00:00Z   2025-06-01 00:00:00 UTC   1.2 GiB   890 MiB   12 tables
+  2025-06-02T00:00:00Z   2025-06-02 00:00:00 UTC   48 MiB    32 MiB    12 tables
+```
+
+### Scheduling backups
+
+Use **watch mode** to run backups on a schedule. It alternates between full and incremental backups automatically, retries after failures, and cleans up old backups via retention.
+
+Add to your config file (`/etc/chbackup/config.yml`):
+
+```yaml
+watch:
+  watch_interval: 1d    # run an incremental backup every day
+  full_interval: 7d     # run a full backup every 7 days
+
+general:
+  backups_to_keep_local: 3
+  backups_to_keep_remote: 14
+```
+
+Durations accept `30s`, `1h`, `1d` formats.
+
+Then start it:
+
+```bash
+chbackup server --watch
+```
+
+Weekly full backups limit how many incrementals depend on a single base — if a full backup is lost, every incremental in that chain is unusable. Adjust `full_interval` based on your data size and recovery requirements.
+
+> **Need exact clock-time scheduling?** Use crontab instead — see [examples/crontab/](examples/crontab/) for a ready-to-use weekly full + daily incremental setup.
 
 chbackup reads its config from `/etc/chbackup/config.yml`. Override with `-c path` or the `CHBACKUP_CONFIG` env var. A minimal config:
 
@@ -110,6 +168,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 | [Restore Guide](docs/restore.md) | Restore modes, table rename, database remap, partitions |
 | [HTTP API](docs/api.md) | All API endpoints with examples and request/response formats |
 | [Docker Guide](docs/docker.md) | Running with ClickHouse in Docker, docker-compose setups |
+| [Migration Guide](docs/migration.md) | Step-by-step migration from Go clickhouse-backup |
 | [Example Config](config.example.yml) | Annotated config file with all parameters and defaults |
 
 ### Ready-to-use examples
@@ -118,6 +177,29 @@ cargo build --release --target x86_64-unknown-linux-musl
 |---------|-------------|
 | [examples/docker/](examples/docker/) | Docker Compose files for AWS S3, MinIO, and server mode |
 | [examples/kubernetes/](examples/kubernetes/) | Kubernetes sidecar Deployment manifest |
+| [examples/crontab/](examples/crontab/) | Cron-based scheduling with weekly full + daily incremental |
+
+## Roadmap
+
+### Core
+- [x] Full & incremental backups
+- [x] Parallel upload/download/restore
+- [x] Resumable operations
+- [x] S3 ObjectStorage disk support
+- [x] Watch mode (scheduled backups)
+- [x] HTTP API with Prometheus metrics
+- [x] Go clickhouse-backup drop-in compatibility
+
+### Planned
+- [ ] Google Cloud Storage (GCS) backend
+- [ ] Azure Blob Storage backend
+- [ ] Embedded BACKUP/RESTORE (CH 22.7+)
+- [ ] Client-side encryption
+- [ ] FTP/SFTP backends
+- [ ] Custom storage via rclone integration
+- [ ] Disk mapping for cross-cluster restore
+
+Have a feature request? [Open an issue](https://github.com/siqueiraa/chbackup/issues) to start a discussion.
 
 ## Exit codes
 
@@ -146,6 +228,10 @@ Integration tests run against real ClickHouse and S3. See the [CI workflow](.git
 ## Contact
 
 Rafael Siqueira -- [LinkedIn](https://www.linkedin.com/in/rafael-siqueiraa/) -- rafaelsiqueira06@gmail.com
+
+## Acknowledgements
+
+chbackup is inspired by [Altinity/clickhouse-backup](https://github.com/Altinity/clickhouse-backup). Thanks to the Altinity team for the original design.
 
 ## License
 
