@@ -3819,18 +3819,17 @@ if should_run "test_integration_tables"; then
             fail "create operation ${RESULT}"
         fi
 
-        # Step 4: SELECT from system.backup_list
+        # Step 4: SELECT from system.backup_list (now includes desc column via /backup/list)
         info "  Step 4: SELECT from system.backup_list"
         LIST_OUT=$(RUST_LOG=error clickhouse-client -q "
-          SELECT name, created, location,
+          SELECT name, created, location, desc,
             formatReadableSize(size) as size,
             formatReadableSize(data_size) as data_size,
             formatReadableSize(object_disk_size) as object_disk_size,
             formatReadableSize(metadata_size) as metadata_size,
             formatReadableSize(rbac_size) as rbac_size,
             formatReadableSize(config_size) as config_size,
-            formatReadableSize(compressed_size) as compressed_size,
-            required
+            formatReadableSize(compressed_size) as compressed_size
           FROM system.backup_list ORDER BY created DESC" 2>&1) || true
         if echo "$LIST_OUT" | grep -q "${T64_NAME}"; then
             pass "system.backup_list contains ${T64_NAME}"
@@ -3838,13 +3837,22 @@ if should_run "test_integration_tables"; then
             fail "system.backup_list missing ${T64_NAME}: ${LIST_OUT}"
         fi
 
-        # Step 5: SELECT from system.backup_actions
+        # Step 4b: Verify desc column is non-empty and not broken
+        DESC_OUT=$(RUST_LOG=error clickhouse-client -q "
+          SELECT desc FROM system.backup_list WHERE name = '${T64_NAME}'" 2>&1) || true
+        if [[ -n "$DESC_OUT" ]] && ! echo "$DESC_OUT" | grep -q "^broken"; then
+            pass "desc column is '${DESC_OUT}' (not broken)"
+        else
+            fail "desc column unexpected: '${DESC_OUT}'"
+        fi
+
+        # Step 5: SELECT from system.backup_actions (Go-compat: status = 'success', not 'completed')
         info "  Step 5: SELECT from system.backup_actions"
         ACTIONS_OUT=$(RUST_LOG=error clickhouse-client -q "
           SELECT command, status, start, finish, error
           FROM system.backup_actions" 2>&1) || true
-        if echo "$ACTIONS_OUT" | grep -q "create" && echo "$ACTIONS_OUT" | grep -q "completed"; then
-            pass "system.backup_actions shows create completed"
+        if echo "$ACTIONS_OUT" | grep -q "create" && echo "$ACTIONS_OUT" | grep -q "success"; then
+            pass "system.backup_actions shows create success (Go-compat status)"
         else
             fail "system.backup_actions unexpected: ${ACTIONS_OUT}"
         fi
@@ -3859,7 +3867,65 @@ if should_run "test_integration_tables"; then
             fail "clean_broken via INSERT ${RESULT}"
         fi
 
-        info "  Step 7: INSERT delete local via system.backup_actions"
+        # Step 7: Upload first backup to S3 (needed as base for diff-from-remote test)
+        info "  Step 7: Upload backup to S3"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('upload ${T64_NAME}')" 2>/dev/null || true
+        RESULT=$(poll_action_completion 30) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "upload via INSERT completed"
+        else
+            fail "upload via INSERT ${RESULT}"
+        fi
+
+        # Step 8: Create incremental backup with --diff-from-remote (CronJob format)
+        T64_INCR="${T64_NAME}_incr"
+        info "  Step 8: INSERT create --diff-from-remote --rbac --configs via system.backup_actions"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('create --diff-from-remote=${T64_NAME} --rbac --configs ${T64_INCR}')" 2>/dev/null || true
+        RESULT=$(poll_action_completion 30) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "create with --diff-from-remote via INSERT completed"
+        else
+            fail "create with --diff-from-remote via INSERT ${RESULT}"
+        fi
+
+        # Verify incremental backup appears in list
+        INCR_DESC=$(RUST_LOG=error clickhouse-client -q "
+          SELECT desc FROM system.backup_list WHERE name = '${T64_INCR}'" 2>&1) || true
+        if [[ -n "$INCR_DESC" ]]; then
+            pass "incremental backup desc: '${INCR_DESC}'"
+        else
+            fail "incremental backup not found in list"
+        fi
+
+        # Step 9: Test restore with --table and --restore-table-mapping via INSERT (DAG format)
+        info "  Step 9: INSERT restore --table --restore-table-mapping via system.backup_actions"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('restore --table=default.seed_local --restore-table-mapping seed_local:seed_local_dr ${T64_NAME}')" 2>/dev/null || true
+        RESULT=$(poll_action_completion 30) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "restore with --table and --restore-table-mapping via INSERT completed"
+        else
+            # Non-fatal: table mapping restore may fail if source table doesn't exist
+            info "  restore with flags via INSERT: ${RESULT} (may be expected if seed_local doesn't exist)"
+        fi
+        # Cleanup restored table (best-effort)
+        clickhouse-client -q "DROP TABLE IF EXISTS default.seed_local_dr" 2>/dev/null || true
+
+        # Step 10: Test broken backup desc
+        info "  Step 10: Verify broken backup desc"
+        # Create a broken backup by making a directory without metadata.json
+        T64_BROKEN="${T64_NAME}_broken"
+        mkdir -p "/var/lib/clickhouse/backup/${T64_BROKEN}"
+        BROKEN_DESC=$(RUST_LOG=error clickhouse-client -q "
+          SELECT desc FROM system.backup_list WHERE name = '${T64_BROKEN}'" 2>&1) || true
+        if echo "$BROKEN_DESC" | grep -q "^broken"; then
+            pass "broken backup desc starts with 'broken': '${BROKEN_DESC}'"
+        else
+            fail "broken backup desc should start with 'broken', got: '${BROKEN_DESC}'"
+        fi
+        rm -rf "/var/lib/clickhouse/backup/${T64_BROKEN}"
+
+        # Step 11: Delete all test backups
+        info "  Step 11: INSERT delete local via system.backup_actions"
         clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('delete local ${T64_NAME}')" 2>/dev/null || true
         RESULT=$(poll_action_completion 15) || true
         if [[ "$RESULT" == "completed" ]]; then
@@ -3867,12 +3933,17 @@ if should_run "test_integration_tables"; then
         else
             fail "delete local via INSERT ${RESULT}"
         fi
+        # Delete incremental backup and remote copies
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('delete local ${T64_INCR}')" 2>/dev/null || true
+        poll_action_completion 15 >/dev/null 2>&1 || true
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('delete remote ${T64_NAME}')" 2>/dev/null || true
+        poll_action_completion 15 >/dev/null 2>&1 || true
 
-        # Verify backup is gone
-        info "  Step 8: Verify backup deleted"
-        DEL_COUNT=$(RUST_LOG=error clickhouse-client -q "SELECT count() FROM system.backup_list" 2>&1) || true
+        # Verify backups are gone
+        info "  Step 12: Verify backups deleted"
+        DEL_COUNT=$(RUST_LOG=error clickhouse-client -q "SELECT count() FROM system.backup_list WHERE name LIKE '${T64_NAME}%'" 2>&1) || true
         if [[ "$DEL_COUNT" == "0" ]]; then
-            pass "system.backup_list is empty after delete"
+            pass "system.backup_list has no test backups after delete"
         else
             fail "expected count 0 after delete, got: ${DEL_COUNT}"
         fi

@@ -598,6 +598,15 @@ impl ChClient {
     pub async fn create_integration_tables(&self, api_host: &str, api_port: &str) -> Result<()> {
         let (list_ddl, actions_ddl) = integration_table_ddl(api_host, api_port);
 
+        // Drop existing tables first to ensure schema/URL updates on upgrade.
+        // Integration tables are URL engine proxies with no persistent data.
+        self.execute_ddl("DROP TABLE IF EXISTS system.backup_list")
+            .await
+            .context("Failed to drop system.backup_list for recreation")?;
+        self.execute_ddl("DROP TABLE IF EXISTS system.backup_actions")
+            .await
+            .context("Failed to drop system.backup_actions for recreation")?;
+
         self.execute_ddl(&list_ddl)
             .await
             .context("Failed to create system.backup_list integration table")?;
@@ -1543,16 +1552,17 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
         "CREATE TABLE IF NOT EXISTS system.backup_list (\
          name String, \
          created String, \
+         size Int64, \
          location String, \
-         size UInt64, \
+         required String, \
+         desc String, \
          data_size UInt64, \
          object_disk_size UInt64, \
          metadata_size UInt64, \
          rbac_size UInt64, \
          config_size UInt64, \
-         compressed_size UInt64, \
-         required String\
-         ) ENGINE = URL('http://{}:{}/api/v1/list', 'JSONEachRow')",
+         compressed_size UInt64\
+         ) ENGINE = URL('http://{}:{}/backup/list', 'JSONEachRow')",
         escape_sql_string(api_host),
         port
     );
@@ -1564,7 +1574,7 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
          finish String, \
          status String, \
          error String\
-         ) ENGINE = URL('http://{}:{}/api/v1/actions', 'JSONEachRow')",
+         ) ENGINE = URL('http://{}:{}/backup/actions', 'JSONEachRow')",
         escape_sql_string(api_host),
         port
     );
@@ -2150,17 +2160,18 @@ mod tests {
         assert!(list_ddl.contains("CREATE TABLE IF NOT EXISTS system.backup_list"));
         assert!(list_ddl.contains("name String"));
         assert!(list_ddl.contains("created String"));
+        assert!(list_ddl.contains("size Int64"));
         assert!(list_ddl.contains("location String"));
-        assert!(list_ddl.contains("size UInt64"));
+        assert!(list_ddl.contains("required String"));
+        assert!(list_ddl.contains("desc String"));
         assert!(list_ddl.contains("data_size UInt64"));
         assert!(list_ddl.contains("object_disk_size UInt64"));
         assert!(list_ddl.contains("metadata_size UInt64"));
         assert!(list_ddl.contains("rbac_size UInt64"));
         assert!(list_ddl.contains("config_size UInt64"));
         assert!(list_ddl.contains("compressed_size UInt64"));
-        assert!(list_ddl.contains("required String"));
         assert!(
-            list_ddl.contains("ENGINE = URL('http://localhost:7171/api/v1/list', 'JSONEachRow')")
+            list_ddl.contains("ENGINE = URL('http://localhost:7171/backup/list', 'JSONEachRow')")
         );
 
         // Verify backup_actions DDL
@@ -2171,7 +2182,7 @@ mod tests {
         assert!(actions_ddl.contains("status String"));
         assert!(actions_ddl.contains("error String"));
         assert!(actions_ddl
-            .contains("ENGINE = URL('http://localhost:7171/api/v1/actions', 'JSONEachRow')"));
+            .contains("ENGINE = URL('http://localhost:7171/backup/actions', 'JSONEachRow')"));
     }
 
     #[test]
@@ -2241,8 +2252,8 @@ mod tests {
     #[test]
     fn test_integration_table_ddl_custom_host_port() {
         let (list_ddl, actions_ddl) = integration_table_ddl("backup-server", "8080");
-        assert!(list_ddl.contains("http://backup-server:8080/api/v1/list"));
-        assert!(actions_ddl.contains("http://backup-server:8080/api/v1/actions"));
+        assert!(list_ddl.contains("http://backup-server:8080/backup/list"));
+        assert!(actions_ddl.contains("http://backup-server:8080/backup/actions"));
     }
 
     #[test]
