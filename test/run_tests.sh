@@ -3772,6 +3772,130 @@ if should_run "test_partial_restore"; then
 fi
 
 # ---------------------------------------------------------------------------
+# T64: API integration tables (system.backup_list, system.backup_actions)
+# ---------------------------------------------------------------------------
+if should_run "test_integration_tables"; then
+    info "T64: API integration tables (system.backup_list, system.backup_actions)"
+    T64_NAME="t64_integ_$$"
+    SERVER_PID=""
+
+    # Step 1: Start server in background
+    info "  Step 1: Start chbackup server"
+    chbackup server &
+    SERVER_PID=$!
+    sleep 2
+
+    if ! wait_for_server 10; then
+        fail "Server did not become ready within 10s"
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    else
+        pass "Server is ready"
+
+        # Step 2: Verify tables exist in empty state
+        info "  Step 2: Verify system.backup_list exists (empty state)"
+        EMPTY_COUNT=$(RUST_LOG=error clickhouse-client -q "SELECT count() FROM system.backup_list" 2>&1) || true
+        if [[ "$EMPTY_COUNT" == "0" ]]; then
+            pass "system.backup_list exists and is empty"
+        else
+            fail "expected count 0, got: ${EMPTY_COUNT}"
+        fi
+
+        # Step 3: Create backup via API
+        info "  Step 3: POST /api/v1/create"
+        CREATE_RESP=$(curl -s -X POST http://localhost:7171/api/v1/create \
+            -H "Content-Type: application/json" \
+            -d "{\"backup_name\": \"${T64_NAME}\"}")
+        if echo "$CREATE_RESP" | grep -q '"status"'; then
+            pass "create API responded"
+        else
+            fail "create API response: ${CREATE_RESP}"
+        fi
+
+        RESULT=$(poll_action_completion 30) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "create operation completed"
+        else
+            fail "create operation ${RESULT}"
+        fi
+
+        # Step 4: SELECT from system.backup_list
+        info "  Step 4: SELECT from system.backup_list"
+        LIST_OUT=$(RUST_LOG=error clickhouse-client -q "
+          SELECT name, created, location,
+            formatReadableSize(size) as size,
+            formatReadableSize(data_size) as data_size,
+            formatReadableSize(object_disk_size) as object_disk_size,
+            formatReadableSize(metadata_size) as metadata_size,
+            formatReadableSize(rbac_size) as rbac_size,
+            formatReadableSize(config_size) as config_size,
+            formatReadableSize(compressed_size) as compressed_size,
+            required
+          FROM system.backup_list ORDER BY created DESC" 2>&1) || true
+        if echo "$LIST_OUT" | grep -q "${T64_NAME}"; then
+            pass "system.backup_list contains ${T64_NAME}"
+        else
+            fail "system.backup_list missing ${T64_NAME}: ${LIST_OUT}"
+        fi
+
+        # Step 5: SELECT from system.backup_actions
+        info "  Step 5: SELECT from system.backup_actions"
+        ACTIONS_OUT=$(RUST_LOG=error clickhouse-client -q "
+          SELECT command, status, start, finish, error
+          FROM system.backup_actions" 2>&1) || true
+        if echo "$ACTIONS_OUT" | grep -q "create" && echo "$ACTIONS_OUT" | grep -q "completed"; then
+            pass "system.backup_actions shows create completed"
+        else
+            fail "system.backup_actions unexpected: ${ACTIONS_OUT}"
+        fi
+
+        # Step 6: INSERT command dispatch via system.backup_actions
+        info "  Step 6: INSERT clean_broken via system.backup_actions"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('clean_broken')" 2>/dev/null || true
+        RESULT=$(poll_action_completion 15) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "clean_broken via INSERT completed"
+        else
+            fail "clean_broken via INSERT ${RESULT}"
+        fi
+
+        info "  Step 7: INSERT delete local via system.backup_actions"
+        clickhouse-client -q "INSERT INTO system.backup_actions (command) VALUES ('delete local ${T64_NAME}')" 2>/dev/null || true
+        RESULT=$(poll_action_completion 15) || true
+        if [[ "$RESULT" == "completed" ]]; then
+            pass "delete local via INSERT completed"
+        else
+            fail "delete local via INSERT ${RESULT}"
+        fi
+
+        # Verify backup is gone
+        info "  Step 8: Verify backup deleted"
+        DEL_COUNT=$(RUST_LOG=error clickhouse-client -q "SELECT count() FROM system.backup_list" 2>&1) || true
+        if [[ "$DEL_COUNT" == "0" ]]; then
+            pass "system.backup_list is empty after delete"
+        else
+            fail "expected count 0 after delete, got: ${DEL_COUNT}"
+        fi
+
+        # Cleanup: stop server and delete backup (safety net)
+        info "  Cleanup"
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        cleanup_backup "${T64_NAME}"
+
+        # Step 9: Verify tables dropped after server shutdown
+        info "  Step 9: Verify tables dropped after shutdown"
+        sleep 1
+        TABLE_CHECK=$(clickhouse-client -q "SELECT 1 FROM system.backup_list" 2>&1) || true
+        if echo "$TABLE_CHECK" | grep -qi "UNKNOWN_TABLE\|doesn't exist\|does not exist\|Table .* does not exist"; then
+            pass "system.backup_list dropped after shutdown"
+        else
+            fail "system.backup_list still exists after shutdown: ${TABLE_CHECK}"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 echo ""

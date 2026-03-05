@@ -1542,7 +1542,7 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
     let list_ddl = format!(
         "CREATE TABLE IF NOT EXISTS system.backup_list (\
          name String, \
-         created DateTime, \
+         created String, \
          location String, \
          size UInt64, \
          data_size UInt64, \
@@ -2149,7 +2149,7 @@ mod tests {
         // Verify backup_list DDL
         assert!(list_ddl.contains("CREATE TABLE IF NOT EXISTS system.backup_list"));
         assert!(list_ddl.contains("name String"));
-        assert!(list_ddl.contains("created DateTime"));
+        assert!(list_ddl.contains("created String"));
         assert!(list_ddl.contains("location String"));
         assert!(list_ddl.contains("size UInt64"));
         assert!(list_ddl.contains("data_size UInt64"));
