@@ -84,7 +84,7 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - CRC64 mismatch (same name, different checksum): part stays `source = "uploaded"` (re-uploaded) + `warn!()` log per design doc section 3.5
 - Extra tables in base that are not in current: gracefully ignored
 - `DiffResult` returns counts: `carried`, `uploaded`, `crc_mismatches`
-- Triggered by `--diff-from` flag in `create()`, or by `--diff-from-remote` in `upload()` (reuses same function)
+- Triggered by `--diff-from` flag in `create()`, `--diff-from-remote` in `create()` (downloads remote manifest from S3), or `--diff-from-remote` in `upload()` (reuses same function)
 - **S3 objects carry-forward** (Phase 2c): When a part is carried from the base manifest, `s3_objects` is cloned from the base part so the new manifest remains self-contained for download/restore. For local parts (`s3_objects: None`), cloning is a no-op.
 
 ### Backup Directory Layout
@@ -143,13 +143,13 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - `RBAC_ENTITY_TYPES` constant: Maps SQL entity types to lowercase identifiers and JSONL filenames.
 
 ### Public API
-- `create(config, ch, backup_name, table_pattern, schema_only, diff_from: Option<&str>, partitions: Option<&str>, skip_check_parts_columns: bool, rbac: bool, configs: bool, named_collections: bool, skip_projections: &[String]) -> Result<BackupManifest>` -- Main entry point; supports partition-level freeze, parts column check (Phase 2d), RBAC/config/named-collections backup (Phase 4e), and projection filtering (Phase 5)
+- `create(config, ch, backup_name, table_pattern, schema_only, diff_from: Option<&str>, diff_from_remote: Option<&str>, s3: Option<&S3Client>, partitions: Option<&str>, skip_check_parts_columns: bool, rbac: bool, configs: bool, named_collections: bool, skip_projections: &[String]) -> Result<BackupManifest>` -- Main entry point; supports partition-level freeze, parts column check (Phase 2d), RBAC/config/named-collections backup (Phase 4e), projection filtering (Phase 5), and remote incremental base via `--diff-from-remote` (downloads manifest from S3, skips hardlinks for matching parts)
 - `diff_parts(current, base) -> DiffResult` -- Incremental comparison of current vs base manifest parts
 - `compute_crc64(path) -> Result<u64>` -- File-level CRC64
 - `compute_crc64_bytes(data) -> u64` -- In-memory CRC64
 - `per_disk_backup_dir(disk_path, backup_name) -> PathBuf` -- Compute per-disk backup directory `{disk_path}/backup/{backup_name}`
 - `resolve_shadow_part_path(backup_dir, manifest_disks, backup_name, disk_name, encoded_db, encoded_table, plain_db, plain_table, part_name) -> Option<PathBuf>` -- 4-step fallback chain for shadow path resolution (per-disk -> legacy encoded -> legacy plain -> None)
-- `collect_parts(data_path, freeze_name, backup_dir, backup_name, tables, disk_type_map, disk_paths, skip_projections: &[String]) -> Result<HashMap<String, Vec<CollectedPart>>>` -- Walk all disk shadow directories, stage to per-disk backup dirs, detect S3 disk parts, hardlink local parts, filter projections (Phase 2c + Phase 5 + per-disk updated signature)
+- `collect_parts(data_path, freeze_name, backup_name, tables, disk_type_map, disk_paths, skip_disks, skip_disk_types, skip_projections: &[String], base_parts: Option<&BasePartsMap>) -> Result<HashMap<String, Vec<CollectedPart>>>` -- Walk all disk shadow directories, stage to per-disk backup dirs, detect S3 disk parts, hardlink local parts, filter projections, skip hardlinks for parts matching remote base by CRC64 (Phase 2c + Phase 5 + per-disk + diff-from-remote)
 - `CollectedPart` -- Struct with `database`, `table`, `part_info: PartInfo`, `disk_name: String`
 - `freeze_table(ch, db, table, freeze_name) -> Result<()>` -- Issue FREEZE
 - `check_mutations(ch, targets, timeout) -> Result<()>` -- Mutation pre-flight

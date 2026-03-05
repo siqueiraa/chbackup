@@ -53,7 +53,7 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `freeze_sql(db, table, freeze_name) -> String` -- ALTER TABLE FREEZE WITH NAME
 - `unfreeze_sql(db, table, freeze_name) -> String` -- ALTER TABLE UNFREEZE WITH NAME
 - `freeze_partition_sql(db, table, partition, freeze_name) -> String` -- ALTER TABLE FREEZE PARTITION (Phase 2d)
-- `integration_table_ddl(api_host, api_port) -> (String, String)` -- Generate DDL for `system.backup_list` (URL engine -> `/api/v1/list`) and `system.backup_actions` (URL engine -> `/api/v1/actions`) (Phase 3a)
+- `integration_table_ddl(api_host, api_port) -> (String, String)` -- Generate DDL for `system.backup_list` (URL engine -> `/backup/list`, Go-compatible format with `desc` column and `Int64` size) and `system.backup_actions` (URL engine -> `/backup/actions`, Go-compatible status values)
 - `drop_table_sql(db, table, on_cluster) -> String` -- DROP TABLE IF EXISTS with optional ON CLUSTER clause (Phase 4d)
 - `drop_database_sql(db, on_cluster) -> String` -- DROP DATABASE IF EXISTS with optional ON CLUSTER clause (Phase 4d)
 - `detach_table_sync_sql(db, table) -> String` -- DETACH TABLE SYNC (Phase 4d)
@@ -83,7 +83,7 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `get_macros() -> Result<HashMap<String, String>>` -- Query system.macros for template resolution (Phase 3d); returns empty HashMap on error (graceful -- system.macros may not exist)
 - `query_table_dependencies() -> Result<HashMap<String, Vec<String>>>` -- Query `system.tables` for `dependencies_database`/`dependencies_table` columns (CH 23.3+). Returns map from `"db.table"` to `Vec<"dep_db.dep_table">`. On query failure (CH < 23.3), catches error, logs warning, and returns `Ok(HashMap::new())` for graceful degradation. Follows `list_tables()` pattern: conditional SQL logging, `fetch_all`, `.context()`.
 - `execute_ddl(ddl) -> Result<()>` -- Execute arbitrary DDL
-- `create_integration_tables(api_host, api_port) -> Result<()>` -- Create `system.backup_list` and `system.backup_actions` URL engine tables for API server integration (Phase 3a)
+- `create_integration_tables(api_host, api_port) -> Result<()>` -- Drop and recreate `system.backup_list` and `system.backup_actions` URL engine tables for API server integration (DROP before CREATE ensures schema/URL updates on upgrade)
 - `drop_integration_tables() -> Result<()>` -- Drop both integration tables (called on server shutdown)
 - `database_exists(db) -> Result<bool>` -- Check system.databases
 - `table_exists(db, table) -> Result<bool>` -- Check system.tables

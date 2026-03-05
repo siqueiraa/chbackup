@@ -127,13 +127,21 @@ The incremental backup's manifest marks unchanged parts as "carried" from the ba
 
 ### Remote incremental
 
-When uploading, reference a remote backup as the base:
+You can reference a remote backup as the incremental base in two ways:
+
+**During create** (recommended for CronJob workflows): downloads the remote manifest from S3 and skips hardlinks for parts that match by CRC64, saving local disk I/O and space:
+
+```bash
+chbackup create --diff-from-remote=full-remote incr-backup
+```
+
+**During upload**: skips uploading parts that already exist in the remote base:
 
 ```bash
 chbackup upload --diff-from-remote=full-remote incr-backup
 ```
 
-Parts that already exist in the remote base are skipped during upload (they are referenced by key in the manifest).
+Both approaches produce the same result — parts that match the remote base are marked as "carried" in the manifest.
 
 ### With create_remote
 

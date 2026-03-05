@@ -408,6 +408,31 @@ The body also accepts a JSON array (`[{"command":"..."}]`) or JSONEachRow format
 
 Supported commands: `create`, `upload`, `download`, `restore`, `create_remote`, `restore_remote`, `delete`, `clean_broken`.
 
+#### Flag support
+
+Commands support CLI-style flags in the command string (both `--flag=VALUE` and `--flag VALUE` forms):
+
+```bash
+# Create with incremental base, RBAC, and configs (CronJob format)
+curl -X POST http://localhost:7171/api/v1/actions \
+  -H "Content-Type: application/json" \
+  -d '{"command": "create --diff-from-remote=base-backup --rbac --configs my-backup"}'
+
+# Restore with table filter and table mapping (DAG format)
+curl -X POST http://localhost:7171/api/v1/actions \
+  -H "Content-Type: application/json" \
+  -d '{"command": "restore --table=events.transactions --restore-table-mapping transactions:transactions_DR my-backup"}'
+```
+
+| Flag | Commands | Description |
+|------|----------|-------------|
+| `--table` / `-t` | create, restore, create_remote, restore_remote | Table filter pattern |
+| `--diff-from-remote` | create, upload, create_remote | Remote incremental base backup |
+| `--restore-table-mapping` | restore, restore_remote | Table rename mapping (`src:dst`). Database prefix auto-inferred from `--table` when mapping lacks dots |
+| `--rbac` | create, restore, create_remote, restore_remote | Include RBAC objects |
+| `--configs` | create, restore, create_remote, restore_remote | Include config files |
+| `--rm` / `--drop` | restore, restore_remote | Drop existing tables before restore |
+
 ## Legacy Go compatibility (`/backup/*` routes)
 
 chbackup exposes a second set of API routes under `/backup/*` that match the Go clickhouse-backup API. This allows existing ClickHouse URL engine integration tables (e.g., `system.backup_list`, `system.backup_actions`) and CronJob scripts to work without modification after swapping the Docker image.
@@ -466,7 +491,12 @@ Go routes use `YYYY-MM-DD HH:MM:SS` (no `T` separator, no timezone) instead of R
 
 ### Integration table compatibility
 
-Existing ClickHouse URL engine tables created by Go clickhouse-backup that point to `/backup/list` or `/backup/actions` will work automatically — no need to DROP and recreate them.
+chbackup's auto-created integration tables (`system.backup_list`, `system.backup_actions`) now point to the Go-compatible `/backup/list` and `/backup/actions` endpoints. This means:
+- `system.backup_list` includes the `desc` column (`"tar, regular"`, `"tar, incremental"`, or `"broken: {reason}"`)
+- `system.backup_actions` returns Go status values (`success`, `in progress`, `error`, `cancel`)
+- On server startup, existing integration tables are dropped and recreated to pick up any schema/URL changes
+
+Existing tables created by Go clickhouse-backup will also work automatically — the `/backup/*` routes are fully compatible.
 
 ## Error responses
 

@@ -49,6 +49,7 @@ If `BACKUP_NAME` is omitted, a timestamped name like `2024-01-15T12-00-00` is ge
 | `-t, --tables PATTERN` | Table filter (glob patterns: `default.*`, `*.users`, `db.table`) |
 | `--partitions LIST` | Only backup specific partitions (comma-separated) |
 | `--diff-from NAME` | Create an incremental backup based on a local backup |
+| `--diff-from-remote NAME` | Create an incremental backup based on a remote (S3) backup (downloads manifest, skips hardlinks for matching parts) |
 | `--skip-projections PATTERNS` | Glob patterns for projections to skip (comma-separated, `*` = all) |
 | `--schema` | Backup schema (DDL) only, no data |
 | `--rbac` | Include RBAC objects (users, roles, quotas, row policies, settings profiles) |
@@ -71,8 +72,11 @@ chbackup create -t "default.*"
 # Backup specific tables
 chbackup create -t "default.users,default.orders"
 
-# Incremental backup (only changed parts since base)
+# Incremental backup (only changed parts since local base)
 chbackup create --diff-from=full-backup incr-backup
+
+# Incremental backup using a remote base (no local base needed)
+chbackup create --diff-from-remote=full-remote incr-backup
 
 # Backup only specific partitions (e.g., January and February 2024)
 chbackup create --partitions="202401,202402"
