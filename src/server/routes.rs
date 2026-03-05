@@ -3570,10 +3570,7 @@ mod tests {
             "backup",
         ];
         let flags = parse_action_flags(&parts);
-        assert_eq!(
-            flags.rename_as.as_deref(),
-            Some("mydb.users:mydb.users_DR")
-        );
+        assert_eq!(flags.rename_as.as_deref(), Some("mydb.users:mydb.users_DR"));
     }
 
     #[test]

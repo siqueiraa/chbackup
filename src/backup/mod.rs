@@ -205,20 +205,23 @@ pub async fn create(
 
     // Build base_parts lookup from remote manifest for skipping hardlinks during collect
     let base_parts: Option<Arc<collect::BasePartsMap>> = remote_base.as_ref().map(|base| {
-            let mut map = HashMap::new();
-            for (table_key, tm) in &base.tables {
-                for (disk_name, parts) in &tm.parts {
-                    for part in parts {
-                        map.insert(
-                            (table_key.clone(), disk_name.clone(), part.name.clone()),
-                            (part.checksum_crc64, part.size),
-                        );
-                    }
+        let mut map = HashMap::new();
+        for (table_key, tm) in &base.tables {
+            for (disk_name, parts) in &tm.parts {
+                for part in parts {
+                    map.insert(
+                        (table_key.clone(), disk_name.clone(), part.name.clone()),
+                        (part.checksum_crc64, part.size),
+                    );
                 }
             }
-            info!(entries = map.len(), "Built base_parts lookup for diff-from-remote");
-            Arc::new(map)
-        });
+        }
+        info!(
+            entries = map.len(),
+            "Built base_parts lookup for diff-from-remote"
+        );
+        Arc::new(map)
+    });
 
     // 3. List all user tables
     let all_tables = ch.list_tables().await?;
@@ -627,9 +630,7 @@ pub async fn create(
                     &skip_disks_clone,
                     &skip_disk_types_clone,
                     &skip_projections_clone,
-                    base_parts_clone
-                        .as_ref()
-                        .map(|arc| arc.as_ref()),
+                    base_parts_clone.as_ref().map(|arc| arc.as_ref()),
                 )
             })
             .await
@@ -881,9 +882,11 @@ pub async fn create(
             .join("backup")
             .join(base_name)
             .join("metadata.json");
-        Some(BackupManifest::load_from_file(&base_manifest_path).with_context(|| {
-            format!("Failed to load base backup '{}' for --diff-from", base_name)
-        })?)
+        Some(
+            BackupManifest::load_from_file(&base_manifest_path).with_context(|| {
+                format!("Failed to load base backup '{}' for --diff-from", base_name)
+            })?,
+        )
     } else {
         None
     };

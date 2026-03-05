@@ -349,8 +349,7 @@ pub fn collect_parts(
                         let mut part_info = PartInfo::new(part_name, base_size, crc64);
                         // For S3 disk parts, we still need the object refs from shadow
                         if is_s3 {
-                            let (s3_objects, _) =
-                                collect_s3_part_metadata(&part_entry.path())?;
+                            let (s3_objects, _) = collect_s3_part_metadata(&part_entry.path())?;
                             part_info = part_info.with_s3_objects(s3_objects);
                         }
                         result

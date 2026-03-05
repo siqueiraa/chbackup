@@ -205,6 +205,8 @@ docker build -t chbackup .                                  # production image
 
 Integration tests require real ClickHouse + S3 (no mocks).
 
+**MANDATORY before committing:** Run `cargo fmt -- --check` to verify formatting. CI will reject unformatted code. Run `cargo fmt` to auto-fix.
+
 ## Infrastructure Files
 
 | File | Purpose |
