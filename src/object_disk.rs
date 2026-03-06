@@ -350,6 +350,45 @@ pub fn build_disk_remote_paths(disks: &[DiskRow], config_dir: &str) -> BTreeMap<
     paths
 }
 
+/// Resolve ClickHouse macros (`{cluster}`, `{replica}`, etc.) in disk remote paths.
+///
+/// ClickHouse config files and `system.disks` may contain unresolved macro
+/// placeholders like `{cluster}` or `{replica}`. These must be replaced with
+/// actual values from `system.macros` before constructing S3 CopyObject source keys.
+pub fn resolve_macros_in_paths(
+    paths: &mut BTreeMap<String, String>,
+    macros: &std::collections::HashMap<String, String>,
+) {
+    if macros.is_empty() {
+        return;
+    }
+    for (disk_name, path) in paths.iter_mut() {
+        if !path.contains('{') {
+            continue;
+        }
+        let original = path.clone();
+        for (key, value) in macros {
+            let pattern = format!("{{{}}}", key);
+            *path = path.replace(&pattern, value);
+        }
+        if *path != original {
+            info!(
+                disk = %disk_name,
+                original = %original,
+                resolved = %path,
+                "Resolved macros in disk remote path"
+            );
+        }
+        if path.contains('{') {
+            warn!(
+                disk = %disk_name,
+                path = %path,
+                "Disk remote path still contains unresolved macros"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,5 +864,35 @@ mod tests {
     #[test]
     fn test_normalize_disk_type_s3_passthrough() {
         assert_eq!(normalize_disk_type("s3", ""), "s3");
+    }
+
+    #[test]
+    fn test_resolve_macros_in_paths() {
+        let mut paths = BTreeMap::from([
+            (
+                "s3disk".to_string(),
+                "s3://bucket/clickhouse/{cluster}/{replica}/".to_string(),
+            ),
+            ("local".to_string(), "/data/local".to_string()),
+        ]);
+        let macros = std::collections::HashMap::from([
+            ("cluster".to_string(), "mycluster".to_string()),
+            ("replica".to_string(), "replica1".to_string()),
+        ]);
+        resolve_macros_in_paths(&mut paths, &macros);
+        assert_eq!(
+            paths["s3disk"],
+            "s3://bucket/clickhouse/mycluster/replica1/"
+        );
+        assert_eq!(paths["local"], "/data/local");
+    }
+
+    #[test]
+    fn test_resolve_macros_empty_macros() {
+        let mut paths =
+            BTreeMap::from([("s3disk".to_string(), "s3://bucket/{cluster}/".to_string())]);
+        let macros = std::collections::HashMap::new();
+        resolve_macros_in_paths(&mut paths, &macros);
+        assert_eq!(paths["s3disk"], "s3://bucket/{cluster}/");
     }
 }

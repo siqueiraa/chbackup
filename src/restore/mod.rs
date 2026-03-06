@@ -500,7 +500,12 @@ pub async fn restore(
     let disk_remote_paths: BTreeMap<String, String> = if has_s3_disks {
         match ch.get_disks().await {
             Ok(disks) => {
-                crate::object_disk::build_disk_remote_paths(&disks, &config.clickhouse.config_dir)
+                let mut paths = crate::object_disk::build_disk_remote_paths(
+                    &disks,
+                    &config.clickhouse.config_dir,
+                );
+                crate::object_disk::resolve_macros_in_paths(&mut paths, &macros);
+                paths
             }
             Err(e) => {
                 warn!(error = %e, "Failed to get disk info for S3 restore");

@@ -170,8 +170,12 @@ pub async fn create(
             )
         })
         .collect();
-    let disk_remote_paths =
+    let mut disk_remote_paths =
         object_disk::build_disk_remote_paths(&disks, &config.clickhouse.config_dir);
+
+    // Resolve ClickHouse macros ({cluster}, {replica}, etc.) in disk remote paths
+    let macros = ch.get_macros().await.unwrap_or_default();
+    object_disk::resolve_macros_in_paths(&mut disk_remote_paths, &macros);
 
     // 2b. Download remote base manifest for --diff-from-remote
     let remote_base: Option<BackupManifest> = if let Some(remote_name) = diff_from_remote {
