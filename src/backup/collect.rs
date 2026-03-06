@@ -550,14 +550,29 @@ fn hardlink_dir(src_dir: &Path, dst_dir: &Path, skip_proj_patterns: &[String]) -
         } else {
             // Try hardlink first, fall back to copy on cross-device
             if let Err(e) = std::fs::hard_link(entry.path(), &target) {
-                let is_exdev = e.raw_os_error() == Some(libc::EXDEV);
-                if is_exdev {
+                let raw = e.raw_os_error();
+                if raw == Some(libc::EXDEV) {
                     debug!(
                         src = %entry.path().display(),
                         dst = %target.display(),
                         "Cross-device hardlink failed, falling back to copy"
                     );
                     std::fs::copy(entry.path(), &target)?;
+                } else if raw == Some(libc::EEXIST) {
+                    // Destination already exists (leftover from a previous failed backup).
+                    // Remove and retry the hardlink.
+                    debug!(
+                        dst = %target.display(),
+                        "Destination exists, replacing with new hardlink"
+                    );
+                    std::fs::remove_file(&target)?;
+                    std::fs::hard_link(entry.path(), &target).with_context(|| {
+                        format!(
+                            "Failed to hardlink {} -> {} (after removing existing)",
+                            entry.path().display(),
+                            target.display()
+                        )
+                    })?;
                 } else {
                     return Err(e).with_context(|| {
                         format!(
