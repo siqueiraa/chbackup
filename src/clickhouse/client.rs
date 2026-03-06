@@ -1360,7 +1360,9 @@ impl ChClient {
 
         let mut results = Vec::with_capacity(names.len());
         for name_row in &names {
-            let show_sql = format!("SHOW CREATE FUNCTION {}", quote_identifier(&name_row.name));
+            // SHOW CREATE FUNCTION does not accept backtick-quoted identifiers.
+            // The name is from system.functions so it is safe to use unquoted.
+            let show_sql = format!("SHOW CREATE FUNCTION {}", &name_row.name);
 
             match self
                 .inner
