@@ -108,7 +108,7 @@ pub struct AppState {
     pub manifest_cache: Arc<Mutex<ManifestCache>>,
 }
 
-/// Tracks a currently running operation for cancellation support.
+/// Tracks a currently running or queued operation for cancellation support.
 pub struct RunningOp {
     pub id: u64,
     pub command: String,
@@ -116,7 +116,8 @@ pub struct RunningOp {
     pub backup_name: Option<String>,
     pub cancel_token: CancellationToken,
     /// Held for the duration of the operation to enforce concurrency limits.
-    _permit: OwnedSemaphorePermit,
+    /// `None` when the operation is queued (waiting for a semaphore permit).
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl AppState {
@@ -190,7 +191,7 @@ impl AppState {
             command: command.to_string(),
             backup_name: backup_name.clone(),
             cancel_token: token.clone(),
-            _permit: permit,
+            _permit: Some(permit),
         };
 
         // Atomically check for a same-backup conflict and insert — eliminates the TOCTOU
@@ -219,6 +220,93 @@ impl AppState {
                 );
             }
             return Err("operation already in progress for this backup");
+        }
+
+        Ok((id, token))
+    }
+
+    /// Queue a new operation, waiting for the semaphore permit instead of rejecting immediately.
+    ///
+    /// The `RunningOp` is inserted with `_permit: None` (queued) so it is visible to
+    /// `kill_op` while waiting. Once the permit is acquired, it is stored in the op.
+    ///
+    /// Used by `/backup/actions` (Go-compat integration table INSERT) where commands
+    /// should queue sequentially instead of being rejected with 423.
+    pub async fn queue_start_op(
+        &self,
+        command: &str,
+        backup_name: Option<String>,
+    ) -> Result<(u64, CancellationToken), &'static str> {
+        let token = CancellationToken::new();
+
+        // Lock ordering: action_log first, then running_ops (matches try_start_op)
+        let id = {
+            let mut log = self.action_log.lock().await;
+            log.start(command.to_string())
+        };
+
+        // Per-backup conflict check + insert into running_ops (visible to kill_op)
+        {
+            let mut ops = self.running_ops.lock().await;
+            if backup_name.as_deref().is_some_and(|name| {
+                ops.values()
+                    .any(|op| op.backup_name.as_deref() == Some(name))
+            }) {
+                // Conflict — fail this entry.
+                // Drop running_ops first, then acquire action_log (preserves lock order).
+                drop(ops);
+                let mut log = self.action_log.lock().await;
+                log.fail(
+                    id,
+                    "operation already in progress for this backup".to_string(),
+                );
+                return Err("operation already in progress for this backup");
+            }
+            ops.insert(
+                id,
+                RunningOp {
+                    id,
+                    command: command.to_string(),
+                    backup_name,
+                    cancel_token: token.clone(),
+                    _permit: None, // No permit yet — queued
+                },
+            );
+        }
+
+        // Wait for semaphore permit OR cancellation
+        let permit = tokio::select! {
+            _ = token.cancelled() => {
+                // Cancelled while queued (via kill_op)
+                self.running_ops.lock().await.remove(&id);
+                return Err("killed while queued");
+            }
+            result = self.op_semaphore.load_full().acquire_owned() => {
+                match result {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Semaphore closed
+                        self.fail_op(id, "server shutting down".to_string()).await;
+                        return Err("server shutting down");
+                    }
+                }
+            }
+        };
+
+        // Store the real permit (atomically check still exists — kill_op may have removed it)
+        {
+            let mut ops = self.running_ops.lock().await;
+            if let Some(op) = ops.get_mut(&id) {
+                if token.is_cancelled() {
+                    // Killed between acquire and here — remove and release permit
+                    ops.remove(&id);
+                    return Err("killed while queued");
+                }
+                op._permit = Some(permit);
+            } else {
+                // kill_op already removed it — drop permit, return error
+                return Err("killed while queued");
+            }
         }
 
         Ok((id, token))
@@ -1133,7 +1221,7 @@ mod tests {
                         command: format!("op{}", i),
                         backup_name: None,
                         cancel_token: token.clone(),
-                        _permit: permit,
+                        _permit: Some(permit),
                     },
                 );
             }
@@ -1172,7 +1260,7 @@ mod tests {
                         command: format!("op{}", i),
                         backup_name: None,
                         cancel_token: token.clone(),
-                        _permit: permit,
+                        _permit: Some(permit),
                     },
                 );
             }
@@ -1218,7 +1306,7 @@ mod tests {
                     command: "failing_op".to_string(),
                     backup_name: None,
                     cancel_token: token,
-                    _permit: permit,
+                    _permit: Some(permit),
                 },
             );
         }
@@ -1263,7 +1351,7 @@ mod tests {
                         command: format!("op{}", i),
                         backup_name: None,
                         cancel_token: token.clone(),
-                        _permit: permit,
+                        _permit: Some(permit),
                     },
                 );
             }
@@ -1317,7 +1405,7 @@ mod tests {
                     command: "create".to_string(),
                     backup_name: None,
                     cancel_token: token.clone(),
-                    _permit: permit,
+                    _permit: Some(permit),
                 },
             );
         }
@@ -1384,7 +1472,7 @@ mod tests {
                     command: "upload".to_string(),
                     backup_name: None,
                     cancel_token: token.clone(),
-                    _permit: permit,
+                    _permit: Some(permit),
                 },
             );
         }

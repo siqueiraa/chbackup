@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::list;
 use crate::manifest::BackupManifest;
@@ -432,476 +433,658 @@ pub async fn get_actions(State(state): State<AppState>) -> Json<Vec<ActionRespon
     Json(entries)
 }
 
+/// Parse action requests from a request body.
+///
+/// Accepts two formats:
+/// 1. JSON array:   `[{"command":"create foo"}]`  (direct API clients)
+/// 2. JSONEachRow:  `{"command":"create foo"}`     (ClickHouse URL-engine INSERT, one object per line)
+fn parse_action_requests(body: &[u8]) -> Vec<ActionRequest> {
+    if let Ok(arr) = serde_json::from_slice::<Vec<ActionRequest>>(body) {
+        arr
+    } else {
+        let mut items = Vec::new();
+        for line in body.split(|&b| b == b'\n') {
+            if let Ok(s) = std::str::from_utf8(line) {
+                let s = s.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                if let Ok(req) = serde_json::from_str::<ActionRequest>(s) {
+                    items.push(req);
+                }
+            }
+        }
+        items
+    }
+}
+
+/// Validated action command: parsed parts, flags, and computed conflict backup name.
+struct ValidatedAction {
+    parts: Vec<String>,
+    flags: ActionFlags,
+    conflict_backup_name: Option<String>,
+}
+
+/// Validate and parse an action command string.
+///
+/// Returns the owned parts, parsed flags, and conflict backup name,
+/// or an error response tuple for invalid commands.
+fn validate_action_command(
+    command: &str,
+) -> Result<ValidatedAction, (StatusCode, Json<ErrorResponse>)> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    let op_name = parts.first().copied().unwrap_or("");
+
+    match op_name {
+        "create" | "upload" | "download" | "restore" | "create_remote" | "restore_remote"
+        | "delete" | "clean_broken" => {}
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("unknown command: '{}'", op_name),
+                }),
+            ));
+        }
+    }
+
+    // Parse flags from command parts (skip for delete/clean_broken which have positional format)
+    let flags = if matches!(op_name, "delete" | "clean_broken") {
+        ActionFlags {
+            backup_name: parts.get(1).map(|s| s.to_string()),
+            table_pattern: None,
+            rename_as: None,
+            diff_from_remote: None,
+            rbac: false,
+            configs: false,
+            rm: false,
+        }
+    } else {
+        parse_action_flags(&parts)
+    };
+
+    // Validate backup name if explicitly provided in the command.
+    if let Some(ref name) = flags.backup_name {
+        validate_backup_name(name).map_err(|e| validation_error(name, e))?;
+    }
+    if op_name == "delete" {
+        // Reject "delete local" / "delete remote" without a backup name.
+        if parts.len() == 2 && matches!(parts.get(1).copied(), Some("local") | Some("remote")) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "delete: missing backup name (usage: delete [local|remote] <name>)"
+                        .to_string(),
+                }),
+            ));
+        }
+        if let Some(name) = parts.get(2) {
+            validate_backup_name(name).map_err(|e| validation_error(name, e))?;
+        }
+    }
+
+    // For create/create_remote, also reject reserved shortcut names.
+    if matches!(op_name, "create" | "create_remote") {
+        if let Some(ref name) = flags.backup_name {
+            reject_reserved_backup_name(name).map_err(|e| validation_error(name, e))?;
+        }
+    }
+
+    // Compute backup_name for per-backup conflict detection.
+    let conflict_backup_name: Option<String> = if op_name == "delete" {
+        parts.get(2).or_else(|| parts.get(1)).map(|s| s.to_string())
+    } else {
+        flags.backup_name.clone()
+    };
+
+    let parts_owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+
+    Ok(ValidatedAction {
+        parts: parts_owned,
+        flags,
+        conflict_backup_name,
+    })
+}
+
+/// Execute a single action command. Called from both `post_actions` and `go_post_actions`.
+///
+/// Returns `Ok(())` on success or the underlying error. Caller is responsible for
+/// metrics recording and `finish_op`/`fail_op` lifecycle calls.
+async fn dispatch_action_command(
+    parts: &[String],
+    flags: &ActionFlags,
+    backup_name: &str,
+    config: &crate::config::Config,
+    ch: &crate::clickhouse::ChClient,
+    s3: &crate::storage::S3Client,
+    metrics: &Option<Arc<Metrics>>,
+    cancel: CancellationToken,
+    state: &AppState,
+) -> Result<(), anyhow::Error> {
+    let op = parts[0].as_str();
+    match op {
+        "create" => crate::backup::create(
+            config,
+            ch,
+            backup_name,
+            flags.table_pattern.as_deref(),
+            false, // schema_only
+            None,  // diff_from
+            flags.diff_from_remote.as_deref(),
+            Some(s3),
+            None,  // partitions
+            false, // skip_check_parts_columns
+            flags.rbac,
+            flags.configs,
+            false, // named_collections
+            &config.backup.skip_projections,
+            cancel,
+        )
+        .await
+        .map(|_| ()),
+        "upload" => {
+            let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
+                .join("backup")
+                .join(backup_name);
+            let effective_resume = config.general.use_resumable_state;
+            let upload_result = crate::upload::upload(
+                config,
+                s3,
+                backup_name,
+                &backup_dir,
+                false, // delete_local
+                flags.diff_from_remote.as_deref(),
+                effective_resume,
+                cancel,
+            )
+            .await;
+
+            if let Ok(ref stats) = upload_result {
+                if let Some(m) = metrics {
+                    m.parts_uploaded_total.inc_by(stats.uploaded_count);
+                    m.parts_skipped_incremental_total
+                        .inc_by(stats.carried_count);
+                }
+                list::apply_retention_after_upload(
+                    config,
+                    s3,
+                    Some(backup_name),
+                    Some(&state.manifest_cache),
+                )
+                .await;
+            }
+            upload_result.map(|_| ())
+        }
+        "download" => {
+            let effective_resume = config.general.use_resumable_state;
+            crate::download::download(config, s3, backup_name, effective_resume, false, cancel)
+                .await
+                .map(|_| ())
+        }
+        "restore" => {
+            let effective_resume = config.general.use_resumable_state;
+            crate::restore::restore(
+                config,
+                ch,
+                backup_name,
+                flags.table_pattern.as_deref(),
+                false, // schema_only
+                false, // data_only
+                flags.rm,
+                effective_resume,
+                flags.rename_as.as_deref(),
+                None, // database_mapping
+                flags.rbac,
+                flags.configs,
+                false, // named_collections
+                None,  // partitions
+                false, // skip_empty_tables
+                cancel,
+            )
+            .await
+        }
+        "create_remote" => {
+            let create_result = crate::backup::create(
+                config,
+                ch,
+                backup_name,
+                flags.table_pattern.as_deref(),
+                false, // schema_only
+                None,  // diff_from
+                flags.diff_from_remote.as_deref(),
+                Some(s3),
+                None,  // partitions
+                false, // skip_check_parts_columns
+                flags.rbac,
+                flags.configs,
+                false, // named_collections
+                &config.backup.skip_projections,
+                cancel.clone(),
+            )
+            .await;
+            match create_result {
+                Ok(_) => {
+                    let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
+                        .join("backup")
+                        .join(backup_name);
+                    let effective_resume = config.general.use_resumable_state;
+                    let upload_result = crate::upload::upload(
+                        config,
+                        s3,
+                        backup_name,
+                        &backup_dir,
+                        false, // delete_local
+                        flags.diff_from_remote.as_deref(),
+                        effective_resume,
+                        cancel,
+                    )
+                    .await;
+
+                    if let Ok(ref stats) = upload_result {
+                        if let Some(m) = metrics {
+                            m.parts_uploaded_total.inc_by(stats.uploaded_count);
+                            m.parts_skipped_incremental_total
+                                .inc_by(stats.carried_count);
+                        }
+                        list::apply_retention_after_upload(
+                            config,
+                            s3,
+                            Some(backup_name),
+                            Some(&state.manifest_cache),
+                        )
+                        .await;
+                    }
+                    upload_result.map(|_| ())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "restore_remote" => {
+            let effective_resume = config.general.use_resumable_state;
+            let dl = crate::download::download(
+                config,
+                s3,
+                backup_name,
+                effective_resume,
+                false, // hardlink_exists_files
+                cancel.clone(),
+            )
+            .await;
+            match dl {
+                Ok(_) => {
+                    crate::restore::restore(
+                        config,
+                        ch,
+                        backup_name,
+                        flags.table_pattern.as_deref(),
+                        false, // schema_only
+                        false, // data_only
+                        flags.rm,
+                        effective_resume,
+                        flags.rename_as.as_deref(),
+                        None, // database_mapping
+                        flags.rbac,
+                        flags.configs,
+                        false, // named_collections
+                        None,  // partitions
+                        false, // skip_empty_tables
+                        cancel,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "delete" => {
+            // delete <location> <name> OR delete <name> (defaults to remote)
+            let (loc, name) = if parts.len() >= 3 {
+                (parts[1].as_str().to_string(), parts[2].clone())
+            } else {
+                ("remote".to_string(), backup_name.to_string())
+            };
+            let data_path = config.clickhouse.data_path.clone();
+            match loc.as_str() {
+                "local" => {
+                    let n = name.clone();
+                    tokio::task::spawn_blocking(move || list::delete_local(&data_path, &n))
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
+                }
+                "remote" => list::delete_remote(s3, &name).await,
+                _ => Err(anyhow::anyhow!(
+                    "delete: invalid location '{}' (must be 'local' or 'remote')",
+                    loc,
+                )),
+            }
+        }
+        "clean_broken" => {
+            let location = parts.get(1).map(String::as_str).unwrap_or("");
+            match location {
+                "local" => {
+                    let data_path = config.clickhouse.data_path.clone();
+                    tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
+                        .map(|_| ())
+                }
+                "remote" => list::clean_broken_remote(s3).await.map(|_| ()),
+                _ => {
+                    let s3_result = list::clean_broken_remote(s3).await;
+                    let data_path = config.clickhouse.data_path.clone();
+                    let local_result =
+                        tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
+                            });
+                    match (s3_result, local_result) {
+                        (Ok(_), Ok(_)) => Ok(()),
+                        (Err(s3_err), Err(local_err)) => Err(anyhow::anyhow!(
+                            "Both remote and local clean_broken failed: remote: {}; local: {}",
+                            s3_err,
+                            local_err
+                        )),
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                    }
+                }
+            }
+        }
+        _ => Err(anyhow::anyhow!("unknown command: {}", op)),
+    }
+}
+
 /// POST /api/v1/actions -- dispatch operations from ClickHouse URL engine INSERT
 ///
 /// Accepts JSONEachRow: `[{"command": "create_remote daily_backup"}]`
-/// Parses the first command string and dispatches to the appropriate handler.
+/// Processes ALL commands in the batch sequentially within a single spawned task.
+/// Each command goes through try_start_op (immediate 423 reject for the first command,
+/// subsequent commands within the batch are processed sequentially).
 ///
 /// NOTE: This handler is intentionally excluded from the `run_operation()` DRY helper
 /// because it returns `(StatusCode, Json<OperationStarted>)` (200 OK with action ID)
 /// which is incompatible with the helper's `Result<Json<OperationStarted>, ...>` return type.
-/// The inline try_start_op + tokio::spawn + tokio::select! pattern is retained here.
 pub async fn post_actions(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<OperationStarted>), (StatusCode, Json<ErrorResponse>)> {
-    // Accept two body formats:
-    // 1. JSON array:   [{"command":"create foo"}]  (direct API clients)
-    // 2. JSONEachRow:  {"command":"create foo"}     (ClickHouse URL-engine INSERT, one object per line)
-    let parsed: Vec<ActionRequest> =
-        if let Ok(arr) = serde_json::from_slice::<Vec<ActionRequest>>(&body) {
-            arr
-        } else {
-            let mut items = Vec::new();
-            for line in body.split(|&b| b == b'\n') {
-                if let Ok(s) = std::str::from_utf8(line) {
-                    let s = s.trim();
-                    if s.is_empty() {
-                        continue;
-                    }
-                    if let Ok(req) = serde_json::from_str::<ActionRequest>(s) {
-                        items.push(req);
-                    }
-                }
-            }
-            items
-        };
-
-    let request = parsed.into_iter().next().ok_or_else(|| {
-        (
+    let parsed = parse_action_requests(&body);
+    if parsed.is_empty() {
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "empty or unparseable request body".to_string(),
             }),
-        )
-    })?;
-
-    let parts: Vec<&str> = request.command.split_whitespace().collect();
-    let op_name = parts.first().copied().unwrap_or("");
-
-    // Dispatch based on operation name
-    match op_name {
-        "create" | "upload" | "download" | "restore" | "create_remote" | "restore_remote"
-        | "delete" | "clean_broken" => {
-            // Parse flags from command parts (skip for delete/clean_broken which have positional format)
-            let flags = if matches!(op_name, "delete" | "clean_broken") {
-                ActionFlags {
-                    backup_name: parts.get(1).map(|s| s.to_string()),
-                    table_pattern: None,
-                    rename_as: None,
-                    diff_from_remote: None,
-                    rbac: false,
-                    configs: false,
-                    rm: false,
-                }
-            } else {
-                parse_action_flags(&parts)
-            };
-
-            // Validate backup name if explicitly provided in the command.
-            if let Some(ref name) = flags.backup_name {
-                validate_backup_name(name).map_err(|e| validation_error(name, e))?;
-            }
-            if op_name == "delete" {
-                // Reject "delete local" / "delete remote" without a backup name.
-                // parts[1] is a location keyword only when there's no parts[2];
-                // in that case the user forgot the name and we must not silently
-                // treat "local"/"remote" as the backup name.
-                if parts.len() == 2
-                    && matches!(parts.get(1).copied(), Some("local") | Some("remote"))
-                {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error:
-                                "delete: missing backup name (usage: delete [local|remote] <name>)"
-                                    .to_string(),
-                        }),
-                    ));
-                }
-                if let Some(name) = parts.get(2) {
-                    validate_backup_name(name).map_err(|e| validation_error(name, e))?;
-                }
-            }
-
-            // For create/create_remote, also reject reserved shortcut names.
-            // Other commands (upload, download, restore) accept "latest"/"previous"
-            // as shortcut inputs that get resolved at runtime.
-            if matches!(op_name, "create" | "create_remote") {
-                if let Some(ref name) = flags.backup_name {
-                    reject_reserved_backup_name(name).map_err(|e| validation_error(name, e))?;
-                }
-            }
-
-            // Compute backup_name for per-backup conflict detection before starting the op.
-            // For "delete <loc> <name>", the backup name is at parts[2]; for
-            // "delete <name>" (no location), it is at parts[1]; for all other
-            // commands it is at parts[1] (may be absent for auto-named commands).
-            let conflict_backup_name: Option<String> = if op_name == "delete" {
-                parts.get(2).or_else(|| parts.get(1)).map(|s| s.to_string())
-            } else {
-                flags.backup_name.clone()
-            };
-
-            let (id, token) = state
-                .try_start_op(&request.command, conflict_backup_name)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::LOCKED,
-                        Json(ErrorResponse {
-                            error: e.to_string(),
-                        }),
-                    )
-                })?;
-
-            let state_clone = state.clone();
-            let metrics_clone = state.metrics.clone();
-            let command = request.command.clone();
-            let parts_owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
-            let cancel_for_ops = token.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = token.cancelled() => {
-                        warn!(id = id, "Operation {} killed by user", id);
-                        // kill_op() already removed this op from running_ops and set its
-                        // ActionLog status to Killed before cancelling the token.
-                        // Calling fail_op() here would overwrite Killed with Failed — do nothing.
-                    }
-                    _ = async {
-                tracing::info!(command = %command, "Action dispatched from POST /api/v1/actions");
-                let backup_name = flags.backup_name
-                    .unwrap_or_else(crate::generate_backup_name);
-
-                let op = parts_owned[0].as_str();
-
-                // Acquire PID lock before loading clients — provides cross-process
-                // exclusion between CLI and server (design §9, same as run_operation).
-                let lock_scope = crate::lock::lock_for_command(op, Some(&backup_name));
-                let _pid_lock = if let Some(lock_path) = crate::lock::lock_path_for_scope(&lock_scope) {
-                    match crate::lock::PidLock::acquire(&lock_path, op) {
-                        Ok(lock) => Some(lock),
-                        Err(e) => {
-                            warn!(id = id, error = %e, "post_actions: failed to acquire PID lock");
-                            state_clone.fail_op(id, e.to_string()).await;
-                            return;
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                let config = state_clone.config.load();
-                let ch = state_clone.ch.load();
-                let s3 = state_clone.s3.load();
-                let start_time = std::time::Instant::now();
-
-                // NOTE: post_actions uses string-based dispatch with no typed body
-                // per-action, so `resume` always uses the config default here.
-                // Use the dedicated /api/v1/{command}/{name} endpoints to override.
-                let result: Result<(), anyhow::Error> = match op {
-                    "create" => {
-                        crate::backup::create(
-                            &config,
-                            &ch,
-                            &backup_name,
-                            flags.table_pattern.as_deref(),
-                            false, // schema_only
-                            None,  // diff_from
-                            flags.diff_from_remote.as_deref(),
-                            Some(&*s3),
-                            None,  // partitions
-                            false, // skip_check_parts_columns
-                            flags.rbac,
-                            flags.configs,
-                            false, // named_collections
-                            &config.backup.skip_projections,
-                            cancel_for_ops.clone(),
-                        )
-                        .await
-                        .map(|_| ())
-                    }
-                    "upload" => {
-                        let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
-                            .join("backup")
-                            .join(&backup_name);
-                        let effective_resume = config.general.use_resumable_state;
-                        let upload_result = crate::upload::upload(
-                            &config,
-                            &s3,
-                            &backup_name,
-                            &backup_dir,
-                            false, // delete_local
-                            flags.diff_from_remote.as_deref(),
-                            effective_resume,
-                            cancel_for_ops.clone(),
-                        )
-                        .await;
-
-                        if let Ok(ref stats) = upload_result {
-                            if let Some(m) = &metrics_clone {
-                                m.parts_uploaded_total.inc_by(stats.uploaded_count);
-                                m.parts_skipped_incremental_total.inc_by(stats.carried_count);
-                            }
-                            // Apply retention after successful upload (design doc 3.6 step 7)
-                            list::apply_retention_after_upload(
-                                &config,
-                                &s3,
-                                Some(&backup_name),
-                                Some(&state_clone.manifest_cache),
-                            )
-                            .await;
-                        }
-                        upload_result.map(|_| ())
-                    }
-                    "download" => {
-                        let effective_resume = config.general.use_resumable_state;
-                        crate::download::download(
-                            &config,
-                            &s3,
-                            &backup_name,
-                            effective_resume,
-                            false, // hardlink_exists_files
-                            cancel_for_ops.clone(),
-                        )
-                        .await
-                        .map(|_| ())
-                    }
-                    "restore" => {
-                        let effective_resume = config.general.use_resumable_state;
-                        crate::restore::restore(
-                            &config,
-                            &ch,
-                            &backup_name,
-                            flags.table_pattern.as_deref(),
-                            false, // schema_only
-                            false, // data_only
-                            flags.rm,
-                            effective_resume,
-                            flags.rename_as.as_deref(),
-                            None,  // database_mapping
-                            flags.rbac,
-                            flags.configs,
-                            false, // named_collections
-                            None,  // partitions
-                            false, // skip_empty_tables
-                            cancel_for_ops.clone(),
-                        )
-                        .await
-                    }
-                    "create_remote" => {
-                        let create_result = crate::backup::create(
-                            &config,
-                            &ch,
-                            &backup_name,
-                            flags.table_pattern.as_deref(),
-                            false, // schema_only
-                            None,  // diff_from
-                            flags.diff_from_remote.as_deref(),
-                            Some(&*s3),
-                            None,  // partitions
-                            false, // skip_check_parts_columns
-                            flags.rbac,
-                            flags.configs,
-                            false, // named_collections
-                            &config.backup.skip_projections,
-                            cancel_for_ops.clone(),
-                        )
-                        .await;
-                        match create_result {
-                            Ok(_) => {
-                                let backup_dir =
-                                    std::path::PathBuf::from(&config.clickhouse.data_path)
-                                        .join("backup")
-                                        .join(&backup_name);
-                                let effective_resume = config.general.use_resumable_state;
-                                let upload_result = crate::upload::upload(
-                                    &config,
-                                    &s3,
-                                    &backup_name,
-                                    &backup_dir,
-                                    false, // delete_local
-                                    flags.diff_from_remote.as_deref(),
-                                    effective_resume,
-                                    cancel_for_ops.clone(),
-                                )
-                                .await;
-
-                                if let Ok(ref stats) = upload_result {
-                                    if let Some(m) = &metrics_clone {
-                                        m.parts_uploaded_total.inc_by(stats.uploaded_count);
-                                        m.parts_skipped_incremental_total
-                                            .inc_by(stats.carried_count);
-                                    }
-                                    // Apply retention after successful upload (design doc 3.6 step 7)
-                                    list::apply_retention_after_upload(
-                                        &config,
-                                        &s3,
-                                        Some(&backup_name),
-                                        Some(&state_clone.manifest_cache),
-                                    )
-                                    .await;
-                                }
-                                upload_result.map(|_| ())
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    "restore_remote" => {
-                        let effective_resume = config.general.use_resumable_state;
-                        let dl = crate::download::download(
-                            &config,
-                            &s3,
-                            &backup_name,
-                            effective_resume,
-                            false, // hardlink_exists_files
-                            cancel_for_ops.clone(),
-                        )
-                        .await;
-                        match dl {
-                            Ok(_) => {
-                                crate::restore::restore(
-                                    &config,
-                                    &ch,
-                                    &backup_name,
-                                    flags.table_pattern.as_deref(),
-                                    false, // schema_only
-                                    false, // data_only
-                                    flags.rm,
-                                    effective_resume,
-                                    flags.rename_as.as_deref(),
-                                    None,  // database_mapping
-                                    flags.rbac,
-                                    flags.configs,
-                                    false, // named_collections
-                                    None,  // partitions
-                                    false, // skip_empty_tables
-                                    cancel_for_ops.clone(),
-                                )
-                                .await
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    "delete" => {
-                        // delete <location> <name> OR delete <name> (defaults to remote)
-                        let (loc, name) = if parts_owned.len() >= 3 {
-                            (parts_owned[1].as_str().to_string(), parts_owned[2].clone())
-                        } else {
-                            ("remote".to_string(), backup_name.clone())
-                        };
-                        let data_path = config.clickhouse.data_path.clone();
-                        match loc.as_str() {
-                            "local" => {
-                                let n = name.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    list::delete_local(&data_path, &n)
-                                })
-                                .await
-                                .unwrap_or_else(|e| {
-                                    Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
-                                })
-                            }
-                            "remote" => list::delete_remote(&s3, &name).await,
-                            _ => Err(anyhow::anyhow!(
-                                "delete: invalid location '{}' (must be 'local' or 'remote')",
-                                loc,
-                            )),
-                        }
-                    }
-                    "clean_broken" => {
-                        // Respect optional location token: "clean_broken [local|remote]"
-                        // No token (or unknown token) → clean both.
-                        let location = parts_owned.get(1).map(String::as_str).unwrap_or("");
-                        match location {
-                            "local" => {
-                                let data_path = config.clickhouse.data_path.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    list::clean_broken_local(&data_path)
-                                })
-                                .await
-                                .unwrap_or_else(|e| {
-                                    Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
-                                })
-                                .map(|_| ())
-                            }
-                            "remote" => {
-                                list::clean_broken_remote(&s3).await.map(|_| ())
-                            }
-                            _ => {
-                                // Both (default when no location specified)
-                                let s3_result = list::clean_broken_remote(&s3).await;
-                                let data_path = config.clickhouse.data_path.clone();
-                                let local_result = tokio::task::spawn_blocking(move || {
-                                    list::clean_broken_local(&data_path)
-                                })
-                                .await
-                                .unwrap_or_else(|e| {
-                                    Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
-                                });
-                                match (s3_result, local_result) {
-                                    (Ok(_), Ok(_)) => Ok(()),
-                                    (Err(s3_err), Err(local_err)) => Err(anyhow::anyhow!(
-                                        "Both remote and local clean_broken failed: remote: {}; local: {}",
-                                        s3_err, local_err
-                                    )),
-                                    (Err(e), _) | (_, Err(e)) => Err(e),
-                                }
-                            }
-                        }
-                    }
-                    _ => Err(anyhow::anyhow!("unknown command: {}", op)),
-                };
-
-                let duration = start_time.elapsed().as_secs_f64();
-
-                match result {
-                    Ok(()) => {
-                        if let Some(m) = &state_clone.metrics {
-                            let labels = OperationLabels::new(op);
-                            m.backup_duration_seconds
-                                .get_or_create(&labels)
-                                .observe(duration);
-                            m.successful_operations_total.get_or_create(&labels).inc();
-                        }
-                        info!(command = %command, "Action completed from POST /api/v1/actions");
-                        // Invalidate manifest cache for operations that mutate remote state
-                        if matches!(op, "upload" | "create_remote" | "delete" | "clean_broken") {
-                            state_clone.manifest_cache.lock().await.invalidate();
-                        }
-                        state_clone.finish_op(id).await;
-                    }
-                    Err(e) => {
-                        if let Some(m) = &state_clone.metrics {
-                            let labels = OperationLabels::new(op);
-                            m.backup_duration_seconds
-                                .get_or_create(&labels)
-                                .observe(duration);
-                            m.errors_total.get_or_create(&labels).inc();
-                        }
-                        warn!(command = %command, error = format_args!("{e:#}"), "Action failed from POST /api/v1/actions");
-                        state_clone.fail_op(id, format!("{e:#}")).await;
-                    }
-                }
-                    } => {}
-                }
-            });
-
-            Ok((
-                StatusCode::OK,
-                Json(OperationStarted {
-                    id,
-                    status: "started".to_string(),
-                }),
-            ))
-        }
-        _ => Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("unknown command: '{}'", op_name),
-            }),
-        )),
+        ));
     }
+
+    // Validate all commands upfront before starting any operations
+    let mut validated: Vec<(String, ValidatedAction)> = Vec::new();
+    for req in &parsed {
+        let v = validate_action_command(&req.command)?;
+        validated.push((req.command.clone(), v));
+    }
+
+    // Start the first command via try_start_op (immediate 423 on conflict)
+    let (first_command, first_validated) = validated.remove(0);
+    let (first_id, first_token) = state
+        .try_start_op(&first_command, first_validated.conflict_backup_name.clone())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::LOCKED,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        // Execute the first command
+        execute_action_command(
+            &state_clone,
+            first_id,
+            first_token,
+            &first_command,
+            &first_validated,
+        )
+        .await;
+
+        // Execute remaining commands sequentially
+        for (command_str, v) in validated {
+            let (id, token) = match state_clone
+                .try_start_op(&command_str, v.conflict_backup_name.clone())
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(command = %command_str, error = %e, "Batch command rejected");
+                    continue;
+                }
+            };
+
+            execute_action_command(&state_clone, id, token, &command_str, &v).await;
+        }
+    });
+
+    Ok((
+        StatusCode::OK,
+        Json(OperationStarted {
+            id: first_id,
+            status: "started".to_string(),
+        }),
+    ))
+}
+
+/// Execute a single action command within a spawned task context.
+///
+/// Handles PID lock acquisition, dispatch, metrics, and finish/fail lifecycle.
+async fn execute_action_command(
+    state: &AppState,
+    id: u64,
+    token: CancellationToken,
+    command: &str,
+    validated: &ValidatedAction,
+) {
+    let cancel_for_ops = token.clone();
+    tokio::select! {
+        _ = token.cancelled() => {
+            warn!(id = id, "Operation {} killed by user", id);
+        }
+        _ = async {
+            info!(command = %command, "Action dispatched from POST /api/v1/actions");
+            let backup_name = validated.flags.backup_name
+                .clone()
+                .unwrap_or_else(crate::generate_backup_name);
+
+            let op = validated.parts[0].as_str();
+
+            let lock_scope = crate::lock::lock_for_command(op, Some(&backup_name));
+            let _pid_lock = if let Some(lock_path) = crate::lock::lock_path_for_scope(&lock_scope) {
+                match crate::lock::PidLock::acquire(&lock_path, op) {
+                    Ok(lock) => Some(lock),
+                    Err(e) => {
+                        warn!(id = id, error = %e, "post_actions: failed to acquire PID lock");
+                        state.fail_op(id, e.to_string()).await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let config = state.config.load();
+            let ch = state.ch.load();
+            let s3 = state.s3.load();
+            let start_time = std::time::Instant::now();
+
+            let result = dispatch_action_command(
+                &validated.parts,
+                &validated.flags,
+                &backup_name,
+                &config,
+                &ch,
+                &s3,
+                &state.metrics,
+                cancel_for_ops,
+                state,
+            )
+            .await;
+
+            let duration = start_time.elapsed().as_secs_f64();
+
+            match result {
+                Ok(()) => {
+                    if let Some(m) = &state.metrics {
+                        let labels = OperationLabels::new(op);
+                        m.backup_duration_seconds
+                            .get_or_create(&labels)
+                            .observe(duration);
+                        m.successful_operations_total.get_or_create(&labels).inc();
+                    }
+                    info!(command = %command, "Action completed from POST /api/v1/actions");
+                    if matches!(op, "upload" | "create_remote" | "delete" | "clean_broken") {
+                        state.manifest_cache.lock().await.invalidate();
+                    }
+                    state.finish_op(id).await;
+                }
+                Err(e) => {
+                    if let Some(m) = &state.metrics {
+                        let labels = OperationLabels::new(op);
+                        m.backup_duration_seconds
+                            .get_or_create(&labels)
+                            .observe(duration);
+                        m.errors_total.get_or_create(&labels).inc();
+                    }
+                    warn!(command = %command, error = format_args!("{e:#}"), "Action failed from POST /api/v1/actions");
+                    state.fail_op(id, format!("{e:#}")).await;
+                }
+            }
+        } => {}
+    }
+}
+
+/// POST /backup/actions -- Go-compatible queuing action handler
+///
+/// Unlike `post_actions` (which rejects with 423 on conflict), this handler
+/// queues commands and waits for the semaphore permit. All commands in the
+/// batch are processed sequentially. Returns 200 OK immediately.
+///
+/// Used by ClickHouse integration tables where INSERT writes multiple commands
+/// that should queue rather than fail.
+pub async fn go_post_actions(State(state): State<AppState>, body: Bytes) -> StatusCode {
+    let parsed = parse_action_requests(&body);
+    if parsed.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    // Validate all commands upfront
+    let mut validated: Vec<(String, ValidatedAction)> = Vec::new();
+    for req in &parsed {
+        match validate_action_command(&req.command) {
+            Ok(v) => validated.push((req.command.clone(), v)),
+            Err(_) => {
+                warn!(command = %req.command, "Invalid command rejected in /backup/actions");
+                return StatusCode::BAD_REQUEST;
+            }
+        }
+    }
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        for (command_str, v) in validated {
+            let backup_name = v
+                .flags
+                .backup_name
+                .clone()
+                .unwrap_or_else(crate::generate_backup_name);
+
+            // Queue for semaphore (waits if another op is running)
+            let (cmd_id, token) = match state_clone
+                .queue_start_op(&command_str, v.conflict_backup_name.clone())
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(command = %command_str, error = %e, "Queued command rejected");
+                    continue;
+                }
+            };
+
+            let cancel_for_ops = token.clone();
+            tokio::select! {
+                _ = token.cancelled() => {
+                    warn!(command = %command_str, "Queued command killed by user");
+                }
+                _ = async {
+                    info!(command = %command_str, "Queued action dispatched from POST /backup/actions");
+
+                    let op = v.parts[0].as_str();
+
+                    // PID lock per-command
+                    let lock_scope = crate::lock::lock_for_command(op, Some(&backup_name));
+                    let _pid_lock = if let Some(lock_path) = crate::lock::lock_path_for_scope(&lock_scope) {
+                        match crate::lock::PidLock::acquire(&lock_path, op) {
+                            Ok(lock) => Some(lock),
+                            Err(e) => {
+                                warn!(command = %command_str, error = %e, "Failed to acquire PID lock");
+                                state_clone.fail_op(cmd_id, e.to_string()).await;
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let config = state_clone.config.load();
+                    let ch = state_clone.ch.load();
+                    let s3 = state_clone.s3.load();
+                    let start = std::time::Instant::now();
+
+                    let result = dispatch_action_command(
+                        &v.parts,
+                        &v.flags,
+                        &backup_name,
+                        &config,
+                        &ch,
+                        &s3,
+                        &state_clone.metrics,
+                        cancel_for_ops,
+                        &state_clone,
+                    )
+                    .await;
+
+                    let duration = start.elapsed().as_secs_f64();
+
+                    match &result {
+                        Ok(()) => {
+                            if let Some(m) = &state_clone.metrics {
+                                let labels = OperationLabels::new(op);
+                                m.backup_duration_seconds.get_or_create(&labels).observe(duration);
+                                m.successful_operations_total.get_or_create(&labels).inc();
+                            }
+                            if matches!(op, "upload" | "create_remote" | "delete" | "clean_broken") {
+                                state_clone.manifest_cache.lock().await.invalidate();
+                            }
+                            state_clone.finish_op(cmd_id).await;
+                            info!(command = %command_str, elapsed_secs = duration, "Queued command completed");
+                        }
+                        Err(e) => {
+                            if let Some(m) = &state_clone.metrics {
+                                let labels = OperationLabels::new(op);
+                                m.backup_duration_seconds.get_or_create(&labels).observe(duration);
+                                m.errors_total.get_or_create(&labels).inc();
+                            }
+                            warn!(command = %command_str, error = format_args!("{e:#}"), "Queued command failed");
+                            state_clone.fail_op(cmd_id, format!("{e:#}")).await;
+                        }
+                    }
+                } => {}
+            }
+        }
+    });
+
+    StatusCode::OK
 }
 
 /// GET /api/v1/list -- list backups, optionally filtered by location

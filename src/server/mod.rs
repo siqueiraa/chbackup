@@ -94,7 +94,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/backup/list/:where", get(routes::go_list_by_location))
         .route(
             "/backup/actions",
-            get(routes::go_get_actions).post(routes::post_actions),
+            get(routes::go_get_actions).post(routes::go_post_actions),
         )
         .route("/backup/create", post(routes::go_create_backup))
         .route("/backup/create_remote", post(routes::go_create_remote))
