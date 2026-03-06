@@ -21,12 +21,15 @@ WORKDIR /src
 # Dependency caching: copy manifests first, build with dummy main.rs,
 # then copy real source. Docker layer cache means dependency rebuild only
 # happens when Cargo.toml or Cargo.lock change.
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock ./
+# Dummy build.rs for dependency caching (real one sets git SHA)
 RUN mkdir src && echo "fn main(){}" > src/main.rs \
+    && echo "fn main(){}" > build.rs \
     && cargo build --release \
-    && rm -rf src
+    && rm -rf src build.rs
 
 ARG VCS_REF
+COPY build.rs ./
 COPY src/ src/
 RUN VCS_REF=${VCS_REF} cargo build --release
 
