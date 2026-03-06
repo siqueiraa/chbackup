@@ -28,7 +28,7 @@ use chrono::Utc;
 use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::clickhouse::client::{freeze_name, ChClient, ColumnInconsistency, TableRow};
 use crate::concurrency::effective_max_connections;
@@ -415,12 +415,28 @@ pub async fn create(
             databases_seen.insert(db.clone(), ddl);
         }
 
-        let is_metadata_only = is_metadata_only_engine(&table_row.engine);
+        let is_data = is_data_engine(&table_row.engine);
 
-        if !schema_only && !is_metadata_only {
+        if !schema_only && is_data {
             data_tables.push((*table_row).clone());
         } else {
-            // Schema-only or metadata-only table -- no FREEZE needed
+            // Schema-only or non-data engine -- no FREEZE needed
+            if !is_data {
+                if table_row.total_bytes.unwrap_or(0) > 0 {
+                    warn!(
+                        table = %full_name,
+                        engine = %table_row.engine,
+                        total_bytes = table_row.total_bytes.unwrap_or(0),
+                        "Non-data engine reports data bytes; only DDL will be backed up"
+                    );
+                } else {
+                    debug!(
+                        table = %full_name,
+                        engine = %table_row.engine,
+                        "Skipping FREEZE for non-data engine (schema-only backup)"
+                    );
+                }
+            }
             let table_deps = deps_map.get(&full_name).cloned().unwrap_or_default();
             if !table_deps.is_empty() {
                 info!(table = %full_name, deps = ?table_deps, "Populated dependencies for metadata-only table");
@@ -434,7 +450,7 @@ pub async fn create(
                     total_bytes: 0,
                     parts: BTreeMap::new(),
                     pending_mutations: Vec::new(),
-                    metadata_only: is_metadata_only,
+                    metadata_only: !is_data,
                     dependencies: table_deps,
                 },
             );
@@ -939,22 +955,13 @@ pub async fn create(
     Ok(manifest)
 }
 
-/// Check if an engine is metadata-only (views, dictionaries, etc.).
-fn is_metadata_only_engine(engine: &str) -> bool {
-    matches!(
-        engine,
-        "View"
-            | "MaterializedView"
-            | "LiveView"
-            | "WindowView"
-            | "Dictionary"
-            | "Null"
-            | "Set"
-            | "Join"
-            | "Buffer"
-            | "Distributed"
-            | "Merge"
-    )
+/// Returns true if this engine supports FREEZE and has data parts to back up.
+/// Matches Go clickhouse-backup behavior: only MergeTree family + MaterializedMySQL/PostgreSQL.
+/// All other engines are schema-only (DDL backed up, no FREEZE/data).
+fn is_data_engine(engine: &str) -> bool {
+    engine.ends_with("MergeTree")
+        || engine == "MaterializedMySQL"
+        || engine == "MaterializedPostgreSQL"
 }
 
 /// Check if a type string represents a benign drift type.
@@ -1013,14 +1020,16 @@ mod tests {
     }
 
     #[test]
-    fn test_is_metadata_only_engine() {
-        assert!(is_metadata_only_engine("View"));
-        assert!(is_metadata_only_engine("MaterializedView"));
-        assert!(is_metadata_only_engine("Dictionary"));
-        assert!(is_metadata_only_engine("Distributed"));
-        assert!(!is_metadata_only_engine("MergeTree"));
-        assert!(!is_metadata_only_engine("ReplicatedMergeTree"));
-        assert!(!is_metadata_only_engine("ReplacingMergeTree"));
+    fn test_is_data_engine() {
+        assert!(is_data_engine("MergeTree"));
+        assert!(is_data_engine("ReplicatedMergeTree"));
+        assert!(is_data_engine("ReplacingMergeTree"));
+        assert!(is_data_engine("MaterializedMySQL"));
+        assert!(is_data_engine("MaterializedPostgreSQL"));
+        assert!(!is_data_engine("View"));
+        assert!(!is_data_engine("MaterializedView"));
+        assert!(!is_data_engine("Dictionary"));
+        assert!(!is_data_engine("Distributed"));
     }
 
     #[test]
@@ -1471,40 +1480,59 @@ mod tests {
     }
 
     #[test]
-    fn test_is_metadata_only_engine_all_variants() {
-        // All metadata-only engines
-        for engine in &[
-            "View",
-            "MaterializedView",
-            "LiveView",
-            "WindowView",
-            "Dictionary",
-            "Null",
-            "Set",
-            "Join",
-            "Buffer",
-            "Distributed",
-            "Merge",
-        ] {
-            assert!(
-                is_metadata_only_engine(engine),
-                "{engine} should be metadata-only"
-            );
-        }
-
-        // Data engines
+    fn test_is_data_engine_all_variants() {
+        // Data engines (support FREEZE)
         for engine in &[
             "MergeTree",
             "ReplicatedMergeTree",
+            "SummingMergeTree",
             "ReplacingMergeTree",
             "AggregatingMergeTree",
             "CollapsingMergeTree",
             "VersionedCollapsingMergeTree",
-            "SummingMergeTree",
+            "GraphiteMergeTree",
+            "ReplicatedSummingMergeTree",
+            "MaterializedMySQL",
+            "MaterializedPostgreSQL",
+        ] {
+            assert!(is_data_engine(engine), "{engine} should be a data engine");
+        }
+
+        // Non-data engines (schema-only)
+        for engine in &[
+            "View",
+            "MaterializedView",
+            "Dictionary",
+            "Distributed",
+            "Merge",
+            "MySQL",
+            "PostgreSQL",
+            "SQLite",
+            "MongoDB",
+            "S3",
+            "URL",
+            "HDFS",
+            "Log",
+            "TinyLog",
+            "StripeLog",
+            "Memory",
+            "Null",
+            "Set",
+            "Join",
+            "Buffer",
+            "Kafka",
+            "NATS",
+            "RabbitMQ",
+            "S3Queue",
+            "Iceberg",
+            "Hudi",
+            "DeltaLake",
+            "LiveView",
+            "WindowView",
         ] {
             assert!(
-                !is_metadata_only_engine(engine),
-                "{engine} should NOT be metadata-only"
+                !is_data_engine(engine),
+                "{engine} should NOT be a data engine"
             );
         }
     }
