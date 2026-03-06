@@ -175,6 +175,21 @@ pub async fn upload(
     let mut manifest = BackupManifest::load_from_file(&manifest_path)
         .with_context(|| format!("Failed to load manifest from: {}", manifest_path.display()))?;
 
+    // 1a. Resolve ClickHouse macros in disk_remote_paths (handles manifests created
+    // before macro resolution was added at backup time)
+    if manifest.disk_remote_paths.values().any(|p| p.contains('{')) {
+        let macros =
+            crate::clickhouse::client::discover_macros_from_config(&config.clickhouse.config_dir);
+        if !macros.is_empty() {
+            crate::object_disk::resolve_macros_in_paths(&mut manifest.disk_remote_paths, &macros);
+        } else {
+            warn!(
+                config_dir = %config.clickhouse.config_dir,
+                "Disk remote paths contain unresolved macros but no macros found in ClickHouse config"
+            );
+        }
+    }
+
     // 1b. If --diff-from-remote is specified, load remote base manifest and apply diff
     if let Some(base_name) = diff_from_remote {
         info!(base = %base_name, "Loading remote base manifest for diff-from-remote");

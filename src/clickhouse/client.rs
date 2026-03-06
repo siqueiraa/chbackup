@@ -1673,6 +1673,118 @@ pub fn discover_s3_disk_endpoints(config_dir: &str) -> std::collections::BTreeMa
     endpoints
 }
 
+/// Discover ClickHouse macros from XML config files.
+///
+/// Parses `<macros>` sections from config XML files to extract macro key-value
+/// pairs (e.g., `{cluster}`, `{replica}`). Used when `system.macros` is not
+/// accessible (e.g., during upload which has no ChClient).
+pub fn discover_macros_from_config(config_dir: &str) -> std::collections::HashMap<String, String> {
+    use std::path::Path;
+
+    let mut macros = std::collections::HashMap::new();
+    let config_path = Path::new(config_dir);
+
+    let mut xml_files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in &[config_path.to_path_buf(), config_path.join("config.d")] {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "xml") {
+                    xml_files.push(path);
+                }
+            }
+        }
+    }
+
+    for xml_file in &xml_files {
+        let content = match std::fs::read_to_string(xml_file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if !content.contains("<macros>") {
+            continue;
+        }
+
+        if let Some(macros_section) = extract_xml_section(&content, "macros") {
+            parse_macros_from_xml(&macros_section, &mut macros);
+        }
+    }
+
+    if !macros.is_empty() {
+        debug!(
+            count = macros.len(),
+            keys = ?macros.keys().collect::<Vec<_>>(),
+            "Discovered macros from ClickHouse config"
+        );
+    }
+
+    macros
+}
+
+/// Parse macro key-value pairs from a `<macros>` XML section.
+///
+/// Extracts simple `<key>value</key>` pairs from the macros section.
+fn parse_macros_from_xml(macros_xml: &str, macros: &mut std::collections::HashMap<String, String>) {
+    let mut pos = 0;
+    while pos < macros_xml.len() {
+        let tag_start = match macros_xml[pos..].find('<') {
+            Some(i) => pos + i,
+            None => break,
+        };
+
+        // Skip comments
+        if macros_xml[tag_start..].starts_with("<!--") {
+            if let Some(end) = macros_xml[tag_start..].find("-->") {
+                pos = tag_start + end + 3;
+                continue;
+            }
+            break;
+        }
+
+        // Skip closing tags and processing instructions
+        if macros_xml[tag_start + 1..].starts_with('/')
+            || macros_xml[tag_start + 1..].starts_with('?')
+        {
+            pos = tag_start + 1;
+            // Find end of this tag
+            if let Some(end) = macros_xml[pos..].find('>') {
+                pos += end + 1;
+            }
+            continue;
+        }
+
+        // Find tag name
+        let name_start = tag_start + 1;
+        let name_end = match macros_xml[name_start..].find(|c: char| c == '>' || c.is_whitespace())
+        {
+            Some(i) => name_start + i,
+            None => break,
+        };
+        let tag_name = &macros_xml[name_start..name_end];
+
+        // Skip nested sections (like <installation> which wraps macros in some configs)
+        // Try to extract simple value
+        if let Some(value) = extract_xml_section(&macros_xml[tag_start..], tag_name) {
+            let trimmed = value.trim();
+            // If value contains '<', it's a nested section — recurse
+            if trimmed.contains('<') {
+                parse_macros_from_xml(trimmed, macros);
+            } else if !trimmed.is_empty() {
+                macros.insert(tag_name.to_string(), trimmed.to_string());
+            }
+        }
+
+        // Move past the closing tag
+        let close_tag = format!("</{}>", tag_name);
+        if let Some(close_pos) = macros_xml[tag_start..].find(&close_tag) {
+            pos = tag_start + close_pos + close_tag.len();
+        } else {
+            pos = name_end + 1;
+        }
+    }
+}
+
 /// Extract content between `<tag>` and `</tag>` (first occurrence).
 fn extract_xml_section(content: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
@@ -2575,6 +2687,41 @@ mod tests {
     #[test]
     fn test_discover_s3_disk_endpoints_nonexistent_dir() {
         let result = discover_s3_disk_endpoints("/nonexistent/path");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_macros_from_xml_simple() {
+        let xml = r#"
+            <cluster>mycluster</cluster>
+            <replica>replica1</replica>
+            <shard>01</shard>
+        "#;
+        let mut macros = std::collections::HashMap::new();
+        parse_macros_from_xml(xml, &mut macros);
+        assert_eq!(macros["cluster"], "mycluster");
+        assert_eq!(macros["replica"], "replica1");
+        assert_eq!(macros["shard"], "01");
+    }
+
+    #[test]
+    fn test_parse_macros_from_xml_nested() {
+        // Some CH configs wrap macros in an <installation> element
+        let xml = r#"
+            <installation>
+                <cluster>prod</cluster>
+                <replica>r1</replica>
+            </installation>
+        "#;
+        let mut macros = std::collections::HashMap::new();
+        parse_macros_from_xml(xml, &mut macros);
+        assert_eq!(macros["cluster"], "prod");
+        assert_eq!(macros["replica"], "r1");
+    }
+
+    #[test]
+    fn test_discover_macros_from_config_nonexistent_dir() {
+        let result = discover_macros_from_config("/nonexistent/path");
         assert!(result.is_empty());
     }
 }
