@@ -24,7 +24,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 # Dummy build.rs for dependency caching (real one sets git SHA)
 RUN mkdir src && echo "fn main(){}" > src/main.rs \
-    && echo "fn main(){}" > build.rs \
+    && echo 'fn main(){ println!("cargo:rustc-env=CHBACKUP_GIT_SHA=unknown"); }' > build.rs \
     && cargo build --release \
     && rm -rf src build.rs
 
