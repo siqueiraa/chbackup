@@ -4,14 +4,12 @@ use tracing_subscriber::EnvFilter;
 ///
 /// - `log_format`: `"text"` for human-readable (default), `"json"` for structured JSON lines.
 /// - `log_level`: default log level string (e.g. `"info"`, `"debug"`).
-/// - `is_server`: if `true`, forces JSON mode regardless of `log_format`.
 ///
 /// The `RUST_LOG` environment variable, when set, overrides `log_level`.
 ///
-/// JSON mode is activated when `log_format == "json"` **or** `is_server == true`
-/// (per design doc section 11.4).
-pub fn init_logging(log_format: &str, log_level: &str, is_server: bool) {
-    let use_json = log_format.eq_ignore_ascii_case("json") || is_server;
+/// JSON mode is activated when `log_format == "json"`.
+pub fn init_logging(log_format: &str, log_level: &str) {
+    let use_json = log_format.eq_ignore_ascii_case("json");
 
     // Build the env filter: RUST_LOG takes precedence over the config log_level.
     // When RUST_LOG is not set, cap noisy dependency crates at warn to prevent

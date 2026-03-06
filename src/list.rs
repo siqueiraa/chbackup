@@ -463,10 +463,10 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
                     summaries.push(summary_from_manifest(&manifest));
                 }
                 Err(e) => {
-                    let reason = format!("manifest parse error: {e}");
+                    let reason = format!("manifest parse error: {e:#}");
                     warn!(
                         backup = %name,
-                        error = %e,
+                        error = format_args!("{e:#}"),
                         "Failed to parse remote manifest, marking as broken"
                     );
                     summaries.push(broken_summary(name, reason));
@@ -1272,7 +1272,7 @@ fn active_freeze_prefixes() -> HashSet<String> {
 /// `backup::create` operations.
 ///
 /// Returns the number of directories removed.
-fn clean_shadow_dir(disk_path: &str, name: Option<&str>) -> Result<usize> {
+fn clean_shadow_dir(disk_path: &str, name: Option<&str>, force: bool) -> Result<usize> {
     let shadow_path = PathBuf::from(disk_path).join("shadow");
 
     if !shadow_path.exists() {
@@ -1285,15 +1285,18 @@ fn clean_shadow_dir(disk_path: &str, name: Option<&str>) -> Result<usize> {
     let prefix_filter = name.map(|n| format!("chbackup_{}_", sanitize_name(n)));
 
     // When cleaning a specific backup, check its per-backup PID lock once up front.
-    if let Some(n) = name {
-        let lock_path = std::path::PathBuf::from(format!("/tmp/chbackup.{n}.pid"));
-        if crate::lock::is_lock_file_active(&lock_path) {
-            warn!(
-                backup = %n,
-                disk = %disk_path,
-                "clean_shadow: skipping disk, backup is currently active"
-            );
-            return Ok(0);
+    // Skip this check when force=true (called from cleanup_failed_backup which holds the lock).
+    if !force {
+        if let Some(n) = name {
+            let lock_path = std::path::PathBuf::from(format!("/tmp/chbackup.{n}.pid"));
+            if crate::lock::is_lock_file_active(&lock_path) {
+                warn!(
+                    backup = %n,
+                    disk = %disk_path,
+                    "clean_shadow: skipping disk, backup is currently active"
+                );
+                return Ok(0);
+            }
         }
     }
 
@@ -1378,7 +1381,29 @@ fn clean_shadow_dir(disk_path: &str, name: Option<&str>) -> Result<usize> {
 ///
 /// If `name` is provided, only removes entries matching `chbackup_{sanitized_name}_*`.
 /// Returns the total number of directories removed across all disks.
+///
+/// When `force` is true, skip PID lock checks (used by cleanup_failed_backup
+/// which already holds the lock).
 pub async fn clean_shadow(ch: &ChClient, data_path: &str, name: Option<&str>) -> Result<usize> {
+    clean_shadow_inner(ch, data_path, name, false).await
+}
+
+/// Like `clean_shadow` but skips PID lock checks. Use when the caller already
+/// holds the lock (e.g., cleanup after a failed backup).
+pub async fn clean_shadow_force(
+    ch: &ChClient,
+    data_path: &str,
+    name: Option<&str>,
+) -> Result<usize> {
+    clean_shadow_inner(ch, data_path, name, true).await
+}
+
+async fn clean_shadow_inner(
+    ch: &ChClient,
+    data_path: &str,
+    name: Option<&str>,
+    force: bool,
+) -> Result<usize> {
     let disks = ch.get_disks().await?;
 
     let mut total = 0;
@@ -1392,7 +1417,7 @@ pub async fn clean_shadow(ch: &ChClient, data_path: &str, name: Option<&str>) ->
         let disk_path = disk.path.clone();
         let name_owned = name.map(|n| n.to_string());
         let count = tokio::task::spawn_blocking(move || {
-            clean_shadow_dir(&disk_path, name_owned.as_deref())
+            clean_shadow_dir(&disk_path, name_owned.as_deref(), force)
         })
         .await
         .context("Shadow cleanup task panicked")??;
@@ -1406,10 +1431,11 @@ pub async fn clean_shadow(ch: &ChClient, data_path: &str, name: Option<&str>) ->
     if !data_path_in_disks {
         let dp = data_path.to_string();
         let name_owned = name.map(|n| n.to_string());
-        let count =
-            tokio::task::spawn_blocking(move || clean_shadow_dir(&dp, name_owned.as_deref()))
-                .await
-                .context("Shadow cleanup task panicked")??;
+        let count = tokio::task::spawn_blocking(move || {
+            clean_shadow_dir(&dp, name_owned.as_deref(), force)
+        })
+        .await
+        .context("Shadow cleanup task panicked")??;
         total += count;
     }
 
@@ -1489,11 +1515,11 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
     match BackupManifest::load_from_file(metadata_path) {
         Ok(manifest) => summary_from_manifest(&manifest),
         Err(e) => {
-            let reason = format!("manifest parse error: {e}");
+            let reason = format!("manifest parse error: {e:#}");
             warn!(
                 backup = %name,
                 path = %metadata_path.display(),
-                error = %e,
+                error = format_args!("{e:#}"),
                 "Failed to parse manifest, marking as broken"
             );
             broken_summary(name.to_string(), reason)
@@ -1902,7 +1928,7 @@ mod tests {
         let other = shadow_dir.join("other_freeze_data");
         std::fs::create_dir_all(&other).unwrap();
 
-        let count = clean_shadow_dir(dir.path().to_str().unwrap(), None).unwrap();
+        let count = clean_shadow_dir(dir.path().to_str().unwrap(), None, false).unwrap();
 
         assert_eq!(count, 2, "Should have removed 2 chbackup shadow dirs");
         assert!(!chbackup1.exists(), "chbackup_daily_mon should be removed");
@@ -1924,7 +1950,8 @@ mod tests {
         std::fs::create_dir_all(&chbackup2).unwrap();
 
         // Filter by backup name "daily-mon" -> sanitized to "daily_mon"
-        let count = clean_shadow_dir(dir.path().to_str().unwrap(), Some("daily-mon")).unwrap();
+        let count =
+            clean_shadow_dir(dir.path().to_str().unwrap(), Some("daily-mon"), false).unwrap();
 
         assert_eq!(count, 1, "Should have removed 1 matching shadow dir");
         assert!(!chbackup1.exists(), "chbackup_daily_mon should be removed");
@@ -1938,7 +1965,7 @@ mod tests {
     fn test_clean_shadow_no_shadow_dir() {
         let dir = tempfile::tempdir().unwrap();
         // No shadow directory created
-        let count = clean_shadow_dir(dir.path().to_str().unwrap(), None).unwrap();
+        let count = clean_shadow_dir(dir.path().to_str().unwrap(), None, false).unwrap();
         assert_eq!(count, 0, "Should return 0 when no shadow dir exists");
     }
 
@@ -1948,7 +1975,7 @@ mod tests {
         let shadow_dir = dir.path().join("shadow");
         std::fs::create_dir_all(&shadow_dir).unwrap();
         // Shadow dir exists but empty
-        let count = clean_shadow_dir(dir.path().to_str().unwrap(), None).unwrap();
+        let count = clean_shadow_dir(dir.path().to_str().unwrap(), None, false).unwrap();
         assert_eq!(count, 0, "Should return 0 when shadow dir is empty");
     }
 

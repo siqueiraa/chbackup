@@ -58,6 +58,10 @@ pub struct DiskRow {
     /// Empty for local disks or older CH versions without this column.
     #[serde(default)]
     pub object_storage_type: String,
+    /// Cache path for cache-layer disks (e.g. `s3_cache`). Non-empty means
+    /// this disk is a cache wrapper and should be skipped during backup.
+    #[serde(default)]
+    pub cache_path: String,
 }
 
 /// Row from `system.parts` query -- active parts for a table.
@@ -470,13 +474,21 @@ impl ChClient {
     // -- Replica sync --
 
     /// Execute SYSTEM SYNC REPLICA for the given table.
+    ///
+    /// Always logs at debug level (not info) since the caller logs a summary.
     pub async fn sync_replica(&self, db: &str, table: &str) -> Result<()> {
         let sql = format!(
             "SYSTEM SYNC REPLICA {}.{}",
             quote_identifier(db),
             quote_identifier(table)
         );
-        self.log_and_execute(&sql, "SYNC REPLICA").await
+        debug!(sql = %sql, "Executing SYNC REPLICA");
+        self.inner
+            .query(&sql)
+            .execute()
+            .await
+            .with_context(|| format!("SYNC REPLICA failed: {}", sql))?;
+        Ok(())
     }
 
     // -- Part attachment --
@@ -518,10 +530,11 @@ impl ChClient {
     /// 2. Query with `object_storage_type` but no `remote_path` (CH 24.8+)
     /// 3. Minimal query without either column (oldest supported CH)
     pub async fn get_disks(&self) -> Result<Vec<DiskRow>> {
-        // Try full query first (newest CH with remote_path)
+        // Try full query first (newest CH with remote_path + cache_path)
         let sql_full = "SELECT name, path, type, \
                          ifNull(remote_path, '') as remote_path, \
-                         ifNull(object_storage_type, '') as object_storage_type \
+                         ifNull(object_storage_type, '') as object_storage_type, \
+                         ifNull(cache_path, '') as cache_path \
                          FROM system.disks";
         self.log_sql(sql_full, "Executing get_disks");
 
@@ -529,10 +542,23 @@ impl ChClient {
             return Ok(rows);
         }
 
+        // Try without cache_path (older CH)
+        let sql_no_cache = "SELECT name, path, type, \
+                             ifNull(remote_path, '') as remote_path, \
+                             ifNull(object_storage_type, '') as object_storage_type, \
+                             '' as cache_path \
+                             FROM system.disks";
+        debug!("cache_path column not available, trying without it");
+
+        if let Ok(rows) = self.inner.query(sql_no_cache).fetch_all::<DiskRow>().await {
+            return Ok(rows);
+        }
+
         // Try with object_storage_type but without remote_path (CH 24.8+)
         let sql_no_remote = "SELECT name, path, type, \
                               '' as remote_path, \
-                              ifNull(object_storage_type, '') as object_storage_type \
+                              ifNull(object_storage_type, '') as object_storage_type, \
+                              '' as cache_path \
                               FROM system.disks";
         debug!("remote_path column not available, trying query with object_storage_type only");
 
@@ -541,8 +567,11 @@ impl ChClient {
         }
 
         // Minimal fallback (oldest CH versions)
-        let sql_minimal =
-            "SELECT name, path, type, '' as remote_path, '' as object_storage_type FROM system.disks";
+        let sql_minimal = "SELECT name, path, type, \
+                            '' as remote_path, \
+                            '' as object_storage_type, \
+                            '' as cache_path \
+                            FROM system.disks";
         debug!("object_storage_type column not available, using minimal query");
         self.inner
             .query(sql_minimal)
@@ -1922,6 +1951,7 @@ mod tests {
             disk_type: "s3".to_string(),
             remote_path: "s3://data-bucket/ch-data/".to_string(),
             object_storage_type: "S3".to_string(),
+            cache_path: String::new(),
         };
         assert_eq!(disk.remote_path, "s3://data-bucket/ch-data/");
 
@@ -1932,6 +1962,7 @@ mod tests {
             disk_type: "local".to_string(),
             remote_path: String::new(),
             object_storage_type: String::new(),
+            cache_path: String::new(),
         };
         assert!(local_disk.remote_path.is_empty());
     }

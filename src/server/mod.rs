@@ -254,17 +254,39 @@ pub async fn start_server(
         .parse()
         .with_context(|| format!("invalid api.listen address: '{}'", listen))?;
 
-    // Create integration tables if configured
+    // Wait for ClickHouse to become reachable, then create integration tables.
+    // In K8s sidecar deployments, ClickHouse starts alongside chbackup so we
+    // retry indefinitely until it's ready.
     let created_tables = if config.api.create_integration_tables {
-        let (host, port) = parse_integration_host_port(&config);
-        match ch.create_integration_tables(&host, &port).await {
-            Ok(()) => {
-                info!("Integration tables created");
-                true
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to create integration tables (continuing anyway)");
-                false
+        let mut attempt = 0u64;
+        loop {
+            attempt += 1;
+            match ch.ping().await {
+                Ok(()) => {
+                    let (host, port) = parse_integration_host_port(&config);
+                    match ch.create_integration_tables(&host, &port).await {
+                        Ok(()) => {
+                            info!("Integration tables created");
+                            break true;
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = format_args!("{e:#}"),
+                                "Failed to create integration tables (continuing anyway)"
+                            );
+                            break false;
+                        }
+                    }
+                }
+                Err(_) => {
+                    let delay = std::cmp::min(attempt * 2, 30);
+                    info!(
+                        attempt = attempt,
+                        retry_in_secs = delay,
+                        "Waiting for ClickHouse to become reachable"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
             }
         }
     } else {

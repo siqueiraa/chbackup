@@ -21,6 +21,7 @@ pub mod sync_replica;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -125,6 +126,8 @@ pub async fn create(
     skip_projections: &[String],
     cancel: CancellationToken,
 ) -> Result<BackupManifest> {
+    let start_time = Instant::now();
+
     info!(
         backup_name = %backup_name,
         table_pattern = ?table_pattern,
@@ -785,7 +788,9 @@ pub async fn create(
         }
 
         // Clean shadow directories left by this backup's FREEZE operations
-        match crate::list::clean_shadow(ch, &config.clickhouse.data_path, Some(backup_name)).await {
+        match crate::list::clean_shadow_force(ch, &config.clickhouse.data_path, Some(backup_name))
+            .await
+        {
             Ok(n) if n > 0 => info!(count = n, "Cleaned shadow directories after backup error"),
             Err(shadow_err) => {
                 warn!(error = %shadow_err, "Failed to clean shadow directories after backup error");
@@ -922,10 +927,12 @@ pub async fn create(
         .map(|parts| parts.len())
         .sum();
 
+    let elapsed = start_time.elapsed();
     info!(
         backup_name = %backup_name,
         tables = table_count,
         parts = part_count,
+        elapsed_secs = elapsed.as_secs_f64(),
         "Backup created successfully"
     );
 

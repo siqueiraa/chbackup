@@ -288,6 +288,15 @@ pub fn is_s3_disk(disk_type: &str) -> bool {
     lower == "s3" || lower == "object_storage" || lower == "objectstorage"
 }
 
+/// Check if a disk is a cache layer (e.g., `s3_cache`).
+///
+/// Cache disks are not real storage — they wrap another disk and should be
+/// skipped during backup. ClickHouse reports a non-empty `cache_path` in
+/// `system.disks` for cache-layer disks.
+pub fn is_cache_disk(disk: &DiskRow) -> bool {
+    !disk.cache_path.is_empty()
+}
+
 /// Normalize disk type for CH 24.8+ where ObjectStorage replaced "s3".
 ///
 /// CH 24.8+ reports disk type as "ObjectStorage" with a separate
@@ -318,7 +327,7 @@ pub fn build_disk_remote_paths(disks: &[DiskRow], config_dir: &str) -> BTreeMap<
         .iter()
         .filter(|d| {
             let eff = normalize_disk_type(&d.disk_type, &d.object_storage_type);
-            is_s3_disk(&eff) && !paths.contains_key(&d.name)
+            is_s3_disk(&eff) && !paths.contains_key(&d.name) && !is_cache_disk(d)
         })
         .map(|d| d.name.as_str())
         .collect();

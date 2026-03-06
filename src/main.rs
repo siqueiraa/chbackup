@@ -102,11 +102,24 @@ async fn run() -> Result<()> {
     let config = Config::load(&config_path, &cli.env_overrides)?;
 
     // 2. Init logging.
-    let is_server = matches!(&cli.command, Command::Server { .. });
-    logging::init_logging(
-        &config.general.log_format,
-        &config.general.log_level,
-        is_server,
+    logging::init_logging(&config.general.log_format, &config.general.log_level);
+
+    // 2a. Startup banner with version and key config.
+    let cmd_name = format!("{:?}", cli.command)
+        .split_whitespace()
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_sha = env!("CHBACKUP_GIT_SHA"),
+        command = %cmd_name,
+        config_path = %config_path.display(),
+        data_path = %config.clickhouse.data_path,
+        clickhouse = format_args!("{}:{}", config.clickhouse.host, config.clickhouse.port),
+        s3_bucket = %config.s3.bucket,
+        s3_prefix = %config.s3.prefix,
+        "chbackup starting"
     );
 
     // 3. Validate backup name BEFORE any processing to prevent path-traversal

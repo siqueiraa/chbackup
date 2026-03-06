@@ -21,13 +21,14 @@ WORKDIR /src
 # Dependency caching: copy manifests first, build with dummy main.rs,
 # then copy real source. Docker layer cache means dependency rebuild only
 # happens when Cargo.toml or Cargo.lock change.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs \
     && cargo build --release \
     && rm -rf src
 
+ARG VCS_REF
 COPY src/ src/
-RUN cargo build --release
+RUN VCS_REF=${VCS_REF} cargo build --release
 
 # Stage 2: Minimal Alpine runtime
 FROM alpine:3.21

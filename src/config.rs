@@ -537,7 +537,7 @@ impl Default for ClickHouseConfig {
             tls_key: String::new(),
             tls_cert: String::new(),
             tls_ca: String::new(),
-            sync_replicated_tables: true,
+            sync_replicated_tables: false,
             check_replicas_before_attach: true,
             check_replicas_before_attach_timeout: default_check_replicas_timeout(),
             check_parts_columns: false,
@@ -2974,7 +2974,7 @@ s3:
         assert_eq!(config.clickhouse.username, "default");
         assert!(config.clickhouse.password.is_empty());
         assert!(!config.clickhouse.secure);
-        assert!(config.clickhouse.sync_replicated_tables);
+        assert!(!config.clickhouse.sync_replicated_tables);
         assert!(config.clickhouse.check_replicas_before_attach);
         assert!(!config.clickhouse.check_parts_columns);
         assert!(config.clickhouse.log_sql_queries);

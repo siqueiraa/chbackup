@@ -879,8 +879,8 @@ pub async fn post_actions(
                                 .observe(duration);
                             m.errors_total.get_or_create(&labels).inc();
                         }
-                        warn!(command = %command, error = %e, "Action failed from POST /api/v1/actions");
-                        state_clone.fail_op(id, e.to_string()).await;
+                        warn!(command = %command, error = format_args!("{e:#}"), "Action failed from POST /api/v1/actions");
+                        state_clone.fail_op(id, format!("{e:#}")).await;
                     }
                 }
                     } => {}

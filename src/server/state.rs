@@ -395,8 +395,8 @@ where
                                 .get_or_create(&labels)
                                 .inc();
                         }
-                        warn!(op = %op_label_owned, error = %e, "Operation failed");
-                        state_clone.fail_op(id, e.to_string()).await;
+                        warn!(op = %op_label_owned, error = format_args!("{e:#}"), "Operation failed");
+                        state_clone.fail_op(id, format!("{e:#}")).await;
                     }
                 }
             } => {}

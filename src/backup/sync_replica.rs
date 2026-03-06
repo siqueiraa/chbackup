@@ -4,14 +4,15 @@
 //! before FREEZE to ensure all pending replication queue entries are applied.
 //!
 //! Sync operations run in parallel bounded by a semaphore (max_connections).
-//! If any sync fails, the entire operation returns an error listing all failures.
-//! Users who want lenient behavior should set `sync_replicated_tables: false`.
+//! Sync failures are logged as warnings but do not abort the backup
+//! (matching Go clickhouse-backup behavior).
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use tokio::sync::Semaphore;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::clickhouse::client::{ChClient, TableRow};
 
@@ -20,7 +21,7 @@ use crate::clickhouse::client::{ChClient, TableRow};
 /// Non-replicated tables are silently skipped. Sync operations are performed
 /// in parallel, bounded by `max_connections` via a semaphore.
 ///
-/// Returns an error if any table fails to sync.
+/// Sync failures are logged as warnings and do not abort the backup.
 pub async fn sync_replicas(
     ch: &ChClient,
     tables: &[TableRow],
@@ -35,6 +36,8 @@ pub async fn sync_replicas(
         debug!("No replicated tables to sync");
         return Ok(());
     }
+
+    let sync_start = Instant::now();
 
     info!(
         count = replicated.len(),
@@ -69,35 +72,34 @@ pub async fn sync_replicas(
         }));
     }
 
-    let mut errors: Vec<(String, String, String)> = Vec::new();
+    let mut error_count = 0usize;
 
     for handle in handles {
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err((db, table, e))) => {
-                errors.push((db, table, e.to_string()));
+                warn!(
+                    db = %db,
+                    table = %table,
+                    error = format_args!("{e:#}"),
+                    "SYNC REPLICA failed, proceeding with backup"
+                );
+                error_count += 1;
             }
             Err(join_err) => {
-                errors.push((
-                    "unknown".to_string(),
-                    "unknown".to_string(),
-                    format!("task panicked or was cancelled: {join_err}"),
-                ));
+                warn!(error = %join_err, "SYNC REPLICA task panicked or was cancelled");
+                error_count += 1;
             }
         }
     }
 
-    if !errors.is_empty() {
-        let details: Vec<String> = errors
-            .iter()
-            .map(|(db, table, e)| format!("  {db}.{table}: {e}"))
-            .collect();
-        bail!(
-            "SYNC REPLICA failed for {} table(s) (set sync_replicated_tables: false to skip):\n{}",
-            errors.len(),
-            details.join("\n")
-        );
-    }
+    let elapsed = sync_start.elapsed();
+    info!(
+        count = replicated.len(),
+        elapsed_secs = elapsed.as_secs_f64(),
+        errors = error_count,
+        "Replica sync completed"
+    );
 
     Ok(())
 }
