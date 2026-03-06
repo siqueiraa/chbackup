@@ -5,7 +5,7 @@
 //! await async operations.
 
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::clickhouse::client::ChClient;
 
@@ -60,7 +60,7 @@ impl FreezeGuard {
     /// the whole operation -- leftover shadow data can be cleaned later.
     pub async fn unfreeze_all(&mut self, ch: &ChClient) -> Result<()> {
         for info in &self.frozen {
-            info!(
+            debug!(
                 db = %info.database,
                 table = %info.table,
                 freeze_name = %info.freeze_name,
