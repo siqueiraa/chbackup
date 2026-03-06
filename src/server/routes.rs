@@ -2105,7 +2105,7 @@ pub struct GoActionResponse {
 /// Format a chrono DateTime as "YYYY-MM-DD HH:MM:SS" (Go format, no T, no timezone).
 fn format_go_timestamp(rfc3339: &str) -> String {
     if rfc3339.is_empty() {
-        return String::new();
+        return "1970-01-01 00:00:00".to_string();
     }
     // Parse RFC3339 and reformat
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
@@ -2292,7 +2292,7 @@ pub async fn go_get_actions(State(state): State<AppState>) -> impl IntoResponse 
                 finish: e
                     .finish
                     .map(|f| format_go_timestamp(&f.to_rfc3339()))
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| "1970-01-01 00:00:00".to_string()),
                 status: map_go_status(status_str).to_string(),
                 error: error_str,
             }

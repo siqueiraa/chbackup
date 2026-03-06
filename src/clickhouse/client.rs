@@ -1551,7 +1551,7 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
     let list_ddl = format!(
         "CREATE TABLE IF NOT EXISTS system.backup_list (\
          name String, \
-         created String, \
+         created DateTime, \
          size Int64, \
          location String, \
          required String, \
@@ -1570,8 +1570,8 @@ pub fn integration_table_ddl(api_host: &str, api_port: &str) -> (String, String)
     let actions_ddl = format!(
         "CREATE TABLE IF NOT EXISTS system.backup_actions (\
          command String, \
-         start String, \
-         finish String, \
+         start DateTime, \
+         finish DateTime, \
          status String, \
          error String\
          ) ENGINE = URL('http://{}:{}/backup/actions', 'JSONEachRow')",
@@ -2159,7 +2159,7 @@ mod tests {
         // Verify backup_list DDL
         assert!(list_ddl.contains("CREATE TABLE IF NOT EXISTS system.backup_list"));
         assert!(list_ddl.contains("name String"));
-        assert!(list_ddl.contains("created String"));
+        assert!(list_ddl.contains("created DateTime"));
         assert!(list_ddl.contains("size Int64"));
         assert!(list_ddl.contains("location String"));
         assert!(list_ddl.contains("required String"));
@@ -2177,8 +2177,8 @@ mod tests {
         // Verify backup_actions DDL
         assert!(actions_ddl.contains("CREATE TABLE IF NOT EXISTS system.backup_actions"));
         assert!(actions_ddl.contains("command String"));
-        assert!(actions_ddl.contains("start String"));
-        assert!(actions_ddl.contains("finish String"));
+        assert!(actions_ddl.contains("start DateTime"));
+        assert!(actions_ddl.contains("finish DateTime"));
         assert!(actions_ddl.contains("status String"));
         assert!(actions_ddl.contains("error String"));
         assert!(actions_ddl
