@@ -237,7 +237,9 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
                 warn!(
                     disk = %disk_name,
                     parts_skipped = disk_parts_count,
-                    "No remote_path found for S3 disk, cannot restore S3 disk parts"
+                    "No remote_path found for S3 disk, cannot restore S3 disk parts. \
+                     This usually means the disk is a cache wrapper whose underlying \
+                     disk endpoint could not be resolved."
                 );
                 skipped_count += disk_parts_count;
                 continue;

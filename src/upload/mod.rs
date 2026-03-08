@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 use tokio_util::sync::CancellationToken;
 
 use crate::backup::diff::diff_parts;
+use crate::clickhouse::ChClient;
 use crate::concurrency::{
     effective_object_disk_copy_concurrency, effective_upload_concurrency,
     effective_upload_rate_limit,
@@ -145,6 +146,7 @@ struct S3DiskUploadWorkItem {
 #[allow(clippy::too_many_arguments)]
 pub async fn upload(
     config: &Config,
+    ch: &ChClient,
     s3: &S3Client,
     backup_name: &str,
     backup_dir: &Path,
@@ -175,18 +177,40 @@ pub async fn upload(
     let mut manifest = BackupManifest::load_from_file(&manifest_path)
         .with_context(|| format!("Failed to load manifest from: {}", manifest_path.display()))?;
 
-    // 1a. Resolve ClickHouse macros in disk_remote_paths (handles manifests created
-    // before macro resolution was added at backup time)
-    if manifest.disk_remote_paths.values().any(|p| p.contains('{')) {
-        let macros =
-            crate::clickhouse::client::discover_macros_from_config(&config.clickhouse.config_dir);
-        if !macros.is_empty() {
-            crate::object_disk::resolve_macros_in_paths(&mut manifest.disk_remote_paths, &macros);
-        } else {
-            warn!(
-                config_dir = %config.clickhouse.config_dir,
-                "Disk remote paths contain unresolved macros but no macros found in ClickHouse config"
-            );
+    // 1a. Rebuild disk_remote_paths from live ClickHouse config (matches Go behavior
+    // and our restore code at restore/mod.rs:499-517). The manifest's disk_remote_paths
+    // may be empty for old backups or when system.disks.remote_path was unavailable.
+    let has_s3_disks = manifest.disk_types.values().any(|dt| is_s3_disk(dt));
+    if has_s3_disks {
+        match ch.get_disks().await {
+            Ok(disks) => {
+                let mut live_paths = crate::object_disk::build_disk_remote_paths(
+                    &disks,
+                    &config.clickhouse.config_dir,
+                );
+                let macros = ch.get_macros().await.unwrap_or_default();
+                crate::object_disk::resolve_macros_in_paths(&mut live_paths, &macros);
+                // Live paths override manifest paths (live is authoritative)
+                for (disk, path) in live_paths {
+                    if !path.is_empty() {
+                        manifest.disk_remote_paths.insert(disk, path);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to get live disk config for S3 upload, using manifest paths");
+            }
+        }
+
+        // Warn about any disk_remote_paths that still contain unresolved macros
+        for (disk, path) in &manifest.disk_remote_paths {
+            if path.contains('{') {
+                warn!(
+                    disk = %disk,
+                    path = %path,
+                    "Disk remote path contains unresolved macros, CopyObject source keys may be wrong"
+                );
+            }
         }
     }
 
@@ -316,7 +340,17 @@ pub async fn upload(
                         .unwrap_or_default();
 
                     let (source_bucket, source_prefix) = if remote_path.is_empty() {
-                        // Fallback: use the backup S3 bucket
+                        warn!(
+                            disk = %disk_name,
+                            table = %table_key,
+                            part = %part.name,
+                            "S3 disk has no remote_path in manifest or live config. \
+                             This usually means the disk is a cache wrapper whose \
+                             underlying disk endpoint could not be resolved. \
+                             CopyObject will likely fail. Check ClickHouse disk \
+                             configuration and ensure cache disk's underlying S3 \
+                             disk has a discoverable endpoint."
+                        );
                         (s3.bucket().to_string(), String::new())
                     } else {
                         parse_s3_uri(&remote_path)
@@ -866,8 +900,8 @@ pub async fn upload(
                 .await
                 .with_context(|| {
                     format!(
-                        "CopyObject failed for S3 object {} in part {}",
-                        s3_obj.path, item.part.name
+                        "CopyObject failed for S3 object {} in part {} (source: {}/{})",
+                        s3_obj.path, item.part.name, item.source_bucket, source_key
                     )
                 })?;
 
@@ -924,7 +958,6 @@ pub async fn upload(
 
             progress.inc();
 
-            // S3 disk parts have no compressed_size (no compression)
             Ok((item.table_key, item.disk_name, updated_part, 0u64))
 
             } => result,
@@ -952,12 +985,9 @@ pub async fn upload(
     progress.finish();
 
     // 4. Apply results to manifest sequentially
-    let mut total_compressed_size = 0u64;
-
     // Group results by (table_key, disk_name)
     let mut updates: HashMap<(String, String), Vec<PartInfo>> = HashMap::new();
-    for (table_key, disk_name, updated_part, compressed) in results {
-        total_compressed_size += compressed;
+    for (table_key, disk_name, updated_part, _compressed) in results {
         updates
             .entry((table_key, disk_name))
             .or_default()
@@ -988,7 +1018,17 @@ pub async fn upload(
         }
     }
 
-    // 5. Update manifest with compressed_size and data_format
+    // 5. Compute compressed_size from final merged manifest's per-part backup_size.
+    // This correctly accounts for S3 disk parts, resume-skipped parts, and
+    // excludes carried parts (whose data lives in the base backup).
+    let total_compressed_size: u64 = manifest
+        .tables
+        .values()
+        .flat_map(|tm| tm.parts.values())
+        .flatten()
+        .filter(|p| !p.source.starts_with("carried:"))
+        .map(|p| p.backup_size)
+        .sum();
     manifest.compressed_size = total_compressed_size;
     manifest.data_format = data_format.clone();
 

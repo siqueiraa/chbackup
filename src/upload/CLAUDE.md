@@ -127,7 +127,7 @@ For parts exceeding `config.backup.streaming_upload_threshold` (default 256 MiB 
 - **Config**: `backup.streaming_upload_threshold` (u64, default 268435456 / 256 MiB). Set to 0 to force all parts through the streaming path; set very high to disable.
 
 ### Public API
-- `upload(config, s3, backup_name, backup_dir, delete_local, diff_from_remote: Option<&str>, resume: bool) -> Result<()>` -- Main entry point with resume and atomic manifest (Phase 2d)
+- `upload(config, ch, s3, backup_name, backup_dir, delete_local, diff_from_remote: Option<&str>, resume: bool) -> Result<()>` -- Main entry point with resume and atomic manifest (Phase 2d)
 - `compress_part(part_dir, archive_name, data_format, compression_level) -> Result<Vec<u8>>` -- Sync multi-format buffered compression (lz4, zstd, gzip, none) (Phase 4f)
 - `compress_part_streaming(part_dir, archive_name, data_format, compression_level, chunk_size) -> Result<mpsc::Receiver<Result<Vec<u8>>>>` -- Sync multi-format streaming compression producing fixed-size chunks via channel (Phase 8)
 - `archive_extension(data_format) -> &str` -- Maps format name to file extension (e.g., "lz4" -> ".tar.lz4") (Phase 4f)

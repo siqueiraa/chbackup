@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::clickhouse::ChClient;
@@ -131,6 +132,11 @@ pub fn build_router(state: AppState) -> Router {
         state.clone(),
         auth::auth_middleware,
     ));
+
+    // Add HTTP request/response tracing to capture transport-level failures
+    // that may never reach the handler (connection resets, body extraction
+    // errors, panics). Logs method, path, status, and duration for ALL requests.
+    let router = router.layer(TraceLayer::new_for_http());
 
     router.with_state(state)
 }
@@ -254,6 +260,24 @@ pub async fn start_server(
         .parse()
         .with_context(|| format!("invalid api.listen address: '{}'", listen))?;
 
+    // For the non-TLS path, bind the TCP listener BEFORE creating integration
+    // tables.  TcpListener::bind() registers the socket with the OS kernel,
+    // which immediately starts accepting TCP SYN packets into the kernel's
+    // backlog queue.  This prevents a startup race where ClickHouse tries to
+    // reach the integration table URL while the server is not yet listening.
+    //
+    // TLS path limitation: axum_server::bind_rustls() combines bind+serve, so
+    // we keep the current ordering there (integration tables before serve).
+    let listener = if !config.api.secure {
+        let l = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("failed to bind to {}", addr))?;
+        info!(listen = %addr, "TCP listener bound on {}", addr);
+        Some(l)
+    } else {
+        None
+    };
+
     // Wait for ClickHouse to become reachable, then create integration tables.
     // In K8s sidecar deployments, ClickHouse starts alongside chbackup so we
     // retry indefinitely until it's ready.
@@ -336,9 +360,8 @@ pub async fn start_server(
     } else {
         info!(listen = %addr, "Starting API server on {}", addr);
 
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("failed to bind to {}", addr))?;
+        // unwrap is safe: listener is always Some when !config.api.secure
+        let listener = listener.unwrap();
 
         let ch_shutdown = ch.clone();
         let created_tables_shutdown = created_tables;

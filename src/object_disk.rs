@@ -347,6 +347,64 @@ pub fn build_disk_remote_paths(disks: &[DiskRow], config_dir: &str) -> BTreeMap<
         }
     }
 
+    // Strategy A: Resolve cache/alias disks via same-path matching.
+    // When two disks share the same normalized path, copy the endpoint from the
+    // resolved disk to the unresolved one. Handles production case where s3_cache
+    // shares path with underlying s3 disk.
+    let mut disk_by_path: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, d) in disks.iter().enumerate() {
+        let normalized = d.path.trim_end_matches('/').to_string();
+        disk_by_path.entry(normalized).or_default().push(i);
+    }
+    for (_path, indices) in &disk_by_path {
+        // Find the first disk at this path that has a resolved endpoint
+        let resolved = indices
+            .iter()
+            .find(|&&i| paths.contains_key(&disks[i].name));
+        if let Some(&source_idx) = resolved {
+            let source_endpoint = paths[&disks[source_idx].name].clone();
+            for &i in indices {
+                if !paths.contains_key(&disks[i].name) {
+                    let eff =
+                        normalize_disk_type(&disks[i].disk_type, &disks[i].object_storage_type);
+                    if is_s3_disk(&eff) {
+                        paths.insert(disks[i].name.clone(), source_endpoint.clone());
+                        info!(
+                            disk = %disks[i].name,
+                            source_disk = %disks[source_idx].name,
+                            "Inherited S3 endpoint from same-path disk"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy B: XML-based cache->underlying disk mapping for disks still unresolved.
+    let unresolved: Vec<&str> = disks
+        .iter()
+        .filter(|d| {
+            let eff = normalize_disk_type(&d.disk_type, &d.object_storage_type);
+            is_s3_disk(&eff) && !paths.contains_key(&d.name)
+        })
+        .map(|d| d.name.as_str())
+        .collect();
+    if !unresolved.is_empty() {
+        let cache_refs = crate::clickhouse::client::discover_cache_disk_refs(config_dir);
+        for name in &unresolved {
+            if let Some(underlying) = cache_refs.get(*name) {
+                if let Some(endpoint) = paths.get(underlying) {
+                    paths.insert(name.to_string(), endpoint.clone());
+                    info!(
+                        disk = %name,
+                        underlying = %underlying,
+                        "Resolved cache disk via XML config reference"
+                    );
+                }
+            }
+        }
+    }
+
     paths
 }
 
@@ -894,5 +952,91 @@ mod tests {
         let macros = std::collections::HashMap::new();
         resolve_macros_in_paths(&mut paths, &macros);
         assert_eq!(paths["s3disk"], "s3://bucket/{cluster}/");
+    }
+
+    #[test]
+    fn test_build_disk_remote_paths_cache_inherits_same_path() {
+        // Simulate production case: s3 and s3_cache share the same path.
+        // s3 has remote_path, s3_cache does not.
+        let disks = vec![
+            DiskRow {
+                name: "s3".to_string(),
+                path: "/var/lib/clickhouse/disks/s3/".to_string(),
+                disk_type: "ObjectStorage".to_string(),
+                remote_path: "s3://my-bucket/data/".to_string(),
+                object_storage_type: "S3".to_string(),
+                cache_path: "".to_string(),
+            },
+            DiskRow {
+                name: "s3_cache".to_string(),
+                path: "/var/lib/clickhouse/disks/s3/".to_string(),
+                disk_type: "ObjectStorage".to_string(),
+                remote_path: "".to_string(),
+                object_storage_type: "S3".to_string(),
+                cache_path: "/var/lib/clickhouse/cache/s3_cache".to_string(),
+            },
+        ];
+        // Use a non-existent config dir since we don't need XML fallback here
+        let paths = build_disk_remote_paths(&disks, "/nonexistent");
+        assert_eq!(paths.get("s3").unwrap(), "s3://my-bucket/data/");
+        assert_eq!(
+            paths.get("s3_cache").unwrap(),
+            "s3://my-bucket/data/",
+            "Cache disk should inherit endpoint from same-path real disk"
+        );
+    }
+
+    #[test]
+    fn test_build_disk_remote_paths_no_same_path_no_inherit() {
+        // When cache disk has a different path, Strategy A should not apply
+        let disks = vec![
+            DiskRow {
+                name: "s3".to_string(),
+                path: "/var/lib/clickhouse/disks/s3/".to_string(),
+                disk_type: "ObjectStorage".to_string(),
+                remote_path: "s3://my-bucket/data/".to_string(),
+                object_storage_type: "S3".to_string(),
+                cache_path: "".to_string(),
+            },
+            DiskRow {
+                name: "s3_cache".to_string(),
+                path: "/var/lib/clickhouse/disks/s3_cache/".to_string(),
+                disk_type: "ObjectStorage".to_string(),
+                remote_path: "".to_string(),
+                object_storage_type: "S3".to_string(),
+                cache_path: "/var/lib/clickhouse/cache/s3_cache".to_string(),
+            },
+        ];
+        let paths = build_disk_remote_paths(&disks, "/nonexistent");
+        assert_eq!(paths.get("s3").unwrap(), "s3://my-bucket/data/");
+        // s3_cache has a different path, so Strategy A doesn't apply.
+        // Strategy B would need XML config which doesn't exist here.
+        assert!(
+            !paths.contains_key("s3_cache"),
+            "Cache disk with different path should not inherit via same-path strategy"
+        );
+    }
+
+    #[test]
+    fn test_is_cache_disk() {
+        let cache = DiskRow {
+            name: "s3_cache".to_string(),
+            path: "/disks/s3/".to_string(),
+            disk_type: "ObjectStorage".to_string(),
+            remote_path: "".to_string(),
+            object_storage_type: "S3".to_string(),
+            cache_path: "/cache/s3_cache".to_string(),
+        };
+        assert!(is_cache_disk(&cache));
+
+        let real = DiskRow {
+            name: "s3".to_string(),
+            path: "/disks/s3/".to_string(),
+            disk_type: "ObjectStorage".to_string(),
+            remote_path: "s3://bucket/".to_string(),
+            object_storage_type: "S3".to_string(),
+            cache_path: "".to_string(),
+        };
+        assert!(!is_cache_disk(&real));
     }
 }

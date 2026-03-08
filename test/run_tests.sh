@@ -4565,6 +4565,73 @@ if should_run "test_s3_restore_rename_drop_safety"; then
     cleanup_backup "$T72_NAME"
 fi
 
+# T73: Batch INSERT into system.backup_actions (no HTTP 500 on first)
+if should_run "test_batch_actions_insert"; then
+    info "T73: Batch INSERT into system.backup_actions (no HTTP 500 on first)"
+    SERVER_PID=""
+
+    chbackup server &
+    SERVER_PID=$!
+    sleep 2
+
+    if ! wait_for_server 10; then
+        fail "T73: Server did not start"
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    else
+        pass "T73: Server is ready"
+
+        # Step 1: Direct HTTP test — POST /backup/actions must return 200
+        info "  Step 1: Direct HTTP POST /backup/actions (first request)"
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST http://localhost:7171/backup/actions \
+            -H "Content-Type: application/json" \
+            -d '{"command":"clean_broken"}')
+        if [[ "$HTTP_CODE" == "200" ]]; then
+            pass "Direct POST /backup/actions returned 200"
+        else
+            fail "Direct POST /backup/actions returned ${HTTP_CODE} (expected 200)"
+        fi
+        sleep 2  # let operation drain
+
+        # Step 2: Batch ClickHouse INSERTs — all must succeed
+        info "  Step 2: Batch INSERT via system.backup_actions"
+        BATCH_OK=true
+        for i in 1 2 3; do
+            if ! clickhouse-client -q \
+                "INSERT INTO system.backup_actions (command) VALUES ('clean_broken')" 2>/dev/null; then
+                fail "Batch INSERT #${i} failed"
+                BATCH_OK=false
+                break
+            fi
+        done
+        if $BATCH_OK; then
+            pass "All 3 batch INSERTs succeeded"
+        fi
+        sleep 3  # let operations drain
+
+        # Step 3: Second batch after idle gap (tests connection reuse)
+        info "  Step 3: Second batch after idle gap"
+        sleep 5  # deliberate idle gap
+        BATCH2_OK=true
+        for i in 1 2 3; do
+            if ! clickhouse-client -q \
+                "INSERT INTO system.backup_actions (command) VALUES ('clean_broken')" 2>/dev/null; then
+                fail "Second batch INSERT #${i} failed"
+                BATCH2_OK=false
+                break
+            fi
+        done
+        if $BATCH2_OK; then
+            pass "Second batch after idle: all 3 succeeded"
+        fi
+
+        # Cleanup
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------

@@ -170,6 +170,12 @@ pub async fn create(
             )
         })
         .collect();
+    let cache_disk_names: HashSet<String> = disks
+        .iter()
+        .filter(|d| object_disk::is_cache_disk(d))
+        .map(|d| d.name.clone())
+        .collect();
+
     let mut disk_remote_paths =
         object_disk::build_disk_remote_paths(&disks, &config.clickhouse.config_dir);
 
@@ -507,6 +513,7 @@ pub async fn create(
         let freeze_by_part_where = config.clickhouse.freeze_by_part_where.clone();
         let frozen_so_far_clone = frozen_so_far.clone();
         let base_parts_clone = base_parts.clone();
+        let cache_disk_names_clone = cache_disk_names.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -654,6 +661,7 @@ pub async fn create(
                     &skip_disk_types_clone,
                     &skip_projections_clone,
                     base_parts_clone.as_ref().map(|arc| arc.as_ref()),
+                    &cache_disk_names_clone,
                 )
             })
             .await

@@ -142,6 +142,12 @@ struct ShowCreateRow {
     statement: String,
 }
 
+/// Row returned by `SELECT create_query FROM system.functions`.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+struct CreateQueryRow {
+    create_query: String,
+}
+
 impl ChClient {
     /// Build a new `ChClient` from the given `ClickHouseConfig`.
     ///
@@ -554,13 +560,30 @@ impl ChClient {
             return Ok(rows);
         }
 
-        // Try with object_storage_type but without remote_path (CH 24.8+)
+        // Try without remote_path but WITH cache_path (CH versions with cache_path but no remote_path)
+        let sql_no_remote_with_cache = "SELECT name, path, type, \
+                              '' as remote_path, \
+                              ifNull(object_storage_type, '') as object_storage_type, \
+                              ifNull(cache_path, '') as cache_path \
+                              FROM system.disks";
+        debug!("remote_path column not available, trying with object_storage_type + cache_path");
+
+        if let Ok(rows) = self
+            .inner
+            .query(sql_no_remote_with_cache)
+            .fetch_all::<DiskRow>()
+            .await
+        {
+            return Ok(rows);
+        }
+
+        // Try with object_storage_type but without remote_path or cache_path
         let sql_no_remote = "SELECT name, path, type, \
                               '' as remote_path, \
                               ifNull(object_storage_type, '') as object_storage_type, \
                               '' as cache_path \
                               FROM system.disks";
-        debug!("remote_path column not available, trying query with object_storage_type only");
+        debug!("cache_path column also not available, trying query with object_storage_type only");
 
         if let Ok(rows) = self.inner.query(sql_no_remote).fetch_all::<DiskRow>().await {
             return Ok(rows);
@@ -1343,11 +1366,13 @@ impl ChClient {
     ///
     /// On query error, logs a warning and returns an empty Vec (graceful degradation).
     pub async fn query_user_defined_functions(&self) -> Result<Vec<String>> {
-        let names_sql = "SELECT name FROM system.functions WHERE origin = 'SQLUserDefined'";
+        // Use system.functions instead of SHOW CREATE FUNCTION which fails on CH 25.3+
+        // with RowBinary format errors.
+        let sql = "SELECT create_query FROM system.functions WHERE origin = 'SQLUserDefined' AND create_query != ''";
 
-        self.log_sql(names_sql, "Executing query_user_defined_functions");
+        self.log_sql(sql, "Executing query_user_defined_functions");
 
-        let names: Vec<NameRow> = match self.inner.query(names_sql).fetch_all().await {
+        let rows: Vec<CreateQueryRow> = match self.inner.query(sql).fetch_all().await {
             Ok(rows) => rows,
             Err(e) => {
                 warn!(
@@ -1358,31 +1383,7 @@ impl ChClient {
             }
         };
 
-        let mut results = Vec::with_capacity(names.len());
-        for name_row in &names {
-            // SHOW CREATE FUNCTION does not accept backtick-quoted identifiers.
-            // The name is from system.functions so it is safe to use unquoted.
-            let show_sql = format!("SHOW CREATE FUNCTION {}", &name_row.name);
-
-            match self
-                .inner
-                .query(&show_sql)
-                .fetch_one::<ShowCreateRow>()
-                .await
-            {
-                Ok(row) => {
-                    results.push(row.statement);
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        name = %name_row.name,
-                        "Failed to SHOW CREATE FUNCTION {}, skipping", name_row.name
-                    );
-                }
-            }
-        }
-
+        let results: Vec<String> = rows.into_iter().map(|r| r.create_query).collect();
         debug!(count = results.len(), "Queried user-defined functions");
         Ok(results)
     }
@@ -1673,6 +1674,125 @@ pub fn discover_s3_disk_endpoints(config_dir: &str) -> std::collections::BTreeMa
     endpoints
 }
 
+/// Discover cache disk -> underlying disk mappings from ClickHouse XML config.
+///
+/// Parses `<disks>` sections for `<type>cache</type>` entries and extracts the
+/// `<disk>underlying_name</disk>` reference. Returns a map from cache disk name
+/// to its underlying disk name.
+pub fn discover_cache_disk_refs(config_dir: &str) -> std::collections::BTreeMap<String, String> {
+    use std::path::Path;
+
+    let mut refs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let config_path = Path::new(config_dir);
+    let mut xml_files: Vec<std::path::PathBuf> = Vec::new();
+
+    for dir in &[config_path.to_path_buf(), config_path.join("config.d")] {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "xml") {
+                    xml_files.push(path);
+                }
+            }
+        }
+    }
+
+    for xml_file in &xml_files {
+        let content = match std::fs::read_to_string(xml_file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if !content.contains("<storage_configuration>") {
+            continue;
+        }
+
+        if let Some(disks_section) = extract_xml_section(&content, "disks") {
+            parse_cache_disk_refs_from_xml(&disks_section, &mut refs);
+        }
+    }
+
+    if !refs.is_empty() {
+        info!(
+            count = refs.len(),
+            mappings = ?refs,
+            "Discovered cache disk references from ClickHouse config"
+        );
+    }
+
+    refs
+}
+
+/// Parse cache disk definitions from a `<disks>` XML section.
+///
+/// For each disk with `<type>cache</type>`, extracts the `<disk>` child element
+/// which names the underlying storage disk.
+fn parse_cache_disk_refs_from_xml(
+    disks_xml: &str,
+    refs: &mut std::collections::BTreeMap<String, String>,
+) {
+    // Reuse the same tag-scanning pattern as parse_s3_disks_from_xml
+    let mut pos = 0;
+    while pos < disks_xml.len() {
+        let tag_start = match disks_xml[pos..].find('<') {
+            Some(i) => pos + i,
+            None => break,
+        };
+
+        if disks_xml[tag_start..].starts_with("<!--") {
+            if let Some(end) = disks_xml[tag_start..].find("-->") {
+                pos = tag_start + end + 3;
+                continue;
+            }
+            break;
+        }
+
+        let tag_name_start = tag_start + 1;
+        let tag_name_end =
+            match disks_xml[tag_name_start..].find(|c: char| c == '>' || c.is_whitespace()) {
+                Some(i) => tag_name_start + i,
+                None => break,
+            };
+
+        if disks_xml[tag_name_start..].starts_with('/') {
+            pos = tag_name_end + 1;
+            continue;
+        }
+
+        let disk_name = &disks_xml[tag_name_start..tag_name_end];
+
+        let close_tag = format!("</{}>", disk_name);
+        let disk_content_start = match disks_xml[tag_name_end..].find('>') {
+            Some(i) => tag_name_end + i + 1,
+            None => break,
+        };
+        let disk_content_end = match disks_xml[disk_content_start..].find(&close_tag) {
+            Some(i) => disk_content_start + i,
+            None => {
+                pos = disk_content_start;
+                continue;
+            }
+        };
+
+        let disk_content = &disks_xml[disk_content_start..disk_content_end];
+
+        // Check if this is a cache disk
+        let is_cache = extract_xml_section(disk_content, "type")
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("cache"));
+
+        if is_cache {
+            if let Some(underlying) = extract_xml_section(disk_content, "disk") {
+                let underlying = underlying.trim().to_string();
+                if !underlying.is_empty() {
+                    refs.insert(disk_name.to_string(), underlying);
+                }
+            }
+        }
+
+        pos = disk_content_end + close_tag.len();
+    }
+}
+
 /// Discover ClickHouse macros from XML config files.
 ///
 /// Parses `<macros>` sections from config XML files to extract macro key-value
@@ -1702,7 +1822,7 @@ pub fn discover_macros_from_config(config_dir: &str) -> std::collections::HashMa
             Err(_) => continue,
         };
 
-        if !content.contains("<macros>") {
+        if !content.contains("<macros") {
             continue;
         }
 
@@ -1724,7 +1844,10 @@ pub fn discover_macros_from_config(config_dir: &str) -> std::collections::HashMa
 
 /// Parse macro key-value pairs from a `<macros>` XML section.
 ///
-/// Extracts simple `<key>value</key>` pairs from the macros section.
+/// Handles three tag forms:
+/// - `<key>value</key>` — simple text content
+/// - `<key from_env="VAR"/>` — self-closing, value from environment variable
+/// - `<key from_env="VAR">fallback</key>` — env var with text fallback
 fn parse_macros_from_xml(macros_xml: &str, macros: &mut std::collections::HashMap<String, String>) {
     let mut pos = 0;
     while pos < macros_xml.len() {
@@ -1747,7 +1870,6 @@ fn parse_macros_from_xml(macros_xml: &str, macros: &mut std::collections::HashMa
             || macros_xml[tag_start + 1..].starts_with('?')
         {
             pos = tag_start + 1;
-            // Find end of this tag
             if let Some(end) = macros_xml[pos..].find('>') {
                 pos += end + 1;
             }
@@ -1756,40 +1878,105 @@ fn parse_macros_from_xml(macros_xml: &str, macros: &mut std::collections::HashMa
 
         // Find tag name
         let name_start = tag_start + 1;
-        let name_end = match macros_xml[name_start..].find(|c: char| c == '>' || c.is_whitespace())
+        let name_end = match macros_xml[name_start..]
+            .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
         {
             Some(i) => name_start + i,
             None => break,
         };
         let tag_name = &macros_xml[name_start..name_end];
 
-        // Skip nested sections (like <installation> which wraps macros in some configs)
-        // Try to extract simple value
-        if let Some(value) = extract_xml_section(&macros_xml[tag_start..], tag_name) {
-            let trimmed = value.trim();
-            // If value contains '<', it's a nested section — recurse
-            if trimmed.contains('<') {
-                parse_macros_from_xml(trimmed, macros);
-            } else if !trimmed.is_empty() {
-                macros.insert(tag_name.to_string(), trimmed.to_string());
-            }
-        }
+        // Find end of opening tag
+        let gt_pos = match macros_xml[name_end..].find('>') {
+            Some(i) => name_end + i,
+            None => break,
+        };
 
-        // Move past the closing tag
-        let close_tag = format!("</{}>", tag_name);
-        if let Some(close_pos) = macros_xml[tag_start..].find(&close_tag) {
-            pos = tag_start + close_pos + close_tag.len();
+        // Extract the opening tag content (between tag name and '>') for attribute parsing
+        let tag_opening = &macros_xml[name_end..gt_pos];
+        let is_self_closing = tag_opening.ends_with('/');
+
+        if is_self_closing {
+            // Self-closing: <key from_env="VAR"/>
+            if let Some(env_var) = extract_attribute(tag_opening.trim(), "from_env") {
+                if let Ok(val) = std::env::var(&env_var) {
+                    if !val.is_empty() {
+                        macros.insert(tag_name.to_string(), val);
+                    }
+                }
+            }
+            pos = gt_pos + 1;
         } else {
-            pos = name_end + 1;
+            // Non-self-closing: check for from_env attribute with text fallback
+            let from_env_val = extract_attribute(tag_opening.trim(), "from_env")
+                .and_then(|var| std::env::var(&var).ok().filter(|v| !v.is_empty()));
+
+            // Extract inner content via closing tag
+            let close_tag = format!("</{}>", tag_name);
+            let content_start = gt_pos + 1;
+            if let Some(close_offset) = macros_xml[content_start..].find(&close_tag) {
+                let inner = &macros_xml[content_start..content_start + close_offset];
+                let trimmed = inner.trim();
+
+                if let Some(val) = from_env_val {
+                    // from_env resolved — use it regardless of inner content
+                    macros.insert(tag_name.to_string(), val);
+                } else if trimmed.contains('<') {
+                    // Nested section — recurse
+                    parse_macros_from_xml(trimmed, macros);
+                } else if !trimmed.is_empty() {
+                    // Simple text value (or from_env fallback)
+                    macros.insert(tag_name.to_string(), trimmed.to_string());
+                }
+
+                pos = content_start + close_offset + close_tag.len();
+            } else {
+                pos = gt_pos + 1;
+            }
         }
     }
 }
 
-/// Extract content between `<tag>` and `</tag>` (first occurrence).
+/// Extract a named attribute value from an XML opening tag string.
+///
+/// `tag_opening` should be the content of the opening tag (e.g., `replica from_env="HOSTNAME"`).
+/// Uses word-boundary-aware matching (leading space or start of string before attr name).
+fn extract_attribute(tag_opening: &str, attr_name: &str) -> Option<String> {
+    // Search for ` attr_name=` or start-of-string `attr_name=`
+    let needle = format!(" {}=", attr_name);
+    let attr_start = if tag_opening.starts_with(&format!("{}=", attr_name)) {
+        0
+    } else {
+        tag_opening.find(&needle).map(|i| i + 1)? // skip the leading space
+    };
+    let eq_pos = attr_start + attr_name.len();
+    let rest = &tag_opening[eq_pos + 1..]; // skip '='
+    let quote = rest.as_bytes().first()?;
+    if *quote != b'"' && *quote != b'\'' {
+        return None;
+    }
+    let end = rest[1..].find(*quote as char)?;
+    let value = &rest[1..1 + end];
+    Some(value.to_string())
+}
+
+/// Extract content between `<tag>` (or `<tag attr="..">`) and `</tag>` (first occurrence).
 fn extract_xml_section(content: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
+    let open_prefix = format!("<{}", tag);
     let close = format!("</{}>", tag);
-    let start = content.find(&open)? + open.len();
+    let prefix_pos = content.find(&open_prefix)?;
+    // Verify the character after the tag name is `>`, whitespace, or `/` (not a substring match)
+    let after = content.as_bytes().get(prefix_pos + open_prefix.len())?;
+    if *after != b'>' && *after != b'/' && !(*after as char).is_ascii_whitespace() {
+        return None;
+    }
+    // Find the end of the opening tag
+    let gt_pos = content[prefix_pos..].find('>')? + prefix_pos;
+    // Check for self-closing tag
+    if content.as_bytes()[gt_pos - 1] == b'/' {
+        return None; // self-closing has no inner content
+    }
+    let start = gt_pos + 1;
     let end = content[start..].find(&close)? + start;
     Some(content[start..end].to_string())
 }
@@ -2723,5 +2910,106 @@ mod tests {
     fn test_discover_macros_from_config_nonexistent_dir() {
         let result = discover_macros_from_config("/nonexistent/path");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_macros_from_xml_self_closing_from_env() {
+        std::env::set_var("TEST_MACRO_REPLICA_VAR", "host-42");
+        let xml = r#"
+            <cluster>mycluster</cluster>
+            <replica from_env="TEST_MACRO_REPLICA_VAR"/>
+        "#;
+        let mut macros = std::collections::HashMap::new();
+        parse_macros_from_xml(xml, &mut macros);
+        assert_eq!(macros["cluster"], "mycluster");
+        assert_eq!(macros["replica"], "host-42");
+        std::env::remove_var("TEST_MACRO_REPLICA_VAR");
+    }
+
+    #[test]
+    fn test_parse_macros_from_xml_from_env_with_text_fallback() {
+        // Ensure the env var does NOT exist
+        std::env::remove_var("TEST_MACRO_MISSING_VAR_XYZ");
+        let xml = r#"<replica from_env="TEST_MACRO_MISSING_VAR_XYZ">fallback-replica</replica>"#;
+        let mut macros = std::collections::HashMap::new();
+        parse_macros_from_xml(xml, &mut macros);
+        assert_eq!(macros["replica"], "fallback-replica");
+    }
+
+    #[test]
+    fn test_parse_macros_from_xml_from_env_empty_var() {
+        std::env::set_var("TEST_MACRO_EMPTY_VAR", "");
+        let xml = r#"<replica from_env="TEST_MACRO_EMPTY_VAR">fallback-value</replica>"#;
+        let mut macros = std::collections::HashMap::new();
+        parse_macros_from_xml(xml, &mut macros);
+        // Empty env var treated as missing → uses text fallback
+        assert_eq!(macros["replica"], "fallback-value");
+        std::env::remove_var("TEST_MACRO_EMPTY_VAR");
+    }
+
+    #[test]
+    fn test_extract_attribute_double_quotes() {
+        assert_eq!(
+            extract_attribute(r#" from_env="HOSTNAME""#, "from_env"),
+            Some("HOSTNAME".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_attribute_single_quotes() {
+        assert_eq!(
+            extract_attribute(" from_env='HOSTNAME'", "from_env"),
+            Some("HOSTNAME".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_attribute_missing() {
+        assert_eq!(extract_attribute(" other='value'", "from_env"), None);
+    }
+
+    #[test]
+    fn test_extract_attribute_no_false_substring() {
+        // "my_from_env" should NOT match "from_env"
+        assert_eq!(extract_attribute(r#" my_from_env="X""#, "from_env"), None);
+    }
+
+    #[test]
+    fn test_extract_xml_section_with_attributes() {
+        let xml = r#"<root><macros optional="true"><cluster>test</cluster></macros></root>"#;
+        let section = extract_xml_section(xml, "macros").unwrap();
+        assert!(section.contains("<cluster>test</cluster>"));
+    }
+
+    #[test]
+    fn test_parse_cache_disk_refs_from_xml() {
+        let xml = r#"
+            <s3>
+                <type>s3</type>
+                <endpoint>https://s3.amazonaws.com/bucket/data/</endpoint>
+            </s3>
+            <s3_cache>
+                <type>cache</type>
+                <disk>s3</disk>
+                <path>/cache/s3_cache/</path>
+            </s3_cache>
+        "#;
+        let mut refs = std::collections::BTreeMap::new();
+        parse_cache_disk_refs_from_xml(xml, &mut refs);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs.get("s3_cache").unwrap(), "s3");
+    }
+
+    #[test]
+    fn test_parse_cache_disk_refs_no_cache() {
+        let xml = r#"
+            <s3>
+                <type>s3</type>
+                <endpoint>https://s3.amazonaws.com/bucket/data/</endpoint>
+            </s3>
+        "#;
+        let mut refs = std::collections::BTreeMap::new();
+        parse_cache_disk_refs_from_xml(xml, &mut refs);
+        assert!(refs.is_empty());
     }
 }

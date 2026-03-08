@@ -182,19 +182,49 @@ pub fn collect_parts(
     skip_disk_types: &[String],
     skip_projections: &[String],
     base_parts: Option<&BasePartsMap>,
+    cache_disk_names: &HashSet<String>,
 ) -> Result<HashMap<String, Vec<CollectedPart>>> {
     let uuid_map = build_uuid_map(tables);
     let mut result: HashMap<String, Vec<CollectedPart>> = HashMap::new();
     // Track which disks have already been logged to avoid per-part log spam.
     let mut logged_disks: HashSet<String> = HashSet::new();
 
-    // Collect all disk paths to walk. Always include the default data_path
-    // (for the "default" disk even if not explicitly in disk_paths).
-    let mut paths_to_walk: Vec<(String, String)> = Vec::new(); // (disk_name, disk_path)
-
+    // Build deduplicated path→disk_name map. When a cache disk shares its path
+    // with the underlying real disk, prefer the non-cache disk to avoid walking
+    // the same shadow directory twice with incorrect disk_name tagging.
+    let mut path_to_disk: BTreeMap<String, (String, bool)> = BTreeMap::new();
     for (disk_name, disk_path) in disk_paths {
-        paths_to_walk.push((disk_name.clone(), disk_path.clone()));
+        let normalized = disk_path.trim_end_matches('/').to_string();
+        let is_cache = cache_disk_names.contains(disk_name);
+        match path_to_disk.entry(normalized) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert((disk_name.clone(), is_cache));
+            }
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                let (ref existing_name, existing_is_cache) = *e.get();
+                if existing_is_cache && !is_cache {
+                    info!(
+                        cache_disk = %existing_name,
+                        real_disk = %disk_name,
+                        path = %disk_path,
+                        "Deduplicating cache disk from walk (same path as real disk)"
+                    );
+                    e.insert((disk_name.clone(), is_cache));
+                } else if !existing_is_cache && is_cache {
+                    info!(
+                        cache_disk = %disk_name,
+                        real_disk = %existing_name,
+                        path = %disk_path,
+                        "Skipping cache disk from walk (same path as real disk)"
+                    );
+                }
+            }
+        }
     }
+    let mut paths_to_walk: Vec<(String, String)> = path_to_disk
+        .into_iter()
+        .map(|(path, (name, _))| (name, path))
+        .collect();
 
     // Ensure we always walk the default data_path even if disk_paths is empty
     let data_path_normalized = data_path.trim_end_matches('/');
@@ -780,6 +810,7 @@ mod tests {
             &[],
             &[],
             None,
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -864,6 +895,7 @@ mod tests {
             &[],
             &[],
             None,
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -1040,6 +1072,7 @@ mod tests {
             &[],
             &[],
             None,
+            &HashSet::new(),
         )
         .unwrap();
 

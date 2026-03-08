@@ -70,7 +70,7 @@ libc = "0.2"
 
 # HTTP API server
 axum = "0.7"
-tower-http = { version = "0.6", features = ["auth"] }
+tower-http = { version = "0.6", features = ["auth", "trace"] }
 tower = "0.5"
 http = "1"
 base64 = "0.22"

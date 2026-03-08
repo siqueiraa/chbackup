@@ -632,7 +632,7 @@ pub async fn auto_resume(state: &AppState) {
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::info!(
                                 backup_name = %backup_name,
                                 error = %e,
                                 "Auto-resume: could not start upload operation"
@@ -664,6 +664,7 @@ pub async fn auto_resume(state: &AppState) {
                             };
 
                             let config = state_clone.config.load();
+                            let ch = state_clone.ch.load();
                             let s3 = state_clone.s3.load();
                             let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
                                 .join("backup")
@@ -671,6 +672,7 @@ pub async fn auto_resume(state: &AppState) {
 
                             match crate::upload::upload(
                                 &config,
+                                &ch,
                                 &s3,
                                 &backup_name,
                                 &backup_dir,
@@ -686,7 +688,7 @@ pub async fn auto_resume(state: &AppState) {
                                     state_clone.finish_op(id).await;
                                 }
                                 Err(e) => {
-                                    tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: upload failed");
+                                    tracing::warn!(backup_name = %backup_name, error = ?e, "Auto-resume: upload failed");
                                     state_clone.fail_op(id, e.to_string()).await;
                                 }
                             }
@@ -702,7 +704,7 @@ pub async fn auto_resume(state: &AppState) {
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::info!(
                                 backup_name = %backup_name,
                                 error = %e,
                                 "Auto-resume: could not start download operation"
@@ -795,7 +797,7 @@ pub async fn auto_resume(state: &AppState) {
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::info!(
                                 backup_name = %backup_name,
                                 error = %e,
                                 "Auto-resume: could not start restore operation"

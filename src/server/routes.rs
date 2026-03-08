@@ -13,7 +13,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -589,6 +589,7 @@ async fn dispatch_action_command(
             let effective_resume = config.general.use_resumable_state;
             let upload_result = crate::upload::upload(
                 config,
+                ch,
                 s3,
                 backup_name,
                 &backup_dir,
@@ -670,6 +671,7 @@ async fn dispatch_action_command(
                     let effective_resume = config.general.use_resumable_state;
                     let upload_result = crate::upload::upload(
                         config,
+                        ch,
                         s3,
                         backup_name,
                         &backup_dir,
@@ -972,10 +974,24 @@ async fn execute_action_command(
 ///
 /// Used by ClickHouse integration tables where INSERT writes multiple commands
 /// that should queue rather than fail.
-pub async fn go_post_actions(State(state): State<AppState>, body: Bytes) -> StatusCode {
+pub async fn go_post_actions(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<GoOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!(body_len = body.len(), "POST /backup/actions received");
+
     let parsed = parse_action_requests(&body);
     if parsed.is_empty() {
-        return StatusCode::BAD_REQUEST;
+        warn!(
+            body_len = body.len(),
+            "POST /backup/actions: empty/unparseable body, returning 400"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "empty or unparseable body".to_string(),
+            }),
+        ));
     }
 
     // Validate all commands upfront
@@ -985,7 +1001,12 @@ pub async fn go_post_actions(State(state): State<AppState>, body: Bytes) -> Stat
             Ok(v) => validated.push((req.command.clone(), v)),
             Err(_) => {
                 warn!(command = %req.command, "Invalid command rejected in /backup/actions");
-                return StatusCode::BAD_REQUEST;
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid command: {}", req.command),
+                    }),
+                ));
             }
         }
     }
@@ -1084,7 +1105,7 @@ pub async fn go_post_actions(State(state): State<AppState>, body: Bytes) -> Stat
         }
     });
 
-    StatusCode::OK
+    go_operation_response("actions")
 }
 
 /// GET /api/v1/list -- list backups, optionally filtered by location
@@ -1243,7 +1264,7 @@ pub async fn upload_backup(
         "upload",
         Some(name.clone()), // per-backup conflict detection
         true,               // invalidate cache after upload
-        move |config, _ch, s3, cancel| async move {
+        move |config, ch, s3, cancel| async move {
             info!(backup_name = %name, "Starting upload operation");
             let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
                 .join("backup")
@@ -1251,6 +1272,7 @@ pub async fn upload_backup(
             let effective_resume = req.resume.unwrap_or(config.general.use_resumable_state);
             let stats = crate::upload::upload(
                 &config,
+                &ch,
                 &s3,
                 &name,
                 &backup_dir,
@@ -1472,6 +1494,7 @@ pub async fn create_remote(
             let effective_resume = req.resume.unwrap_or(config.general.use_resumable_state);
             let stats = crate::upload::upload(
                 &config,
+                &ch,
                 &s3,
                 &backup_name,
                 &backup_dir,

@@ -197,6 +197,7 @@ async fn run() -> Result<()> {
             let raw_name = backup_name_required(backup_name, "upload")?;
             let name = resolve_local_shortcut(&raw_name, &config.clickhouse.data_path)?;
             let _lock = acquire_lock("upload", Some(&name))?;
+            let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;
 
             let backup_dir = PathBuf::from(&config.clickhouse.data_path)
@@ -206,6 +207,7 @@ async fn run() -> Result<()> {
             let effective_resume = resume && config.general.use_resumable_state;
             let _stats = upload::upload(
                 &config,
+                &ch,
                 &s3,
                 &name,
                 &backup_dir,
@@ -350,6 +352,7 @@ async fn run() -> Result<()> {
             let effective_resume = resume && config.general.use_resumable_state;
             let _stats = upload::upload(
                 &config,
+                &ch,
                 &s3,
                 &name,
                 &backup_dir,

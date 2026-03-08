@@ -618,6 +618,7 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
 
         let upload_result = crate::upload::upload(
             &ctx.config,
+            &ctx.ch,
             &ctx.s3,
             &backup_name,
             &backup_dir,

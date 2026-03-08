@@ -31,7 +31,7 @@ RUN mkdir src && echo "fn main(){}" > src/main.rs \
 ARG VCS_REF
 COPY build.rs ./
 COPY src/ src/
-RUN VCS_REF=${VCS_REF} cargo build --release
+RUN touch build.rs && VCS_REF=${VCS_REF} cargo build --release
 
 # Stage 2: Minimal Alpine runtime
 FROM alpine:3.21
