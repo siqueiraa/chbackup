@@ -356,7 +356,7 @@ pub fn build_disk_remote_paths(disks: &[DiskRow], config_dir: &str) -> BTreeMap<
         let normalized = d.path.trim_end_matches('/').to_string();
         disk_by_path.entry(normalized).or_default().push(i);
     }
-    for (_path, indices) in &disk_by_path {
+    for indices in disk_by_path.values() {
         // Find the first disk at this path that has a resolved endpoint
         let resolved = indices
             .iter()

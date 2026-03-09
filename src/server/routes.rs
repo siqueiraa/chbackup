@@ -550,6 +550,7 @@ fn validate_action_command(
 ///
 /// Returns `Ok(())` on success or the underlying error. Caller is responsible for
 /// metrics recording and `finish_op`/`fail_op` lifecycle calls.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_action_command(
     parts: &[String],
     flags: &ActionFlags,
