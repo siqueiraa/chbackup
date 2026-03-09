@@ -130,6 +130,9 @@ pub struct OwnedAttachParams {
     pub source_db: String,
     /// Original (pre-remap) table name for shadow path lookup.
     pub source_table: String,
+    /// Disk name -> local filesystem path for S3 disks. Used to write S3 metadata
+    /// pointer files to the correct disk's detached directory on tiered storage policies.
+    pub disk_local_paths: BTreeMap<String, String>,
 }
 
 /// Derive the UUID-based S3 path prefix for restore.
@@ -173,6 +176,9 @@ struct S3RestoreParams<'a> {
     source_table: &'a str,
     /// Disk name -> remote_path S3 URI for data disks (from DiskRow.remote_path).
     disk_remote_paths: &'a BTreeMap<String, String>,
+    /// Disk name -> local filesystem path for S3 disks. Used to write S3 metadata
+    /// to the correct disk's detached directory on tiered storage policies.
+    disk_local_paths: &'a BTreeMap<String, String>,
 }
 
 /// Restore S3 disk parts for a single table.
@@ -203,7 +209,6 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
     );
 
     let semaphore = Arc::new(Semaphore::new(p.concurrency));
-    let detached_dir = p.table_data_path.join("detached");
     let mut skipped_count = 0u64;
 
     let url_src_db = encode_path_component(p.source_db);
@@ -226,6 +231,21 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
         if !is_s3_disk(disk_type) {
             continue;
         }
+
+        // Compute detached_dir per-disk: for tiered storage policies, S3 metadata
+        // pointer files must be written to the S3 disk's own detached directory,
+        // not the local disk's detached/ (which is data_paths[0] for tiered tables).
+        let detached_dir = if let Some(disk_local_path) = p.disk_local_paths.get(disk_name) {
+            // Use the S3 disk's local metadata path + table UUID
+            let uuid_path = uuid_s3_prefix(p.table_uuid);
+            PathBuf::from(disk_local_path)
+                .join(uuid_path)
+                .join("detached")
+        } else {
+            // Fallback: use table_data_path (handles cross-cluster restore where
+            // disk names don't match the live server's disks)
+            p.table_data_path.join("detached")
+        };
 
         // Parse the data disk's S3 URI to get its bucket and prefix.
         // This tells us WHERE to write the restored objects (data disk location,
@@ -652,6 +672,7 @@ pub(crate) async fn attach_parts_owned(params: OwnedAttachParams) -> Result<Atta
                 source_db: &params.source_db,
                 source_table: &params.source_table,
                 disk_remote_paths: &params.disk_remote_paths,
+                disk_local_paths: &params.disk_local_paths,
             };
             s3_skipped = restore_s3_disk_parts(&s3_params).await?;
         }
@@ -790,10 +811,13 @@ async fn attach_parts_inner(
         let dest_dir = detached_dir.join(&part.name);
 
         let is_s3_part = part.s3_objects.is_some();
-        if is_s3_part && dest_dir.exists() {
+        if is_s3_part {
+            // S3 disk parts have their metadata written to the S3 disk's detached
+            // directory by restore_s3_disk_parts(). Skip hardlink entirely — the
+            // local detached/ may be on a different disk (tiered storage policies).
             debug!(
                 part = %part.name,
-                "S3 disk part already prepared in detached/, skipping hardlink"
+                "S3 disk part handled by restore_s3_disk_parts, skipping hardlink"
             );
         } else {
             let disk_name = part_to_disk
@@ -1394,6 +1418,7 @@ mod tests {
             manifest_disks: BTreeMap::new(),
             source_db: "default".to_string(),
             source_table: "trades".to_string(),
+            disk_local_paths: BTreeMap::new(),
         };
 
         assert_eq!(params.object_disk_server_side_copy_concurrency, 32);
@@ -1437,6 +1462,7 @@ mod tests {
             manifest_disks: BTreeMap::new(),
             source_db: "default".to_string(),
             source_table: "trades".to_string(),
+            disk_local_paths: BTreeMap::new(),
         };
 
         assert_eq!(params.already_attached.len(), 2);

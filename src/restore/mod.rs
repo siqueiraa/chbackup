@@ -496,24 +496,46 @@ pub async fn restore(
         None
     };
 
-    // Build disk remote paths from live disks (for S3 CopyObject destination)
-    let disk_remote_paths: BTreeMap<String, String> = if has_s3_disks {
+    // Build disk remote paths and disk local paths from live disks.
+    // disk_remote_paths: S3 URI for CopyObject destination (data disk bucket/prefix).
+    // disk_local_paths: local filesystem path for S3 disk metadata directories.
+    //   Used to write S3 metadata pointer files to the correct detached/ directory
+    //   on tiered storage policies (where data_paths[0] may be a local disk).
+    let (disk_remote_paths, disk_local_paths): (
+        BTreeMap<String, String>,
+        BTreeMap<String, String>,
+    ) = if has_s3_disks {
         match ch.get_disks().await {
             Ok(disks) => {
-                let mut paths = crate::object_disk::build_disk_remote_paths(
+                let mut remote_paths = crate::object_disk::build_disk_remote_paths(
                     &disks,
                     &config.clickhouse.config_dir,
                 );
-                crate::object_disk::resolve_macros_in_paths(&mut paths, &macros);
-                paths
+                crate::object_disk::resolve_macros_in_paths(&mut remote_paths, &macros);
+
+                // Collect local filesystem paths for S3 disks (non-cache)
+                let local_paths: BTreeMap<String, String> = disks
+                    .iter()
+                    .filter(|d| {
+                        let eff = crate::object_disk::normalize_disk_type(
+                            &d.disk_type,
+                            &d.object_storage_type,
+                        );
+                        crate::object_disk::is_s3_disk(&eff)
+                            && !crate::object_disk::is_cache_disk(d)
+                    })
+                    .map(|d| (d.name.clone(), d.path.clone()))
+                    .collect();
+
+                (remote_paths, local_paths)
             }
             Err(e) => {
                 warn!(error = %e, "Failed to get disk info for S3 restore");
-                BTreeMap::new()
+                (BTreeMap::new(), BTreeMap::new())
             }
         }
     } else {
-        BTreeMap::new()
+        (BTreeMap::new(), BTreeMap::new())
     };
 
     let object_disk_concurrency =
@@ -642,6 +664,7 @@ pub async fn restore(
                 manifest_disks: manifest.disks.clone(),
                 source_db: src_db.to_string(),
                 source_table: src_table.to_string(),
+                disk_local_paths: disk_local_paths.clone(),
             },
         ));
     }
