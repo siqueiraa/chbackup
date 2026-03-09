@@ -313,7 +313,13 @@ async fn run() -> Result<()> {
             resume,
             backup_name,
         } => {
-            let name = resolve_backup_name(backup_name)?;
+            let name = match backup_name {
+                Some(n) => resolve_backup_name(Some(n))?,
+                None => match diff_from_remote.as_deref() {
+                    Some(base) => chbackup::derive_incremental_name(base),
+                    None => chbackup::generate_backup_name(),
+                },
+            };
             let _lock = acquire_lock("create_remote", Some(&name))?;
             let ch = ChClient::new(&config.clickhouse)?;
             let s3 = S3Client::new(&config.s3).await?;

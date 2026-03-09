@@ -4632,6 +4632,31 @@ if should_run "test_batch_actions_insert"; then
     fi
 fi
 
+# T74: Incremental backup name derives from base name pattern
+if should_run "test_incr_name_derivation"; then
+    info "T74: Incremental backup name derives from base name pattern"
+    T74_FULL="t74-full-$(date -u +%Y-%m-%d-%H-%M-%S)"
+
+    run_cmd "T74 create" env RUST_LOG=error chbackup create "$T74_FULL"
+    run_cmd "T74 upload" env RUST_LOG=error chbackup upload "$T74_FULL"
+
+    # create_remote with no explicit name — should derive t74-incr-*
+    run_cmd "T74 create_remote" env RUST_LOG=error chbackup create_remote \
+        --diff-from-remote "$T74_FULL"
+
+    # Verify name matches t74-incr-YYYY-MM-DD-HH-MM-SS
+    INCR_NAME=$(env RUST_LOG=error chbackup list 2>/dev/null \
+        | grep 't74-incr-' | head -1 | awk '{print $1}')
+    if [[ -n "$INCR_NAME" && "$INCR_NAME" =~ ^t74-incr-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
+        pass "Incremental name derived correctly: $INCR_NAME"
+    else
+        fail "Expected t74-incr-YYYY-MM-DD-HH-MM-SS, got: '${INCR_NAME}'"
+    fi
+
+    cleanup_backup "$T74_FULL"
+    if [[ -n "$INCR_NAME" ]]; then cleanup_backup "$INCR_NAME"; fi
+fi
+
 # ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------

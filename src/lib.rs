@@ -26,6 +26,20 @@ pub fn generate_backup_name() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H%M%S%.3f").to_string()
 }
 
+/// Derive an incremental backup name from a `--diff-from-remote` base name.
+///
+/// Splits on the last `-full-` token, replaces with `-incr-`, and
+/// substitutes the trailing timestamp with the current UTC time.
+/// Falls back to `generate_backup_name()` if no `-full-` token found.
+pub fn derive_incremental_name(base_name: &str) -> String {
+    if let Some((prefix, _suffix)) = base_name.rsplit_once("-full-") {
+        let now = chrono::Utc::now();
+        format!("{}-incr-{}", prefix, now.format("%Y-%m-%d-%H-%M-%S"))
+    } else {
+        generate_backup_name()
+    }
+}
+
 /// Spawn a SIGHUP handler that sends `true` on `reload_tx` for config reload.
 #[cfg(unix)]
 pub fn spawn_sighup_handler(reload_tx: tokio::sync::watch::Sender<bool>) {
@@ -62,6 +76,43 @@ mod tests {
     //! Compile-time verification that all Phase 2c public types and functions
     //! are accessible from the crate root. This test exists to catch wiring
     //! issues where a module is declared but its public API is not reachable.
+
+    #[test]
+    fn test_derive_incremental_name_from_full() {
+        let name = crate::derive_incremental_name(
+            "chi-ch-cluster-ch-deployment-0-0-full-2026-03-08-13-18-19",
+        );
+        assert!(
+            name.starts_with("chi-ch-cluster-ch-deployment-0-0-incr-"),
+            "expected -incr- prefix, got: {name}"
+        );
+        // Should match YYYY-MM-DD-HH-MM-SS suffix
+        let suffix = name
+            .strip_prefix("chi-ch-cluster-ch-deployment-0-0-incr-")
+            .unwrap();
+        assert_eq!(suffix.len(), 19, "timestamp should be 19 chars: {suffix}");
+    }
+
+    #[test]
+    fn test_derive_incremental_name_no_full_token() {
+        // No "-full-" token → falls back to generate_backup_name()
+        let name = crate::derive_incremental_name("my-backup-2026-03-08");
+        // Should be a plain timestamp (no -incr-)
+        assert!(
+            !name.contains("-incr-"),
+            "should fall back to generate_backup_name, got: {name}"
+        );
+    }
+
+    #[test]
+    fn test_derive_incremental_name_rsplit_once() {
+        // Multiple "-full-" tokens → splits on the LAST one
+        let name = crate::derive_incremental_name("a-full-b-full-2026-01-01-00-00-00");
+        assert!(
+            name.starts_with("a-full-b-incr-"),
+            "should split on last -full-, got: {name}"
+        );
+    }
 
     #[test]
     fn test_phase2c_types_importable() {

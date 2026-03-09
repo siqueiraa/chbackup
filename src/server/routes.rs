@@ -897,7 +897,13 @@ async fn execute_action_command(
             info!(command = %command, "Action dispatched from POST /api/v1/actions");
             let backup_name = validated.flags.backup_name
                 .clone()
-                .unwrap_or_else(crate::generate_backup_name);
+                .unwrap_or_else(|| {
+                    if let Some(ref base) = validated.flags.diff_from_remote {
+                        crate::derive_incremental_name(base)
+                    } else {
+                        crate::generate_backup_name()
+                    }
+                });
 
             let op = validated.parts[0].as_str();
 
@@ -1014,11 +1020,13 @@ pub async fn go_post_actions(
     let state_clone = state.clone();
     tokio::spawn(async move {
         for (command_str, v) in validated {
-            let backup_name = v
-                .flags
-                .backup_name
-                .clone()
-                .unwrap_or_else(crate::generate_backup_name);
+            let backup_name = v.flags.backup_name.clone().unwrap_or_else(|| {
+                if let Some(ref base) = v.flags.diff_from_remote {
+                    crate::derive_incremental_name(base)
+                } else {
+                    crate::generate_backup_name()
+                }
+            });
 
             // Queue for semaphore (waits if another op is running)
             let (cmd_id, token) = match state_clone
@@ -1448,10 +1456,13 @@ pub async fn create_remote(
 
     // Pre-generate the backup name so run_operation() can acquire a per-backup
     // PID lock instead of falling back to the global lock when no name is given.
-    let backup_name = req
-        .backup_name
-        .clone()
-        .unwrap_or_else(crate::generate_backup_name);
+    let backup_name = req.backup_name.clone().unwrap_or_else(|| {
+        if let Some(ref base) = req.diff_from_remote {
+            crate::derive_incremental_name(base)
+        } else {
+            crate::generate_backup_name()
+        }
+    });
 
     let metrics_clone = state.metrics.clone();
     let cache_clone = state.manifest_cache.clone();
