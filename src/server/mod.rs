@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -132,6 +133,12 @@ pub fn build_router(state: AppState) -> Router {
         state.clone(),
         auth::auth_middleware,
     ));
+
+    // CatchPanic BEFORE TraceLayer in code = INNER layer at runtime.
+    // This means TraceLayer (outer) will see and log the 500 from caught panics.
+    // Without this, a handler panic silently drops the TCP connection, making
+    // the issue undiagnosable from ClickHouse error messages.
+    let router = router.layer(CatchPanicLayer::new());
 
     // Add HTTP request/response tracing to capture transport-level failures
     // that may never reach the handler (connection resets, body extraction
@@ -260,14 +267,7 @@ pub async fn start_server(
         .parse()
         .with_context(|| format!("invalid api.listen address: '{}'", listen))?;
 
-    // For the non-TLS path, bind the TCP listener BEFORE creating integration
-    // tables.  TcpListener::bind() registers the socket with the OS kernel,
-    // which immediately starts accepting TCP SYN packets into the kernel's
-    // backlog queue.  This prevents a startup race where ClickHouse tries to
-    // reach the integration table URL while the server is not yet listening.
-    //
-    // TLS path limitation: axum_server::bind_rustls() combines bind+serve, so
-    // we keep the current ordering there (integration tables before serve).
+    // Bind TCP listener early for non-TLS path so the port is open.
     let listener = if !config.api.secure {
         let l = tokio::net::TcpListener::bind(addr)
             .await
@@ -278,47 +278,77 @@ pub async fn start_server(
         None
     };
 
-    // Wait for ClickHouse to become reachable, then create integration tables.
-    // In K8s sidecar deployments, ClickHouse starts alongside chbackup so we
-    // retry indefinitely until it's ready.
-    let created_tables = if config.api.create_integration_tables {
-        let mut attempt = 0u64;
-        loop {
-            attempt += 1;
-            match ch.ping().await {
-                Ok(()) => {
-                    let (host, port) = parse_integration_host_port(&config);
-                    match ch.create_integration_tables(&host, &port).await {
+    // --- Background init task ---
+    // Integration table creation and auto-resume run AFTER axum starts serving.
+    // This prevents a stale TCP connection in ClickHouse's HTTP pool: during
+    // CREATE TABLE, ClickHouse may probe the URL endpoint. If the kernel accepts
+    // the TCP connection (port is open via bind) but axum isn't serving yet,
+    // ClickHouse gets a half-open connection that fails on first use.
+    let created_tables = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bg_cancel = tokio_util::sync::CancellationToken::new();
+    let server_ready = Arc::new(tokio::sync::Notify::new());
+
+    let bg_handle = {
+        let ch_bg = ch.clone();
+        let config_bg = config.clone();
+        let state_bg = state.clone();
+        let flag = created_tables.clone();
+        let cancel = bg_cancel.clone();
+        let ready = server_ready.clone();
+        let should_create_tables = config.api.create_integration_tables;
+        tokio::spawn(async move {
+            // Wait until axum is serving (or shutdown is requested)
+            tokio::select! {
+                _ = ready.notified() => {}
+                _ = cancel.cancelled() => { return; }
+            }
+            // Defensive yield: ensure serve task has fully entered accept loop
+            tokio::task::yield_now().await;
+
+            // Auto-resume runs immediately after server readiness,
+            // independent of CH availability (CH may be slow/unreachable)
+            state::auto_resume(&state_bg).await;
+
+            if should_create_tables {
+                // Wait for ClickHouse to become reachable, then create tables.
+                // In K8s sidecar deployments CH starts alongside chbackup.
+                let mut attempt = 0u64;
+                loop {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    attempt += 1;
+                    match ch_bg.ping().await {
                         Ok(()) => {
-                            info!("Integration tables created");
-                            break true;
+                            let (host, port) = parse_integration_host_port(&config_bg);
+                            match ch_bg.create_integration_tables(&host, &port).await {
+                                Ok(()) => {
+                                    flag.store(true, std::sync::atomic::Ordering::Release);
+                                    info!("Integration tables created");
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = format_args!("{e:#}"),
+                                        "Failed to create integration tables (continuing anyway)"
+                                    );
+                                }
+                            }
+                            break;
                         }
-                        Err(e) => {
-                            warn!(
-                                error = format_args!("{e:#}"),
-                                "Failed to create integration tables (continuing anyway)"
+                        Err(_) => {
+                            let delay = std::cmp::min(attempt * 2, 30);
+                            info!(
+                                attempt = attempt,
+                                retry_in_secs = delay,
+                                "Waiting for ClickHouse to become reachable"
                             );
-                            break false;
+                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                         }
                     }
                 }
-                Err(_) => {
-                    let delay = std::cmp::min(attempt * 2, 30);
-                    info!(
-                        attempt = attempt,
-                        retry_in_secs = delay,
-                        "Waiting for ClickHouse to become reachable"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                }
             }
-        }
-    } else {
-        false
+        })
     };
-
-    // Auto-resume interrupted operations
-    state::auto_resume(&state).await;
 
     // Start server (TLS or plain)
     if config.api.secure {
@@ -336,7 +366,8 @@ pub async fn start_server(
 
         // Spawn shutdown signal handler
         let ch_shutdown = ch.clone();
-        let created_tables_shutdown = created_tables;
+        let flag_shutdown = created_tables.clone();
+        let bg_cancel_shutdown = bg_cancel.clone();
         let watch_shutdown_tx_clone = watch_shutdown_tx.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
@@ -344,13 +375,18 @@ pub async fn start_server(
             if let Some(tx) = watch_shutdown_tx_clone {
                 tx.send(true).ok();
             }
-            if created_tables_shutdown {
+            // Cancel background init task and wait for it to finish
+            bg_cancel_shutdown.cancel();
+            if flag_shutdown.load(std::sync::atomic::Ordering::Acquire) {
                 if let Err(e) = ch_shutdown.drop_integration_tables().await {
                     warn!(error = %e, "Failed to drop integration tables during shutdown");
                 }
             }
             handle_clone.shutdown();
         });
+
+        // Signal readiness just before serving
+        server_ready.notify_one();
 
         axum_server::bind_rustls(addr, tls_config)
             .handle(handle)
@@ -364,8 +400,12 @@ pub async fn start_server(
         let listener = listener.unwrap();
 
         let ch_shutdown = ch.clone();
-        let created_tables_shutdown = created_tables;
+        let flag_shutdown = created_tables.clone();
+        let bg_cancel_shutdown = bg_cancel.clone();
         let watch_shutdown_tx_clone = watch_shutdown_tx.clone();
+
+        // Signal readiness just before serving
+        server_ready.notify_one();
 
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
@@ -374,7 +414,9 @@ pub async fn start_server(
                 if let Some(tx) = watch_shutdown_tx_clone {
                     tx.send(true).ok();
                 }
-                if created_tables_shutdown {
+                // Cancel background init task and wait with timeout
+                bg_cancel_shutdown.cancel();
+                if flag_shutdown.load(std::sync::atomic::Ordering::Acquire) {
                     if let Err(e) = ch_shutdown.drop_integration_tables().await {
                         warn!(error = %e, "Failed to drop integration tables during shutdown");
                     }
@@ -382,6 +424,13 @@ pub async fn start_server(
             })
             .await
             .context("server error")?;
+    }
+
+    // Wait for background task to finish (with timeout)
+    bg_cancel.cancel();
+    match tokio::time::timeout(std::time::Duration::from_secs(5), bg_handle).await {
+        Ok(_) => {}
+        Err(_) => warn!("Background init task timed out during shutdown"),
     }
 
     info!("Server stopped");
