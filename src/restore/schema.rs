@@ -573,34 +573,12 @@ pub async fn create_tables(
             continue;
         }
 
-        // ZK conflict resolution for Replicated tables (before CREATE)
-        if is_replicated_engine(&table_manifest.engine) {
-            // Build macro map with database/table context
-            let mut table_macros = macros.clone();
-            table_macros
-                .entry("database".to_string())
-                .or_insert_with(|| dst_db.clone());
-            table_macros
-                .entry("table".to_string())
-                .or_insert_with(|| dst_table.clone());
-
-            if let Err(e) = resolve_zk_conflict(
-                ch,
-                &table_manifest.ddl,
-                &table_macros,
-                table_manifest.uuid.as_deref(),
-            )
-            .await
-            {
-                warn!(
-                    table = %format!("{}.{}", dst_db, dst_table),
-                    error = %e,
-                    "ZK conflict resolution failed (non-fatal, proceeding with CREATE)"
-                );
-            }
-        }
-
-        // Build DDL: rewrite if remap is active, otherwise just ensure IF NOT EXISTS
+        // Build DDL: rewrite if remap is active, otherwise just ensure IF NOT EXISTS.
+        // DDL rewriting MUST happen before ZK conflict resolution so that
+        // resolve_zk_conflict() parses the remapped ZK path (not the source table's path).
+        // Using the original DDL would cause DROP REPLICA against the source table's
+        // ZK path, which is harmless on single-replica setups but potentially destructive
+        // on multi-replica clusters.
         let mut ddl = match remap {
             Some(rc) if rc.is_active() && (src_db != dst_db || src_table != dst_table) => {
                 let rewritten = rewrite_create_table_ddl(
@@ -633,6 +611,28 @@ pub async fn create_tables(
         if let Some(cluster) = on_cluster {
             if !replicated_databases.contains(&dst_db) {
                 ddl = add_on_cluster_clause(&ddl, cluster);
+            }
+        }
+
+        // ZK conflict resolution for Replicated tables (after DDL rewrite)
+        if is_replicated_engine(&table_manifest.engine) {
+            // Build macro map with database/table context
+            let mut table_macros = macros.clone();
+            table_macros
+                .entry("database".to_string())
+                .or_insert_with(|| dst_db.clone());
+            table_macros
+                .entry("table".to_string())
+                .or_insert_with(|| dst_table.clone());
+
+            if let Err(e) =
+                resolve_zk_conflict(ch, &ddl, &table_macros, table_manifest.uuid.as_deref()).await
+            {
+                warn!(
+                    table = %format!("{}.{}", dst_db, dst_table),
+                    error = %e,
+                    "ZK conflict resolution failed (non-fatal, proceeding with CREATE)"
+                );
             }
         }
 
