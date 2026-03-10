@@ -15,6 +15,7 @@
 //! For S3 disk parts, metadata files are parsed to extract S3 object references
 //! instead of hardlinking data (the data lives on S3, not the local filesystem).
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -129,29 +130,93 @@ pub fn parse_part_name(name: &str) -> Option<(String, u64, u64, u64)> {
 ///
 /// We extract the UUID hex portion from the path to create the mapping.
 fn build_uuid_map(tables: &[TableRow]) -> HashMap<String, (String, String)> {
-    let mut map = HashMap::new();
+    // Track whether each entry is a data engine so we can resolve UUID collisions.
+    // MaterializedView with TO clause has data_paths pointing to the target table's
+    // UUID directory, causing both the MV and the target to map to the same UUID key.
+    // We prefer data-engine tables (MergeTree family) over non-data-engine tables.
+    let mut map: HashMap<String, (String, String, bool)> = HashMap::new();
+
     for table in tables {
+        let is_data = table.engine.ends_with("MergeTree")
+            || table.engine == "MaterializedMySQL"
+            || table.engine == "MaterializedPostgreSQL";
+
         for data_path in &table.data_paths {
             // Extract the UUID directory from the path
             // Format: .../store/{3char_prefix}/{uuid_with_dashes}/
             let normalized = data_path.trim_end_matches('/');
             if let Some(uuid_dir) = normalized.rsplit('/').next() {
-                // The directory name is the UUID with dashes
-                map.insert(
+                insert_with_priority(
+                    &mut map,
                     uuid_dir.to_string(),
-                    (table.database.clone(), table.name.clone()),
+                    &table.database,
+                    &table.name,
+                    is_data,
                 );
             }
         }
         // Also map by the `uuid` column from system.tables
         if !table.uuid.is_empty() && table.uuid != "00000000-0000-0000-0000-000000000000" {
-            map.insert(
+            insert_with_priority(
+                &mut map,
                 table.uuid.clone(),
-                (table.database.clone(), table.name.clone()),
+                &table.database,
+                &table.name,
+                is_data,
             );
         }
     }
-    map
+
+    map.into_iter()
+        .map(|(k, (db, tbl, _))| (k, (db, tbl)))
+        .collect()
+}
+
+/// Insert into the UUID map with data-engine priority.
+///
+/// When a UUID collision occurs, a data-engine table (MergeTree family) takes precedence
+/// over a non-data-engine table (e.g. MaterializedView). If both are data engines or both
+/// are not, the first writer wins.
+fn insert_with_priority(
+    map: &mut HashMap<String, (String, String, bool)>,
+    key: String,
+    database: &str,
+    table: &str,
+    is_data: bool,
+) {
+    match map.entry(key) {
+        Entry::Vacant(e) => {
+            e.insert((database.to_string(), table.to_string(), is_data));
+        }
+        Entry::Occupied(mut e) => {
+            let (existing_db, existing_tbl, existing_is_data) = e.get();
+            if is_data && !*existing_is_data {
+                warn!(
+                    uuid = %e.key(),
+                    winner = %format!("{}.{}", database, table),
+                    loser = %format!("{}.{}", existing_db, existing_tbl),
+                    "UUID collision resolved: data-engine table takes priority over non-data-engine table"
+                );
+                e.insert((database.to_string(), table.to_string(), is_data));
+            } else if !is_data && *existing_is_data {
+                warn!(
+                    uuid = %e.key(),
+                    winner = %format!("{}.{}", existing_db, existing_tbl),
+                    loser = %format!("{}.{}", database, table),
+                    "UUID collision resolved: data-engine table takes priority over non-data-engine table"
+                );
+                // Keep existing (data engine wins)
+            } else if (database, table) != (existing_db.as_str(), existing_tbl.as_str()) {
+                warn!(
+                    uuid = %e.key(),
+                    kept = %format!("{}.{}", existing_db, existing_tbl),
+                    duplicate = %format!("{}.{}", database, table),
+                    "UUID collision between tables of same engine class; keeping first entry"
+                );
+                // Keep existing (first writer wins when same priority)
+            }
+        }
+    }
 }
 
 /// Represents a collected part from the shadow directory.
