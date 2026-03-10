@@ -151,6 +151,14 @@ pub async fn restore(
         .collect();
 
     if table_keys.is_empty() {
+        if let Some(pattern) = table_pattern {
+            if !config.backup.allow_empty_backups {
+                bail!(
+                    "Table filter '{}' matched no tables in backup manifest",
+                    pattern
+                );
+            }
+        }
         warn!("No tables match the filter pattern");
         return Ok(());
     }
@@ -282,7 +290,7 @@ pub async fn restore(
             )
             .await?;
         }
-        if !data_only && !manifest.functions.is_empty() {
+        if !data_only && table_pattern.is_none() && !manifest.functions.is_empty() {
             create_functions(ch, &manifest, on_cluster).await?;
         }
 
@@ -527,6 +535,7 @@ pub async fn restore(
                     .map(|d| (d.name.clone(), d.path.clone()))
                     .collect();
 
+                debug!(disk_local_paths = ?local_paths, "S3 disk local paths for metadata placement");
                 (remote_paths, local_paths)
             }
             Err(e) => {
@@ -568,6 +577,7 @@ pub async fn restore(
 
     // Collect data tables that need data restore (phases.data_tables already excludes DDL-only)
     let mut restore_items: Vec<(String, OwnedAttachParams)> = Vec::new();
+    let mut zero_part_table_names: Vec<String> = Vec::new();
 
     for table_key in &phases.data_tables {
         let table_manifest = match manifest.tables.get(table_key) {
@@ -589,6 +599,7 @@ pub async fn restore(
             .values()
             .flat_map(|parts| parts.iter().cloned())
             .collect();
+        let manifest_part_count = all_parts.len();
 
         // Filter parts by partition if --partitions is specified
         if !partition_filter.is_empty() {
@@ -614,8 +625,15 @@ pub async fn restore(
         if all_parts.is_empty() {
             if skip_empty_tables {
                 info!(table = %table_key, "Skipping table with zero parts (--skip-empty-tables)");
+            } else if manifest_part_count > 0 {
+                // Partition filter narrowed to 0 — intentional, not a manifest problem
+                info!(table = %table_key, manifest_parts = manifest_part_count,
+                      "No parts match partition filter, skipping");
             } else {
-                debug!(table = %table_key, "No data parts, skipping");
+                // Manifest itself has 0 parts for a data table — may be legitimately empty
+                // or backup config excluded disks. Warn so callers can detect.
+                warn!(table = %table_key, "Data table has zero parts in manifest");
+                zero_part_table_names.push(table_key.clone());
             }
             continue;
         }
@@ -752,11 +770,10 @@ pub async fn restore(
                 )
                 .await
                 {
-                    Ok(true) => {
-                        let count = params.parts.len() as u64;
-                        attach_table_results.push((table_key, count, 0));
+                    Ok((true, attached, skipped)) => {
+                        attach_table_results.push((table_key, attached, skipped));
                     }
-                    Ok(false) => {
+                    Ok((false, _, _)) => {
                         // Not eligible -- fall back to normal attach
                         normal_items.push((table_key, params));
                     }
@@ -842,6 +859,17 @@ pub async fn restore(
         total_skipped += skipped;
     }
 
+    // Report data tables with zero parts in manifest. These may be legitimately
+    // empty or may indicate backup config issues (e.g. skip_disk_types excluding S3).
+    // Log at warn level so monitoring/DAGs can detect, but don't fail the restore.
+    if !zero_part_table_names.is_empty() {
+        warn!(
+            count = zero_part_table_names.len(),
+            tables = %zero_part_table_names.join(", "),
+            "Data tables with zero parts in backup manifest"
+        );
+    }
+
     // Phase 2.5: Mutation re-apply (after all data is attached, before Phase 2b)
     if !schema_only {
         reapply_pending_mutations(ch, &manifest, &results, remap_ref).await;
@@ -883,8 +911,8 @@ pub async fn restore(
         .await?;
     }
 
-    // Phase 4: Functions
-    if !data_only && !manifest.functions.is_empty() {
+    // Phase 4: Functions (skip when restoring specific tables)
+    if !data_only && table_pattern.is_none() && !manifest.functions.is_empty() {
         create_functions(ch, &manifest, on_cluster).await?;
     }
 
@@ -1109,8 +1137,8 @@ fn find_table_uuid(
 /// Flow: DETACH TABLE SYNC -> DROP REPLICA from ZK -> hardlink parts to data dir ->
 /// ATTACH TABLE -> SYSTEM RESTORE REPLICA
 ///
-/// Returns `Ok(true)` if ATTACH TABLE mode was used successfully.
-/// Returns `Ok(false)` if the table is not eligible (non-Replicated or no DDL).
+/// Returns `Ok((true, attached, skipped))` if ATTACH TABLE mode was used successfully.
+/// Returns `Ok((false, 0, 0))` if the table is not eligible (non-Replicated engine).
 /// Returns `Err` on unrecoverable failure.
 #[allow(clippy::too_many_arguments)]
 async fn try_attach_table_mode(
@@ -1129,11 +1157,11 @@ async fn try_attach_table_mode(
     ch_gid: Option<u32>,
     manifest_disks: &BTreeMap<String, String>,
     parts_by_disk: &BTreeMap<String, Vec<crate::manifest::PartInfo>>,
-) -> Result<bool> {
+) -> Result<(bool, u64, u64)> {
     use crate::backup::collect::resolve_shadow_part_path;
 
     if !is_replicated_engine(engine) {
-        return Ok(false);
+        return Ok((false, 0, 0));
     }
 
     let dst_key = format!("{}.{}", dst_db, dst_table);
@@ -1264,12 +1292,16 @@ async fn try_attach_table_mode(
             )
         })?;
 
+    let total_parts = parts.len() as u64;
+    let skipped = total_parts.saturating_sub(hardlink_result);
     info!(
         table = %dst_key,
-        parts = parts.len(),
+        attached = hardlink_result,
+        skipped = skipped,
+        total = total_parts,
         "ATTACH TABLE mode: complete"
     );
-    Ok(true)
+    Ok((true, hardlink_result, skipped))
 }
 
 #[cfg(test)]

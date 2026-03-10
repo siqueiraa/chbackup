@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use futures::future::try_join_all;
+use libc;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
@@ -1106,6 +1107,19 @@ pub(crate) fn hardlink_or_copy_dir(src: &Path, dst: &Path) -> Result<()> {
                         std::fs::copy(entry.path(), &dest_path).with_context(|| {
                             format!(
                                 "Failed to copy {} to {}",
+                                entry.path().display(),
+                                dest_path.display()
+                            )
+                        })?;
+                    } else if e.raw_os_error() == Some(libc::EEXIST) {
+                        debug!(
+                            dst = %dest_path.display(),
+                            "Destination exists, replacing with new hardlink"
+                        );
+                        std::fs::remove_file(&dest_path)?;
+                        std::fs::hard_link(entry.path(), &dest_path).with_context(|| {
+                            format!(
+                                "Failed to hardlink {} to {} (after removing existing)",
                                 entry.path().display(),
                                 dest_path.display()
                             )
