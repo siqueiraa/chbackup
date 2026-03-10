@@ -1,9 +1,15 @@
 //! Shadow directory walk and part collection.
 //!
-//! After FREEZE, ClickHouse places hardlinks in:
-//!   `{data_path}/shadow/{freeze_name}/store/{shard_hex_prefix}/{table_hex_uuid}/{part_name}/...`
+//! After FREEZE, ClickHouse places hardlinks in shadow directories whose structure
+//! depends on the database engine:
 //!
-//! This module walks those directories, hardlinks files to the backup staging area,
+//! - **Atomic** (DatabaseAtomic, default since CH 20.5):
+//!   `{disk_path}/shadow/{freeze_name}/store/{3char_prefix}/{uuid}/{part_name}/...`
+//!
+//! - **Ordinary** (DatabaseOrdinary, legacy):
+//!   `{disk_path}/shadow/{freeze_name}/data/{database}/{table}/{part_name}/...`
+//!
+//! This module walks both layouts, hardlinks files to the backup staging area,
 //! and computes CRC64 checksums.
 //!
 //! For S3 disk parts, metadata files are parsed to extract S3 object references
@@ -271,205 +277,142 @@ pub fn collect_parts(
             );
         }
 
-        // Walk the shadow directory looking for part directories
-        // Structure: shadow/{freeze_name}/store/{3char_prefix}/{uuid_dir}/{part_name}/...
+        // Walk the shadow directory looking for part directories.
+        // Two layouts are supported:
+        //   Atomic:   shadow/{freeze_name}/store/{3char_prefix}/{uuid_dir}/{part_name}/...
+        //   Ordinary: shadow/{freeze_name}/data/{database}/{table}/{part_name}/...
+
+        // --- Atomic database layout: store/{prefix}/{uuid}/{part} ---
         let store_dir = shadow_dir.join("store");
-        if !store_dir.exists() {
-            debug!(
-                store_dir = %store_dir.display(),
-                "Store directory does not exist in shadow"
-            );
-            continue;
-        }
-
-        // Iterate: store/{prefix_3}/{uuid_dir}/{part_name}
-        for prefix_entry in std::fs::read_dir(&store_dir)
-            .with_context(|| format!("Failed to read shadow store dir: {}", store_dir.display()))?
-        {
-            let prefix_entry = prefix_entry?;
-            if !prefix_entry.file_type()?.is_dir() {
-                continue;
-            }
-
-            for uuid_entry in std::fs::read_dir(prefix_entry.path())? {
-                let uuid_entry = uuid_entry?;
-                if !uuid_entry.file_type()?.is_dir() {
+        if store_dir.exists() {
+            for prefix_entry in std::fs::read_dir(&store_dir).with_context(|| {
+                format!("Failed to read shadow store dir: {}", store_dir.display())
+            })? {
+                let prefix_entry = prefix_entry?;
+                if !prefix_entry.file_type()?.is_dir() {
                     continue;
                 }
 
-                let uuid_dir_name = match uuid_entry.file_name().to_str() {
-                    Some(name) => name.to_string(),
-                    None => {
-                        warn!(path = %uuid_entry.path().display(), "Non-UTF-8 directory name, skipping");
-                        continue;
-                    }
-                };
-
-                // Look up which table this UUID belongs to
-                let (db, table) = match uuid_map.get(&uuid_dir_name) {
-                    Some(pair) => pair.clone(),
-                    None => {
-                        warn!(
-                            uuid = %uuid_dir_name,
-                            "Could not map shadow UUID to a table, skipping"
-                        );
-                        continue;
-                    }
-                };
-
-                let full_table_name = format!("{}.{}", db, table);
-
-                // Iterate part directories under this UUID directory
-                for part_entry in std::fs::read_dir(uuid_entry.path())? {
-                    let part_entry = part_entry?;
-                    // Non-directory entries (e.g. frozen_metadata.txt) are
-                    // already filtered here; only directories can be parts.
-                    if !part_entry.file_type()?.is_dir() {
+                for uuid_entry in std::fs::read_dir(prefix_entry.path())? {
+                    let uuid_entry = uuid_entry?;
+                    if !uuid_entry.file_type()?.is_dir() {
                         continue;
                     }
 
-                    let part_name = match part_entry.file_name().to_str() {
+                    let uuid_dir_name = match uuid_entry.file_name().to_str() {
                         Some(name) => name.to_string(),
                         None => {
-                            warn!(path = %part_entry.path().display(), "Non-UTF-8 directory name, skipping");
+                            warn!(path = %uuid_entry.path().display(), "Non-UTF-8 directory name, skipping");
                             continue;
                         }
                     };
 
-                    // Verify this is a real part by checking for checksums.txt
-                    let checksums_path = part_entry.path().join("checksums.txt");
-                    if !checksums_path.exists() {
-                        debug!(
-                            part = %part_name,
-                            "Skipping directory without checksums.txt"
-                        );
+                    // Look up which table this UUID belongs to
+                    let (db, table) = match uuid_map.get(&uuid_dir_name) {
+                        Some(pair) => pair.clone(),
+                        None => {
+                            warn!(
+                                uuid = %uuid_dir_name,
+                                "Could not map shadow UUID to a table, skipping"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let full_table_name = format!("{}.{}", db, table);
+
+                    // Iterate part directories under this UUID directory
+                    for part_entry in std::fs::read_dir(uuid_entry.path())? {
+                        let part_entry = part_entry?;
+                        if !part_entry.file_type()?.is_dir() {
+                            continue;
+                        }
+
+                        process_shadow_part(
+                            &part_entry,
+                            &db,
+                            &table,
+                            &full_table_name,
+                            disk_name,
+                            disk_path,
+                            is_s3,
+                            backup_name,
+                            skip_projections,
+                            base_parts,
+                            &mut logged_disks,
+                            &mut result,
+                        )?;
+                    }
+                }
+            }
+        } else {
+            debug!(
+                store_dir = %store_dir.display(),
+                "Store directory does not exist in shadow"
+            );
+        }
+
+        // --- Ordinary database layout: data/{database}/{table}/{part} ---
+        let data_dir = shadow_dir.join("data");
+        if data_dir.exists() {
+            info!(
+                disk = %disk_name,
+                data_dir = %data_dir.display(),
+                "Walking Ordinary database shadow directory (data/ layout)"
+            );
+
+            for db_entry in std::fs::read_dir(&data_dir).with_context(|| {
+                format!("Failed to read shadow data dir: {}", data_dir.display())
+            })? {
+                let db_entry = db_entry?;
+                if !db_entry.file_type()?.is_dir() {
+                    continue;
+                }
+
+                let db_name = match db_entry.file_name().to_str() {
+                    Some(name) => name.to_string(),
+                    None => {
+                        warn!(path = %db_entry.path().display(), "Non-UTF-8 directory name, skipping");
+                        continue;
+                    }
+                };
+
+                for table_entry in std::fs::read_dir(db_entry.path())? {
+                    let table_entry = table_entry?;
+                    if !table_entry.file_type()?.is_dir() {
                         continue;
                     }
 
-                    // Compute CRC64 of checksums.txt
-                    let crc64 = compute_crc64(&checksums_path).with_context(|| {
-                        format!(
-                            "Failed to compute CRC64 for {}/{}",
-                            full_table_name, part_name
-                        )
-                    })?;
-
-                    // Check if this part matches the remote base (skip hardlink for carried parts)
-                    let carried_from_base = base_parts
-                        .and_then(|bp| {
-                            bp.get(&(
-                                full_table_name.clone(),
-                                disk_name.clone(),
-                                part_name.clone(),
-                            ))
-                        })
-                        .filter(|(base_crc, _)| *base_crc == crc64);
-
-                    if let Some(&(_, base_size)) = carried_from_base {
-                        // Part matches base -- skip hardlink, use base size for accurate reporting
-                        // DEBUG_MARKER:F001 - verify carried part skip during diff-from-remote
-                        info!(
-                            table = %full_table_name,
-                            part = %part_name,
-                            disk = %disk_name,
-                            "Skipping hardlink for carried part (matches remote base)"
-                        );
-                        // END_DEBUG_MARKER:F001
-
-                        let mut part_info = PartInfo::new(part_name, base_size, crc64);
-                        // For S3 disk parts, we still need the object refs from shadow
-                        if is_s3 {
-                            let (s3_objects, _) = collect_s3_part_metadata(&part_entry.path())?;
-                            part_info = part_info.with_s3_objects(s3_objects);
+                    let table_name = match table_entry.file_name().to_str() {
+                        Some(name) => name.to_string(),
+                        None => {
+                            warn!(path = %table_entry.path().display(), "Non-UTF-8 directory name, skipping");
+                            continue;
                         }
-                        result
-                            .entry(full_table_name.clone())
-                            .or_default()
-                            .push(CollectedPart {
-                                database: db.clone(),
-                                table: table.clone(),
-                                part_info,
-                                disk_name: disk_name.clone(),
-                            });
-                        continue; // Skip to next part -- no hardlink needed
-                    }
+                    };
 
-                    if is_s3 {
-                        // S3 disk part: parse metadata files to extract object references
-                        let (s3_objects, part_size) = collect_s3_part_metadata(&part_entry.path())?;
+                    let full_table_name = format!("{}.{}", db_name, table_name);
 
-                        info!(
-                            table = %full_table_name,
-                            part = %part_name,
-                            disk = %disk_name,
-                            objects = s3_objects.len(),
-                            size = part_size,
-                            "Collected S3 disk part metadata"
-                        );
-
-                        // Stage S3 disk metadata files to per-disk backup dir so they
-                        // survive UNFREEZE and are available for upload (CopyObject needs
-                        // the metadata files alongside the S3 object references).
-                        let disk_path_trimmed = disk_path.trim_end_matches('/');
-                        let per_disk_dir = per_disk_backup_dir(disk_path_trimmed, backup_name);
-                        if logged_disks.insert(format!("{}:s3meta", &disk_name)) {
-                            info!(
-                                disk = %disk_name,
-                                path = %per_disk_dir.display(),
-                                "staging S3 disk metadata to per-disk backup dir"
-                            );
+                    for part_entry in std::fs::read_dir(table_entry.path())? {
+                        let part_entry = part_entry?;
+                        if !part_entry.file_type()?.is_dir() {
+                            continue;
                         }
-                        let staging_dir = per_disk_dir
-                            .join("shadow")
-                            .join(encode_path_component(&db))
-                            .join(encode_path_component(&table))
-                            .join(&part_name);
-                        hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
 
-                        let part_info =
-                            PartInfo::new(part_name, part_size, crc64).with_s3_objects(s3_objects);
-
-                        result
-                            .entry(full_table_name.clone())
-                            .or_default()
-                            .push(CollectedPart {
-                                database: db.clone(),
-                                table: table.clone(),
-                                part_info,
-                                disk_name: disk_name.clone(),
-                            });
-                    } else {
-                        // Local disk part: hardlink files to backup staging
-                        let part_size = dir_size(&part_entry.path())?;
-
-                        let disk_path_trimmed = disk_path.trim_end_matches('/');
-                        let per_disk_dir = per_disk_backup_dir(disk_path_trimmed, backup_name);
-                        if logged_disks.insert(disk_name.clone()) {
-                            info!(
-                                disk = %disk_name,
-                                path = %per_disk_dir.display(),
-                                "staging per-disk backup dir"
-                            );
-                        }
-                        let staging_dir = per_disk_dir
-                            .join("shadow")
-                            .join(encode_path_component(&db))
-                            .join(encode_path_component(&table))
-                            .join(&part_name);
-
-                        hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
-
-                        let part_info = PartInfo::new(part_name, part_size, crc64);
-
-                        result
-                            .entry(full_table_name.clone())
-                            .or_default()
-                            .push(CollectedPart {
-                                database: db.clone(),
-                                table: table.clone(),
-                                part_info,
-                                disk_name: disk_name.clone(),
-                            });
+                        process_shadow_part(
+                            &part_entry,
+                            &db_name,
+                            &table_name,
+                            &full_table_name,
+                            disk_name,
+                            disk_path,
+                            is_s3,
+                            backup_name,
+                            skip_projections,
+                            base_parts,
+                            &mut logged_disks,
+                            &mut result,
+                        )?;
                     }
                 }
             }
@@ -477,6 +420,186 @@ pub fn collect_parts(
     }
 
     Ok(result)
+}
+
+/// Process a single shadow part directory entry.
+///
+/// Handles checksums.txt verification, CRC64 computation, base-parts dedup,
+/// S3 vs local disk routing, hardlinking, and result collection. Shared by
+/// both the `store/` (Atomic) and `data/` (Ordinary) shadow walks.
+#[allow(clippy::too_many_arguments)]
+fn process_shadow_part(
+    part_entry: &std::fs::DirEntry,
+    db: &str,
+    table: &str,
+    full_table_name: &str,
+    disk_name: &str,
+    disk_path: &str,
+    is_s3: bool,
+    backup_name: &str,
+    skip_projections: &[String],
+    base_parts: Option<&BasePartsMap>,
+    logged_disks: &mut HashSet<String>,
+    result: &mut HashMap<String, Vec<CollectedPart>>,
+) -> Result<()> {
+    let part_name = match part_entry.file_name().to_str() {
+        Some(name) => name.to_string(),
+        None => {
+            warn!(path = %part_entry.path().display(), "Non-UTF-8 directory name, skipping");
+            return Ok(());
+        }
+    };
+
+    // Verify this is a real part by checking for checksums.txt
+    let checksums_path = part_entry.path().join("checksums.txt");
+    if !checksums_path.exists() {
+        debug!(
+            part = %part_name,
+            "Skipping directory without checksums.txt"
+        );
+        return Ok(());
+    }
+
+    // Dedup: skip if this exact part was already collected (e.g. from store/ walk)
+    if let Some(parts) = result.get(full_table_name) {
+        if parts
+            .iter()
+            .any(|p| p.disk_name == disk_name && p.part_info.name == part_name)
+        {
+            debug!(
+                table = %full_table_name,
+                part = %part_name,
+                disk = %disk_name,
+                "Skipping duplicate part (already collected)"
+            );
+            return Ok(());
+        }
+    }
+
+    // Compute CRC64 of checksums.txt
+    let crc64 = compute_crc64(&checksums_path).with_context(|| {
+        format!(
+            "Failed to compute CRC64 for {}/{}",
+            full_table_name, part_name
+        )
+    })?;
+
+    // Check if this part matches the remote base (skip hardlink for carried parts)
+    let carried_from_base = base_parts
+        .and_then(|bp| {
+            bp.get(&(
+                full_table_name.to_string(),
+                disk_name.to_string(),
+                part_name.clone(),
+            ))
+        })
+        .filter(|(base_crc, _)| *base_crc == crc64);
+
+    if let Some(&(_, base_size)) = carried_from_base {
+        // Part matches base -- skip hardlink, use base size for accurate reporting
+        info!(
+            table = %full_table_name,
+            part = %part_name,
+            disk = %disk_name,
+            "Skipping hardlink for carried part (matches remote base)"
+        );
+
+        let mut part_info = PartInfo::new(part_name, base_size, crc64);
+        // For S3 disk parts, we still need the object refs from shadow
+        if is_s3 {
+            let (s3_objects, _) = collect_s3_part_metadata(&part_entry.path())?;
+            part_info = part_info.with_s3_objects(s3_objects);
+        }
+        result
+            .entry(full_table_name.to_string())
+            .or_default()
+            .push(CollectedPart {
+                database: db.to_string(),
+                table: table.to_string(),
+                part_info,
+                disk_name: disk_name.to_string(),
+            });
+        return Ok(());
+    }
+
+    if is_s3 {
+        // S3 disk part: parse metadata files to extract object references
+        let (s3_objects, part_size) = collect_s3_part_metadata(&part_entry.path())?;
+
+        info!(
+            table = %full_table_name,
+            part = %part_name,
+            disk = %disk_name,
+            objects = s3_objects.len(),
+            size = part_size,
+            "Collected S3 disk part metadata"
+        );
+
+        // Stage S3 disk metadata files to per-disk backup dir so they
+        // survive UNFREEZE and are available for upload (CopyObject needs
+        // the metadata files alongside the S3 object references).
+        let disk_path_trimmed = disk_path.trim_end_matches('/');
+        let per_disk_dir = per_disk_backup_dir(disk_path_trimmed, backup_name);
+        if logged_disks.insert(format!("{}:s3meta", disk_name)) {
+            info!(
+                disk = %disk_name,
+                path = %per_disk_dir.display(),
+                "staging S3 disk metadata to per-disk backup dir"
+            );
+        }
+        let staging_dir = per_disk_dir
+            .join("shadow")
+            .join(encode_path_component(db))
+            .join(encode_path_component(table))
+            .join(&part_name);
+        hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
+
+        let part_info = PartInfo::new(part_name, part_size, crc64).with_s3_objects(s3_objects);
+
+        result
+            .entry(full_table_name.to_string())
+            .or_default()
+            .push(CollectedPart {
+                database: db.to_string(),
+                table: table.to_string(),
+                part_info,
+                disk_name: disk_name.to_string(),
+            });
+    } else {
+        // Local disk part: hardlink files to backup staging
+        let part_size = dir_size(&part_entry.path())?;
+
+        let disk_path_trimmed = disk_path.trim_end_matches('/');
+        let per_disk_dir = per_disk_backup_dir(disk_path_trimmed, backup_name);
+        if logged_disks.insert(disk_name.to_string()) {
+            info!(
+                disk = %disk_name,
+                path = %per_disk_dir.display(),
+                "staging per-disk backup dir"
+            );
+        }
+        let staging_dir = per_disk_dir
+            .join("shadow")
+            .join(encode_path_component(db))
+            .join(encode_path_component(table))
+            .join(&part_name);
+
+        hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
+
+        let part_info = PartInfo::new(part_name, part_size, crc64);
+
+        result
+            .entry(full_table_name.to_string())
+            .or_default()
+            .push(CollectedPart {
+                database: db.to_string(),
+                table: table.to_string(),
+                part_info,
+                disk_name: disk_name.to_string(),
+            });
+    }
+
+    Ok(())
 }
 
 /// Parse metadata files in an S3 disk part directory to extract S3 object references.

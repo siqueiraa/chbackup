@@ -148,14 +148,11 @@ pub async fn create(
         }
     };
 
-    // 2. Get disk information
-    let disks = match ch.get_disks().await {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(error = %e, "Failed to get disk info, using defaults");
-            Vec::new()
-        }
-    };
+    // 2. Get disk information (fatal: empty disks silently skips non-default disk tables)
+    let disks = ch
+        .get_disks()
+        .await
+        .context("Failed to get disk info — cannot safely create backup without disk discovery")?;
 
     let disk_map: BTreeMap<String, String> = disks
         .iter()
@@ -669,6 +666,21 @@ pub async fn create(
 
             // Build TableManifest: group collected parts by actual disk name
             let collected = parts_map.get(&full_name).cloned().unwrap_or_default();
+
+            // Warn if a data table reports bytes but produced zero parts
+            if collected.is_empty() {
+                let tb = table_row_clone.total_bytes.unwrap_or(0);
+                if tb > 0 {
+                    warn!(
+                        table = %full_name,
+                        system_total_bytes = tb,
+                        engine = %table_row_clone.engine,
+                        "Data table has bytes in system.tables but ZERO parts collected \
+                         — check disk configuration and shadow directories"
+                    );
+                }
+            }
+
             let total_bytes: u64 = collected.iter().map(|cp| cp.part_info.size).sum();
 
             let mut parts_by_disk: BTreeMap<String, Vec<_>> = BTreeMap::new();
@@ -750,11 +762,19 @@ pub async fn create(
     let mut freeze_guard = FreezeGuard::new();
     let mut had_error = false;
     let mut first_error: Option<anyhow::Error> = None;
+    let mut zero_parts_with_data: Vec<String> = Vec::new();
 
     for result in results {
         match result {
             Ok(Some((freeze_info, full_name, table_manifest))) => {
                 freeze_guard.add(freeze_info);
+                // Track data tables with zero parts but reported bytes
+                if !table_manifest.metadata_only
+                    && table_manifest.parts.values().all(|v| v.is_empty())
+                    && table_manifest.total_bytes > 0
+                {
+                    zero_parts_with_data.push(full_name.clone());
+                }
                 table_manifests.insert(full_name, table_manifest);
             }
             Ok(None) => {
@@ -767,6 +787,14 @@ pub async fn create(
                 }
             }
         }
+    }
+
+    if !zero_parts_with_data.is_empty() {
+        warn!(
+            count = zero_parts_with_data.len(),
+            tables = %zero_parts_with_data.join(", "),
+            "Tables with data in system.tables but zero parts in backup"
+        );
     }
 
     // 10. UNFREEZE all tables (even on error, clean up frozen tables)
