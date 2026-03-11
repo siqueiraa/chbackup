@@ -76,7 +76,6 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.major_minor }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
