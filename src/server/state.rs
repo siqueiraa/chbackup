@@ -245,29 +245,18 @@ impl AppState {
             log.start(command.to_string())
         };
 
-        // Per-backup conflict check + insert into running_ops (visible to kill_op)
+        // Insert into running_ops immediately (visible to kill_op while queued).
+        // Per-backup conflict check is deferred until after semaphore acquisition,
+        // so that sequential commands for the same backup name queue behind each other
+        // instead of being rejected immediately.
         {
             let mut ops = self.running_ops.lock().await;
-            if backup_name.as_deref().is_some_and(|name| {
-                ops.values()
-                    .any(|op| op.backup_name.as_deref() == Some(name))
-            }) {
-                // Conflict — fail this entry.
-                // Drop running_ops first, then acquire action_log (preserves lock order).
-                drop(ops);
-                let mut log = self.action_log.lock().await;
-                log.fail(
-                    id,
-                    "operation already in progress for this backup".to_string(),
-                );
-                return Err("operation already in progress for this backup");
-            }
             ops.insert(
                 id,
                 RunningOp {
                     id,
                     command: command.to_string(),
-                    backup_name,
+                    backup_name: backup_name.clone(),
                     cancel_token: token.clone(),
                     _permit: None, // No permit yet — queued
                 },
@@ -293,20 +282,39 @@ impl AppState {
             }
         };
 
-        // Store the real permit (atomically check still exists — kill_op may have removed it)
+        // Store permit + per-backup conflict check (now that we hold the permit,
+        // previous same-name ops have completed in the serial case).
         {
             let mut ops = self.running_ops.lock().await;
-            if let Some(op) = ops.get_mut(&id) {
-                if token.is_cancelled() {
-                    // Killed between acquire and here — remove and release permit
-                    ops.remove(&id);
-                    return Err("killed while queued");
-                }
-                op._permit = Some(permit);
-            } else {
+            if !ops.contains_key(&id) {
                 // kill_op already removed it — drop permit, return error
                 return Err("killed while queued");
             }
+            if token.is_cancelled() {
+                // Killed between acquire and here — remove and release permit
+                ops.remove(&id);
+                return Err("killed while queued");
+            }
+            // Per-backup conflict check (excludes our own entry via op.id != id).
+            // Only triggers with allow_parallel=true when two same-name ops
+            // truly overlap. In serial mode the previous op has already finished.
+            if let Some(ref name) = backup_name {
+                if ops
+                    .values()
+                    .any(|other| other.id != id && other.backup_name.as_deref() == Some(name))
+                {
+                    ops.remove(&id);
+                    // Drop running_ops before acquiring action_log (lock order)
+                    drop(ops);
+                    let mut log = self.action_log.lock().await;
+                    log.fail(
+                        id,
+                        "operation already in progress for this backup".to_string(),
+                    );
+                    return Err("operation already in progress for this backup");
+                }
+            }
+            ops.get_mut(&id).unwrap()._permit = Some(permit);
         }
 
         Ok((id, token))
