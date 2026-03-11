@@ -787,6 +787,13 @@ fn resolve_local_shortcut(name: &str, data_path: &str) -> Result<String> {
     if name == "latest" || name == "previous" {
         let backups = list::list_local(data_path)?;
         let resolved = list::resolve_backup_shortcut(name, &backups)?;
+        validate_backup_name(&resolved).map_err(|e| {
+            anyhow::anyhow!(
+                "resolved local backup name '{}' is invalid: {}",
+                resolved,
+                e
+            )
+        })?;
         info!(original = name, resolved = %resolved, "Resolved local backup name shortcut");
         Ok(resolved)
     } else {
@@ -802,6 +809,13 @@ async fn resolve_remote_shortcut(name: &str, s3: &S3Client) -> Result<String> {
     if name == "latest" || name == "previous" {
         let backups = list::list_remote(s3).await?;
         let resolved = list::resolve_backup_shortcut(name, &backups)?;
+        validate_backup_name(&resolved).map_err(|e| {
+            anyhow::anyhow!(
+                "resolved remote backup name '{}' is invalid: {}",
+                resolved,
+                e
+            )
+        })?;
         info!(original = name, resolved = %resolved, "Resolved remote backup name shortcut");
         Ok(resolved)
     } else {
@@ -1275,5 +1289,22 @@ mod tests {
         let previous = resolve_local_shortcut("previous", data_path.to_str().unwrap())
             .expect("previous shortcut should resolve");
         assert_eq!(previous, "daily-older");
+    }
+
+    #[test]
+    fn test_resolve_local_shortcut_rejects_invalid_resolved_name() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let data_path = tmp.path();
+
+        write_local_manifest(data_path, "..hidden", 2025, 1, 1);
+
+        let result = resolve_local_shortcut("latest", data_path.to_str().unwrap());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid"),
+            "Expected invalid-name error, got: {}",
+            err
+        );
     }
 }

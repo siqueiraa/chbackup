@@ -676,6 +676,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_route_backup_status_idle() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/backup/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["status"], "idle");
+        assert!(json["command"].is_null());
+        assert!(json["start"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_route_backup_actions_empty_jsoneachrow() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/backup/actions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp.into_body()).await).unwrap();
+        assert!(
+            body.trim().is_empty(),
+            "Expected empty JSONEachRow payload for empty action log, got: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_backup_list_invalid_location_returns_400() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/backup/list/not-valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp.into_body()).await;
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Invalid location"));
+    }
+
+    #[tokio::test]
     async fn test_route_watch_status_default() {
         let app = test_router().await;
         let resp = app
@@ -957,6 +1016,25 @@ mod tests {
         assert!(json["version"].is_string());
         assert!(!json["version"].as_str().unwrap().is_empty());
         // clickhouse_version will be "unknown" since we have no real CH
+        assert!(json["clickhouse_version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_route_backup_version_endpoint() {
+        let app = test_router().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/backup/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert!(json["version"].is_string());
+        assert!(!json["version"].as_str().unwrap().is_empty());
         assert!(json["clickhouse_version"].is_string());
     }
 

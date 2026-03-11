@@ -2753,6 +2753,37 @@ mod tests {
     }
 
     #[test]
+    fn test_format_go_timestamp_rfc3339() {
+        let ts = "2026-03-11T10:20:30+00:00";
+        assert_eq!(format_go_timestamp(ts), "2026-03-11 10:20:30");
+    }
+
+    #[test]
+    fn test_format_go_timestamp_empty_and_invalid() {
+        assert_eq!(format_go_timestamp(""), "1970-01-01 00:00:00");
+        assert_eq!(
+            format_go_timestamp("not-a-timestamp"),
+            "not-a-timestamp".to_string()
+        );
+    }
+
+    #[test]
+    fn test_map_go_status_values() {
+        assert_eq!(map_go_status("running"), "in progress");
+        assert_eq!(map_go_status("completed"), "success");
+        assert_eq!(map_go_status("failed"), "error");
+        assert_eq!(map_go_status("killed"), "cancel");
+        assert_eq!(map_go_status("unknown"), "error");
+    }
+
+    #[test]
+    fn test_go_operation_response_acknowledged() {
+        let Json(resp) = go_operation_response("create").expect("response should build");
+        assert_eq!(resp.status, "acknowledged");
+        assert_eq!(resp.operation, "create");
+    }
+
+    #[test]
     fn test_list_response_all_columns() {
         // Verify ListResponse has all integration table columns
         let response = ListResponse {

@@ -460,7 +460,7 @@ pub async fn list_remote(s3: &S3Client) -> Result<Vec<BackupSummary>> {
         match s3.get_object(&manifest_key).await {
             Ok(data) => match BackupManifest::from_json_bytes(&data) {
                 Ok(manifest) => {
-                    summaries.push(summary_from_manifest(&manifest));
+                    summaries.push(summary_from_manifest(&manifest, &name));
                 }
                 Err(e) => {
                     let reason = format!("manifest parse error: {e:#}");
@@ -1450,11 +1450,18 @@ async fn clean_shadow_inner(
 /// Computes `object_disk_size` (sum of S3 object sizes), `required` (diff-from
 /// base name), and populates all size/count fields. Used by both `list_remote()`
 /// and `parse_backup_summary()` to avoid duplicating this logic.
-fn summary_from_manifest(manifest: &BackupManifest) -> BackupSummary {
+fn summary_from_manifest(manifest: &BackupManifest, backup_name: &str) -> BackupSummary {
+    // Never trust manifest.name for operation targeting; callers pass the name
+    // from the local directory or S3 prefix.
+    let effective_name = if backup_name.is_empty() {
+        &manifest.name
+    } else {
+        backup_name
+    };
     let object_disk_size = compute_object_disk_size(manifest);
     let required = extract_required_backup(manifest);
     BackupSummary {
-        name: manifest.name.clone(),
+        name: effective_name.to_string(),
         timestamp: Some(manifest.timestamp),
         size: total_uncompressed_size(manifest),
         compressed_size: manifest.compressed_size,
@@ -1513,7 +1520,7 @@ fn parse_backup_summary(name: &str, metadata_path: &Path) -> BackupSummary {
     }
 
     match BackupManifest::load_from_file(metadata_path) {
-        Ok(manifest) => summary_from_manifest(&manifest),
+        Ok(manifest) => summary_from_manifest(&manifest, name),
         Err(e) => {
             let reason = format!("manifest parse error: {e:#}");
             warn!(
@@ -3208,7 +3215,7 @@ mod tests {
         let manifest = BackupManifest::test_new("test-summary")
             .with_compressed_size(2048)
             .with_metadata_size(512);
-        let summary = summary_from_manifest(&manifest);
+        let summary = summary_from_manifest(&manifest, "test-summary");
 
         assert_eq!(summary.name, "test-summary");
         assert!(!summary.is_broken);
@@ -3255,7 +3262,7 @@ mod tests {
             .with_tables(tables)
             .with_compressed_size(3000);
 
-        let summary = summary_from_manifest(&manifest);
+        let summary = summary_from_manifest(&manifest, "s3-summary");
         assert_eq!(summary.object_disk_size, 1000); // 800 + 200
         assert_eq!(summary.size, 5000);
         assert_eq!(summary.table_count, 1);
@@ -3284,8 +3291,20 @@ mod tests {
         );
 
         let manifest = BackupManifest::test_new("incr-summary").with_tables(tables);
-        let summary = summary_from_manifest(&manifest);
+        let summary = summary_from_manifest(&manifest, "incr-summary");
         assert_eq!(summary.required, "base-full-backup");
+    }
+
+    #[test]
+    fn test_parse_backup_summary_uses_directory_name_not_manifest_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_path = dir.path().join("metadata.json");
+
+        let manifest = BackupManifest::test_new("../evil-name");
+        manifest.save_to_file(&metadata_path).unwrap();
+
+        let summary = parse_backup_summary("safe-backup", &metadata_path);
+        assert_eq!(summary.name, "safe-backup");
     }
 
     // -----------------------------------------------------------------------

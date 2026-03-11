@@ -1164,14 +1164,34 @@ fn collect_files_recursive(
     {
         let entry = entry?;
         let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("Failed to read file type for: {}", path.display()))?;
 
-        if path.is_dir() {
+        if file_type.is_symlink() {
+            warn!(
+                "Skipping symlink during metadata collection: {}",
+                path.display()
+            );
+            continue;
+        }
+
+        if file_type.is_dir() {
             collect_files_recursive(base_dir, &path, files)?;
-        } else if path.is_file() {
-            let relative = match path.strip_prefix(base_dir).unwrap_or(&path).to_str() {
-                Some(s) => s.to_string(),
-                None => {
-                    warn!("Skipping non-UTF-8 filename: {}", path.display());
+        } else if file_type.is_file() {
+            let relative = match path.strip_prefix(base_dir) {
+                Ok(rel) => match rel.to_str() {
+                    Some(s) => s.to_string(),
+                    None => {
+                        warn!("Skipping non-UTF-8 filename: {}", path.display());
+                        continue;
+                    }
+                },
+                Err(_) => {
+                    warn!(
+                        "Skipping path outside metadata base dir: {}",
+                        path.display()
+                    );
                     continue;
                 }
             };
@@ -1179,6 +1199,8 @@ fn collect_files_recursive(
                 .with_context(|| format!("Failed to read file: {}", path.display()))?;
             let relative_key = format!("/{}", relative.replace('\\', "/"));
             files.push((relative_key, data));
+        } else {
+            warn!("Skipping non-file metadata entry: {}", path.display());
         }
     }
 
@@ -1684,6 +1706,28 @@ mod tests {
         assert_eq!(files[0].1, b"test data");
         assert_eq!(files[1].0, "/subdir/data.bin");
         assert_eq!(files[1].1, b"more data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_files_recursive_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(base.join("checksums.txt"), b"safe").unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        symlink(&outside_file, base.join("leak-link")).unwrap();
+
+        let mut files = Vec::new();
+        collect_files_recursive(base, base, &mut files).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "/checksums.txt");
+        assert_eq!(files[0].1, b"safe");
     }
 
     #[test]

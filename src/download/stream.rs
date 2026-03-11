@@ -6,6 +6,59 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+fn unpack_archive_from_reader<R: std::io::Read>(
+    reader: R,
+    output_dir: &Path,
+    data_format: &str,
+) -> Result<()> {
+    match data_format {
+        "lz4" => {
+            let decoder = lz4_flex::frame::FrameDecoder::new(reader);
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(output_dir).with_context(|| {
+                format!(
+                    "Failed to unpack LZ4 tar archive to: {}",
+                    output_dir.display()
+                )
+            })?;
+        }
+        "zstd" => {
+            let decoder = zstd::Decoder::new(reader).context("Failed to create zstd decoder")?;
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(output_dir).with_context(|| {
+                format!(
+                    "Failed to unpack zstd tar archive to: {}",
+                    output_dir.display()
+                )
+            })?;
+        }
+        "gzip" => {
+            let decoder = flate2::read::GzDecoder::new(reader);
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(output_dir).with_context(|| {
+                format!(
+                    "Failed to unpack gzip tar archive to: {}",
+                    output_dir.display()
+                )
+            })?;
+        }
+        "none" => {
+            let mut archive = tar::Archive::new(reader);
+            archive.unpack(output_dir).with_context(|| {
+                format!(
+                    "Failed to unpack raw tar archive to: {}",
+                    output_dir.display()
+                )
+            })?;
+        }
+        other => {
+            return Err(anyhow::anyhow!("Unknown compression format: {}", other));
+        }
+    }
+
+    Ok(())
+}
+
 /// Decompress a compressed tar archive and extract to the output directory.
 ///
 /// The `data` is expected to be a tar archive compressed with the specified format.
@@ -24,51 +77,28 @@ pub fn decompress_part(data: &[u8], output_dir: &Path, data_format: &str) -> Res
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output dir: {}", output_dir.display()))?;
 
-    match data_format {
-        "lz4" => {
-            let decoder = lz4_flex::frame::FrameDecoder::new(data);
-            let mut archive = tar::Archive::new(decoder);
-            archive.unpack(output_dir).with_context(|| {
-                format!(
-                    "Failed to unpack LZ4 tar archive to: {}",
-                    output_dir.display()
-                )
-            })?;
-        }
-        "zstd" => {
-            let decoder = zstd::Decoder::new(data).context("Failed to create zstd decoder")?;
-            let mut archive = tar::Archive::new(decoder);
-            archive.unpack(output_dir).with_context(|| {
-                format!(
-                    "Failed to unpack zstd tar archive to: {}",
-                    output_dir.display()
-                )
-            })?;
-        }
-        "gzip" => {
-            let decoder = flate2::read::GzDecoder::new(data);
-            let mut archive = tar::Archive::new(decoder);
-            archive.unpack(output_dir).with_context(|| {
-                format!(
-                    "Failed to unpack gzip tar archive to: {}",
-                    output_dir.display()
-                )
-            })?;
-        }
-        "none" => {
-            let cursor = std::io::Cursor::new(data);
-            let mut archive = tar::Archive::new(cursor);
-            archive.unpack(output_dir).with_context(|| {
-                format!(
-                    "Failed to unpack raw tar archive to: {}",
-                    output_dir.display()
-                )
-            })?;
-        }
-        other => {
-            return Err(anyhow::anyhow!("Unknown compression format: {}", other));
-        }
-    }
+    let cursor = std::io::Cursor::new(data);
+    unpack_archive_from_reader(cursor, output_dir, data_format)?;
+
+    Ok(())
+}
+
+/// Decompress a compressed tar archive stored on disk and extract to output_dir.
+///
+/// This avoids buffering the full compressed archive in memory and is intended
+/// for large downloaded parts.
+pub fn decompress_part_file(
+    archive_path: &Path,
+    output_dir: &Path,
+    data_format: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("Failed to create output dir: {}", output_dir.display()))?;
+
+    let file = std::fs::File::open(archive_path)
+        .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    unpack_archive_from_reader(reader, output_dir, data_format)?;
 
     Ok(())
 }
@@ -311,6 +341,31 @@ mod tests {
         assert_eq!(
             fs::read(output_dir.join("test_part/checksums.txt")).unwrap(),
             b"none_checksum1\n"
+        );
+    }
+
+    #[test]
+    fn test_decompress_part_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_dir = dir.path().join("test_part");
+        fs::create_dir_all(&part_dir).unwrap();
+        fs::write(part_dir.join("data.bin"), b"file-path data").unwrap();
+        fs::write(part_dir.join("checksums.txt"), b"file-path checksums\n").unwrap();
+
+        let compressed = compress_part(&part_dir, "test_part", "lz4", 1).unwrap();
+        let archive_path = dir.path().join("part.tar.lz4");
+        fs::write(&archive_path, compressed).unwrap();
+
+        let output_dir = dir.path().join("output");
+        decompress_part_file(&archive_path, &output_dir, "lz4").unwrap();
+
+        assert_eq!(
+            fs::read(output_dir.join("test_part/data.bin")).unwrap(),
+            b"file-path data"
+        );
+        assert_eq!(
+            fs::read(output_dir.join("test_part/checksums.txt")).unwrap(),
+            b"file-path checksums\n"
         );
     }
 

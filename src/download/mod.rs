@@ -21,6 +21,7 @@ use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::backup::checksum::compute_crc64;
@@ -444,15 +445,21 @@ pub async fn download(
         if *required_bytes == 0 {
             continue;
         }
-        let disk_path = manifest
-            .disks
-            .get(disk_name)
-            .map(|s| s.as_str())
-            .unwrap_or(data_path);
-        let check_dir = if Path::new(disk_path).exists() {
-            Path::new(disk_path).join("backup")
-        } else {
-            Path::new(data_path).join("backup")
+        let check_dir = match manifest.disks.get(disk_name).map(|s| s.as_str()) {
+            Some(disk_path) => {
+                let normalized = disk_path.trim_end_matches('/');
+                if validate_disk_path(normalized) && Path::new(normalized).exists() {
+                    Path::new(normalized).join("backup")
+                } else {
+                    warn!(
+                        disk_name = %disk_name,
+                        disk_path = %disk_path,
+                        "Disk path is invalid or not present locally; using default data_path for space preflight"
+                    );
+                    Path::new(data_path).join("backup")
+                }
+            }
+            None => Path::new(data_path).join("backup"),
         };
         std::fs::create_dir_all(&check_dir).ok();
         check_disk_space(&check_dir, *required_bytes)?;
@@ -853,14 +860,51 @@ pub async fn download(
                         tokio::time::sleep(std::time::Duration::from_millis(jittered_ms)).await;
                     }
 
-                    let compressed_data = s3.get_object(&backup_key).await.with_context(|| {
-                        format!(
-                            "Failed to download part {} for table {}",
-                            part_name, item.table_key
-                        )
-                    })?;
+                    let tmp_archive = shadow_dir.join(format!(".{}.download.tmp", part_name));
+                    let compressed_size = {
+                        let mut object_stream = s3
+                            .get_object_stream(&backup_key)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to download part {} for table {}",
+                                    part_name, item.table_key
+                                )
+                            })?;
 
-                    let compressed_size = compressed_data.len() as u64;
+                        let mut out = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .open(&tmp_archive)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Failed to create temp archive file: {}",
+                                    tmp_archive.display()
+                                )
+                            })?;
+
+                        let mut total = 0u64;
+                        while let Some(chunk) = object_stream.try_next().await.with_context(|| {
+                            format!(
+                                "Failed while streaming part {} for table {}",
+                                part_name, item.table_key
+                            )
+                        })? {
+                            total += chunk.len() as u64;
+                            out.write_all(&chunk).await.with_context(|| {
+                                format!(
+                                    "Failed to write temp archive file: {}",
+                                    tmp_archive.display()
+                                )
+                            })?;
+                        }
+                        out.flush().await.with_context(|| {
+                            format!("Failed to flush temp archive file: {}", tmp_archive.display())
+                        })?;
+                        total
+                    };
 
                     // Rate limit after download
                     rate_limiter.consume(compressed_size).await;
@@ -869,12 +913,23 @@ pub async fn download(
                     let shadow_dir_clone = shadow_dir.clone();
                     let part_name_clone = part_name.clone();
                     let fmt = data_format_clone.clone();
-                    tokio::task::spawn_blocking(move || {
-                        stream::decompress_part(&compressed_data, &shadow_dir_clone, &fmt)
+                    let tmp_archive_clone = tmp_archive.clone();
+                    let decompress_result = tokio::task::spawn_blocking(move || {
+                        stream::decompress_part_file(&tmp_archive_clone, &shadow_dir_clone, &fmt)
                     })
                     .await
-                    .context("Decompress task panicked")?
-                    .with_context(|| {
+                    .context("Decompress task panicked")?;
+
+                    // Temp file is no longer needed after decompression attempt.
+                    if let Err(e) = std::fs::remove_file(&tmp_archive) {
+                        debug!(
+                            file = %tmp_archive.display(),
+                            error = %e,
+                            "Failed to remove temp archive file"
+                        );
+                    }
+
+                    decompress_result.with_context(|| {
                         format!(
                             "Failed to decompress part {} to {}",
                             part_name_clone,
@@ -1553,6 +1608,23 @@ mod tests {
         assert_eq!(
             target, backup_dir,
             "Non-existent disk path should fall back to default backup_dir"
+        );
+    }
+
+    #[test]
+    fn test_download_per_disk_fallback_invalid_disk_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup").join("daily-2024");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let mut manifest_disks = BTreeMap::new();
+        manifest_disks.insert("nvme1".to_string(), "/etc".to_string());
+
+        let target =
+            resolve_download_target_dir(&manifest_disks, "nvme1", "daily-2024", &backup_dir);
+        assert_eq!(
+            target, backup_dir,
+            "Invalid manifest disk path must fall back to default backup_dir"
         );
     }
 
