@@ -135,6 +135,9 @@ fn build_uuid_map(tables: &[TableRow]) -> HashMap<String, (String, String)> {
     // UUID directory, causing both the MV and the target to map to the same UUID key.
     // We prefer data-engine tables (MergeTree family) over non-data-engine tables.
     let mut map: HashMap<String, (String, String, bool)> = HashMap::new();
+    // Deduplicate collision log messages: a single logical collision (e.g. MV + target
+    // table) can produce 5+ entries via data_paths + uuid column across multiple disks.
+    let mut logged_uuids: HashSet<String> = HashSet::new();
 
     for table in tables {
         let is_data = table.engine.ends_with("MergeTree")
@@ -148,6 +151,7 @@ fn build_uuid_map(tables: &[TableRow]) -> HashMap<String, (String, String)> {
             if let Some(uuid_dir) = normalized.rsplit('/').next() {
                 insert_with_priority(
                     &mut map,
+                    &mut logged_uuids,
                     uuid_dir.to_string(),
                     &table.database,
                     &table.name,
@@ -159,6 +163,7 @@ fn build_uuid_map(tables: &[TableRow]) -> HashMap<String, (String, String)> {
         if !table.uuid.is_empty() && table.uuid != "00000000-0000-0000-0000-000000000000" {
             insert_with_priority(
                 &mut map,
+                &mut logged_uuids,
                 table.uuid.clone(),
                 &table.database,
                 &table.name,
@@ -179,6 +184,7 @@ fn build_uuid_map(tables: &[TableRow]) -> HashMap<String, (String, String)> {
 /// are not, the first writer wins.
 fn insert_with_priority(
     map: &mut HashMap<String, (String, String, bool)>,
+    logged_uuids: &mut HashSet<String>,
     key: String,
     database: &str,
     table: &str,
@@ -191,28 +197,34 @@ fn insert_with_priority(
         Entry::Occupied(mut e) => {
             let (existing_db, existing_tbl, existing_is_data) = e.get();
             if is_data && !*existing_is_data {
-                warn!(
-                    uuid = %e.key(),
-                    winner = %format!("{}.{}", database, table),
-                    loser = %format!("{}.{}", existing_db, existing_tbl),
-                    "UUID collision resolved: data-engine table takes priority over non-data-engine table"
-                );
+                if logged_uuids.insert(e.key().clone()) {
+                    debug!(
+                        uuid = %e.key(),
+                        winner = %format!("{}.{}", database, table),
+                        loser = %format!("{}.{}", existing_db, existing_tbl),
+                        "UUID collision resolved: data-engine table takes priority over non-data-engine table"
+                    );
+                }
                 e.insert((database.to_string(), table.to_string(), is_data));
             } else if !is_data && *existing_is_data {
-                warn!(
-                    uuid = %e.key(),
-                    winner = %format!("{}.{}", existing_db, existing_tbl),
-                    loser = %format!("{}.{}", database, table),
-                    "UUID collision resolved: data-engine table takes priority over non-data-engine table"
-                );
+                if logged_uuids.insert(e.key().clone()) {
+                    debug!(
+                        uuid = %e.key(),
+                        winner = %format!("{}.{}", existing_db, existing_tbl),
+                        loser = %format!("{}.{}", database, table),
+                        "UUID collision resolved: data-engine table takes priority over non-data-engine table"
+                    );
+                }
                 // Keep existing (data engine wins)
             } else if (database, table) != (existing_db.as_str(), existing_tbl.as_str()) {
-                warn!(
-                    uuid = %e.key(),
-                    kept = %format!("{}.{}", existing_db, existing_tbl),
-                    duplicate = %format!("{}.{}", database, table),
-                    "UUID collision between tables of same engine class; keeping first entry"
-                );
+                if logged_uuids.insert(e.key().clone()) {
+                    debug!(
+                        uuid = %e.key(),
+                        kept = %format!("{}.{}", existing_db, existing_tbl),
+                        duplicate = %format!("{}.{}", database, table),
+                        "UUID collision between tables of same engine class; keeping first entry"
+                    );
+                }
                 // Keep existing (first writer wins when same priority)
             }
         }
