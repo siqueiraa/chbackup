@@ -216,15 +216,15 @@ fn insert_with_priority(
                     );
                 }
                 // Keep existing (data engine wins)
-            } else if (database, table) != (existing_db.as_str(), existing_tbl.as_str()) {
-                if logged_uuids.insert(e.key().clone()) {
-                    debug!(
-                        uuid = %e.key(),
-                        kept = %format!("{}.{}", existing_db, existing_tbl),
-                        duplicate = %format!("{}.{}", database, table),
-                        "UUID collision between tables of same engine class; keeping first entry"
-                    );
-                }
+            } else if (database, table) != (existing_db.as_str(), existing_tbl.as_str())
+                && logged_uuids.insert(e.key().clone())
+            {
+                debug!(
+                    uuid = %e.key(),
+                    kept = %format!("{}.{}", existing_db, existing_tbl),
+                    duplicate = %format!("{}.{}", database, table),
+                    "UUID collision between tables of same engine class; keeping first entry"
+                );
                 // Keep existing (first writer wins when same priority)
             }
         }
