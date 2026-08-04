@@ -12,6 +12,7 @@
 
 pub mod checksum;
 pub mod collect;
+pub mod deferred;
 pub mod diff;
 pub mod freeze;
 pub mod mutations;
@@ -103,6 +104,27 @@ fn parse_partition_list(partitions: Option<&str>) -> PartitionSpec {
     }
 }
 
+/// Full names (`db.table`) of tables that have at least one part on an S3 object disk.
+///
+/// These are the tables whose FREEZE must be held until `upload` has copied their objects:
+/// their parts are only *pointers* into remote storage, and the shadow metadata hardlinks
+/// are ClickHouse's sole refcount on the referenced objects. Local-disk tables need no
+/// deferral -- `collect_parts` already hardlinked their data into the backup directory.
+fn tables_with_s3_parts(
+    table_manifests: &std::collections::BTreeMap<String, TableManifest>,
+) -> HashSet<String> {
+    table_manifests
+        .iter()
+        .filter(|(_, tm)| {
+            tm.parts
+                .values()
+                .flatten()
+                .any(|p| p.s3_objects.as_ref().is_some_and(|objs| !objs.is_empty()))
+        })
+        .map(|(full_name, _)| full_name.clone())
+        .collect()
+}
+
 /// Check if a FREEZE error is ignorable (table/partition not found).
 ///
 /// Returns true for:
@@ -151,6 +173,12 @@ pub async fn create(
     configs: bool,
     named_collections: bool,
     skip_projections: &[String],
+    // Hold the FREEZE on tables with S3 object-disk parts past the end of `create`, so
+    // their remote objects stay pinned until `upload` copies them. Only safe when the
+    // caller will actually run `upload` (`create_remote`, watch mode). Standalone `create`
+    // must pass `false`: nothing would ever release the freeze, and the shadow data would
+    // accumulate until `chbackup clean`.
+    defer_unfreeze_s3: bool,
     cancel: CancellationToken,
 ) -> Result<BackupManifest> {
     let start_time = Instant::now();
@@ -846,9 +874,14 @@ pub async fn create(
         );
     }
 
-    // 10. UNFREEZE all tables (even on error, clean up frozen tables)
-    info!("Unfreezing all tables");
-    freeze_guard.unfreeze_all(ch).await?;
+    // 10. UNFREEZE.
+    //
+    // On failure we never defer anything: release every freeze before cleanup runs, so the
+    // directory removal and shadow cleanup below operate on data nothing depends on.
+    if first_error.is_some() {
+        info!("Unfreezing all tables (backup failed)");
+        freeze_guard.unfreeze_all(ch).await?;
+    }
 
     // Propagate the first error if any task failed -- clean up backup dir + shadow
     if let Some(e) = first_error {
@@ -905,143 +938,230 @@ pub async fn create(
         return Err(e);
     }
 
-    // 11. Build database list
-    let databases: Vec<DatabaseInfo> = databases_seen
-        .into_iter()
-        .map(|(name, ddl)| DatabaseInfo { name, ddl })
-        .collect();
+    // Split the freeze: tables whose parts live on S3 object disks must stay frozen until
+    // `upload` has copied their objects.
+    //
+    // For local disks the data is already pinned -- collect_parts hardlinked it into the
+    // backup dir, so a merge cannot destroy it. For S3 object disks only *pointers* were
+    // recorded; the shadow metadata hardlinks are ClickHouse's sole refcount on the remote
+    // objects, so unfreezing here lets it merge the parts away and GC the objects before
+    // CopyObject reads them (observed in production as NoSuchKey after a 4.5 h backup).
+    let s3_tables = tables_with_s3_parts(&table_manifests);
 
-    // 12. Save per-table metadata files (encoded paths for round-trip compatibility)
-    let metadata_dir = backup_dir.join("metadata");
-    for (full_name, table_manifest) in &table_manifests {
-        if let Some((db, table)) = full_name.split_once('.') {
-            let table_metadata_dir =
-                metadata_dir.join(crate::path_encoding::encode_path_component(db));
-            std::fs::create_dir_all(&table_metadata_dir)?;
-            let table_json = serde_json::to_string_pretty(table_manifest)?;
-            std::fs::write(
-                table_metadata_dir.join(format!(
-                    "{}.json",
-                    crate::path_encoding::encode_path_component(table)
-                )),
-                &table_json,
-            )?;
-        }
-    }
-
-    // 13. Build manifest
-    let mut manifest = BackupManifest {
-        manifest_version: 1,
-        name: backup_name.to_string(),
-        timestamp: Utc::now(),
-        clickhouse_version: ch_version,
-        chbackup_version: env!("CARGO_PKG_VERSION").to_string(),
-        data_format: config.backup.compression.clone(),
-        compressed_size: 0, // Set during upload
-        metadata_size: 0,
-        disks: disk_map,
-        disk_types: disk_type_map,
-        disk_remote_paths,
-        tables: table_manifests,
-        databases,
-        functions: Vec::new(),
-        named_collections: Vec::new(),
-        rbac: None,
-        rbac_size: 0,
-        config_size: 0,
-    };
-
-    // 13a. Backup RBAC, configs, named collections (populates manifest fields)
-    rbac::backup_rbac_and_configs(
-        config,
-        ch,
-        &backup_dir,
-        &mut manifest,
-        rbac,
-        configs,
-        named_collections,
-    )
-    .await?;
-
-    // 13a.1. Compute rbac_size and config_size from backup directories
-    if manifest.rbac.is_some() {
-        let access_dir = backup_dir.join("access");
-        if access_dir.exists() {
-            manifest.rbac_size = collect::dir_size(&access_dir)?;
-        }
-    }
-    {
-        let configs_dir = backup_dir.join("configs");
-        if configs_dir.exists() {
-            manifest.config_size = collect::dir_size(&configs_dir)?;
-        }
-    }
-    info!(
-        rbac_size = manifest.rbac_size,
-        config_size = manifest.config_size,
-        "Computed RBAC and config sizes"
-    );
-
-    // 13b. Apply incremental diff if --diff-from or --diff-from-remote is specified
-    let effective_base: Option<BackupManifest> = if let Some(ref base) = remote_base {
-        // diff-from-remote: already downloaded
-        Some(base.clone())
-    } else if let Some(base_name) = diff_from {
-        info!(base = %base_name, "Loading base manifest for diff-from");
-        let base_manifest_path = PathBuf::from(&config.clickhouse.data_path)
-            .join("backup")
-            .join(base_name)
-            .join("metadata.json");
-        Some(
-            BackupManifest::load_from_file(&base_manifest_path).with_context(|| {
-                format!("Failed to load base backup '{}' for --diff-from", base_name)
-            })?,
-        )
+    let mut retained: Vec<freeze::FreezeInfo> = if defer_unfreeze_s3 && !s3_tables.is_empty() {
+        freeze_guard
+            .take_matching(|info| s3_tables.contains(&format!("{}.{}", info.database, info.table)))
     } else {
-        None
+        Vec::new()
     };
 
-    if let Some(base) = effective_base {
-        let result = diff_parts(&mut manifest, &base);
-        info!(
-            carried = result.carried,
-            uploaded = result.uploaded,
-            crc_mismatches = result.crc_mismatches,
-            "Incremental diff applied to manifest"
+    if !retained.is_empty() {
+        // Write-ahead: publish the ownership record BEFORE skipping any unfreeze. A crash in
+        // this gap then leaves a record with nothing retained (harmless) rather than a live
+        // freeze with no record, which would leak with nothing to find it by.
+        let record = deferred::DeferredFreezeRecord::new(
+            backup_name,
+            retained.clone(),
+            deferred::DEFAULT_TTL_SECS,
+        );
+        if let Err(e) = deferred::publish(&backup_dir, &record) {
+            // Do NOT defer without a record -- an unrecorded freeze is strictly worse than
+            // running with the race. Put the entries back and release them normally.
+            warn!(
+                error = %e,
+                tables = retained.len(),
+                "Failed to publish deferred-freeze record; releasing S3 object-disk freezes \
+                 now. Upload may fail with NoSuchKey if ClickHouse merges these parts away."
+            );
+            for info in retained.drain(..) {
+                freeze_guard.add(info);
+            }
+        } else {
+            info!(
+                tables = retained.len(),
+                "Holding FREEZE for S3 object-disk tables until upload copies their objects"
+            );
+        }
+    } else if !s3_tables.is_empty() {
+        warn!(
+            tables = s3_tables.len(),
+            "Backup contains S3 object-disk tables but the freeze is not being deferred. \
+             Their objects are unprotected between now and upload; use `create_remote` so \
+             create and upload run in one operation."
         );
     }
 
-    // 14. Save manifest
-    let manifest_path = backup_dir.join("metadata.json");
-    manifest.save_to_file(&manifest_path)?;
+    info!("Unfreezing all tables");
+    freeze_guard.unfreeze_all(ch).await?;
 
-    // Calculate metadata_size
-    let metadata_size = std::fs::metadata(&manifest_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    // Everything from here on can fail. If it does, the deferred freeze must still be
+    // released -- otherwise `create` returns an error and no `upload` ever runs to clean up.
+    let tail_result: Result<BackupManifest> = async {
+        // 11. Build database list
+        let databases: Vec<DatabaseInfo> = databases_seen
+            .into_iter()
+            .map(|(name, ddl)| DatabaseInfo { name, ddl })
+            .collect();
 
-    // Update manifest with metadata_size and re-save
-    manifest.metadata_size = metadata_size;
-    manifest.save_to_file(&manifest_path)?;
+        // 12. Save per-table metadata files (encoded paths for round-trip compatibility)
+        let metadata_dir = backup_dir.join("metadata");
+        for (full_name, table_manifest) in &table_manifests {
+            if let Some((db, table)) = full_name.split_once('.') {
+                let table_metadata_dir =
+                    metadata_dir.join(crate::path_encoding::encode_path_component(db));
+                std::fs::create_dir_all(&table_metadata_dir)?;
+                let table_json = serde_json::to_string_pretty(table_manifest)?;
+                std::fs::write(
+                    table_metadata_dir.join(format!(
+                        "{}.json",
+                        crate::path_encoding::encode_path_component(table)
+                    )),
+                    &table_json,
+                )?;
+            }
+        }
 
-    let table_count = manifest.tables.len();
-    let part_count: usize = manifest
-        .tables
-        .values()
-        .flat_map(|t| t.parts.values())
-        .map(|parts| parts.len())
-        .sum();
+        // 13. Build manifest
+        let mut manifest = BackupManifest {
+            manifest_version: 1,
+            name: backup_name.to_string(),
+            timestamp: Utc::now(),
+            clickhouse_version: ch_version,
+            chbackup_version: env!("CARGO_PKG_VERSION").to_string(),
+            data_format: config.backup.compression.clone(),
+            compressed_size: 0, // Set during upload
+            metadata_size: 0,
+            disks: disk_map,
+            disk_types: disk_type_map,
+            disk_remote_paths,
+            tables: table_manifests,
+            databases,
+            functions: Vec::new(),
+            named_collections: Vec::new(),
+            rbac: None,
+            rbac_size: 0,
+            config_size: 0,
+        };
 
-    let elapsed = start_time.elapsed();
-    info!(
-        backup_name = %backup_name,
-        tables = table_count,
-        parts = part_count,
-        elapsed_secs = elapsed.as_secs_f64(),
-        "Backup created successfully"
-    );
+        // 13a. Backup RBAC, configs, named collections (populates manifest fields)
+        rbac::backup_rbac_and_configs(
+            config,
+            ch,
+            &backup_dir,
+            &mut manifest,
+            rbac,
+            configs,
+            named_collections,
+        )
+        .await?;
 
-    Ok(manifest)
+        // 13a.1. Compute rbac_size and config_size from backup directories
+        if manifest.rbac.is_some() {
+            let access_dir = backup_dir.join("access");
+            if access_dir.exists() {
+                manifest.rbac_size = collect::dir_size(&access_dir)?;
+            }
+        }
+        {
+            let configs_dir = backup_dir.join("configs");
+            if configs_dir.exists() {
+                manifest.config_size = collect::dir_size(&configs_dir)?;
+            }
+        }
+        info!(
+            rbac_size = manifest.rbac_size,
+            config_size = manifest.config_size,
+            "Computed RBAC and config sizes"
+        );
+
+        // 13b. Apply incremental diff if --diff-from or --diff-from-remote is specified
+        let effective_base: Option<BackupManifest> = if let Some(ref base) = remote_base {
+            // diff-from-remote: already downloaded
+            Some(base.clone())
+        } else if let Some(base_name) = diff_from {
+            info!(base = %base_name, "Loading base manifest for diff-from");
+            let base_manifest_path = PathBuf::from(&config.clickhouse.data_path)
+                .join("backup")
+                .join(base_name)
+                .join("metadata.json");
+            Some(
+                BackupManifest::load_from_file(&base_manifest_path).with_context(|| {
+                    format!("Failed to load base backup '{}' for --diff-from", base_name)
+                })?,
+            )
+        } else {
+            None
+        };
+
+        if let Some(base) = effective_base {
+            let result = diff_parts(&mut manifest, &base);
+            info!(
+                carried = result.carried,
+                uploaded = result.uploaded,
+                crc_mismatches = result.crc_mismatches,
+                "Incremental diff applied to manifest"
+            );
+        }
+
+        // 14. Save manifest
+        let manifest_path = backup_dir.join("metadata.json");
+        manifest.save_to_file(&manifest_path)?;
+
+        // Calculate metadata_size
+        let metadata_size = std::fs::metadata(&manifest_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        // Update manifest with metadata_size and re-save
+        manifest.metadata_size = metadata_size;
+        manifest.save_to_file(&manifest_path)?;
+
+        let table_count = manifest.tables.len();
+        let part_count: usize = manifest
+            .tables
+            .values()
+            .flat_map(|t| t.parts.values())
+            .map(|parts| parts.len())
+            .sum();
+
+        let elapsed = start_time.elapsed();
+        info!(
+            backup_name = %backup_name,
+            tables = table_count,
+            parts = part_count,
+            elapsed_secs = elapsed.as_secs_f64(),
+            "Backup created successfully"
+        );
+
+        Ok(manifest)
+    }
+    .await;
+
+    match tail_result {
+        Ok(manifest) => Ok(manifest),
+        Err(e) => {
+            // Release the deferred freeze: no upload will run to do it for us.
+            if !retained.is_empty() {
+                warn!(
+                    tables = retained.len(),
+                    "Releasing deferred S3 object-disk freezes after post-freeze failure"
+                );
+                let mut guard = FreezeGuard::from_frozen(retained);
+                match guard.unfreeze_all_checked(ch).await {
+                    Ok(()) => {
+                        if let Err(del_err) = deferred::delete(&backup_dir) {
+                            warn!(error = %del_err, "Failed to remove deferred-freeze record");
+                        }
+                    }
+                    Err(failed) => {
+                        // Keep the record so the leak stays discoverable and retryable.
+                        deferred::retain_failed(&backup_dir, backup_name, failed);
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Returns true if this engine supports FREEZE and has data parts to back up.
@@ -1220,6 +1340,60 @@ mod tests {
             expect_ids(parse_partition_list(Some("202401,202402"))).len(),
             2
         );
+    }
+
+    #[test]
+    fn test_tables_with_s3_parts_detects_only_object_disk_tables() {
+        use crate::manifest::{PartInfo, S3ObjectInfo};
+
+        let mut manifests = std::collections::BTreeMap::new();
+
+        // Local-disk table: data is hardlinked into the backup dir, no deferral needed.
+        let mut local = TableManifest::test_new("MergeTree");
+        local.parts.insert(
+            "default".to_string(),
+            vec![PartInfo::new("all_1_1_0", 100, 42)],
+        );
+        manifests.insert("db.local_tbl".to_string(), local);
+
+        // S3 object-disk table: parts are pointers, so its freeze must be held.
+        let mut s3 = TableManifest::test_new("MergeTree");
+        s3.parts.insert(
+            "s3".to_string(),
+            vec![
+                PartInfo::new("all_1_1_0", 100, 42).with_s3_objects(vec![S3ObjectInfo {
+                    path: "abc/def".to_string(),
+                    size: 100,
+                    backup_key: String::new(),
+                }]),
+            ],
+        );
+        manifests.insert("db.s3_tbl".to_string(), s3);
+
+        let found = tables_with_s3_parts(&manifests);
+        assert_eq!(found.len(), 1);
+        assert!(found.contains("db.s3_tbl"));
+        assert!(!found.contains("db.local_tbl"));
+    }
+
+    #[test]
+    fn test_tables_with_s3_parts_ignores_empty_object_lists() {
+        use crate::manifest::PartInfo;
+        // Some(vec![]) carries no object references, so there is nothing to keep pinned.
+        let mut manifests = std::collections::BTreeMap::new();
+        let mut tm = TableManifest::test_new("MergeTree");
+        tm.parts.insert(
+            "s3".to_string(),
+            vec![PartInfo::new("all_1_1_0", 0, 0).with_s3_objects(vec![])],
+        );
+        manifests.insert("db.t".to_string(), tm);
+
+        assert!(tables_with_s3_parts(&manifests).is_empty());
+    }
+
+    #[test]
+    fn test_tables_with_s3_parts_empty_input() {
+        assert!(tables_with_s3_parts(&std::collections::BTreeMap::new()).is_empty());
     }
 
     #[test]

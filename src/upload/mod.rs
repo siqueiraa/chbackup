@@ -143,8 +143,153 @@ struct S3DiskUploadWorkItem {
 /// * `delete_local` - If true, remove local backup directory after successful upload
 /// * `diff_from_remote` - Optional remote base backup name for incremental upload
 /// * `resume` - If true and use_resumable_state config is set, load resume state
+///
+/// # Deferred-freeze finalisation
+///
+/// This wrapper guarantees any deferred FREEZE is released exactly once, on every exit path.
+///
+/// `backup::create` may deliberately leave tables with S3 object-disk parts frozen so their
+/// remote objects stay pinned until the CopyObject below has read them (see
+/// `backup::deferred`). Releasing that freeze is this function's responsibility, and it must
+/// happen whether the upload succeeds, returns an error, or panics.
+///
+/// Two structural requirements drive the shape here:
+///
+/// 1. **The work is spawned**, so a panic becomes a `JoinError` value instead of unwinding
+///    past the finaliser.
+/// 2. **Finalisation runs *inside* that task**, not in this wrapper. If a caller drops the
+///    `upload()` future -- `auto_resume` selects over it and can -- dropping the
+///    `JoinHandle` merely *detaches* the task; it keeps running while anything after the
+///    `.await` here is gone forever. Only in-task cleanup survives that.
+///
+/// SIGKILL is not survivable in-process; that case is covered by stale-record adoption in
+/// `backup::deferred`, which is why the persisted record is the primary safety mechanism
+/// and this path is the fast one.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload(
+    config: &Config,
+    ch: &ChClient,
+    s3: &S3Client,
+    backup_name: &str,
+    backup_dir: &Path,
+    delete_local: bool,
+    diff_from_remote: Option<&str>,
+    resume: bool,
+    cancel: CancellationToken,
+) -> Result<UploadStats> {
+    // Owned clones: spawn requires 'static and the public signature takes borrows.
+    let config_owned = config.clone();
+    let ch_owned = ch.clone();
+    let s3_owned = s3.clone();
+    let name_owned = backup_name.to_string();
+    let dir_owned = backup_dir.to_path_buf();
+    let diff_owned = diff_from_remote.map(|s| s.to_string());
+
+    let handle = tokio::spawn(async move {
+        // Nested spawn: a panic in upload_inner must not skip the finaliser below.
+        let work = tokio::spawn({
+            let config = config_owned.clone();
+            let ch = ch_owned.clone();
+            let s3 = s3_owned.clone();
+            let name = name_owned.clone();
+            let dir = dir_owned.clone();
+            let diff = diff_owned.clone();
+            async move {
+                upload_inner(
+                    &config,
+                    &ch,
+                    &s3,
+                    &name,
+                    &dir,
+                    delete_local,
+                    diff.as_deref(),
+                    resume,
+                    cancel,
+                )
+                .await
+            }
+        });
+
+        let result = match work.await {
+            Ok(r) => r,
+            Err(join_err) => Err(anyhow::anyhow!("upload task failed: {join_err}")),
+        };
+
+        finalize_deferred_freeze(&ch_owned, &dir_owned, &name_owned, result.is_ok()).await;
+        result
+    });
+
+    match handle.await {
+        Ok(r) => r,
+        Err(join_err) => Err(anyhow::anyhow!("upload task failed: {join_err}")),
+    }
+}
+
+/// Release any deferred FREEZE recorded for this backup.
+///
+/// Deletes the record only after the freeze is genuinely released -- on partial failure the
+/// record is rewritten with just the entries that are still frozen, so the leak stays
+/// discoverable and the next run retries it rather than being silently dropped.
+async fn finalize_deferred_freeze(
+    ch: &ChClient,
+    backup_dir: &Path,
+    backup_name: &str,
+    upload_succeeded: bool,
+) {
+    use crate::backup::deferred::{self, LoadOutcome};
+
+    let retained = match deferred::load(backup_dir, backup_name) {
+        LoadOutcome::None => return,
+        LoadOutcome::Usable(record) => record.retained,
+        LoadOutcome::ForeignLive(record) => {
+            warn!(
+                backup = %backup_name,
+                owner_pid = record.owner_pid,
+                "Deferred-freeze record is owned by another live process; leaving it alone"
+            );
+            return;
+        }
+        LoadOutcome::Corrupt(reason) => {
+            // Do NOT guess which tables to unfreeze. Freeze names are injective, but a
+            // corrupt record means we cannot prove what was deferred or who owns it, and
+            // unfreezing the wrong entry would release another backup's data protection.
+            warn!(
+                backup = %backup_name,
+                reason = %reason,
+                "Deferred-freeze record is unreadable -- leaving the FREEZE in place. \
+                 Run `chbackup clean` once no backup is running to remove leftover shadow \
+                 directories."
+            );
+            return;
+        }
+    };
+
+    if retained.is_empty() {
+        let _ = deferred::delete(backup_dir);
+        return;
+    }
+
+    info!(
+        tables = retained.len(),
+        upload_succeeded = upload_succeeded,
+        "Releasing deferred S3 object-disk freezes"
+    );
+
+    let mut guard = crate::backup::freeze::FreezeGuard::from_frozen(retained);
+    match guard.unfreeze_all_checked(ch).await {
+        Ok(()) => {
+            if let Err(e) = deferred::delete(backup_dir) {
+                warn!(error = %e, "Failed to remove deferred-freeze record after unfreeze");
+            }
+        }
+        Err(failed) => {
+            deferred::retain_failed(backup_dir, backup_name, failed);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_inner(
     config: &Config,
     ch: &ChClient,
     s3: &S3Client,

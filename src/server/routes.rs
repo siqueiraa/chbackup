@@ -579,6 +579,7 @@ async fn dispatch_action_command(
             flags.configs,
             false, // named_collections
             &config.backup.skip_projections,
+            false, // defer_unfreeze_s3: create-only, no upload will release the freeze
             cancel,
         )
         .await
@@ -661,6 +662,7 @@ async fn dispatch_action_command(
                 flags.configs,
                 false, // named_collections
                 &config.backup.skip_projections,
+                true, // defer_unfreeze_s3: upload follows and will release the freeze
                 cancel.clone(),
             )
             .await;
@@ -1224,6 +1226,7 @@ pub async fn create_backup(
                 req.skip_projections
                     .as_ref()
                     .unwrap_or(&config.backup.skip_projections),
+                false, // defer_unfreeze_s3: create-only, no upload will release the freeze
                 cancel,
             )
             .await?;
@@ -1494,6 +1497,7 @@ pub async fn create_remote(
                 req.skip_projections
                     .as_ref()
                     .unwrap_or(&config.backup.skip_projections),
+                true, // defer_unfreeze_s3: upload follows and will release the freeze
                 cancel.clone(),
             )
             .await?;

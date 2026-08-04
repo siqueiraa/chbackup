@@ -103,7 +103,15 @@ export function stripDead(src) {
 
 /** Load a Rust file with comments and provably-dead code removed. */
 export function loadLive(path) {
-  return stripDead(stripComments(fs.readFileSync(path, "utf8")));
+  let raw;
+  try {
+    raw = fs.readFileSync(path, "utf8");
+  } catch (e) {
+    // Must be an assertion, never an uncaught throw: a crash exit is easily misread
+    // as a real finding, and a crash on some other path could exit 0.
+    fail(`cannot read ${path} (${e.code || e.message}) - the gate cannot verify anything`);
+  }
+  return stripDead(stripComments(raw));
 }
 
 /**

@@ -1416,6 +1416,24 @@ async fn clean_shadow_inner(
     name: Option<&str>,
     force: bool,
 ) -> Result<usize> {
+    // Backstop: refuse to delete shadow data that another live process is deliberately
+    // holding frozen so its S3 object-disk objects stay pinned until upload copies them.
+    //
+    // This is checked once up front and gates every disk, and it applies even when
+    // `force` is set -- `force` exists to bypass the *PID lock* check for callers that
+    // already hold that lock, not to override freeze ownership.
+    //
+    // The predicate is ownership-aware rather than "is a lock held": `cleanup_failed_backup`
+    // runs while holding the backup's PID lock, so a presence check would stop it from ever
+    // cleaning its own shadow. `blocks_shadow_cleanup` therefore compares PIDs and only
+    // blocks on a record owned by a *different* live process. It also fails closed on an
+    // unreadable record, since ownership cannot be established from corrupt data.
+    if let Some(n) = name {
+        if crate::backup::deferred::blocks_shadow_cleanup(data_path, n) {
+            return Ok(0);
+        }
+    }
+
     let disks = ch.get_disks().await?;
 
     let mut total = 0;

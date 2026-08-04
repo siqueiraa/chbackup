@@ -28,6 +28,17 @@ const REQUIRED_TAGS = [
 // The consequence chbackup depends on: which codes mean "part is missing" vs
 // "part is a duplicate". Asserted so a future upstream renumbering breaks CI
 // loudly instead of silently re-breaking restore classification.
+// Fingerprints of the FULL upstream ErrorCodes.cpp each excerpt was taken from,
+// recorded at fetch time. These differ per version because the real files differ,
+// which is what makes copy-pasted provenance detectable: four sections claiming
+// four tags must carry these four DISTINCT fingerprints.
+const FINGERPRINTS = {
+  "v23.8.16.40-lts": { sha256: "76c4d78a57ec27f805a046732d6f7a732ad619b78b49cfa8b828ad5240e2b23f", lines: 679 },
+  "v24.3.12.75-lts": { sha256: "d9c62fd292e0f370733bb610550ec304c5718c831d1b759e7fe9b6bb2074b370", lines: 694 },
+  "v24.8.14.39-lts": { sha256: "e952b05ffef64b88ccb4651b6d7ac0afdb017c2d90a5b13444fa9af4c14a78cd", lines: 705 },
+  "v25.1.5.31-stable": { sha256: "de5e5986b566c63073927b59c223c4b03049c05bb2418c391623a62d6d2f4d78", lines: 739 },
+};
+
 const LOAD_BEARING = {
   "232": "NO_SUCH_DATA_PART",
   "233": "BAD_DATA_PART_NAME",
@@ -50,6 +61,7 @@ try {
 }
 
 const versions = {};
+const fingerprints = {};
 let cur = null;
 for (const line of raw.split("\n")) {
   const header = line.match(/^##\s+(\S+)/);
@@ -58,6 +70,8 @@ for (const line of raw.split("\n")) {
     versions[cur] = {};
     continue;
   }
+  const fp = line.match(/^FINGERPRINT sha256=([0-9a-f]{64}) lines=(\d+)/);
+  if (fp && cur) { fingerprints[cur] = { sha256: fp[1], lines: Number(fp[2]) }; continue; }
   const m = line.match(/^M\((\d+),\s*([A-Z_]+)\)/);
   if (m && cur) versions[cur][m[1]] = m[2];
 }
@@ -78,6 +92,27 @@ for (const got of tags) {
     fail(`vendored source contains an unexpected tag ${got} - only the pinned CI tags are accepted `
        + `(${REQUIRED_TAGS.join(", ")}), so relabelled excerpts cannot fake provenance`);
   }
+}
+
+// Provenance: each section must carry the fingerprint of the real upstream file for
+// its tag, and all four must be distinct. Copy-pasting one excerpt under four
+// headings yields identical fingerprints and is rejected here.
+const seenFp = new Map();
+for (const tag of tags) {
+  const want = FINGERPRINTS[tag];
+  const got = fingerprints[tag];
+  if (!got) fail(`section ${tag} has no FINGERPRINT line - provenance cannot be checked`);
+  if (got.sha256 !== want.sha256 || got.lines !== want.lines) {
+    fail(`section ${tag} fingerprint does not match the recorded upstream file `
+       + `(got sha256=${got.sha256.slice(0,16)}../lines=${got.lines}, `
+       + `expected ${want.sha256.slice(0,16)}../lines=${want.lines})`);
+  }
+  const key = got.sha256 + ":" + got.lines;
+  if (seenFp.has(key)) {
+    fail(`sections ${seenFp.get(key)} and ${tag} carry the SAME fingerprint - one excerpt was `
+       + `copy-pasted under multiple tag headings rather than fetched per version`);
+  }
+  seenFp.set(key, tag);
 }
 
 // The mapping must be identical across every vendored version, else

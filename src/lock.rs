@@ -201,7 +201,15 @@ pub fn lock_path_for_scope(scope: &LockScope) -> Option<PathBuf> {
 /// - `ret == -1, ESRCH`  → no such process → dead
 /// - `ret == -1, EPERM`  → process exists but permission denied → alive
 ///   (can happen in containers with security contexts or cross-uid scenarios)
-fn is_pid_alive(pid: u32) -> bool {
+pub fn is_pid_alive(pid: u32) -> bool {
+    // PID 0 is never a real user process, but `kill(0, 0)` means "signal every process in
+    // the caller's process group" and therefore SUCCEEDS -- which would report a zeroed or
+    // corrupt PID as alive. Treat it as dead so bad data cannot pin a lock or a deferred
+    // freeze indefinitely.
+    if pid == 0 {
+        return false;
+    }
+
     #[cfg(unix)]
     {
         // SAFETY: signal 0 does not send a signal; it only checks that the

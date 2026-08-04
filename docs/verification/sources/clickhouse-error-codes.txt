@@ -1,7 +1,12 @@
-# ClickHouse ErrorCodes.cpp excerpts, fetched from github.com/ClickHouse/ClickHouse
-# Only the codes chbackup's ATTACH/FREEZE classification depends on.
+# ClickHouse ErrorCodes.cpp excerpts — src/Common/ErrorCodes.cpp at each CI version tag.
+# Fetched from raw.githubusercontent.com/ClickHouse/ClickHouse/<tag>/src/Common/ErrorCodes.cpp
+#
+# Each section carries a FINGERPRINT of the FULL upstream file it came from. Those differ
+# per version (the files genuinely differ), so copy-pasting one excerpt under four headings
+# cannot produce four distinct fingerprints — which is what validate-h1.mjs requires.
 
 ## v23.8.16.40-lts  (src/Common/ErrorCodes.cpp)
+FINGERPRINT sha256=76c4d78a57ec27f805a046732d6f7a732ad619b78b49cfa8b828ad5240e2b23f lines=679
 M(218, TABLE_IS_DROPPED)
 M(232, NO_SUCH_DATA_PART)
 M(233, BAD_DATA_PART_NAME)
@@ -10,6 +15,7 @@ M(248, INVALID_PARTITION_VALUE)
 M(384, PART_IS_TEMPORARILY_LOCKED)
 
 ## v24.3.12.75-lts  (src/Common/ErrorCodes.cpp)
+FINGERPRINT sha256=d9c62fd292e0f370733bb610550ec304c5718c831d1b759e7fe9b6bb2074b370 lines=694
 M(218, TABLE_IS_DROPPED)
 M(232, NO_SUCH_DATA_PART)
 M(233, BAD_DATA_PART_NAME)
@@ -18,6 +24,7 @@ M(248, INVALID_PARTITION_VALUE)
 M(384, PART_IS_TEMPORARILY_LOCKED)
 
 ## v24.8.14.39-lts  (src/Common/ErrorCodes.cpp)
+FINGERPRINT sha256=e952b05ffef64b88ccb4651b6d7ac0afdb017c2d90a5b13444fa9af4c14a78cd lines=705
 M(218, TABLE_IS_DROPPED)
 M(232, NO_SUCH_DATA_PART)
 M(233, BAD_DATA_PART_NAME)
@@ -26,6 +33,7 @@ M(248, INVALID_PARTITION_VALUE)
 M(384, PART_IS_TEMPORARILY_LOCKED)
 
 ## v25.1.5.31-stable  (src/Common/ErrorCodes.cpp)
+FINGERPRINT sha256=de5e5986b566c63073927b59c223c4b03049c05bb2418c391623a62d6d2f4d78 lines=739
 M(218, TABLE_IS_DROPPED)
 M(232, NO_SUCH_DATA_PART)
 M(233, BAD_DATA_PART_NAME)

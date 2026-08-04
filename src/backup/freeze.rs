@@ -10,7 +10,11 @@ use tracing::{debug, warn};
 use crate::clickhouse::client::ChClient;
 
 /// Metadata for a frozen table. Used to track what needs unfreezing.
-#[derive(Debug, Clone)]
+///
+/// Serializable because deferred freezes outlive the process that created them: the
+/// entries are persisted in a deferred-freeze record so a later `upload` (or a recovery
+/// run) can release exactly the freezes it owns. See `backup::deferred`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FreezeInfo {
     pub database: String,
     pub table: String,
@@ -56,10 +60,58 @@ impl FreezeGuard {
         self.frozen.is_empty()
     }
 
+    /// Build a guard from an existing set of entries.
+    ///
+    /// Used when adopting a deferred freeze recorded by an earlier process.
+    pub fn from_frozen(frozen: Vec<FreezeInfo>) -> Self {
+        Self { frozen }
+    }
+
+    /// Remove and return every entry matching `pred`, leaving the rest in the guard.
+    ///
+    /// Used to split local-disk tables (unfrozen immediately) from S3 object-disk tables
+    /// (whose freeze must be held until their remote objects have been copied).
+    pub fn take_matching<F>(&mut self, mut pred: F) -> Vec<FreezeInfo>
+    where
+        F: FnMut(&FreezeInfo) -> bool,
+    {
+        let mut taken = Vec::new();
+        let mut kept = Vec::with_capacity(self.frozen.len());
+        for info in self.frozen.drain(..) {
+            if pred(&info) {
+                taken.push(info);
+            } else {
+                kept.push(info);
+            }
+        }
+        self.frozen = kept;
+        taken
+    }
+
     /// Unfreeze all tables. Logs warnings on failure but does not fail
     /// the whole operation -- leftover shadow data can be cleaned later.
+    ///
+    /// Prefer [`FreezeGuard::unfreeze_all_checked`] when the caller needs to know whether
+    /// the freeze was actually released -- e.g. before deleting a deferred-freeze record,
+    /// where silently dropping the record while a table stays frozen leaks shadow data.
     pub async fn unfreeze_all(&mut self, ch: &ChClient) -> Result<()> {
-        for info in &self.frozen {
+        let _ = self.unfreeze_all_checked(ch).await;
+        Ok(())
+    }
+
+    /// Unfreeze all tables, reporting which ones could not be released.
+    ///
+    /// Returns `Ok(())` when every table was unfrozen. On partial failure returns
+    /// `Err(remaining)` with the entries that are still frozen; those are also retained in
+    /// the guard so a caller can persist them for a later retry. Successfully unfrozen
+    /// entries are always removed.
+    pub async fn unfreeze_all_checked(
+        &mut self,
+        ch: &ChClient,
+    ) -> std::result::Result<(), Vec<FreezeInfo>> {
+        let mut failed = Vec::new();
+
+        for info in self.frozen.drain(..) {
             debug!(
                 db = %info.database,
                 table = %info.table,
@@ -77,12 +129,17 @@ impl FreezeGuard {
                     error = %e,
                     "Failed to UNFREEZE table (shadow data may need manual cleanup)"
                 );
+                failed.push(info);
             }
         }
 
-        self.frozen.clear();
-
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            // Keep the failures in the guard so the caller can re-persist them.
+            self.frozen = failed.clone();
+            Err(failed)
+        }
     }
 }
 
@@ -174,6 +231,52 @@ mod tests {
         });
         // Drop should log a warning but not panic
         drop(guard);
+    }
+
+    #[test]
+    fn test_take_matching_splits_and_keeps_remainder() {
+        let mut guard = FreezeGuard::new();
+        for (db, t) in [("a", "s3tbl"), ("a", "localtbl"), ("b", "s3tbl")] {
+            guard.add(FreezeInfo {
+                database: db.to_string(),
+                table: t.to_string(),
+                freeze_name: crate::clickhouse::freeze_name("bk", db, t),
+            });
+        }
+
+        let taken = guard.take_matching(|i| i.table == "s3tbl");
+
+        assert_eq!(taken.len(), 2, "both s3tbl entries taken");
+        assert!(taken.iter().all(|i| i.table == "s3tbl"));
+        assert_eq!(guard.len(), 1, "local table stays in the guard");
+        assert_eq!(guard.frozen_tables()[0].table, "localtbl");
+    }
+
+    #[test]
+    fn test_take_matching_none_and_all() {
+        let mut guard = FreezeGuard::new();
+        guard.add(FreezeInfo {
+            database: "a".into(),
+            table: "t".into(),
+            freeze_name: "f".into(),
+        });
+
+        assert!(guard.take_matching(|_| false).is_empty());
+        assert_eq!(guard.len(), 1, "nothing taken means nothing lost");
+
+        assert_eq!(guard.take_matching(|_| true).len(), 1);
+        assert!(guard.is_empty());
+    }
+
+    #[test]
+    fn test_from_frozen_roundtrips() {
+        let entries = vec![FreezeInfo {
+            database: "db".into(),
+            table: "t".into(),
+            freeze_name: "f".into(),
+        }];
+        let guard = FreezeGuard::from_frozen(entries.clone());
+        assert_eq!(guard.frozen_tables(), entries.as_slice());
     }
 
     #[test]

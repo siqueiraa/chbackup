@@ -587,6 +587,7 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             false, // configs (watch mode does not support config backup)
             false, // named_collections (watch mode does not support named collections backup)
             &ctx.config.backup.skip_projections,
+            true, // defer_unfreeze_s3: watch uploads after create, so it releases the freeze
             create_cancel,
         )
         .await;

@@ -181,6 +181,7 @@ async fn run() -> Result<()> {
                 configs,
                 named_collections,
                 &effective_skip_projections,
+                false, // defer_unfreeze_s3: standalone create -- nothing would release a held freeze
                 CancellationToken::new(),
             )
             .await?;
@@ -346,6 +347,7 @@ async fn run() -> Result<()> {
                 configs,
                 named_collections,
                 &effective_skip_projections,
+                true, // defer_unfreeze_s3: upload follows and will release the freeze
                 CancellationToken::new(),
             )
             .await?;
