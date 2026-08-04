@@ -351,7 +351,7 @@ fn format_delimited(summaries: &[BackupSummary], delimiter: char) -> String {
 pub fn resolve_backup_shortcut(name: &str, backups: &[BackupSummary]) -> Result<String> {
     let mut valid: Vec<&BackupSummary> = backups.iter().filter(|b| !b.is_broken).collect();
     // Sort by timestamp ascending; None timestamps sort first (before all Some values).
-    valid.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    valid.sort_by_key(|s| s.timestamp);
 
     match name {
         "latest" => valid
@@ -788,7 +788,7 @@ pub fn retention_local(data_path: &str, keep: i32) -> Result<usize> {
 
     // Sort by timestamp ascending (oldest first).
     // None timestamps (should not happen for valid backups) treated as very old.
-    valid.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    valid.sort_by_key(|s| s.timestamp);
 
     let to_delete = valid.len() - keep;
     let mut deleted = 0;
@@ -1162,7 +1162,7 @@ pub async fn retention_remote(s3: &S3Client, keep: i32) -> Result<usize> {
     }
 
     // Sort by timestamp ascending (oldest first)
-    valid.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    valid.sort_by_key(|s| s.timestamp);
 
     let to_delete = valid.len() - keep;
     let total = backups.len();

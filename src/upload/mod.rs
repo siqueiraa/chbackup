@@ -738,9 +738,12 @@ pub async fn upload(
                     // Upload chunks, aborting on error
                     let upload_result = async {
                         let mut completed_parts: Vec<(i32, String)> = Vec::new();
-                        let mut part_number = 1i32;
 
-                        for chunk_start in (0..compressed.len()).step_by(chunk_size) {
+                        for (idx, chunk_start) in
+                            (0..compressed.len()).step_by(chunk_size).enumerate()
+                        {
+                            // S3 multipart part numbers are 1-based.
+                            let part_number = idx as i32 + 1;
                             let chunk_end = (chunk_start + chunk_size).min(compressed.len());
                             let chunk_data = compressed[chunk_start..chunk_end].to_vec();
 
@@ -755,7 +758,6 @@ pub async fn upload(
                                 .await?;
 
                             completed_parts.push((part_number, e_tag));
-                            part_number += 1;
                         }
 
                         s3.complete_multipart_upload(&item.s3_key, &upload_id, completed_parts)

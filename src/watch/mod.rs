@@ -234,7 +234,7 @@ pub fn resume_state(
     }
 
     // Sort by timestamp descending (most recent first)
-    matching.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    matching.sort_by_key(|s| std::cmp::Reverse(s.timestamp));
 
     // Find most recent full and incremental using template-aware classification
     let last_full = matching
