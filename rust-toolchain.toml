@@ -15,10 +15,11 @@
 # Deliberately NO `targets` key. The release build does not cross-compile: the
 # Dockerfile builds on `rust:<ver>-alpine`, where the host triple is already
 # *-unknown-linux-musl, so `cargo build --release` is native and needs no added
-# target. The only `--target x86_64-unknown-linux-musl` references in the repo are
-# documentation (README.md, CLAUDE.md) describing an opt-in local build. Listing
-# musl targets here would force every clone -- including macOS, where the linker
-# is missing anyway -- to download std for targets it never builds.
+# target. The one `--target x86_64-unknown-linux-musl` reference left in the repo is
+# README.md's opt-in cross-compile section, which documents the `rustup target add`
+# and musl-linker prerequisites it needs. Listing musl targets here would force every
+# clone -- including macOS, where the linker is missing anyway -- to download std for
+# targets it never builds.
 #
 # `llvm-tools-preview` is likewise omitted: only the CI coverage job needs it, and
 # it adds a large download for everyone else. That job installs it on demand via

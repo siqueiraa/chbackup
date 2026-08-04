@@ -199,12 +199,23 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 ## Build & Test
 
 ```bash
-cargo build --release --target x86_64-unknown-linux-musl  # static binary
-cargo test                                                  # unit tests
-docker build -t chbackup .                                  # production image
+cargo build --release   # host binary (dev); toolchain auto-pinned by rust-toolchain.toml
+cargo test              # unit tests
+docker build -t chbackup .   # static musl binary + production image (what ships)
 ```
 
+**Use Docker for the static binary, not `--target x86_64-unknown-linux-musl`.** The
+release workflow does not cross-compile: it builds on `rust:*-alpine`, where the host
+triple is already `*-unknown-linux-musl`, so plain `cargo build --release` is native.
+`rust-toolchain.toml` deliberately declares no `targets`, so the musl target is not
+installed; building it directly also needs a musl *linker* (`musl-tools` on Debian, a
+cross-toolchain on macOS), which is why Docker is the documented path.
+
 Integration tests require real ClickHouse + S3 (no mocks).
+
+> **Note:** CI's Integration jobs skip silently when `TEST_S3_BUCKET` /
+> `TEST_S3_ACCESS_KEY` / `TEST_S3_SECRET_KEY` repo secrets are absent -- the job still
+> reports success. A green CI tick does **not** imply integration coverage ran.
 
 **MANDATORY before committing:** Run `cargo fmt -- --check` to verify formatting. CI will reject unformatted code. Run `cargo fmt` to auto-fix.
 

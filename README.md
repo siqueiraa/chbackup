@@ -132,16 +132,33 @@ curl -L -o /usr/local/bin/chbackup \
 chmod +x /usr/local/bin/chbackup
 ```
 
-**Build from source** (requires Rust 1.85+):
+**Build from source.** The toolchain is pinned in `rust-toolchain.toml`; rustup reads it
+and installs the right version automatically, so no manual version setup is needed:
 
 ```bash
 cargo build --release
 ```
 
-For a static musl binary (Linux):
+This produces a dynamically linked binary for your host — fine for development.
+
+**For the static musl binary** (the artifact that ships), use Docker. This is exactly
+what the release workflow does, and it needs no toolchain setup on the host:
 
 ```bash
-rustup target add x86_64-unknown-linux-musl  # one-time setup
+docker build -t chbackup .
+```
+
+The image builds on `rust:*-alpine`, where the host triple is already
+`*-unknown-linux-musl`, so the static binary is a native build.
+
+To build musl directly instead, note it is a **cross-compile** and needs a musl linker,
+not just the Rust target:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+# Linux: install musl-gcc  (Debian/Ubuntu: apt install musl-tools)
+# macOS: needs a musl cross-toolchain (e.g. brew install FiloSottile/musl-cross/musl-cross)
+#        and a matching linker in .cargo/config.toml -- Docker is far less friction
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
