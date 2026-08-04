@@ -4784,6 +4784,99 @@ if should_run "test_incr_name_derivation"; then
 fi
 
 # ---------------------------------------------------------------------------
+# T75: S3 object-disk freeze race -- objects must survive merges during upload
+# ---------------------------------------------------------------------------
+# Regression test for the production failure:
+#   CopyObject failed for S3 object ... NoSuchKey: The specified key does not exist.
+#
+# S3 object-disk parts are only POINTERS into remote storage. The staged shadow metadata
+# hardlinks are ClickHouse's sole refcount on the referenced objects, so if create()
+# unfreezes before upload copies them, ClickHouse can merge the parts away and garbage-
+# collect the objects out from under the CopyObject.
+#
+# This test forces exactly that: heavy merge pressure on an S3-disk table across a
+# create_remote. With the freeze deferred it must succeed; without the fix the upload
+# fails with NoSuchKey.
+if should_run "test_s3_disk_freeze_race"; then
+    info "T75: S3 object-disk freeze race under merge pressure"
+    RACE_NAME="race_test_$$"
+    RACE_TBL="default.race_s3"
+
+    info "  Step 0: Create an S3-disk table with many small parts (merge bait)"
+    clickhouse-client -q "DROP TABLE IF EXISTS ${RACE_TBL} SYNC"
+    # s3_policy matches the existing S3-disk fixtures in test/fixtures/setup.sql.
+    clickhouse-client -q "
+        CREATE TABLE ${RACE_TBL} (id UInt64, payload String)
+        ENGINE = MergeTree ORDER BY id
+        SETTINGS storage_policy = 's3_policy'
+    "
+
+    # Many separate INSERTs => many small parts => plenty for the merger to consume.
+    for i in $(seq 1 12); do
+        clickhouse-client -q "INSERT INTO ${RACE_TBL} SELECT number + ${i}*1000, repeat('x', 512) FROM numbers(400)"
+    done
+    PRE_RACE=$(clickhouse-client -q "SELECT count() FROM ${RACE_TBL}")
+    PRE_PARTS=$(clickhouse-client -q "SELECT count() FROM system.parts WHERE database='default' AND table='race_s3' AND active")
+    info "  rows=${PRE_RACE}, active parts=${PRE_PARTS}"
+
+    # Confirm the fixture is actually on an S3 disk, or the test proves nothing.
+    RACE_DISK=$(clickhouse-client -q "SELECT DISTINCT disk_name FROM system.parts WHERE database='default' AND table='race_s3' AND active LIMIT 1")
+    if [[ "$RACE_DISK" == s3* ]]; then
+        pass "race fixture is on an S3 disk (${RACE_DISK})"
+    else
+        fail "race fixture landed on '${RACE_DISK}', not an S3 disk -- test cannot detect the race"
+    fi
+
+    info "  Step 1: Hammer merges in the background while create_remote runs"
+    (
+        for _ in $(seq 1 40); do
+            clickhouse-client -q "OPTIMIZE TABLE ${RACE_TBL} FINAL" >/dev/null 2>&1 || true
+            clickhouse-client -q "INSERT INTO ${RACE_TBL} SELECT number + 900000, repeat('y', 512) FROM numbers(200)" >/dev/null 2>&1 || true
+        done
+    ) &
+    MERGE_PID=$!
+
+    # create_remote holds the freeze across create+upload, so the objects must survive.
+    if RUST_LOG=error chbackup create_remote "${RACE_NAME}" -t "${RACE_TBL}" 2>&1; then
+        pass "create_remote survived concurrent merges on an S3-disk table"
+    else
+        fail "create_remote failed under merge pressure (NoSuchKey race?)"
+    fi
+
+    wait $MERGE_PID 2>/dev/null || true
+
+    info "  Step 2: The deferred-freeze record must be cleaned up"
+    RECORD="/var/lib/clickhouse/backup/${RACE_NAME}/deferred_freeze.json"
+    if [ -f "$RECORD" ]; then
+        fail "deferred_freeze.json still present after upload -- freeze was not released"
+    else
+        pass "deferred-freeze record cleaned up"
+    fi
+
+    info "  Step 3: No shadow directories may be left frozen"
+    LEFTOVER=$(find /var/lib/clickhouse/disks/s3/shadow -maxdepth 1 -name "chbackup*${RACE_NAME}*" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$LEFTOVER" == "0" ]]; then
+        pass "no leftover shadow directories for this backup"
+    else
+        fail "${LEFTOVER} shadow directory(ies) still frozen after upload"
+    fi
+
+    info "  Step 4: Backup must be listed and NOT broken"
+    RACE_DESC=$(RUST_LOG=error chbackup list remote --format json 2>/dev/null | grep -F "${RACE_NAME}" || true)
+    if echo "$RACE_DESC" | grep -q 'broken'; then
+        fail "backup is broken: ${RACE_DESC}"
+    elif [[ -n "$RACE_DESC" ]]; then
+        pass "backup listed and not broken"
+    else
+        fail "backup ${RACE_NAME} not found in remote list"
+    fi
+
+    info "  Cleanup"
+    cleanup_backup "${RACE_NAME}"
+    clickhouse-client -q "DROP TABLE IF EXISTS ${RACE_TBL} SYNC"
+fi
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 echo ""
