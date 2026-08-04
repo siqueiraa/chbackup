@@ -118,9 +118,17 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - When IDs came from discovery but none could be frozen, a `warn!` fires -- the table would otherwise be dropped from the manifest with only an `info!`, a silent data gap
 
 ### Disk Filtering (Phase 2d)
-- Before processing collected parts, each part is checked against `config.clickhouse.skip_disks` and `config.clickhouse.skip_disk_types`
-- Uses `table_filter::is_disk_excluded(disk_name, disk_type, skip_disks, skip_disk_types)` for exclusion check
-- Excluded parts are logged at info level and skipped from the backup
+- Applied at **whole-disk granularity during the shadow walk**, NOT per part: `collect_parts` checks each disk once (`collect.rs`, inside the per-disk loop) and `continue`s past excluded disks entirely
+- Uses `table_filter::is_disk_excluded(disk_name, disk_type, skip_disks, skip_disk_types)` for the exclusion check
+- Excluded disks are logged at info level; every part on them is absent from the backup
+- **Only `backup::create` consults these settings.** Upload, download, and restore act on whatever `manifest.disk_types` contains, so excluding a disk silently omits its tables' data rather than failing. `restore/mod.rs` acknowledges the fallout when reporting tables with zero parts.
+
+### S3 Object-Disk Durability Contract
+- **S3 object-disk parts are pointers, not data.** `collect_s3_part_metadata` records `S3ObjectInfo` references and stages only the local *metadata* files; the referenced remote objects are never copied or pinned at create time.
+- The staged shadow metadata hardlinks are ClickHouse's **only refcount** on those remote objects. Releasing the FREEZE lets ClickHouse merge the parts away and garbage-collect the objects.
+- Therefore a table with S3-disk parts must stay frozen until `upload` has run its CopyObject. `create()` takes `defer_unfreeze_s3` and, when set, splits the `FreezeGuard` so only those tables remain frozen; ownership is recorded in `deferred.rs` and released by `upload`'s in-task finaliser.
+- Local-disk tables need no deferral: `collect_parts` hardlinked their data into the backup dir, so merges cannot destroy it.
+- `defer_unfreeze_s3` is only safe when the caller will actually run `upload`. Standalone `create` passes `false` and warns if it collected S3-disk parts.
 
 ### Parts Column Consistency Check (Phase 2d)
 - After listing tables, if `config.clickhouse.check_parts_columns` is true AND `!skip_check_parts_columns` CLI flag:

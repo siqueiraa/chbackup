@@ -156,7 +156,7 @@ S3 storage settings. See the [S3 guide](s3.md) for provider-specific setup.
 | `chunk_size` | int | `0` | Multipart chunk size (0 = auto) |
 | `concurrency` | int | `1` | SDK internal concurrency per upload |
 | `object_disk_path` | string | _(empty)_ | Alternate prefix for S3 disk objects |
-| `allow_object_disk_streaming` | bool | `false` | Fallback to streaming for failed CopyObject |
+| `allow_object_disk_streaming` | bool | `false` | Fallback to streaming download+reupload when CopyObject fails. Does **not** help when the source object is missing — streaming GETs the same key |
 | `debug` | bool | `false` | Verbose S3 SDK logging |
 
 ## Backup
@@ -311,6 +311,7 @@ The most common config parameters can be overridden via environment variables. O
 | `S3_DISABLE_CERT_VERIFICATION` | `s3.disable_cert_verification` |
 | `S3_CONCURRENCY` | `s3.concurrency` |
 | `S3_OBJECT_DISK_PATH` | `s3.object_disk_path` |
+| `S3_ALLOW_OBJECT_DISK_STREAMING` | `s3.allow_object_disk_streaming` |
 
 ### Backup
 

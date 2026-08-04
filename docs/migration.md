@@ -85,3 +85,34 @@ services:
 - **S3 only** — no GCS, Azure, SFTP, or FTP backends
 - **HTTP protocol** — connects to ClickHouse via HTTP (8123), not native TCP (9000)
 - **Rust binary** — ~15 MB vs ~80 MB, same functionality for S3 use cases
+
+### `skip_tables` uses glob patterns, not regex
+
+This one **silently changes which tables get backed up**, so check it before cutting over.
+
+Go clickhouse-backup treats `skip_tables` entries as regular expressions. chbackup matches
+them as **glob** patterns, where `.` is a literal dot and `*` is the wildcard. A pattern
+carried over from a Go config can therefore match nothing at all:
+
+| Pattern | Go (regex) | chbackup (glob) |
+|---|---|---|
+| `.*_log` | any name ending `_log` | **matches nothing** — requires a literal leading `.` |
+| `*_log` | invalid regex | any name ending `_log` |
+| `system.*` | `system` + any char + anything | `system.` + anything ✅ |
+| `tmpdata.*` | similar | `tmpdata.` + anything ✅ |
+
+So `system.*` and `tmpdata.*` happen to work under both, while a leading `.*` does not.
+Rewrite `.*foo` as `*foo`.
+
+Verify what is actually excluded after migrating — a dead pattern shows up as unexpected
+tables present in the backup, not as an error.
+
+### Existing Go-format backups are not readable
+
+chbackup cannot restore backups created by Go clickhouse-backup. The manifest schemas
+differ (Go writes database DDL under `query`, chbackup expects `ddl`), so `list` reports
+pre-existing backups as `broken: manifest parse error ... missing field 'ddl'`.
+
+They are **not** deleted automatically — retention skips broken backups — but be aware that
+`clean_broken remote` would remove them. Keep the Go binary available until you have
+verified a restore from a chbackup-created backup.

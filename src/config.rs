@@ -1179,6 +1179,16 @@ impl Config {
         if let Ok(v) = std::env::var("S3_OBJECT_DISK_PATH") {
             self.s3.object_disk_path = v;
         }
+        if let Ok(v) = std::env::var("S3_ALLOW_OBJECT_DISK_STREAMING") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.s3.allow_object_disk_streaming = b;
+            } else {
+                warn!(
+                    "S3_ALLOW_OBJECT_DISK_STREAMING='{}' is not a valid bool, ignoring",
+                    v
+                );
+            }
+        }
 
         // Backup
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_COMPRESSION") {
@@ -1817,6 +1827,7 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "S3_DISABLE_CERT_VERIFICATION" => Some("s3.disable_cert_verification"),
         "S3_CONCURRENCY" => Some("s3.concurrency"),
         "S3_OBJECT_DISK_PATH" => Some("s3.object_disk_path"),
+        "S3_ALLOW_OBJECT_DISK_STREAMING" => Some("s3.allow_object_disk_streaming"),
 
         // Backup
         "CHBACKUP_BACKUP_COMPRESSION" => Some("backup.compression"),

@@ -89,6 +89,16 @@ macro_rules! apply_s3_object_options {
 ///
 /// Returns `(bucket, prefix)`. If the URI does not match `s3://` format,
 /// returns the whole string as the prefix with an empty bucket.
+/// Whether an S3 error means the referenced key or bucket does not exist.
+///
+/// Used to classify a CopyObject failure as permanent so it is not retried. Kept narrow on
+/// purpose: matching `404` or `"not found"` would catch transient conditions and unrelated
+/// errors whose messages contain those substrings.
+pub fn is_missing_source_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("NoSuchKey") || msg.contains("NoSuchBucket")
+}
+
 pub fn parse_s3_uri(uri: &str) -> (String, String) {
     let stripped = uri
         .strip_prefix("s3://")
@@ -1354,6 +1364,15 @@ impl S3Client {
     }
 
     /// Copy with retry, backoff, and configurable jitter factor.
+    /// Whether an error means the copy source is permanently absent, making retries futile.
+    ///
+    /// Deliberately narrow -- only the S3 codes that mean "this key/bucket does not exist".
+    /// A broader match on `404` or `"not found"` would misclassify transient conditions and
+    /// unrelated errors whose messages happen to contain those substrings.
+    pub fn is_missing_source(err: &anyhow::Error) -> bool {
+        is_missing_source_error(err)
+    }
+
     pub async fn copy_object_with_retry_jitter(
         &self,
         source_bucket: &str,
@@ -1368,6 +1387,18 @@ impl S3Client {
             match self.copy_object(source_bucket, source_key, dest_key).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
+                    // A missing source object will never appear by waiting. Fail fast rather
+                    // than burning the full backoff, and skip the streaming fallback too --
+                    // copy_object_streaming GETs the very same key and would also 404.
+                    if is_missing_source_error(&e) {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "CopyObject source object does not exist: {}/{} \
+                                 (not retried -- a missing object is permanent)",
+                                source_bucket, source_key
+                            )
+                        });
+                    }
                     if attempt < backoff_ms.len() - 1 {
                         let actual_delay = crate::config::apply_jitter(*delay_ms, jitter_factor);
                         debug!(
@@ -1827,6 +1858,37 @@ mod tests {
             "Error should mention explicit endpoint requirement, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_is_missing_source_error_matches_permanent_absence() {
+        assert!(is_missing_source_error(&anyhow::anyhow!(
+            "service error: unhandled error (NoSuchKey): Error {{ code: \"NoSuchKey\", \
+             message: \"The specified key does not exist.\" }}"
+        )));
+        assert!(is_missing_source_error(&anyhow::anyhow!(
+            "NoSuchBucket: the bucket is gone"
+        )));
+    }
+
+    #[test]
+    fn test_is_missing_source_error_ignores_transient_and_unrelated() {
+        // Deliberately narrow: a broad "404"/"not found" match would misclassify these and
+        // turn retryable failures into hard ones.
+        for msg in [
+            "connection reset by peer",
+            "timed out",
+            "SlowDown: please reduce your request rate",
+            "InternalError: we encountered an internal error",
+            "AccessDenied",
+            "HTTP status 404 from an unrelated endpoint",
+            "table not found",
+        ] {
+            assert!(
+                !is_missing_source_error(&anyhow::anyhow!(msg)),
+                "{msg:?} must not be classified as a permanently missing source"
+            );
+        }
     }
 
     #[test]

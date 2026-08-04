@@ -1037,6 +1037,11 @@ async fn upload_inner(
                 // Dest key: {backup_name}/objects/{relative_path}
                 let dest_key = format!("{}/objects/{}", item.backup_name, s3_obj.path);
 
+                // Fail loud on a vanished object rather than skipping the part. Silently
+                // dropping it would publish a manifest that claims completeness while the
+                // table's data is absent -- the same silent-data-loss shape this project has
+                // already been bitten by. If a skip mode is ever added it must also refuse
+                // to publish a manifest that looks complete.
                 s3.copy_object_with_retry_jitter(
                     &item.source_bucket,
                     &source_key,
@@ -1045,11 +1050,29 @@ async fn upload_inner(
                     jitter_factor,
                 )
                 .await
-                .with_context(|| {
-                    format!(
-                        "CopyObject failed for S3 object {} in part {} (source: {}/{})",
-                        s3_obj.path, item.part.name, item.source_bucket, source_key
-                    )
+                .map_err(|e| {
+                    if crate::storage::s3::is_missing_source_error(&e) {
+                        anyhow::anyhow!(
+                            "S3 object-disk source object no longer exists: {}/{}\n  \
+                             table: {}.{}, part: {}, disk: {}\n  \
+                             The object was garbage-collected after being recorded. Usual \
+                             causes: the part was merged away while its FREEZE was not held \
+                             (create must run with the freeze deferred -- use `create_remote`), \
+                             or something deleted objects from the object-disk bucket \
+                             directly.\n  Underlying error: {e:#}",
+                            item.source_bucket,
+                            source_key,
+                            item.db,
+                            item.table,
+                            item.part.name,
+                            item.disk_name,
+                        )
+                    } else {
+                        e.context(format!(
+                            "CopyObject failed for S3 object {} in part {} (source: {}/{})",
+                            s3_obj.path, item.part.name, item.source_bucket, source_key
+                        ))
+                    }
                 })?;
 
                 updated_s3_objects.push(S3ObjectInfo {

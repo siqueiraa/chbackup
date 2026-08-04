@@ -83,6 +83,19 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 - After CopyObject: `s3_obj.backup_key` is set to the destination key in the backup bucket
 - No compression for S3 disk parts (already stored as raw S3 objects)
 
+### Deferred-Freeze Finalisation
+- `upload()` is a thin wrapper; the real body is `upload_inner()`. The wrapper exists to release any FREEZE that `backup::create` deliberately held so S3 object-disk objects stayed pinned until CopyObject read them (see `backup::deferred`).
+- **Finalisation runs inside a spawned task, not in the wrapper.** `auto_resume` selects over the upload future and can drop it; dropping the `JoinHandle` merely *detaches* the task, so anything after the `.await` in the wrapper would never run. Only in-task cleanup survives that.
+- **Nested spawn**: `upload_inner` is itself spawned so a panic becomes a `JoinError` value rather than unwinding past the finaliser.
+- SIGKILL is not survivable in-process — covered by stale-record adoption in `deferred.rs`, which is why the persisted record is the primary safety mechanism and this path is the fast one.
+- `finalize_deferred_freeze()` deletes the record only after a genuine unfreeze. On partial failure it rewrites the record with just the still-frozen entries (via `unfreeze_all_checked`), keeping the leak discoverable. A corrupt record leaves the FREEZE in place rather than guessing what to release.
+- Because the public signature takes borrows, the wrapper clones `Config`/`ChClient`/`S3Client` (all `Clone`) to satisfy `spawn`'s `'static` bound.
+
+### Missing Source Objects
+- A vanished object **fails the upload loudly**; it is never skipped. Skipping would publish a manifest claiming completeness while the table's data is absent. Any future skip mode must also refuse to publish a complete-looking manifest.
+- `storage::s3::is_missing_source_error()` classifies `NoSuchKey`/`NoSuchBucket` as permanent, so `copy_object_with_retry_jitter` returns immediately instead of burning ~2.1 s of backoff, and skips the streaming fallback (which would GET the same missing key).
+- The error names db/table/part/disk and the likely causes: the part was merged away while its FREEZE was not held, or something deleted objects from the object-disk bucket directly.
+
 ### CopyObject Concurrency (Phase 2c)
 - `object_disk_copy_semaphore` limits concurrent CopyObject operations
 - Default concurrency: 8 (conservative, since backup runs alongside FREEZE)
