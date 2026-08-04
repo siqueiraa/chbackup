@@ -14,7 +14,10 @@
 # =============================================================================
 
 # Stage 1: Build static binary
-FROM rust:1.91-alpine AS builder
+# Keep this version in sync with rust-toolchain.toml. If it drifts, rustup honours
+# rust-toolchain.toml and downloads the pinned toolchain inside the container on
+# every build, negating this pin.
+FROM rust:1.93-alpine AS builder
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig gcc
 WORKDIR /src
 

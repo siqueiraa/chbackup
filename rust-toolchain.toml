@@ -1,0 +1,30 @@
+# Pins the Rust toolchain for every build path: local dev, CI, and Docker.
+#
+# Why this exists: CI previously used `dtolnay/rust-toolchain@stable`, which floats.
+# When upstream stable gained stricter lints, `cargo clippy -- -D warnings` began
+# rejecting code that had always compiled -- a release-blocking failure caused by
+# nothing in the repo changing. Worse, the reverse could happen silently: CI passing
+# on floating stable while the release image (pinned to an older Alpine base) failed
+# or produced different codegen.
+#
+# Keep `channel` in sync with the base images in Dockerfile and Dockerfile.test.
+# If they diverge, rustup honours THIS file and re-downloads the pinned toolchain
+# inside the container on every image build -- slow, network-dependent, and it
+# defeats the point of pinning the base image.
+#
+# Deliberately NO `targets` key. The release build does not cross-compile: the
+# Dockerfile builds on `rust:<ver>-alpine`, where the host triple is already
+# *-unknown-linux-musl, so `cargo build --release` is native and needs no added
+# target. The only `--target x86_64-unknown-linux-musl` references in the repo are
+# documentation (README.md, CLAUDE.md) describing an opt-in local build. Listing
+# musl targets here would force every clone -- including macOS, where the linker
+# is missing anyway -- to download std for targets it never builds.
+#
+# `llvm-tools-preview` is likewise omitted: only the CI coverage job needs it, and
+# it adds a large download for everyone else. That job installs it on demand via
+# `rustup component add`, which resolves against this pinned channel.
+
+[toolchain]
+channel = "1.93.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

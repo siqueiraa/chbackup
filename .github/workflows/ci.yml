@@ -33,9 +33,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # rust-toolchain.toml is the single source of truth for the channel. Read it
+      # here rather than hardcoding a version: dtolnay/rust-toolchain requires an
+      # explicit `toolchain:` input and does NOT parse the file itself.
+      #
+      # Do NOT go back to @stable -- it floats, so a new upstream clippy can fail
+      # `cargo clippy -- -D warnings` with no change in the repo, blocking releases.
+      - name: Resolve pinned toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          CHANNEL=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+          if [ -z "$CHANNEL" ]; then
+            echo "ERROR: could not read channel from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "Pinned Rust channel: $CHANNEL"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build
