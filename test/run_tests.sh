@@ -70,6 +70,8 @@ drop_all_tables() {
     clickhouse-client -q "DROP TABLE IF EXISTS default.empty_table SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.jbod_orders SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.app_log SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_unpart SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_tuple SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS tmpdata.scratch SYNC" 2>/dev/null || true
     clickhouse-client -q "DROP DATABASE IF EXISTS tmpdata SYNC" 2>/dev/null || true
 }
@@ -2274,31 +2276,155 @@ if should_run "test_freeze_by_part"; then
     info "T33: Freeze by part"
     FBP_NAME="fbp_test_$$"
 
-    info "  Step 1: Create backup with freeze_by_part=true"
-    run_cmd "create with freeze_by_part=true" chbackup create "${FBP_NAME}" -t 'default.trades' --env "clickhouse.freeze_by_part=true"
+    # Helper: count parts in a local manifest
+    fbp_manifest_parts() {
+        python3 -c "
+import json
+with open('$1') as f:
+    m = json.load(f)
+print(sum(len(p) for t in m.get('tables', {}).values() for p in t.get('parts', {}).values()))
+" 2>/dev/null || echo "0"
+    }
 
-    # Step 2: Verify backup was created successfully
+    # freeze_by_part derives partition IDs from system.parts.partition_id and issues
+    # ALTER TABLE ... FREEZE PARTITION ID '<id>'. The ID and the partition *expression*
+    # only coincide for single-column numeric keys, so cover the shapes where they
+    # diverge -- these previously failed with error 248 INVALID_PARTITION_VALUE:
+    #   fbp_unpart : no PARTITION BY  -> partition_id 'all',     expression tuple() (0 fields)
+    #   fbp_tuple  : 2-column key     -> partition_id '2024-29', expression (2024, 29)
+    info "  Step 0: Create tables whose partition_id != partition expression"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_unpart SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_tuple SYNC"
+    clickhouse-client -q "CREATE TABLE default.fbp_unpart (id UInt64, v String) ENGINE = MergeTree ORDER BY id"
+    clickhouse-client -q "CREATE TABLE default.fbp_tuple (d Date, id UInt64) ENGINE = MergeTree PARTITION BY (toYear(d), toISOWeek(d)) ORDER BY id"
+    clickhouse-client -q "INSERT INTO default.fbp_unpart SELECT number, toString(number) FROM numbers(500)"
+    clickhouse-client -q "INSERT INTO default.fbp_tuple SELECT toDate('2024-07-15') + number, number FROM numbers(60)"
+
+    # Confirm the fixtures actually produce the divergent IDs this test exists to cover
+    UNPART_ID=$(clickhouse-client -q "SELECT DISTINCT partition_id FROM system.parts WHERE database='default' AND table='fbp_unpart' AND active")
+    TUPLE_IDS=$(clickhouse-client -q "SELECT count(DISTINCT partition_id) FROM system.parts WHERE database='default' AND table='fbp_tuple' AND active")
+    if [[ "$UNPART_ID" == "all" ]]; then
+        pass "fbp_unpart partition_id is 'all'"
+    else
+        fail "fbp_unpart partition_id expected 'all' got '${UNPART_ID}'"
+    fi
+    if [[ "$TUPLE_IDS" -gt 1 ]]; then
+        pass "fbp_tuple has ${TUPLE_IDS} hyphen-joined partition IDs"
+    else
+        fail "fbp_tuple expected >1 partitions, got ${TUPLE_IDS}"
+    fi
+
+    PRE_UNPART=$(clickhouse-client -q "SELECT count() FROM default.fbp_unpart")
+    PRE_TUPLE=$(clickhouse-client -q "SELECT count() FROM default.fbp_tuple")
+    PRE_FBP_TRADES=$(clickhouse-client -q "SELECT count() FROM default.trades")
+
+    FBP_TABLES='default.trades,default.fbp_unpart,default.fbp_tuple'
+
+    info "  Step 1: Create backup with freeze_by_part=true"
+    run_cmd "create with freeze_by_part=true" chbackup create "${FBP_NAME}" -t "${FBP_TABLES}" --env "clickhouse.freeze_by_part=true"
+
+    # Step 2: All three tables must be present with parts. A table that freezes
+    # nothing is silently dropped from the manifest, which is the failure mode here.
     MANIFEST="/var/lib/clickhouse/backup/${FBP_NAME}/metadata.json"
     if [ -f "$MANIFEST" ]; then
-        PARTS_COUNT=$(python3 -c "
-import json, sys
-with open('${MANIFEST}') as f:
-    m = json.load(f)
-total = sum(len(p) for t in m.get('tables', {}).values() for p in t.get('parts', {}).values())
-print(total)
-" 2>/dev/null || echo "0")
+        PARTS_COUNT=$(fbp_manifest_parts "$MANIFEST")
         if [[ "$PARTS_COUNT" -gt 0 ]]; then
             pass "freeze_by_part backup has ${PARTS_COUNT} parts"
         else
             fail "freeze_by_part backup has 0 parts"
         fi
+        for TBL in trades fbp_unpart fbp_tuple; do
+            if grep -q "\"default\.${TBL}\"" "$MANIFEST" 2>/dev/null; then
+                pass "freeze_by_part manifest contains default.${TBL}"
+            else
+                fail "freeze_by_part manifest MISSING default.${TBL} (silently skipped?)"
+            fi
+        done
     else
         fail "manifest not found at ${MANIFEST}"
     fi
 
+    # Step 3: Full round-trip. A non-zero part count alone does not prove the data
+    # is restorable, so upload, drop, download and restore.
+    info "  Step 3: Round-trip upload -> drop -> download -> restore"
+    run_cmd "upload ${FBP_NAME}" chbackup upload "${FBP_NAME}"
+    chbackup delete local "${FBP_NAME}" 2>&1 || true
+    clickhouse-client -q "DROP TABLE IF EXISTS default.trades SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_unpart SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_tuple SYNC"
+    run_cmd "download ${FBP_NAME}" chbackup download "${FBP_NAME}"
+    run_cmd "restore ${FBP_NAME}" chbackup restore "${FBP_NAME}" -t "${FBP_TABLES}"
+
+    for PAIR in "fbp_unpart:${PRE_UNPART}" "fbp_tuple:${PRE_TUPLE}" "trades:${PRE_FBP_TRADES}"; do
+        TBL="${PAIR%%:*}"; EXPECTED="${PAIR##*:}"
+        GOT=$(clickhouse-client -q "SELECT count() FROM default.${TBL}" 2>/dev/null || echo "MISSING")
+        if [[ "$GOT" == "$EXPECTED" ]]; then
+            pass "freeze_by_part round-trip ${TBL} rows: ${GOT}"
+        else
+            fail "freeze_by_part round-trip ${TBL} mismatch: expected=${EXPECTED} got=${GOT}"
+        fi
+    done
+
+    # Step 4: --partitions all with freeze_by_part=true must take the whole-table
+    # FREEZE path, NOT fall through to config-driven discovery. Before PartitionSpec
+    # the explicit flag was silently overridden by the config.
+    info "  Step 4: --partitions all wins over freeze_by_part discovery"
+    FBP_ALL="fbp_all_$$"
+    run_cmd "create --partitions all with freeze_by_part=true" \
+        chbackup create "${FBP_ALL}" -t "${FBP_TABLES}" --partitions all --env "clickhouse.freeze_by_part=true"
+    ALL_MANIFEST="/var/lib/clickhouse/backup/${FBP_ALL}/metadata.json"
+    if [ -f "$ALL_MANIFEST" ]; then
+        # Whole-table FREEZE must capture the partitioned tables too, not just
+        # the unpartitioned one whose ID literally is "all".
+        for TBL in trades fbp_tuple fbp_unpart; do
+            if grep -q "\"default\.${TBL}\"" "$ALL_MANIFEST" 2>/dev/null; then
+                pass "--partitions all captured default.${TBL}"
+            else
+                fail "--partitions all MISSING default.${TBL}"
+            fi
+        done
+    else
+        fail "manifest not found at ${ALL_MANIFEST}"
+    fi
+
+    # Step 5: Mixed list "all,<id>" keeps every entry. "all" matches the
+    # unpartitioned table; the numeric ID matches trades. Relies on
+    # ignore_not_exists_error_during_freeze (default true) to skip the
+    # expected 218 where an ID does not apply to a given table.
+    info "  Step 5: Mixed --partitions all,202401"
+    FBP_MIX="fbp_mix_$$"
+    run_cmd "create --partitions all,202401" \
+        chbackup create "${FBP_MIX}" -t 'default.trades,default.fbp_unpart' --partitions "all,202401"
+    MIX_MANIFEST="/var/lib/clickhouse/backup/${FBP_MIX}/metadata.json"
+    if [ -f "$MIX_MANIFEST" ]; then
+        for TBL in trades fbp_unpart; do
+            if grep -q "\"default\.${TBL}\"" "$MIX_MANIFEST" 2>/dev/null; then
+                pass "mixed --partitions captured default.${TBL}"
+            else
+                fail "mixed --partitions MISSING default.${TBL}"
+            fi
+        done
+    else
+        fail "manifest not found at ${MIX_MANIFEST}"
+    fi
+
+    # Step 6: A bogus partition ID is skipped (error 218), yielding an empty
+    # backup rather than a hard failure, under the default ignore config.
+    info "  Step 6: Bogus partition ID is skipped, not fatal"
+    FBP_BOGUS="fbp_bogus_$$"
+    if chbackup create "${FBP_BOGUS}" -t 'default.trades' --partitions "199001" --env "backup.allow_empty_backups=true" 2>&1; then
+        pass "bogus partition ID skipped without fatal error"
+    else
+        fail "bogus partition ID should be skipped (218), not fatal"
+    fi
+
     # Cleanup
     info "  Cleanup"
-    chbackup delete local "${FBP_NAME}" 2>&1 || true
+    cleanup_backup "${FBP_NAME}" "${FBP_ALL}" "${FBP_MIX}" "${FBP_BOGUS}"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_unpart SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_tuple SYNC"
+    info "  Re-seeding data after freeze_by_part test"
+    reseed_data
 fi
 
 # ---------------------------------------------------------------------------

@@ -52,7 +52,7 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `freeze_name(backup_name, db, table) -> String` -- Format: `chbackup_{backup}_{db}_{table}`
 - `freeze_sql(db, table, freeze_name) -> String` -- ALTER TABLE FREEZE WITH NAME
 - `unfreeze_sql(db, table, freeze_name) -> String` -- ALTER TABLE UNFREEZE WITH NAME
-- `freeze_partition_sql(db, table, partition, freeze_name) -> String` -- ALTER TABLE FREEZE PARTITION (Phase 2d)
+- `freeze_partition_sql(db, table, partition_id, freeze_name) -> String` -- `ALTER TABLE ... FREEZE PARTITION ID '<id>'` (Phase 2d). Takes a literal `system.parts.partition_id`, NOT a partition key expression. The `PARTITION ID` form is required: the two forms coincide only for single-column numeric keys, and the expression form fails with error 248 for unpartitioned (`all`) and multi-column (`2024-29`) keys
 - `integration_table_ddl(api_host, api_port) -> (String, String)` -- Generate DDL for `system.backup_list` (URL engine -> `/backup/list`, Go-compatible format with `desc` column and `Int64` size) and `system.backup_actions` (URL engine -> `/backup/actions`, Go-compatible status values)
 - `drop_table_sql(db, table, on_cluster) -> String` -- DROP TABLE IF EXISTS with optional ON CLUSTER clause (Phase 4d)
 - `drop_database_sql(db, on_cluster) -> String` -- DROP DATABASE IF EXISTS with optional ON CLUSTER clause (Phase 4d)
@@ -66,7 +66,7 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `new(config) -> Result<Self>` -- Build from ClickHouseConfig (with TLS env var wiring)
 - `ping() -> Result<()>` -- Connectivity check
 - `freeze_table(db, table, freeze_name) -> Result<()>` -- ALTER TABLE FREEZE
-- `freeze_partition(db, table, partition, freeze_name) -> Result<()>` -- ALTER TABLE FREEZE PARTITION (Phase 2d)
+- `freeze_partition(db, table, partition_id, freeze_name) -> Result<()>` -- ALTER TABLE FREEZE PARTITION ID (Phase 2d)
 - `unfreeze_table(db, table, freeze_name) -> Result<()>` -- ALTER TABLE UNFREEZE
 - `list_tables() -> Result<Vec<TableRow>>` -- Query system.tables (excludes system DBs)
 - `list_all_tables() -> Result<Vec<TableRow>>` -- Query system.tables including system DBs (Phase 4f, for `tables --all` command)

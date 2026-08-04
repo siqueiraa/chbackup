@@ -188,7 +188,14 @@ chbackup restore --partitions="202401" my-backup
 chbackup restore --partitions="202401,202402" my-backup
 ```
 
-Partition IDs come from ClickHouse's partition expression. For monthly partitioning (`PARTITION BY toYYYYMM(ts)`), the IDs are like `202401`. For daily (`PARTITION BY toYYYYMMDD(ts)`), they are like `20240115`.
+Partition IDs are the values in `system.parts.partition_id`, **not** partition key expressions. For monthly partitioning (`PARTITION BY toYYYYMM(ts)`) the IDs look like `202401`; for daily (`PARTITION BY toYYYYMMDD(ts)`), like `20240115`. Multi-column keys join their parts with a hyphen (`(toYear(d), toISOWeek(d))` → `2024-29`) and `String` keys hash to 16 hex characters — so a key's ID is not always its expression. Read the IDs from ClickHouse rather than constructing them:
+
+```sql
+SELECT DISTINCT partition, partition_id FROM system.parts
+WHERE database = 'mydb' AND table = 'mytable' AND active;
+```
+
+Restore matches these IDs against the partition prefix of each backed-up part name, so the values accepted here are the same ones `chbackup create --partitions` takes.
 
 For unpartitioned tables (no PARTITION BY clause or `tuple()`), use `all`:
 

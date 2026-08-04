@@ -1107,6 +1107,9 @@ impl Config {
                 );
             }
         }
+        if let Ok(v) = std::env::var("CLICKHOUSE_FREEZE_BY_PART_WHERE") {
+            self.clickhouse.freeze_by_part_where = v;
+        }
 
         // S3
         if let Ok(v) = std::env::var("S3_BUCKET") {
@@ -1840,6 +1843,7 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "S3_UPLOAD_CONCURRENCY" => Some("backup.upload_concurrency"),
         "S3_DOWNLOAD_CONCURRENCY" => Some("backup.download_concurrency"),
         "CLICKHOUSE_FREEZE_BY_PART" => Some("clickhouse.freeze_by_part"),
+        "CLICKHOUSE_FREEZE_BY_PART_WHERE" => Some("clickhouse.freeze_by_part_where"),
         "ALLOW_EMPTY_BACKUPS" => Some("backup.allow_empty_backups"),
 
         // Watch

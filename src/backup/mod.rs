@@ -49,30 +49,57 @@ fn normalize_uuid(uuid: &str) -> Option<String> {
     }
 }
 
-/// Parse a comma-separated partition list into a vector of partition IDs.
+/// What the caller asked us to freeze.
 ///
-/// Trims whitespace from each partition ID. Returns an empty vec if input is None or empty.
-/// Special case: if any partition ID is "all", returns an empty vec to trigger
-/// whole-table FREEZE (unpartitioned tables use partition_id="all" in system.parts).
-fn parse_partition_list(partitions: Option<&str>) -> Vec<String> {
-    match partitions {
-        Some(s) if !s.is_empty() => {
-            let parts: Vec<String> = s
-                .split(',')
-                .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty())
-                .collect();
-            // "all" means whole-table freeze (for unpartitioned MergeTree tables)
-            if parts.iter().any(|p| p == "all") {
-                info!(
-                    "Partition 'all' specified -- using whole-table FREEZE for unpartitioned tables"
-                );
-                Vec::new()
-            } else {
-                parts
-            }
-        }
+/// This is deliberately tri-state rather than a `Vec<String>`: an empty vec would
+/// conflate "user asked for whole-table FREEZE via `--partitions all`" with "user
+/// asked for nothing", and those must dispatch differently -- only the latter may
+/// fall through to `freeze_by_part` config-driven discovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PartitionSpec {
+    /// No `--partitions` flag given; `clickhouse.freeze_by_part` config may still apply.
+    Unspecified,
+    /// Explicit whole-table FREEZE (`--partitions all`, alone).
+    WholeTable,
+    /// Explicit list of `system.parts.partition_id` values.
+    Ids(Vec<String>),
+}
+
+/// Parse a comma-separated partition list into a [`PartitionSpec`].
+///
+/// Values are literal `system.parts.partition_id` strings (`"all"` for unpartitioned
+/// tables, `"2024-29"`-style for multi-column keys), not partition key expressions.
+/// Whitespace around each entry is trimmed and empty entries are dropped.
+///
+/// - `None`, `Some("")`, or all-whitespace entries -> [`PartitionSpec::Unspecified`]
+///   (nothing usable was specified, so config-driven discovery still applies)
+/// - `Some("all")` alone -> [`PartitionSpec::WholeTable`]
+/// - anything else -> [`PartitionSpec::Ids`], with `"all"` retained as a valid ID
+fn parse_partition_list(partitions: Option<&str>) -> PartitionSpec {
+    let parts: Vec<String> = match partitions {
+        Some(s) if !s.is_empty() => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
         _ => Vec::new(),
+    };
+
+    match parts.len() {
+        // Nothing usable specified -- leave room for freeze_by_part discovery.
+        0 => PartitionSpec::Unspecified,
+        // "all" on its own means whole-table FREEZE. Taken literally it would mean
+        // "the partition whose ID is all" (i.e. unpartitioned tables only), but the
+        // whole-table reading is the documented behaviour and fails safe: it captures
+        // more data, never less, across a mixed set of tables.
+        1 if parts[0] == "all" => {
+            info!("Partition 'all' specified -- using whole-table FREEZE for unpartitioned tables");
+            PartitionSpec::WholeTable
+        }
+        // Mixed lists keep every entry. "all" is a valid PARTITION ID: it freezes
+        // unpartitioned tables and is skipped as error 218 on partitioned ones
+        // (subject to clickhouse.ignore_not_exists_error_during_freeze, default true).
+        _ => PartitionSpec::Ids(parts),
     }
 }
 
@@ -464,8 +491,8 @@ pub async fn create(
         }
     }
 
-    // Parse partition list for partition-level freeze
-    let partition_ids = parse_partition_list(partitions);
+    // Parse partition spec for partition-level freeze
+    let partition_spec = parse_partition_list(partitions);
 
     // Parallel FREEZE + collect for data tables
     let max_conn = effective_max_connections(config) as usize;
@@ -504,7 +531,7 @@ pub async fn create(
         let skip_disks_clone = config.clickhouse.skip_disks.clone();
         let skip_disk_types_clone = config.clickhouse.skip_disk_types.clone();
         let skip_projections_clone = skip_projections.to_vec();
-        let partition_ids_clone = partition_ids.clone();
+        let partition_spec_clone = partition_spec.clone();
         let deps_clone = deps_arc.clone();
         let freeze_by_part = config.clickhouse.freeze_by_part;
         let freeze_by_part_where = config.clickhouse.freeze_by_part_where.clone();
@@ -522,38 +549,48 @@ pub async fn create(
             let fname = freeze_name(&backup_name_owned, &db, &table);
 
             // Determine effective partition list:
-            // 1. CLI --partitions takes precedence (already parsed)
-            // 2. If freeze_by_part is true and no CLI partitions, query system.parts
-            // 3. Otherwise, whole-table freeze (empty partition list)
-            let effective_partitions = if !partition_ids_clone.is_empty() {
-                partition_ids_clone
-            } else if freeze_by_part {
-                // Query system.parts for distinct partition IDs
-                match ch
-                    .query_distinct_partitions(&db, &table, &freeze_by_part_where)
-                    .await
-                {
-                    Ok(discovered) => {
-                        info!(
-                            db = %db,
-                            table = %table,
-                            partition_count = discovered.len(),
-                            "freeze_by_part: discovered partitions from system.parts"
-                        );
-                        discovered
-                    }
-                    Err(e) => {
-                        warn!(
-                            db = %db,
-                            table = %table,
-                            error = %e,
-                            "freeze_by_part: failed to query partitions, falling back to whole-table FREEZE"
-                        );
-                        Vec::new()
+            // 1. Explicit --partitions IDs take precedence
+            // 2. Explicit --partitions all means whole-table FREEZE -- it must NOT
+            //    fall through to freeze_by_part discovery, or the flag is ignored
+            // 3. No flag + freeze_by_part config -> discover IDs from system.parts
+            // 4. Otherwise, whole-table freeze (empty partition list)
+            //
+            // `from_discovery` tracks case 3: there the IDs came from this table's own
+            // system.parts, so freezing none of them is anomalous and worth a warning.
+            // With an explicit list, most tables legitimately match nothing.
+            let mut from_discovery = false;
+            let effective_partitions = match &partition_spec_clone {
+                PartitionSpec::Ids(ids) => ids.clone(),
+                PartitionSpec::WholeTable => Vec::new(),
+                PartitionSpec::Unspecified if freeze_by_part => {
+                    from_discovery = true;
+                    // Query system.parts for distinct partition IDs
+                    match ch
+                        .query_distinct_partitions(&db, &table, &freeze_by_part_where)
+                        .await
+                    {
+                        Ok(discovered) => {
+                            info!(
+                                db = %db,
+                                table = %table,
+                                partition_count = discovered.len(),
+                                "freeze_by_part: discovered partitions from system.parts"
+                            );
+                            discovered
+                        }
+                        Err(e) => {
+                            warn!(
+                                db = %db,
+                                table = %table,
+                                error = %e,
+                                "freeze_by_part: failed to query partitions, falling back to whole-table FREEZE"
+                            );
+                            from_discovery = false;
+                            Vec::new()
+                        }
                     }
                 }
-            } else {
-                Vec::new()
+                PartitionSpec::Unspecified => Vec::new(),
             };
 
             // FREEZE the table (whole-table or per-partition)
@@ -617,6 +654,18 @@ pub async fn create(
                             }
                         }
                     }
+                }
+                if !any_frozen && from_discovery {
+                    // The IDs came from this table's own system.parts, so freezing none
+                    // of them means the table is about to be dropped from the manifest
+                    // despite having active parts -- a silent data gap, not a no-op.
+                    warn!(
+                        db = %db,
+                        table = %table,
+                        partition_count = effective_partitions.len(),
+                        "freeze_by_part: no partitions could be frozen despite being \
+                         discovered in system.parts -- table will be MISSING from the backup"
+                    );
                 }
                 any_frozen
             };
@@ -1083,38 +1132,46 @@ mod tests {
         assert_eq!(parsed.name, "empty-test");
     }
 
+    /// Extract the ID list from a spec, panicking if it is not `Ids`.
+    fn expect_ids(spec: PartitionSpec) -> Vec<String> {
+        match spec {
+            PartitionSpec::Ids(ids) => ids,
+            other => panic!("expected PartitionSpec::Ids, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_partition_list_parsing() {
-        // Empty/None cases
-        let empty = parse_partition_list(None);
-        assert!(empty.is_empty());
-
-        let empty_str = parse_partition_list(Some(""));
-        assert!(empty_str.is_empty());
+        // Empty/None cases -> Unspecified, so freeze_by_part discovery still applies
+        assert_eq!(parse_partition_list(None), PartitionSpec::Unspecified);
+        assert_eq!(parse_partition_list(Some("")), PartitionSpec::Unspecified);
 
         // Single partition
-        let single = parse_partition_list(Some("202401"));
-        assert_eq!(single, vec!["202401"]);
+        assert_eq!(expect_ids(parse_partition_list(Some("202401"))), ["202401"]);
 
         // Multiple partitions
-        let multi = parse_partition_list(Some("202401,202402,202403"));
-        assert_eq!(multi, vec!["202401", "202402", "202403"]);
+        assert_eq!(
+            expect_ids(parse_partition_list(Some("202401,202402,202403"))),
+            ["202401", "202402", "202403"]
+        );
 
         // Whitespace trimming
-        let spaced = parse_partition_list(Some(" 202401 , 202402 , 202403 "));
-        assert_eq!(spaced, vec!["202401", "202402", "202403"]);
+        assert_eq!(
+            expect_ids(parse_partition_list(Some(" 202401 , 202402 , 202403 "))),
+            ["202401", "202402", "202403"]
+        );
     }
 
     #[test]
     fn test_freeze_partition_called_for_each() {
         // Verify that freeze_partition_sql generates correct SQL for each partition
-        let partitions = parse_partition_list(Some("202401,202402"));
+        let partitions = expect_ids(parse_partition_list(Some("202401,202402")));
         assert_eq!(partitions.len(), 2);
 
         let freeze_name = "chbackup_daily_default_trades";
         for partition in &partitions {
             let sql = freeze_partition_sql("default", "trades", partition, freeze_name);
-            assert!(sql.contains("FREEZE PARTITION"));
+            assert!(sql.contains("FREEZE PARTITION ID"));
             assert!(sql.contains(partition));
             assert!(sql.contains(freeze_name));
         }
@@ -1123,36 +1180,46 @@ mod tests {
         let sql1 = freeze_partition_sql("default", "trades", &partitions[0], freeze_name);
         assert_eq!(
             sql1,
-            "ALTER TABLE `default`.`trades` FREEZE PARTITION '202401' WITH NAME 'chbackup_daily_default_trades'"
+            "ALTER TABLE `default`.`trades` FREEZE PARTITION ID '202401' WITH NAME 'chbackup_daily_default_trades'"
         );
 
         // Verify second partition SQL
         let sql2 = freeze_partition_sql("default", "trades", &partitions[1], freeze_name);
         assert_eq!(
             sql2,
-            "ALTER TABLE `default`.`trades` FREEZE PARTITION '202402' WITH NAME 'chbackup_daily_default_trades'"
+            "ALTER TABLE `default`.`trades` FREEZE PARTITION ID '202402' WITH NAME 'chbackup_daily_default_trades'"
         );
     }
 
     #[test]
     fn test_partition_list_all_triggers_whole_table_freeze() {
-        // "all" partition ID should result in empty vec (whole-table freeze)
-        let result = parse_partition_list(Some("all"));
-        assert!(
-            result.is_empty(),
-            "partition 'all' should result in empty vec for whole-table freeze"
+        // "all" alone means whole-table FREEZE. This must be distinct from
+        // Unspecified: WholeTable suppresses freeze_by_part discovery, Unspecified
+        // does not.
+        assert_eq!(
+            parse_partition_list(Some("all")),
+            PartitionSpec::WholeTable,
+            "partition 'all' alone should mean whole-table FREEZE"
+        );
+        assert_ne!(
+            parse_partition_list(Some("all")),
+            PartitionSpec::Unspecified,
+            "explicit 'all' must not be confused with no --partitions flag"
         );
 
-        // "all" mixed with other partitions should still trigger whole-table
-        let mixed = parse_partition_list(Some("202401,all,202403"));
-        assert!(
-            mixed.is_empty(),
-            "partition 'all' in a list should result in empty vec"
+        // "all" mixed with other partitions keeps the full list. Previously this
+        // discarded every entry and silently freezed all partitions of all tables.
+        assert_eq!(
+            expect_ids(parse_partition_list(Some("202401,all,202403"))),
+            ["202401", "all", "202403"],
+            "'all' in a list is a valid PARTITION ID and must be retained"
         );
 
         // Normal partitions should not be affected
-        let normal = parse_partition_list(Some("202401,202402"));
-        assert_eq!(normal.len(), 2);
+        assert_eq!(
+            expect_ids(parse_partition_list(Some("202401,202402"))).len(),
+            2
+        );
     }
 
     #[test]
@@ -1175,6 +1242,17 @@ mod tests {
         ));
         assert!(is_ignorable_freeze_error("Code: 218"));
         assert!(is_ignorable_freeze_error("CANNOT_FREEZE_PARTITION"));
+
+        // Code 248: INVALID_PARTITION_VALUE must stay FATAL. It signals that chbackup
+        // handed ClickHouse a partition reference it could not interpret -- the bug
+        // fixed by switching to FREEZE PARTITION ID. Ignoring it would turn a
+        // systematic failure into a silently empty backup.
+        assert!(!is_ignorable_freeze_error(
+            "Code: 248. DB::Exception: Wrong number of fields in the partition expression: 1, \
+             must be: 0. (INVALID_PARTITION_VALUE)"
+        ));
+        assert!(!is_ignorable_freeze_error("Code: 248"));
+        assert!(!is_ignorable_freeze_error("INVALID_PARTITION_VALUE"));
 
         // Non-ignorable errors should return false
         assert!(!is_ignorable_freeze_error("Code: 999. Some other error"));
@@ -1512,9 +1590,12 @@ mod tests {
 
     #[test]
     fn test_parse_partition_list_whitespace_only() {
-        let result = parse_partition_list(Some("  ,  ,  "));
-        assert!(
-            result.is_empty(),
+        // All entries filtered out means nothing usable was specified, so this maps to
+        // Unspecified (preserving the pre-PartitionSpec fall-through to freeze_by_part
+        // discovery / whole-table FREEZE) rather than to an empty Ids list.
+        assert_eq!(
+            parse_partition_list(Some("  ,  ,  ")),
+            PartitionSpec::Unspecified,
             "whitespace-only entries should be filtered out"
         );
     }

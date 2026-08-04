@@ -733,18 +733,21 @@ impl ChClient {
 
     // -- FREEZE PARTITION --
 
-    /// Execute ALTER TABLE FREEZE PARTITION for a specific partition.
+    /// Execute ALTER TABLE FREEZE PARTITION ID for a specific partition.
     ///
     /// Freezes a single partition instead of the entire table. The frozen data
     /// ends up in the same shadow directory structure as whole-table FREEZE.
+    ///
+    /// `partition_id` must be a literal `system.parts.partition_id`, not a partition
+    /// key expression -- see [`freeze_partition_sql`].
     pub async fn freeze_partition(
         &self,
         db: &str,
         table: &str,
-        partition: &str,
+        partition_id: &str,
         freeze_name: &str,
     ) -> Result<()> {
-        let sql = freeze_partition_sql(db, table, partition, freeze_name);
+        let sql = freeze_partition_sql(db, table, partition_id, freeze_name);
         self.log_and_execute(&sql, "FREEZE PARTITION").await
     }
 
@@ -778,6 +781,11 @@ impl ChClient {
     /// Returns the list of distinct partition_id values for active parts.
     /// Optionally applies an additional WHERE clause for filtering (from
     /// `clickhouse.freeze_by_part_where` config).
+    ///
+    /// These are partition *IDs*, so they must be consumed via the
+    /// `FREEZE PARTITION ID` form -- see [`freeze_partition_sql`]. Feeding them to
+    /// the partition-expression form breaks for unpartitioned tables (`"all"`) and
+    /// multi-column keys (`"2024-29"`).
     pub async fn query_distinct_partitions(
         &self,
         db: &str,
@@ -1473,12 +1481,31 @@ pub fn unfreeze_sql(db: &str, table: &str, freeze_name: &str) -> String {
 }
 
 /// Generate the SQL string for a FREEZE PARTITION command (for testing).
-pub fn freeze_partition_sql(db: &str, table: &str, partition: &str, freeze_name: &str) -> String {
+///
+/// `partition_id` must be a literal `system.parts.partition_id` value, NOT a
+/// partition key expression. ClickHouse distinguishes the two forms:
+///
+/// - `FREEZE PARTITION <expr>`      -- takes the partition key expression value(s)
+/// - `FREEZE PARTITION ID '<id>'`   -- takes the literal partition_id string
+///
+/// The ID form is used here because every caller sources its value from
+/// `system.parts.partition_id` (via `query_distinct_partitions`) or from
+/// `--partitions`, which is documented as taking IDs. The two forms coincide only
+/// for single-column numeric keys like `toYYYYMM`; for unpartitioned tables
+/// (`partition_id = "all"`, zero expression fields) and multi-column keys
+/// (`partition_id = "2024-29"` vs expression `(2024, 29)`) the expression form
+/// fails with error 248 INVALID_PARTITION_VALUE.
+pub fn freeze_partition_sql(
+    db: &str,
+    table: &str,
+    partition_id: &str,
+    freeze_name: &str,
+) -> String {
     format!(
-        "ALTER TABLE {}.{} FREEZE PARTITION '{}' WITH NAME '{}'",
+        "ALTER TABLE {}.{} FREEZE PARTITION ID '{}' WITH NAME '{}'",
         quote_identifier(db),
         quote_identifier(table),
-        escape_sql_string(partition),
+        escape_sql_string(partition_id),
         escape_sql_string(freeze_name)
     )
 }
@@ -2365,22 +2392,66 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "ALTER TABLE `default`.`trades` FREEZE PARTITION '202401' WITH NAME 'chbackup_daily_default_trades'"
+            "ALTER TABLE `default`.`trades` FREEZE PARTITION ID '202401' WITH NAME 'chbackup_daily_default_trades'"
+        );
+    }
+
+    #[test]
+    fn test_freeze_partition_sql_unpartitioned() {
+        // Unpartitioned tables have partition_id = "all" and ZERO partition key fields.
+        // The expression form `FREEZE PARTITION 'all'` fails with error 248
+        // ("Wrong number of fields in the partition expression: 1, must be: 0");
+        // the ID form is the only one that works.
+        let sql = freeze_partition_sql("default", "kv", "all", "chbackup_test_default_kv");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`kv` FREEZE PARTITION ID 'all' WITH NAME 'chbackup_test_default_kv'"
         );
     }
 
     #[test]
     fn test_freeze_partition_sql_tuple_partition() {
-        // Partition IDs can be tuple-based; single quotes inside are escaped
+        // Multi-column partition keys have hyphen-joined IDs: PARTITION BY (year, week)
+        // yields partition_id "2024-29" for the partition whose expression is (2024, 29).
+        // The ID is what must be sent.
         let sql = freeze_partition_sql(
             "default",
             "events",
-            "(202401, 'us')",
+            "2024-29",
             "chbackup_test_default_events",
         );
         assert_eq!(
             sql,
-            "ALTER TABLE `default`.`events` FREEZE PARTITION '(202401, ''us'')' WITH NAME 'chbackup_test_default_events'"
+            "ALTER TABLE `default`.`events` FREEZE PARTITION ID '2024-29' WITH NAME 'chbackup_test_default_events'"
+        );
+    }
+
+    #[test]
+    fn test_freeze_partition_sql_hashed_partition() {
+        // String / complex partition keys hash to a 16-hex-char partition_id. Under the
+        // old expression form this parsed as a valid single String value, matched no
+        // partition, and returned error 218 -- which is ignorable by default, silently
+        // dropping the table from the backup.
+        let sql = freeze_partition_sql(
+            "default",
+            "logs",
+            "a1b2c3d4e5f60718",
+            "chbackup_test_default_logs",
+        );
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`logs` FREEZE PARTITION ID 'a1b2c3d4e5f60718' WITH NAME 'chbackup_test_default_logs'"
+        );
+    }
+
+    #[test]
+    fn test_freeze_partition_sql_escapes_quotes() {
+        // Defensive: single quotes in an id are doubled so they cannot break out of the
+        // literal. Real partition_ids do not contain quotes, but escaping is not optional.
+        let sql = freeze_partition_sql("default", "events", "a'b", "chbackup_test_default_events");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `default`.`events` FREEZE PARTITION ID 'a''b' WITH NAME 'chbackup_test_default_events'"
         );
     }
 

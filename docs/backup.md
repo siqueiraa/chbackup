@@ -202,7 +202,43 @@ chbackup create --partitions="202401,202402" my-backup
 
 This triggers per-partition FREEZE instead of whole-table FREEZE. Only the named partitions are included in the backup.
 
-For tables without a PARTITION BY clause, all data is in a single partition named `all`.
+### Partition IDs, not partition expressions
+
+`--partitions` takes **partition IDs** exactly as they appear in `system.parts.partition_id` — not partition key expressions. The two differ for anything other than a single-column numeric key:
+
+| `PARTITION BY` | `partition` (expression) | `partition_id` (use this) |
+|---|---|---|
+| `toYYYYMM(ts)` | `202401` | `202401` |
+| _(none)_ / `tuple()` | `tuple()` | `all` |
+| `(toYear(d), toISOWeek(d))` | `(2024, 29)` | `2024-29` |
+| a `String` column | `'eu-west'` | 16-hex-char hash |
+
+To find the IDs for a table:
+
+```sql
+SELECT DISTINCT partition, partition_id FROM system.parts
+WHERE database = 'mydb' AND table = 'mytable' AND active;
+```
+
+The hyphen-joined and hashed forms above are illustrative of common cases, not a guaranteed format — always read the ID from `system.parts` rather than constructing it.
+
+### The `all` partition
+
+For tables without a `PARTITION BY` clause, all data lives in a single partition whose ID is `all`.
+
+Passing `--partitions=all` **on its own** is a shorthand for whole-table FREEZE, which is applied to every table in the backup — including partitioned ones. This over-captures rather than under-captures, so it is safe across a mixed set of tables:
+
+```bash
+chbackup create --partitions=all my-backup    # whole-table FREEZE for every table
+```
+
+Mixing `all` with other IDs freezes exactly the listed set. `all` matches unpartitioned tables, and is skipped on partitioned tables:
+
+```bash
+chbackup create --partitions="all,202401" my-backup
+```
+
+> **Note:** that skip relies on `clickhouse.ignore_not_exists_error_during_freeze` (default `true`). With it set to `false`, the harmless "partition does not exist" error (code 218) raised by `all` against a partitioned table becomes fatal, so mixed lists are only safe under the default.
 
 ## Compression
 

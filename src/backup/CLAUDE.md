@@ -106,11 +106,16 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 ```
 
 ### Partition-Level Freeze (Phase 2d)
-- When `--partitions` flag is set, `create()` calls `ch.freeze_partition(db, table, partition, freeze_name)` for each comma-separated partition ID instead of `ch.freeze_table()`
-- Partition IDs are parsed from the comma-separated `--partitions` string and trimmed
+- When `--partitions` is set, `create()` calls `ch.freeze_partition(db, table, partition_id, freeze_name)` for each ID instead of `ch.freeze_table()`, emitting `ALTER TABLE ... FREEZE PARTITION ID '<id>'`
+- Values are literal `system.parts.partition_id` strings, NOT partition key expressions. The ID form is mandatory: the two only coincide for single-column numeric keys (`toYYYYMM` -> `202401`), and diverge for unpartitioned tables (`all` vs `tuple()`), multi-column keys (`2024-29` vs `(2024, 29)`), and `String` keys (16-hex hash). Sending the expression form yields error 248 INVALID_PARTITION_VALUE
+- `parse_partition_list()` returns a tri-state `PartitionSpec`:
+  - `Unspecified` -- no flag (or only whitespace/empty entries); `clickhouse.freeze_by_part` discovery may still apply
+  - `WholeTable` -- `--partitions all` alone; takes the whole-table FREEZE path and deliberately does NOT fall through to discovery, otherwise the explicit flag would be silently overridden by config
+  - `Ids(..)` -- explicit list, with `"all"` retained as a valid ID (mixed lists like `all,202401` freeze exactly the listed set; `all` is skipped as 218 on partitioned tables, which requires the default `ignore_not_exists_error_during_freeze: true`)
 - Multiple partitions are frozen sequentially within a single table task (partition-level parallelism not needed)
 - The freeze_name is the same regardless of whether whole-table or per-partition
 - Shadow walk proceeds identically (frozen parts end up in same shadow directory)
+- When IDs came from discovery but none could be frozen, a `warn!` fires -- the table would otherwise be dropped from the manifest with only an `info!`, a silent data gap
 
 ### Disk Filtering (Phase 2d)
 - Before processing collected parts, each part is checked against `config.clickhouse.skip_disks` and `config.clickhouse.skip_disk_types`

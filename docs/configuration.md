@@ -115,8 +115,8 @@ Connection settings and backup/restore behavior. chbackup must run on the same h
 | `max_connections` | int | `1` | Concurrent restore table operations |
 | `log_sql_queries` | bool | `true` | Log SQL queries at info level |
 | `ignore_not_exists_error_during_freeze` | bool | `true` | Skip tables dropped during backup |
-| `freeze_by_part` | bool | `false` | Freeze individual partitions instead of whole table |
-| `freeze_by_part_where` | string | _(empty)_ | WHERE filter for partition selection |
+| `freeze_by_part` | bool | `false` | Freeze individual partitions instead of whole table. IDs are discovered from `system.parts.partition_id` and issued as `FREEZE PARTITION ID` |
+| `freeze_by_part_where` | string | _(empty)_ | Additional WHERE filter on `system.parts` for partition selection |
 | `backup_mutations` | bool | `true` | Backup pending mutations from `system.mutations` |
 | `restart_command` | string | `exec:systemctl restart clickhouse-server` | Command after RBAC/config restore |
 | `debug` | bool | `false` | Verbose ClickHouse client debug logging |
