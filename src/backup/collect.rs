@@ -926,7 +926,7 @@ mod tests {
     fn test_freeze_name_generation() {
         use crate::clickhouse::client::freeze_name;
         let name = freeze_name("daily-20240115", "default", "trades");
-        assert_eq!(name, "chbackup_daily_20240115_default_trades");
+        assert_eq!(name, "chbackup__daily_2D20240115__default__trades");
     }
 
     /// Helper: create a mock shadow directory for a local disk part.

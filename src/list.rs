@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 use crate::backup::collect::per_disk_backup_dir;
-use crate::clickhouse::{sanitize_name, ChClient};
+use crate::clickhouse::{freeze_prefix, legacy_freeze_prefix, ChClient};
 use crate::config::Config;
 use crate::error::ChBackupError;
 use crate::manifest::BackupManifest;
@@ -1256,7 +1256,11 @@ fn active_freeze_prefixes() -> HashSet<String> {
             continue;
         }
         if crate::lock::is_lock_file_active(&entry.path()) {
-            prefixes.insert(format!("chbackup_{}_", sanitize_name(inner)));
+            // Both schemes: a live backup may hold shadows written under the current
+            // collision-free naming, or legacy ones from a binary predating it. Emitting
+            // only one prefix would leave the other unprotected against unfiltered cleanup.
+            prefixes.insert(freeze_prefix(inner));
+            prefixes.insert(legacy_freeze_prefix(inner));
         }
     }
     prefixes
@@ -1264,7 +1268,10 @@ fn active_freeze_prefixes() -> HashSet<String> {
 
 /// Remove `chbackup_*` directories from a single disk's shadow path (sync helper).
 ///
-/// If `name` is provided, only removes entries matching `chbackup_{sanitized_name}_*`.
+/// If `name` is provided, only removes entries matching that backup's freeze prefix --
+/// both the current `chbackup__{enc(name)}__*` form and the legacy
+/// `chbackup_{sanitize_name(name)}_*` form, so shadows written by binaries predating the
+/// collision-free naming change are still reaped.
 /// If `name` is `None`, removes all entries matching `chbackup_*`.
 ///
 /// Skips any freeze directories that belong to a currently-active backup (PID
@@ -1282,7 +1289,12 @@ fn clean_shadow_dir(disk_path: &str, name: Option<&str>, force: bool) -> Result<
     let entries = std::fs::read_dir(&shadow_path)
         .with_context(|| format!("Failed to read shadow directory: {}", shadow_path.display()))?;
 
-    let prefix_filter = name.map(|n| format!("chbackup_{}_", sanitize_name(n)));
+    // Match both the current and legacy freeze prefixes. The legacy branch is a
+    // deprecation shim: remove it once no deployment can still hold shadows written
+    // before the collision-free naming change.
+    let prefix_filters: Vec<String> = name
+        .map(|n| vec![freeze_prefix(n), legacy_freeze_prefix(n)])
+        .unwrap_or_default();
 
     // When cleaning a specific backup, check its per-backup PID lock once up front.
     // Skip this check when force=true (called from cleanup_failed_backup which holds the lock).
@@ -1328,10 +1340,10 @@ fn clean_shadow_dir(disk_path: &str, name: Option<&str>, force: bool) -> Result<
             None => continue,
         };
 
-        let should_remove = if let Some(ref prefix) = prefix_filter {
-            dir_name.starts_with(prefix)
-        } else {
+        let should_remove = if prefix_filters.is_empty() {
             dir_name.starts_with("chbackup_")
+        } else {
+            prefix_filters.iter().any(|p| dir_name.starts_with(p))
         };
 
         if !should_remove {
@@ -1941,6 +1953,95 @@ mod tests {
         assert!(!chbackup1.exists(), "chbackup_daily_mon should be removed");
         assert!(!chbackup2.exists(), "chbackup_weekly should be removed");
         assert!(other.exists(), "other_freeze_data should NOT be removed");
+    }
+
+    #[test]
+    fn test_clean_shadow_name_filter_matches_current_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let shadow_dir = dir.path().join("shadow");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+
+        // Current collision-free naming: chbackup__{enc(name)}__{enc(db)}__{enc(table)}
+        let current = shadow_dir.join(crate::clickhouse::freeze_name(
+            "daily-mon",
+            "default",
+            "trades",
+        ));
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("data.bin"), b"test").unwrap();
+
+        let count =
+            clean_shadow_dir(dir.path().to_str().unwrap(), Some("daily-mon"), false).unwrap();
+
+        assert_eq!(count, 1, "current-format shadow should be removed");
+        assert!(!current.exists());
+    }
+
+    #[test]
+    fn test_clean_shadow_name_filter_handles_both_formats_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let shadow_dir = dir.path().join("shadow");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+
+        // One shadow from an older binary, one from the current one, same backup.
+        let legacy = shadow_dir.join("chbackup_daily_mon_default_trades");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let current = shadow_dir.join(crate::clickhouse::freeze_name(
+            "daily-mon",
+            "default",
+            "users",
+        ));
+        std::fs::create_dir_all(&current).unwrap();
+
+        let count =
+            clean_shadow_dir(dir.path().to_str().unwrap(), Some("daily-mon"), false).unwrap();
+
+        assert_eq!(count, 2, "both legacy and current shadows should be reaped");
+        assert!(!legacy.exists());
+        assert!(!current.exists());
+    }
+
+    #[test]
+    fn test_clean_shadow_current_format_no_cross_name_collision() {
+        // The whole point of collision-free naming: cleaning `daily-mon` must not touch
+        // `daily_mon`, which the old sanitize_name scheme mapped to the same prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let shadow_dir = dir.path().join("shadow");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+
+        let hyphen = shadow_dir.join(crate::clickhouse::freeze_name("daily-mon", "db", "t"));
+        std::fs::create_dir_all(&hyphen).unwrap();
+        let underscore = shadow_dir.join(crate::clickhouse::freeze_name("daily_mon", "db", "t"));
+        std::fs::create_dir_all(&underscore).unwrap();
+        assert_ne!(hyphen, underscore, "fixture requires distinct dir names");
+
+        let count =
+            clean_shadow_dir(dir.path().to_str().unwrap(), Some("daily-mon"), false).unwrap();
+
+        assert_eq!(
+            count, 1,
+            "only the hyphen backup's shadow should be removed"
+        );
+        assert!(!hyphen.exists());
+        assert!(
+            underscore.exists(),
+            "daily_mon's shadow must survive cleanup of daily-mon"
+        );
+    }
+
+    #[test]
+    fn test_clean_shadow_legacy_format_remains_ambiguous() {
+        // Known limitation of the legacy shim: old-format directories were written with
+        // the many-to-one sanitize_name mapping, so `daily-mon` and `daily_mon` are
+        // indistinguishable in that format. Nothing can recover the original name
+        // retroactively; this is documented rather than fixed, and disappears when the
+        // legacy branch is removed.
+        assert_eq!(
+            legacy_freeze_prefix("daily-mon"),
+            legacy_freeze_prefix("daily_mon")
+        );
+        // The current format is unambiguous, which is what protects live backups.
+        assert_ne!(freeze_prefix("daily-mon"), freeze_prefix("daily_mon"));
     }
 
     #[test]

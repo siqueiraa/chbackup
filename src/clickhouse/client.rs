@@ -1436,6 +1436,12 @@ fn quote_identifier(name: &str) -> String {
 /// Sanitize a name for use in freeze names.
 ///
 /// Replaces all non-alphanumeric characters (except underscore) with underscore.
+///
+/// **Legacy only.** This mapping is many-to-one (`a-b` and `a_b` both become `a_b`), so it
+/// must not be used to build freeze names -- see [`freeze_name`] and
+/// [`encode_freeze_component`]. It is retained solely to reconstruct the *old* shadow
+/// directory prefix so `clean_shadow` can still reap directories written by binaries
+/// predating the collision-free naming change.
 pub fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -1448,16 +1454,69 @@ pub fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
+/// Escape one freeze-name component so that distinct inputs always produce distinct
+/// outputs.
+///
+/// ASCII alphanumerics pass through unchanged; every other byte becomes `_<HEX>` (two
+/// uppercase hex digits), **including `_` itself** (`_` -> `_5F`). Multi-byte UTF-8 is
+/// escaped per byte. The output is therefore always `[A-Za-z0-9_]`, which is valid both as
+/// a ClickHouse `ALTER TABLE ... WITH NAME` value and as a directory name.
+///
+/// Two properties this guarantees, both load-bearing:
+///
+/// 1. **Injective.** Unlike [`sanitize_name`], no two distinct inputs collide. Freeze names
+///    double as shadow directory prefixes, and a collision lets one backup's cleanup delete
+///    another's live shadow data.
+/// 2. **`__` never occurs inside an encoded component.** Every `_` in the output is
+///    followed by exactly two hex digits, so a doubled underscore is impossible -- which is
+///    what makes `__` safe as the component delimiter in [`freeze_name`]. Per-component
+///    escaping alone would not be enough: joined with a single `_`, the components
+///    `("a-b", "2Dc", "2Dd")` and `("a", "2Db", "2Dc-d")` would both render as
+///    `a_2Db_2Dc_2Dd`.
+pub fn encode_freeze_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        if byte.is_ascii_alphanumeric() {
+            out.push(*byte as char);
+        } else {
+            out.push('_');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
 /// Generate the freeze name for a backup operation.
 ///
-/// Format: `chbackup_{backup_name}_{db}_{table}`
+/// Format: `chbackup__{enc(backup_name)}__{enc(db)}__{enc(table)}`, where `enc` is
+/// [`encode_freeze_component`]. The `__` delimiter cannot appear inside an encoded
+/// component, so the whole `(backup_name, db, table)` tuple maps injectively to a name.
+///
+/// Distinct backups therefore never share a shadow directory prefix. That matters because
+/// `clean_shadow` selects directories by prefix: under the previous `sanitize_name`-based
+/// scheme, backups `a-b` and `a_b` both produced `chbackup_a_b_`, so cleaning up one could
+/// delete the other's live shadow data mid-backup.
 pub fn freeze_name(backup_name: &str, db: &str, table: &str) -> String {
     format!(
-        "chbackup_{}_{}_{}",
-        sanitize_name(backup_name),
-        sanitize_name(db),
-        sanitize_name(table)
+        "chbackup__{}__{}__{}",
+        encode_freeze_component(backup_name),
+        encode_freeze_component(db),
+        encode_freeze_component(table)
     )
+}
+
+/// Reconstruct the *legacy* (pre-collision-free) freeze-name prefix for a backup.
+///
+/// Used only by shadow cleanup so directories created by older binaries are still reaped.
+/// Deprecated: remove once no deployment can hold shadows written before the
+/// collision-free naming change.
+pub fn legacy_freeze_prefix(backup_name: &str) -> String {
+    format!("chbackup_{}_", sanitize_name(backup_name))
+}
+
+/// The shadow directory prefix for a backup under the current naming scheme.
+pub fn freeze_prefix(backup_name: &str) -> String {
+    format!("chbackup__{}__", encode_freeze_component(backup_name))
 }
 
 /// Generate the SQL string for a FREEZE command (for testing).
@@ -2263,11 +2322,116 @@ mod tests {
 
     #[test]
     fn test_freeze_name_generation() {
+        // `-` -> _2D, `.` -> _2E, `_` -> _5F
         let name = freeze_name("daily-20240115", "default", "trades");
-        assert_eq!(name, "chbackup_daily_20240115_default_trades");
+        assert_eq!(name, "chbackup__daily_2D20240115__default__trades");
 
         let name = freeze_name("backup.v2", "my-db", "my.table");
-        assert_eq!(name, "chbackup_backup_v2_my_db_my_table");
+        assert_eq!(name, "chbackup__backup_2Ev2__my_2Ddb__my_2Etable");
+    }
+
+    #[test]
+    fn test_encode_freeze_component_charset_and_escapes() {
+        // ASCII alphanumerics pass through
+        assert_eq!(encode_freeze_component("abcXYZ019"), "abcXYZ019");
+        // The escape character itself is escaped, or the delimiter invariant breaks
+        assert_eq!(encode_freeze_component("a_b"), "a_5Fb");
+        assert_eq!(encode_freeze_component("a-b"), "a_2Db");
+        assert_eq!(encode_freeze_component("a.b"), "a_2Eb");
+        assert_eq!(encode_freeze_component("a b"), "a_20b");
+        // Multi-byte UTF-8 is escaped per byte
+        assert_eq!(encode_freeze_component("é"), "_C3_A9");
+
+        // Output charset is always [A-Za-z0-9_]
+        for input in ["a-b", "a_b", "a.b", "a b", "é", "!@#$%^&*()", "日本語"] {
+            let out = encode_freeze_component(input);
+            assert!(
+                out.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                "encode({input:?}) = {out:?} escaped outside [A-Za-z0-9_]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_freeze_component_never_emits_double_underscore() {
+        // This is what makes `__` usable as the component delimiter in freeze_name.
+        for input in ["a_b", "a__b", "___", "a-_-b", "_", "", "a_5Fb"] {
+            let out = encode_freeze_component(input);
+            assert!(
+                !out.contains("__"),
+                "encode({input:?}) = {out:?} contains the delimiter"
+            );
+        }
+    }
+
+    #[test]
+    fn test_freeze_name_injective_per_component() {
+        // sanitize_name collapsed all of these to the same string; freeze_name must not.
+        let variants = ["a-b", "a_b", "a.b", "a b", "a!b"];
+        let names: Vec<String> = variants.iter().map(|v| freeze_name(v, "db", "t")).collect();
+        for i in 0..names.len() {
+            for j in (i + 1)..names.len() {
+                assert_ne!(
+                    names[i], names[j],
+                    "{:?} and {:?} produced the same freeze name",
+                    variants[i], variants[j]
+                );
+            }
+        }
+        // And the old scheme really did collide, which is why this test exists.
+        assert_eq!(sanitize_name("a-b"), sanitize_name("a_b"));
+    }
+
+    #[test]
+    fn test_freeze_name_injective_tuple_level() {
+        // Per-component escaping is not sufficient on its own: joined with a single `_`,
+        // both of these tuples render as `a_2Db_2Dc_2Dd`. The `__` delimiter separates them.
+        let a = freeze_name("a-b", "2Dc", "2Dd");
+        let b = freeze_name("a", "2Db", "2Dc-d");
+        assert_ne!(a, b, "tuple-level collision: {a} == {b}");
+    }
+
+    #[test]
+    fn test_freeze_name_stable_and_prefix_matches() {
+        // Names are persisted in shadow paths and deferred-freeze records across
+        // processes, so they must be deterministic.
+        let a = freeze_name("nightly-1", "db", "t");
+        let b = freeze_name("nightly-1", "db", "t");
+        assert_eq!(a, b);
+
+        // freeze_prefix must actually prefix every freeze_name for that backup.
+        let prefix = freeze_prefix("nightly-1");
+        assert!(a.starts_with(&prefix), "{a} does not start with {prefix}");
+        assert!(freeze_name("nightly-1", "other", "tbl").starts_with(&prefix));
+        // ...and must not match a different backup whose sanitized form collides.
+        assert!(!freeze_name("nightly_1", "db", "t").starts_with(&prefix));
+    }
+
+    #[test]
+    fn test_legacy_freeze_prefix_matches_old_format() {
+        // Old binaries wrote chbackup_{sanitize_name(name)}_{db}_{table}; cleanup must
+        // still be able to find those directories.
+        assert_eq!(legacy_freeze_prefix("daily-1"), "chbackup_daily_1_");
+        let legacy_dir = "chbackup_daily_1_default_trades";
+        assert!(legacy_dir.starts_with(&legacy_freeze_prefix("daily-1")));
+        // The new prefix deliberately does NOT match the legacy directory.
+        assert!(!legacy_dir.starts_with(&freeze_prefix("daily-1")));
+    }
+
+    #[test]
+    fn test_freeze_name_realistic_production_name_length() {
+        // Escaping expands hyphen-dense names ~3x; confirm a real production name stays
+        // well inside the 255-byte filesystem limit for the shadow directory.
+        let name = freeze_name(
+            "chi-ch-cluster-ch-deployment-0-2-full-2026-08-04-17-43-01",
+            "affiliates",
+            "affiliate_activity_sent",
+        );
+        assert!(
+            name.len() < 255,
+            "freeze name too long: {} bytes",
+            name.len()
+        );
     }
 
     #[test]

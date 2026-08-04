@@ -6,3 +6,4 @@ cobertura.xml
 *.profraw
 *.profdata
 .env
+docs/plans/
