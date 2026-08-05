@@ -170,6 +170,10 @@ pub struct ClickHouseConfig {
     #[serde(default)]
     pub restore_as_attach: bool,
 
+    /// refuse ATTACH TABLE mode for a table whose backed-up parts are not all staged
+    #[serde(default = "default_true")]
+    pub attach_table_require_complete: bool,
+
     /// execute DDL with ON CLUSTER clause
     #[serde(default)]
     pub restore_schema_on_cluster: String,
@@ -561,6 +565,7 @@ impl Default for ClickHouseConfig {
             check_parts_columns: false,
             mutation_wait_timeout: default_mutation_wait_timeout(),
             restore_as_attach: false,
+            attach_table_require_complete: true,
             restore_schema_on_cluster: String::new(),
             restore_distributed_cluster: String::new(),
             max_connections: default_max_connections(),
@@ -1085,6 +1090,16 @@ impl Config {
                 );
             }
         }
+        if let Ok(v) = std::env::var("CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.clickhouse.attach_table_require_complete = b;
+            } else {
+                warn!(
+                    "CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE='{}' is not a valid bool, ignoring",
+                    v
+                );
+            }
+        }
         if let Ok(v) = std::env::var("CLICKHOUSE_MAX_CONNECTIONS") {
             if let Ok(n) = v.parse::<u32>() {
                 self.clickhouse.max_connections = n;
@@ -1485,6 +1500,10 @@ impl Config {
             "clickhouse.restore_as_attach" => {
                 self.clickhouse.restore_as_attach = value.parse().context("Invalid bool")?
             }
+            "clickhouse.attach_table_require_complete" => {
+                self.clickhouse.attach_table_require_complete =
+                    value.parse().context("Invalid bool")?
+            }
             "clickhouse.restore_schema_on_cluster" => {
                 self.clickhouse.restore_schema_on_cluster = value.to_string()
             }
@@ -1843,6 +1862,9 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CLICKHOUSE_SYNC_REPLICATED_TABLES" => Some("clickhouse.sync_replicated_tables"),
         "CLICKHOUSE_CHECK_REPLICAS_BEFORE_ATTACH_TIMEOUT" => {
             Some("clickhouse.check_replicas_before_attach_timeout")
+        }
+        "CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE" => {
+            Some("clickhouse.attach_table_require_complete")
         }
         "CLICKHOUSE_MAX_CONNECTIONS" => Some("clickhouse.max_connections"),
         "CLICKHOUSE_TIMEOUT" => Some("clickhouse.timeout"),

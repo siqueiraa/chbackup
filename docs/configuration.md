@@ -118,6 +118,7 @@ Connection settings and backup/restore behavior. chbackup must run on the same h
 | `check_parts_columns` | bool | `false` | Validate column type consistency before backup |
 | `mutation_wait_timeout` | string | `5m` | Timeout for waiting on mutations to complete |
 | `restore_as_attach` | bool | `false` | Use DETACH/ATTACH TABLE mode for full restores |
+| `attach_table_require_complete` | bool | `true` | With the default, restore **refuses to attach a Replicated table whose parts are not all present**: the table is not created, not attached, and all of its parts are reported as skipped, so the restore exits 3. Set to `false` to attach whatever parts are staged and count the deficit as skipped — that brings the table live with known-missing data. Only affects `restore_as_attach` mode |
 | `restore_schema_on_cluster` | string | _(empty)_ | Execute DDL with ON CLUSTER clause. Set to cluster name |
 | `restore_distributed_cluster` | string | _(empty)_ | Rewrite Distributed engine cluster name during restore |
 | `max_connections` | int | `1` | Concurrent restore table operations |
@@ -293,6 +294,7 @@ The most common config parameters can be overridden via environment variables. O
 | `CLICKHOUSE_TLS_CERT` | `clickhouse.tls_cert` |
 | `CLICKHOUSE_TLS_CA` | `clickhouse.tls_ca` |
 | `CLICKHOUSE_SYNC_REPLICATED_TABLES` | `clickhouse.sync_replicated_tables` |
+| `CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE` | `clickhouse.attach_table_require_complete` (default `true` refuses to attach a Replicated table whose parts are not all present) |
 | `CLICKHOUSE_MAX_CONNECTIONS` | `clickhouse.max_connections` |
 | `CLICKHOUSE_TIMEOUT` | `clickhouse.timeout` |
 | `CLICKHOUSE_DEBUG` | `clickhouse.debug` |

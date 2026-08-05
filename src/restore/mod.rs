@@ -34,7 +34,7 @@ use anyhow::{bail, Context, Result};
 use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::clickhouse::client::ChClient;
 use crate::concurrency::{
@@ -219,6 +219,27 @@ pub async fn restore(
     // 2f. Distributed cluster rewrite config
     let dist_cluster = &config.clickhouse.restore_distributed_cluster;
 
+    // 2g. ATTACH TABLE mode pre-flight. This MUST run before any CREATE: ATTACH TABLE
+    // mode brings a table live from whatever sits in its data directory, so refusing to
+    // attach a table with missing parts is only meaningful if the table was never
+    // created -- a live empty table reads as a successful restore of an empty table.
+    let restore_as_attach = config.clickhouse.restore_as_attach;
+    let mut attach_preflight = if restore_as_attach && !schema_only {
+        plan_attach_completeness(
+            &manifest,
+            &phases.data_tables,
+            &backup_dir,
+            &partition_filter,
+            config.clickhouse.attach_table_require_complete,
+        )
+    } else {
+        AttachPreflight::default()
+    };
+
+    // Data tables this restore may touch: refused tables are excluded from CREATE, from
+    // the per-part ATTACH fallback, and from resume bookkeeping.
+    let data_tables = attach_preflight.retain_allowed(&phases.data_tables);
+
     // Phase 0: DROP (Mode A only)
     if rm && !data_only {
         info!("Phase 0: Dropping tables and databases (Mode A --rm)");
@@ -240,11 +261,11 @@ pub async fn restore(
     }
 
     // Phase 2: CREATE data tables (not DDL-only objects)
-    info!(count = phases.data_tables.len(), "Phase 2: data tables");
+    info!(count = data_tables.len(), "Phase 2: data tables");
     create_tables(
         ch,
         &manifest,
-        &phases.data_tables,
+        &data_tables,
         data_only,
         remap_ref,
         on_cluster,
@@ -414,7 +435,7 @@ pub async fn restore(
         // When remap is active, query using the *destination* db/table names
         // Only query data tables (DDL-only objects have no parts)
         let mut tables_with_active_parts: HashSet<String> = HashSet::new();
-        for table_key in &phases.data_tables {
+        for table_key in &data_tables {
             let (orig_db, orig_table) = table_key.split_once('.').unwrap_or(("default", table_key));
             let (query_db, query_table) = match remap_ref {
                 Some(rc) if rc.is_active() => {
@@ -575,11 +596,11 @@ pub async fn restore(
         None
     };
 
-    // Collect data tables that need data restore (phases.data_tables already excludes DDL-only)
+    // Collect data tables that need data restore (data_tables already excludes DDL-only)
     let mut restore_items: Vec<(String, OwnedAttachParams)> = Vec::new();
     let mut zero_part_table_names: Vec<String> = Vec::new();
 
-    for table_key in &phases.data_tables {
+    for table_key in &data_tables {
         let table_manifest = match manifest.tables.get(table_key) {
             Some(tm) => tm,
             None => continue,
@@ -604,14 +625,7 @@ pub async fn restore(
         // Filter parts by partition if --partitions is specified
         if !partition_filter.is_empty() {
             let before_count = all_parts.len();
-            all_parts.retain(|part| {
-                if let Some(key) = PartSortKey::from_part_name(&part.name) {
-                    partition_filter.contains(&key.partition)
-                } else {
-                    // Can't parse partition from name -- keep the part
-                    true
-                }
-            });
+            all_parts.retain(|part| part_matches_partitions(&part.name, &partition_filter));
             if all_parts.len() < before_count {
                 info!(
                     table = %table_key,
@@ -721,79 +735,49 @@ pub async fn restore(
         }
     }
 
-    // 5b. ATTACH TABLE mode: for Replicated tables when restore_as_attach is enabled
-    let restore_as_attach = config.clickhouse.restore_as_attach;
+    // 5b. ATTACH TABLE mode: for Replicated tables when restore_as_attach is enabled.
+    // Eligibility and part completeness were already decided by the pre-flight (2g);
+    // a table without a plan uses the per-part ATTACH flow.
     let mut attach_table_results: Vec<(String, u64, u64)> = Vec::new();
 
     if restore_as_attach {
         let mut normal_items: Vec<(String, OwnedAttachParams)> = Vec::new();
 
         for (table_key, params) in restore_items {
-            // Check if the table has S3 disk parts -- ATTACH TABLE mode
-            // only hardlinks metadata without S3 CopyObject or metadata
-            // rewrite, so S3 disk tables must use per-part ATTACH flow.
-            let has_s3_disk_parts = params.parts_by_disk.iter().any(|(disk_name, disk_parts)| {
-                let disk_type = params
-                    .disk_type_map
-                    .get(disk_name)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                is_s3_disk(disk_type) && disk_parts.iter().any(|p| p.s3_objects.is_some())
-            });
-
-            if is_replicated_engine(&params.engine) && !has_s3_disk_parts {
-                // Try ATTACH TABLE mode for Replicated tables
-                let ddl = manifest
-                    .tables
-                    .get(&table_key)
-                    .map_or("", |tm| tm.ddl.as_str());
-
-                let (src_db, src_table) =
-                    table_key.split_once('.').unwrap_or(("default", &table_key));
-
-                match try_attach_table_mode(
-                    ch,
-                    src_db,
-                    src_table,
-                    &params.db,
-                    &params.table,
-                    ddl,
-                    &params.engine,
-                    &macros,
-                    &params.parts,
-                    &backup_dir,
-                    &params.table_data_path,
-                    ch_uid,
-                    ch_gid,
-                    &manifest.disks,
-                    &params.parts_by_disk,
-                )
-                .await
-                {
-                    Ok((true, attached, skipped)) => {
-                        attach_table_results.push((table_key, attached, skipped));
-                    }
-                    Ok((false, _, _)) => {
-                        // Not eligible -- fall back to normal attach
-                        normal_items.push((table_key, params));
-                    }
-                    Err(e) => {
-                        warn!(
-                            table = %table_key,
-                            error = %e,
-                            "ATTACH TABLE mode failed, falling back to per-part ATTACH"
-                        );
-                        normal_items.push((table_key, params));
-                    }
-                }
-            } else {
-                if has_s3_disk_parts && is_replicated_engine(&params.engine) {
-                    info!(
-                        table = %table_key,
-                        "Skipping ATTACH TABLE mode: table has S3 disk parts, using per-part ATTACH with CopyObject"
-                    );
-                }
+            let Some((plan, missing_parts)) = attach_preflight.plans.remove(&table_key) else {
                 normal_items.push((table_key, params));
+                continue;
+            };
+
+            let ddl = manifest
+                .tables
+                .get(&table_key)
+                .map_or("", |tm| tm.ddl.as_str());
+
+            match try_attach_table_mode(
+                ch,
+                &params.db,
+                &params.table,
+                ddl,
+                &macros,
+                plan,
+                &params.table_data_path,
+                ch_uid,
+                ch_gid,
+            )
+            .await
+            {
+                Ok(attached) => {
+                    attach_table_results.push((table_key, attached, missing_parts));
+                }
+                Err(e) => {
+                    warn!(
+                        table = %table_key,
+                        error = %e,
+                        "ATTACH TABLE mode failed, falling back to per-part ATTACH"
+                    );
+                    normal_items.push((table_key, params));
+                }
             }
         }
 
@@ -850,9 +834,10 @@ pub async fn restore(
     // Merge ATTACH TABLE mode results
     results.extend(attach_table_results);
 
-    // 7. Tally totals
+    // 7. Tally totals. Parts of tables the pre-flight refused count as skipped, so the
+    // PartialRestore contract below fires and the CLI exits 3.
     let mut total_attached = 0u64;
-    let mut total_skipped = 0u64;
+    let mut total_skipped = attach_preflight.refused_parts;
     let tables_restored = results.len() as u64;
     for (_table_key, attached, skipped) in &results {
         total_attached += attached;
@@ -985,8 +970,7 @@ pub async fn restore(
     // the manifest names in the state file allows name-based matching on resume.
     {
         let completion_state = RestoreState {
-            attached_parts: phases
-                .data_tables
+            attached_parts: data_tables
                 .iter()
                 .filter_map(|key| {
                     manifest.tables.get(key).map(|tm| {
@@ -1132,40 +1116,308 @@ fn find_table_uuid(
     None
 }
 
+/// Whether a part passes the `--partitions` filter.
+///
+/// An empty filter accepts every part. A part whose name cannot be parsed is kept:
+/// we cannot prove it is excluded.
+fn part_matches_partitions(part_name: &str, partition_filter: &[String]) -> bool {
+    if partition_filter.is_empty() {
+        return true;
+    }
+    match PartSortKey::from_part_name(part_name) {
+        Some(key) => partition_filter.contains(&key.partition),
+        None => true,
+    }
+}
+
+/// Completeness planning for ATTACH TABLE mode.
+///
+/// This is a module, not a bare struct, so that `CompleteAttachPlan`'s field is private
+/// to *it* rather than to the whole `restore` module: the rest of `restore` cannot forge
+/// a plan with a struct literal. Holding a plan therefore proves it came from
+/// [`decide_attach_table`], the only place the `attach_table_require_complete = false`
+/// escape hatch can produce a plan for a table with missing parts.
+mod attach_plan {
+    use std::path::PathBuf;
+
+    /// The staged source directory of every part of one table.
+    ///
+    /// The only safe constructor is [`CompleteAttachPlan::try_new`], which fails unless
+    /// every part resolved. Because `try_attach_table_mode` takes this type by value, no
+    /// DETACH TABLE, hardlink, ATTACH TABLE or SYSTEM RESTORE REPLICA can run for a table
+    /// with unresolved parts.
+    pub(super) struct CompleteAttachPlan {
+        /// `(part name, staged shadow directory)` for every part to hardlink.
+        sources: Vec<(String, PathBuf)>,
+    }
+
+    impl CompleteAttachPlan {
+        /// Build a plan from one resolution result per part of the table.
+        pub(super) fn try_new(
+            resolved: Vec<(String, Option<PathBuf>)>,
+        ) -> Result<Self, Incomplete> {
+            let total = resolved.len();
+            let mut sources = Vec::with_capacity(total);
+            let mut missing = Vec::new();
+            for (part_name, source) in resolved {
+                match source {
+                    Some(path) => sources.push((part_name, path)),
+                    None => missing.push(part_name),
+                }
+            }
+            if missing.is_empty() {
+                Ok(Self { sources })
+            } else {
+                Err(Incomplete {
+                    sources,
+                    missing,
+                    total,
+                })
+            }
+        }
+
+        pub(super) fn into_sources(self) -> Vec<(String, PathBuf)> {
+            self.sources
+        }
+    }
+
+    /// A table whose staged part sources could not all be resolved.
+    #[derive(Debug)]
+    pub(super) struct Incomplete {
+        /// The parts that did resolve.
+        sources: Vec<(String, PathBuf)>,
+        /// Names of the parts with no staged source directory.
+        pub(super) missing: Vec<String>,
+        /// How many parts the table should have had.
+        pub(super) total: usize,
+    }
+
+    impl Incomplete {
+        /// Escape hatch for `attach_table_require_complete = false`: attach the parts that
+        /// are staged. This deliberately brings a table live with known-missing data,
+        /// which is why it is private to this module and reachable only via
+        /// [`decide_attach_table`].
+        fn attach_available_anyway(self) -> CompleteAttachPlan {
+            CompleteAttachPlan {
+                sources: self.sources,
+            }
+        }
+    }
+
+    /// What the pre-flight decided for one candidate table.
+    pub(super) enum AttachTableDecision {
+        /// Every part resolved -- ATTACH TABLE mode may run.
+        Attach(CompleteAttachPlan),
+        /// Parts are missing and `attach_table_require_complete` is set: the table must be
+        /// neither created nor attached, and all of its parts count as skipped.
+        Refuse { missing: Vec<String>, total: usize },
+        /// Parts are missing but the operator opted out of the check.
+        AttachIncomplete {
+            plan: CompleteAttachPlan,
+            missing: Vec<String>,
+            total: usize,
+        },
+    }
+
+    /// Map one table's per-part resolution results to a decision. Pure: no I/O, no logging.
+    pub(super) fn decide_attach_table(
+        resolved: Vec<(String, Option<PathBuf>)>,
+        require_complete: bool,
+    ) -> AttachTableDecision {
+        match CompleteAttachPlan::try_new(resolved) {
+            Ok(plan) => AttachTableDecision::Attach(plan),
+            Err(incomplete) if require_complete => AttachTableDecision::Refuse {
+                missing: incomplete.missing,
+                total: incomplete.total,
+            },
+            Err(incomplete) => {
+                let missing = incomplete.missing.clone();
+                let total = incomplete.total;
+                AttachTableDecision::AttachIncomplete {
+                    plan: incomplete.attach_available_anyway(),
+                    missing,
+                    total,
+                }
+            }
+        }
+    }
+}
+
+use attach_plan::{decide_attach_table, AttachTableDecision, CompleteAttachPlan};
+
+/// Outcome of the ATTACH TABLE mode pre-flight for the whole restore.
+#[derive(Default)]
+struct AttachPreflight {
+    /// Per-table plan plus how many of its parts are missing. The count is non-zero only
+    /// on the `attach_table_require_complete = false` escape hatch.
+    plans: BTreeMap<String, (CompleteAttachPlan, u64)>,
+    /// Tables that must be neither created nor attached.
+    refused: HashSet<String>,
+    /// Parts of refused tables, all counted as skipped.
+    refused_parts: u64,
+}
+
+impl AttachPreflight {
+    /// Drop refused tables from a list of table keys.
+    fn retain_allowed(&self, table_keys: &[String]) -> Vec<String> {
+        table_keys
+            .iter()
+            .filter(|key| !self.refused.contains(*key))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Comma-separated sample of part names for log messages.
+fn sample_part_names(names: &[String]) -> String {
+    const LIMIT: usize = 10;
+    let mut sample = names
+        .iter()
+        .take(LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > LIMIT {
+        sample.push_str(&format!(" (+{} more)", names.len() - LIMIT));
+    }
+    sample
+}
+
+/// Resolve part completeness for every table eligible for ATTACH TABLE mode.
+///
+/// Called before the CREATE phase, so a table with missing parts is never created. Only
+/// the staged shadow directories are consulted, which means a re-restore whose shadow
+/// data was already cleaned is reported as incomplete rather than silently attached.
+fn plan_attach_completeness(
+    manifest: &BackupManifest,
+    data_tables: &[String],
+    backup_dir: &Path,
+    partition_filter: &[String],
+    require_complete: bool,
+) -> AttachPreflight {
+    use crate::backup::collect::resolve_shadow_part_path;
+
+    let backup_name = backup_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    let mut preflight = AttachPreflight::default();
+
+    for table_key in data_tables {
+        let Some(table_manifest) = manifest.tables.get(table_key) else {
+            continue;
+        };
+        if !is_replicated_engine(&table_manifest.engine) {
+            continue;
+        }
+
+        // S3 object-disk parts need CopyObject plus a metadata rewrite, which ATTACH TABLE
+        // mode does not do, so those tables stay on the per-part ATTACH flow.
+        let has_s3_disk_parts = table_manifest.parts.iter().any(|(disk_name, disk_parts)| {
+            let disk_type = manifest
+                .disk_types
+                .get(disk_name)
+                .map(String::as_str)
+                .unwrap_or("");
+            is_s3_disk(disk_type) && disk_parts.iter().any(|p| p.s3_objects.is_some())
+        });
+        if has_s3_disk_parts {
+            info!(
+                table = %table_key,
+                "Skipping ATTACH TABLE mode: table has S3 disk parts, using per-part ATTACH with CopyObject"
+            );
+            continue;
+        }
+
+        let (src_db, src_table) = table_key.split_once('.').unwrap_or(("default", table_key));
+        let url_db = crate::path_encoding::encode_path_component(src_db);
+        let url_table = crate::path_encoding::encode_path_component(src_table);
+
+        let resolved: Vec<(String, Option<PathBuf>)> = table_manifest
+            .parts
+            .iter()
+            .flat_map(|(disk_name, disk_parts)| {
+                disk_parts.iter().map(move |part| (disk_name, part))
+            })
+            .filter(|(_, part)| part_matches_partitions(&part.name, partition_filter))
+            .map(|(disk_name, part)| {
+                let source = resolve_shadow_part_path(
+                    backup_dir,
+                    &manifest.disks,
+                    backup_name,
+                    disk_name,
+                    &url_db,
+                    &url_table,
+                    src_db,
+                    src_table,
+                    &part.name,
+                );
+                (part.name.clone(), source)
+            })
+            .collect();
+
+        match decide_attach_table(resolved, require_complete) {
+            AttachTableDecision::Attach(plan) => {
+                preflight.plans.insert(table_key.clone(), (plan, 0));
+            }
+            AttachTableDecision::AttachIncomplete {
+                plan,
+                missing,
+                total,
+            } => {
+                warn!(
+                    table = %table_key,
+                    missing = missing.len(),
+                    total = total,
+                    sample = %sample_part_names(&missing),
+                    "Attaching table with missing parts because \
+                     clickhouse.attach_table_require_complete is false"
+                );
+                preflight
+                    .plans
+                    .insert(table_key.clone(), (plan, missing.len() as u64));
+            }
+            AttachTableDecision::Refuse { missing, total } => {
+                error!(
+                    table = %table_key,
+                    missing = missing.len(),
+                    total = total,
+                    sample = %sample_part_names(&missing),
+                    "Refusing to restore table: staged parts are missing, so ATTACH TABLE mode \
+                     would bring it live with incomplete data. Not creating and not attaching \
+                     it; all of its parts count as skipped. Set \
+                     clickhouse.attach_table_require_complete=false to attach anyway"
+                );
+                preflight.refused_parts += total as u64;
+                preflight.refused.insert(table_key.clone());
+            }
+        }
+    }
+
+    preflight
+}
+
 /// Attempt ATTACH TABLE mode for a Replicated table.
 ///
-/// Flow: DETACH TABLE SYNC -> DROP REPLICA from ZK -> hardlink parts to data dir ->
-/// ATTACH TABLE -> SYSTEM RESTORE REPLICA
+/// Flow: DETACH TABLE SYNC -> DROP REPLICA from ZK -> hardlink the planned parts to the
+/// data dir -> ATTACH TABLE -> SYSTEM RESTORE REPLICA
 ///
-/// Returns `Ok((true, attached, skipped))` if ATTACH TABLE mode was used successfully.
-/// Returns `Ok((false, 0, 0))` if the table is not eligible (non-Replicated engine).
-/// Returns `Err` on unrecoverable failure.
+/// Returns the number of parts placed in the data directory, or `Err` on unrecoverable
+/// failure. Taking a [`CompleteAttachPlan`] is what keeps this whole sequence unreachable
+/// for a table whose parts are not all staged.
 #[allow(clippy::too_many_arguments)]
 async fn try_attach_table_mode(
     ch: &ChClient,
-    src_db: &str,
-    src_table: &str,
     dst_db: &str,
     dst_table: &str,
     ddl: &str,
-    engine: &str,
     macros: &HashMap<String, String>,
-    parts: &[crate::manifest::PartInfo],
-    backup_dir: &Path,
+    plan: CompleteAttachPlan,
     table_data_path: &Path,
     ch_uid: Option<u32>,
     ch_gid: Option<u32>,
-    manifest_disks: &BTreeMap<String, String>,
-    parts_by_disk: &BTreeMap<String, Vec<crate::manifest::PartInfo>>,
-) -> Result<(bool, u64, u64)> {
-    use crate::backup::collect::resolve_shadow_part_path;
-
-    if !is_replicated_engine(engine) {
-        return Ok((false, 0, 0));
-    }
-
+) -> Result<u64> {
     let dst_key = format!("{}.{}", dst_db, dst_table);
-    info!(table = %dst_key, "ATTACH TABLE mode: Replicated engine detected");
 
     // Step 1: DETACH TABLE SYNC
     info!(table = %dst_key, "ATTACH TABLE mode: detaching table");
@@ -1195,73 +1447,21 @@ async fn try_attach_table_mode(
         }
     }
 
-    // Step 3: Hardlink parts to the table's data directory (NOT detached/)
+    // Step 3: Hardlink the planned parts to the table's data directory (NOT detached/)
     // ATTACH TABLE reads from the main data directory, not detached/
-    let url_db = crate::path_encoding::encode_path_component(src_db);
-    let url_table = crate::path_encoding::encode_path_component(src_table);
     let data_path = table_data_path.to_owned();
-    let backup_name = backup_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    // Build part_to_disk reverse map from parts_by_disk
-    let part_to_disk: HashMap<String, String> = parts_by_disk
-        .iter()
-        .flat_map(|(disk, disk_parts)| {
-            disk_parts
-                .iter()
-                .map(move |p| (p.name.clone(), disk.clone()))
-        })
-        .collect();
-
-    // Clone data for spawn_blocking
-    let parts_owned: Vec<String> = parts.iter().map(|p| p.name.clone()).collect();
-    let backup_dir_clone = backup_dir.to_path_buf();
-    let manifest_disks_clone = manifest_disks.clone();
-    let src_db_clone = src_db.to_string();
-    let src_table_clone = src_table.to_string();
+    let sources = plan.into_sources();
 
     // Run hardlinking in spawn_blocking since it's sync I/O
     let hardlink_result = tokio::task::spawn_blocking(move || -> Result<u64> {
         let mut linked = 0u64;
-        for part_name in &parts_owned {
+        for (part_name, part_src) in &sources {
             let part_dst = data_path.join(part_name);
 
-            if part_dst.exists() {
-                linked += 1;
-                continue;
+            if !part_dst.exists() {
+                attach::hardlink_or_copy_dir(part_src, &part_dst)?;
+                attach::chown_recursive(&part_dst, ch_uid, ch_gid)?;
             }
-
-            let disk_name = part_to_disk
-                .get(part_name)
-                .map(String::as_str)
-                .unwrap_or("default");
-            let part_src = match resolve_shadow_part_path(
-                &backup_dir_clone,
-                &manifest_disks_clone,
-                &backup_name,
-                disk_name,
-                &url_db,
-                &url_table,
-                &src_db_clone,
-                &src_table_clone,
-                part_name,
-            ) {
-                Some(p) => p,
-                None => {
-                    tracing::warn!(
-                        part = %part_name,
-                        table = format!("{}.{}", src_db_clone, src_table_clone),
-                        "ATTACH TABLE mode: part source directory not found, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            attach::hardlink_or_copy_dir(&part_src, &part_dst)?;
-            attach::chown_recursive(&part_dst, ch_uid, ch_gid)?;
             linked += 1;
         }
         Ok(linked)
@@ -1292,16 +1492,12 @@ async fn try_attach_table_mode(
             )
         })?;
 
-    let total_parts = parts.len() as u64;
-    let skipped = total_parts.saturating_sub(hardlink_result);
     info!(
         table = %dst_key,
         attached = hardlink_result,
-        skipped = skipped,
-        total = total_parts,
         "ATTACH TABLE mode: complete"
     );
-    Ok((true, hardlink_result, skipped))
+    Ok(hardlink_result)
 }
 
 #[cfg(test)]
@@ -1655,6 +1851,162 @@ mod tests {
         );
         assert!(resolved.is_some(), "Should find part at per-disk path");
         assert_eq!(resolved.unwrap(), per_disk_part);
+    }
+
+    /// All parts resolved: a `CompleteAttachPlan` is constructed and ATTACH TABLE mode
+    /// may proceed.
+    #[test]
+    fn attach_table_incomplete_data_all_parts_resolved() {
+        let resolved = vec![
+            ("202401_1_1_0".to_string(), Some(PathBuf::from("/shadow/a"))),
+            ("202401_2_2_0".to_string(), Some(PathBuf::from("/shadow/b"))),
+        ];
+
+        let plan = CompleteAttachPlan::try_new(resolved).expect("all parts resolved");
+        assert_eq!(plan.into_sources().len(), 2);
+    }
+
+    /// One unresolved part: the constructor refuses and names the missing part.
+    #[test]
+    fn attach_table_incomplete_data_constructor_reports_missing_part() {
+        let resolved = vec![
+            ("202401_1_1_0".to_string(), Some(PathBuf::from("/shadow/a"))),
+            ("202401_2_2_0".to_string(), None),
+        ];
+
+        let incomplete = match CompleteAttachPlan::try_new(resolved) {
+            Ok(_) => panic!("a plan must not be constructible with an unresolved part"),
+            Err(incomplete) => incomplete,
+        };
+        assert_eq!(incomplete.missing, vec!["202401_2_2_0".to_string()]);
+        assert_eq!(incomplete.total, 2);
+    }
+
+    /// Strict mode (the default): an incomplete table is not attached at all.
+    #[test]
+    fn attach_table_incomplete_data_strict_refuses_to_attach() {
+        let resolved = vec![
+            ("202401_1_1_0".to_string(), Some(PathBuf::from("/shadow/a"))),
+            ("202401_2_2_0".to_string(), None),
+        ];
+
+        match decide_attach_table(resolved, true) {
+            AttachTableDecision::Refuse { missing, total } => {
+                assert_eq!(missing, vec!["202401_2_2_0".to_string()]);
+                assert_eq!(total, 2, "every part of the table counts as skipped");
+            }
+            _ => panic!("strict mode must refuse an incomplete table"),
+        }
+    }
+
+    /// Escape hatch: with `attach_table_require_complete = false` the staged parts are
+    /// attached anyway and the deficit is reported.
+    #[test]
+    fn attach_table_incomplete_data_escape_hatch_attaches_anyway() {
+        let resolved = vec![
+            ("202401_1_1_0".to_string(), Some(PathBuf::from("/shadow/a"))),
+            ("202401_2_2_0".to_string(), None),
+        ];
+
+        match decide_attach_table(resolved, false) {
+            AttachTableDecision::AttachIncomplete {
+                plan,
+                missing,
+                total,
+            } => {
+                assert_eq!(plan.into_sources().len(), 1, "attaches what is staged");
+                assert_eq!(missing.len(), 1);
+                assert_eq!(total, 2);
+            }
+            _ => panic!("the escape hatch must attach the staged parts"),
+        }
+    }
+
+    /// A table with no parts is unchanged by the check: it is complete, not refused.
+    #[test]
+    fn attach_table_incomplete_data_empty_part_list_is_complete() {
+        for require_complete in [true, false] {
+            match decide_attach_table(Vec::new(), require_complete) {
+                AttachTableDecision::Attach(plan) => assert!(plan.into_sources().is_empty()),
+                _ => panic!("zero parts must not change the outcome"),
+            }
+        }
+    }
+
+    /// End-to-end pre-flight: a table with a missing part is refused, which excludes it
+    /// from the CREATE set, so no live empty table is left behind. The complete table
+    /// beside it is unaffected.
+    #[test]
+    fn restore_incomplete_leaves_no_live_table() {
+        use crate::manifest::{PartInfo, TableManifest};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_name = "daily-2024-01-15";
+        let data_path = tmp.path().join("data");
+        let backup_dir = data_path.join("backup").join(backup_name);
+
+        // Stage both parts of default.complete, but only one part of default.partial.
+        let stage = |table: &str, part: &str| {
+            let dir = backup_dir
+                .join("shadow")
+                .join("default")
+                .join(table)
+                .join(part);
+            std::fs::create_dir_all(&dir).unwrap();
+        };
+        stage("complete", "202401_1_1_0");
+        stage("complete", "202401_2_2_0");
+        stage("partial", "202401_1_1_0");
+
+        let table_manifest = |parts: &[&str]| {
+            TableManifest::test_new("ReplicatedMergeTree").with_parts(BTreeMap::from([(
+                "default".to_string(),
+                parts.iter().map(|p| PartInfo::new(*p, 1024, 1)).collect(),
+            )]))
+        };
+        let manifest = BackupManifest::test_new(backup_name)
+            .with_disks(BTreeMap::from([(
+                "default".to_string(),
+                data_path.to_str().unwrap().to_string(),
+            )]))
+            .with_tables(BTreeMap::from([
+                (
+                    "default.complete".to_string(),
+                    table_manifest(&["202401_1_1_0", "202401_2_2_0"]),
+                ),
+                (
+                    "default.partial".to_string(),
+                    table_manifest(&["202401_1_1_0", "202401_2_2_0"]),
+                ),
+            ]));
+
+        let data_tables = vec![
+            "default.complete".to_string(),
+            "default.partial".to_string(),
+        ];
+        let preflight = plan_attach_completeness(&manifest, &data_tables, &backup_dir, &[], true);
+
+        assert!(
+            preflight.refused.contains("default.partial"),
+            "the table with a missing part must be refused"
+        );
+        assert!(
+            !preflight.plans.contains_key("default.partial"),
+            "a refused table must have no attach plan"
+        );
+        assert_eq!(
+            preflight.refused_parts, 2,
+            "all parts of the refused table count as skipped"
+        );
+        assert_eq!(
+            preflight.retain_allowed(&data_tables),
+            vec!["default.complete".to_string()],
+            "the refused table must be excluded from CREATE, leaving nothing queryable"
+        );
+        assert!(
+            preflight.plans.contains_key("default.complete"),
+            "the complete table is still attached via ATTACH TABLE mode"
+        );
     }
 
     #[test]
