@@ -201,7 +201,6 @@ pub async fn upload(
                     &s3,
                     &name,
                     &dir,
-                    delete_local,
                     diff.as_deref(),
                     resume,
                     cancel,
@@ -216,6 +215,34 @@ pub async fn upload(
         };
 
         finalize_deferred_freeze(&ch_owned, &dir_owned, &name_owned, result.is_ok()).await;
+
+        // `delete_local` runs HERE, after finalisation -- never inside the work.
+        //
+        // The backup directory holds `deferred_freeze.json`, so deleting it before the freeze
+        // is released would destroy the only record of that freeze (and `delete_local` now
+        // refuses outright while one is held). Ordering it after finalisation is what makes
+        // the two compatible.
+        //
+        // Only on success: a failed upload keeps its local data for the retry, and the retry
+        // needs the record too.
+        if delete_local && result.is_ok() {
+            let data_path = config_owned.clickhouse.data_path.clone();
+            let name_for_delete = name_owned.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                crate::list::delete_local(&data_path, &name_for_delete)
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("delete_local task panicked: {e}")))
+            {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to delete local backup '{}' after upload",
+                        name_owned
+                    )
+                });
+            }
+        }
+
         result
     });
 
@@ -225,11 +252,17 @@ pub async fn upload(
     }
 }
 
-/// Release any deferred FREEZE recorded for this backup.
+/// Release any deferred FREEZE recorded for this backup, if the upload succeeded.
 ///
-/// Deletes the record only after the freeze is genuinely released -- on partial failure the
-/// record is rewritten with just the entries that are still frozen, so the leak stays
-/// discoverable and the next run retries it rather than being silently dropped.
+/// **On failure or cancellation the freeze is deliberately KEPT.** `upload.state.json`
+/// survives a failed upload, so `auto_resume` or the next scheduled run will retry — and a
+/// retry needs the objects still pinned, or it hits the exact `NoSuchKey` race this record
+/// exists to prevent. Releasing here would make every retry unprotected. The TTL plus the
+/// reaper bound the hold if no retry ever comes.
+///
+/// On success, deletes the record only after the freeze is genuinely released; on partial
+/// failure the record is rewritten with just the entries still frozen, so the leak stays
+/// discoverable and retryable rather than silently dropped.
 async fn finalize_deferred_freeze(
     ch: &ChClient,
     backup_dir: &Path,
@@ -237,6 +270,19 @@ async fn finalize_deferred_freeze(
     upload_succeeded: bool,
 ) {
     use crate::backup::deferred::{self, LoadOutcome};
+
+    if !upload_succeeded {
+        // Cheap existence probe so we only log when something is actually retained.
+        if deferred::record_path(backup_dir).exists() {
+            warn!(
+                backup = %backup_name,
+                "Upload did not succeed -- KEEPING the deferred S3 object-disk freeze so a \
+                 retry still has its objects pinned. It is released on a successful upload, \
+                 or reaped once the TTL expires."
+            );
+        }
+        return;
+    }
 
     let retained = match deferred::load(backup_dir, backup_name) {
         LoadOutcome::None => return,
@@ -295,7 +341,9 @@ async fn upload_inner(
     s3: &S3Client,
     backup_name: &str,
     backup_dir: &Path,
-    delete_local: bool,
+    // NOTE: no `delete_local` here on purpose. Local deletion happens in the `upload()`
+    // wrapper *after* deferred-freeze finalisation, because the backup directory holds the
+    // freeze record. See the comment at the call site.
     diff_from_remote: Option<&str>,
     resume: bool,
     cancel: CancellationToken,
@@ -303,7 +351,6 @@ async fn upload_inner(
     info!(
         backup_name = %backup_name,
         backup_dir = %backup_dir.display(),
-        delete_local = delete_local,
         resume = resume,
         "Starting upload"
     );
@@ -1270,17 +1317,8 @@ async fn upload_inner(
         delete_state_file(&state_path);
     }
 
-    // 9. Delete local backup if requested
-    if delete_local {
-        let data_path = config.clickhouse.data_path.clone();
-        let backup_name_owned = backup_name.to_string();
-        tokio::task::spawn_blocking(move || {
-            crate::list::delete_local(&data_path, &backup_name_owned)
-        })
-        .await
-        .context("delete_local task panicked")?
-        .with_context(|| format!("Failed to delete local backup '{}'", backup_name))?;
-    }
+    // 9. Local deletion is NOT done here -- see the `upload()` wrapper. It must run after
+    // deferred-freeze finalisation, because the backup directory holds the freeze record.
 
     let uploaded_count = (total_local_parts + total_s3_disk_parts) as u64;
     Ok(UploadStats {

@@ -532,6 +532,26 @@ pub fn delete_local(data_path: &str, backup_name: &str) -> Result<()> {
         .into());
     }
 
+    // Refuse while a deferred S3 object-disk freeze is held for this backup.
+    //
+    // The backup directory contains `deferred_freeze.json`, so removing it would destroy the
+    // only record of that freeze -- leaking it with nothing left to find it by, and no
+    // UNFREEZE issued. That matters most on the retention path, which runs automatically
+    // after every successful upload: without this guard, a later backup's retention sweep
+    // silently strands an earlier backup's freeze.
+    //
+    // Deliberately an error rather than a silent skip. Retention treats it as a warning and
+    // retries next cycle, by which point the freeze has been released by its upload or reaped
+    // as expired -- so this defers a deletion rather than blocking it forever.
+    if crate::backup::deferred::blocks_destructive_op(data_path, backup_name, "delete_local") {
+        return Err(anyhow::anyhow!(
+            "refusing to delete local backup '{}': a deferred S3 object-disk freeze is still \
+             held for it. Deleting now would strand the freeze in ClickHouse. Wait for its \
+             upload to finish, or run `chbackup clean` to release an expired one.",
+            backup_name
+        ));
+    }
+
     // Discover disk map: manifest first, download state file as fallback
     let disk_map: HashMap<String, String> = {
         let manifest_path = backup_dir.join("metadata.json");
@@ -1423,13 +1443,13 @@ async fn clean_shadow_inner(
     // `force` is set -- `force` exists to bypass the *PID lock* check for callers that
     // already hold that lock, not to override freeze ownership.
     //
-    // The predicate is ownership-aware rather than "is a lock held": `cleanup_failed_backup`
-    // runs while holding the backup's PID lock, so a presence check would stop it from ever
-    // cleaning its own shadow. `blocks_shadow_cleanup` therefore compares PIDs and only
-    // blocks on a record owned by a *different* live process. It also fails closed on an
-    // unreadable record, since ownership cannot be established from corrupt data.
+    // Ownership is evidenced by holding the per-backup PID lock, NOT by PID equality: in
+    // server mode `create` and `upload` share one long-lived process, so every record carries
+    // the server's PID and a same-PID test would let an unrelated request in that process
+    // destroy a live freeze. An orphaned record still blocks until its TTL expires, and an
+    // unreadable record fails closed.
     if let Some(n) = name {
-        if crate::backup::deferred::blocks_shadow_cleanup(data_path, n) {
+        if crate::backup::deferred::blocks_destructive_op(data_path, n, "clean_shadow") {
             return Ok(0);
         }
     }
@@ -1728,6 +1748,59 @@ mod tests {
 
         assert!(backup_dir.exists());
         delete_local(dir.path().to_str().unwrap(), "test-delete").unwrap();
+        assert!(!backup_dir.exists());
+    }
+
+    #[test]
+    fn test_delete_local_refuses_while_deferred_freeze_is_held() {
+        // Regression: the backup dir contains deferred_freeze.json, so deleting it destroyed
+        // the only record of a held S3 object-disk freeze -- leaking it with nothing left to
+        // find it by and no UNFREEZE issued. This fired automatically on the retention path
+        // after every successful upload.
+        use crate::backup::deferred::{publish, DeferredFreezeRecord, DEFAULT_TTL_SECS};
+        use crate::backup::freeze::FreezeInfo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup").join("held");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("metadata.json"), "{}").unwrap();
+
+        let rec = DeferredFreezeRecord::new(
+            "held",
+            vec![FreezeInfo {
+                database: "db".into(),
+                table: "t".into(),
+                freeze_name: crate::clickhouse::freeze_name("held", "db", "t"),
+            }],
+            DEFAULT_TTL_SECS,
+        );
+        publish(&backup_dir, &rec).unwrap();
+
+        let result = delete_local(dir.path().to_str().unwrap(), "held");
+        assert!(
+            result.is_err(),
+            "must refuse, not silently destroy the record"
+        );
+        assert!(
+            backup_dir.exists(),
+            "backup dir must survive so the freeze stays discoverable"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("deferred") && msg.contains("freeze"),
+            "error should explain why: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_delete_local_proceeds_when_no_deferred_freeze() {
+        // The guard must not block ordinary deletion.
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backup").join("free");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("metadata.json"), "{}").unwrap();
+
+        delete_local(dir.path().to_str().unwrap(), "free").unwrap();
         assert!(!backup_dir.exists());
     }
 

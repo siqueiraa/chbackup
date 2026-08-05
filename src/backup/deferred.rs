@@ -257,49 +257,125 @@ pub fn retain_failed(backup_dir: &Path, backup_name: &str, failed: Vec<FreezeInf
     }
 }
 
-/// Whether shadow cleanup must refuse to touch this backup's shadow directories.
+/// Why a destructive operation on a backup's local data is or is not permitted.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProtectionStatus {
+    /// No deferred freeze recorded -- nothing to protect.
+    NotProtected,
+    /// A deferred freeze is held. Destroying local data would strand it: for object disks the
+    /// refcount lives in the shadow metadata files, so removing them is not an UNFREEZE.
+    Protected {
+        reason: &'static str,
+        owner_pid: u32,
+    },
+    /// The record is expired and no operation holds the lock, so a *lock-holding reaper* may
+    /// release it. Ordinary callers must still not delete blindly -- they have to reap first.
+    Reapable(DeferredFreezeRecord),
+}
+
+/// Whether a deferred freeze protects this backup's local data from destruction.
 ///
-/// True when a record exists whose owner is a live process **other than** the caller.
+/// Used by shadow cleanup and by local-backup deletion. Both must refuse while a freeze is
+/// held, because `rm -rf` of the shadow metadata does **not** release ClickHouse's refcount on
+/// the referenced S3 objects -- only `UNFREEZE` does.
 ///
-/// Two subtleties this encodes:
-/// - Keying on "is the PID lock held" would self-deadlock: `cleanup_failed_backup` runs
-///   while holding that lock, so it could never clean its own shadow. Comparing PIDs lets
-///   the owner clean up after itself while still protecting other processes.
-/// - An unreadable record fails **closed**. Liveness cannot be established from a corrupt
-///   record, so assuming the owner is dead risks deleting live shadow data.
-pub fn blocks_shadow_cleanup(data_path: &str, backup_name: &str) -> bool {
+/// The predicate is deliberately **not** PID equality. In server mode `create` and `upload` run
+/// inside the same long-lived process, so every record carries the server's PID; treating
+/// "same PID" as ownership would let an unrelated request in that process destroy a live
+/// freeze. Ownership is instead evidenced by holding the **per-backup PID lock**, which is
+/// what actually serializes operations on a backup.
+///
+/// Fails **closed** on an unreadable record: ownership cannot be established from corrupt
+/// data, so assume it is protected.
+pub fn protection_status(data_path: &str, backup_name: &str) -> ProtectionStatus {
     let path = record_path_for(data_path, backup_name);
     if !path.exists() {
-        return false;
+        return ProtectionStatus::NotProtected;
     }
 
-    match crate::resume::load_state_file::<DeferredFreezeRecord>(&path) {
-        Ok(Some(record)) => {
-            if record.owned_by_current_process() {
-                return false;
-            }
-            if record.owner_is_live() {
-                warn!(
-                    backup = %backup_name,
-                    owner_pid = record.owner_pid,
-                    "Refusing shadow cleanup: a deferred freeze is held by a live process"
-                );
-                return true;
-            }
-            false
-        }
-        Ok(None) => false,
+    let record = match crate::resume::load_state_file::<DeferredFreezeRecord>(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => return ProtectionStatus::NotProtected,
         Err(e) => {
-            // Fail closed.
             warn!(
                 backup = %backup_name,
                 error = %e,
                 path = %path.display(),
-                "Refusing shadow cleanup: deferred-freeze record is unreadable, so freeze \
-                 ownership cannot be established"
+                "Deferred-freeze record is unreadable -- treating the backup as protected. \
+                 Ownership cannot be established from corrupt data."
+            );
+            return ProtectionStatus::Protected {
+                reason: "deferred-freeze record is unreadable",
+                owner_pid: 0,
+            };
+        }
+    };
+
+    // An operation is in flight for this backup: it owns the freeze, whoever recorded it.
+    if backup_lock_is_active(backup_name) {
+        return ProtectionStatus::Protected {
+            reason: "an operation holds the per-backup lock",
+            owner_pid: record.owner_pid,
+        };
+    }
+
+    // No lock held. A record whose owner is still alive is mid-flight without the lock
+    // (e.g. queued, or between lock acquisition points) -- leave it alone.
+    if record.owner_is_live() {
+        return ProtectionStatus::Protected {
+            reason: "the recorded owner process is still alive",
+            owner_pid: record.owner_pid,
+        };
+    }
+
+    // Orphaned. Still protected until the TTL expires: the upload it belongs to may simply be
+    // between attempts, and releasing early recreates the race this record exists to prevent.
+    if !record.is_expired() {
+        return ProtectionStatus::Protected {
+            reason: "the deferred freeze is orphaned but has not yet expired",
+            owner_pid: record.owner_pid,
+        };
+    }
+
+    ProtectionStatus::Reapable(record)
+}
+
+/// Whether shadow cleanup or local deletion must refuse to touch this backup.
+///
+/// `Reapable` counts as blocking here: an ordinary caller must not delete a backup whose
+/// freeze is still registered with ClickHouse. Only the lock-holding reaper may act on it,
+/// and it uses [`protection_status`] directly.
+pub fn blocks_destructive_op(data_path: &str, backup_name: &str, op: &str) -> bool {
+    match protection_status(data_path, backup_name) {
+        ProtectionStatus::NotProtected => false,
+        ProtectionStatus::Protected { reason, owner_pid } => {
+            warn!(
+                backup = %backup_name,
+                op = %op,
+                owner_pid = owner_pid,
+                reason = %reason,
+                "Refusing to destroy local backup data: a deferred S3 object-disk freeze is held"
             );
             true
         }
+        ProtectionStatus::Reapable(_) => {
+            warn!(
+                backup = %backup_name,
+                op = %op,
+                "Refusing to destroy local backup data: an expired deferred freeze must be \
+                 released first (run `chbackup clean`, or it is reaped at the next `create`)"
+            );
+            true
+        }
+    }
+}
+
+/// Whether some operation currently holds this backup's PID lock.
+fn backup_lock_is_active(backup_name: &str) -> bool {
+    let scope = crate::lock::LockScope::Backup(backup_name.to_string());
+    match crate::lock::lock_path_for_scope(&scope) {
+        Some(p) => crate::lock::is_lock_file_active(&p),
+        None => false,
     }
 }
 
@@ -388,7 +464,7 @@ mod tests {
 
         assert!(rec.is_expired(), "fixture must be expired");
         assert!(
-            blocks_shadow_cleanup(data_path, "bk-1"),
+            blocks_destructive_op(data_path, "bk-1", "test"),
             "expired record with a live foreign owner must still block cleanup"
         );
     }
@@ -400,49 +476,107 @@ mod tests {
         assert!(!crate::lock::is_pid_alive(0));
     }
 
-    #[test]
-    fn test_blocks_shadow_cleanup_false_for_own_record() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_path = tmp.path().to_str().unwrap();
-        let backup_dir = tmp.path().join("backup").join("bk-1");
+    /// Helper: publish a record for `bk` under `tmp` and return the data_path.
+    fn publish_at(tmp: &std::path::Path, bk: &str, mutate: impl FnOnce(&mut DeferredFreezeRecord)) {
+        let backup_dir = tmp.join("backup").join(bk);
         std::fs::create_dir_all(&backup_dir).unwrap();
-        let rec = DeferredFreezeRecord::new("bk-1", vec![info("db", "t")], DEFAULT_TTL_SECS);
+        let mut rec = DeferredFreezeRecord::new(bk, vec![info("db", "t")], DEFAULT_TTL_SECS);
+        mutate(&mut rec);
         publish(&backup_dir, &rec).unwrap();
-
-        // Our own record must not block us -- otherwise cleanup_failed_backup, which runs
-        // while holding the backup lock, could never clean its own shadow.
-        assert!(!blocks_shadow_cleanup(data_path, "bk-1"));
     }
 
     #[test]
-    fn test_blocks_shadow_cleanup_true_for_foreign_live_record() {
+    fn test_same_pid_record_still_blocks() {
+        // Regression: PID equality is NOT ownership. In server mode create and upload share
+        // one long-lived process, so every record carries the server's PID -- treating that as
+        // "mine, safe to delete" let an unrelated request destroy a live freeze.
         let tmp = tempfile::tempdir().unwrap();
         let data_path = tmp.path().to_str().unwrap();
-        let backup_dir = tmp.path().join("backup").join("bk-1");
-        std::fs::create_dir_all(&backup_dir).unwrap();
-        let mut rec = DeferredFreezeRecord::new("bk-1", vec![info("db", "t")], DEFAULT_TTL_SECS);
+        publish_at(tmp.path(), "bk-1", |_| {}); // owner_pid = current process
+
+        assert!(
+            blocks_destructive_op(data_path, "bk-1", "test"),
+            "a record owned by the current PID must still block when we hold no lock"
+        );
+    }
+
+    #[test]
+    fn test_foreign_live_record_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().to_str().unwrap();
         // PID 1 exists on every Unix system and is not us.
-        rec.owner_pid = 1;
-        publish(&backup_dir, &rec).unwrap();
+        publish_at(tmp.path(), "bk-1", |r| r.owner_pid = 1);
 
-        assert!(blocks_shadow_cleanup(data_path, "bk-1"));
+        assert!(blocks_destructive_op(data_path, "bk-1", "test"));
     }
 
     #[test]
-    fn test_blocks_shadow_cleanup_false_for_orphan() {
+    fn test_unexpired_orphan_blocks() {
+        // Regression: an orphaned record used to be treated as free to delete regardless of
+        // TTL, so `clean <name>` would rm -rf a live deferred shadow in the create->upload
+        // gap, where the creator process is legitimately gone.
         let tmp = tempfile::tempdir().unwrap();
         let data_path = tmp.path().to_str().unwrap();
-        let backup_dir = tmp.path().join("backup").join("bk-1");
-        std::fs::create_dir_all(&backup_dir).unwrap();
-        let mut rec = DeferredFreezeRecord::new("bk-1", vec![info("db", "t")], DEFAULT_TTL_SECS);
-        rec.owner_pid = 0;
-        publish(&backup_dir, &rec).unwrap();
+        publish_at(tmp.path(), "bk-1", |r| r.owner_pid = 0); // orphan, TTL not expired
 
-        assert!(!blocks_shadow_cleanup(data_path, "bk-1"));
+        match protection_status(data_path, "bk-1") {
+            ProtectionStatus::Protected { .. } => {}
+            other => panic!("unexpired orphan must be Protected, got {other:?}"),
+        }
+        assert!(blocks_destructive_op(data_path, "bk-1", "test"));
     }
 
     #[test]
-    fn test_blocks_shadow_cleanup_fails_closed_on_corrupt_record() {
+    fn test_expired_orphan_is_reapable_but_still_blocks_ordinary_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().to_str().unwrap();
+        publish_at(tmp.path(), "bk-1", |r| {
+            r.owner_pid = 0;
+            r.created_at_secs = 1;
+            r.ttl_secs = 0;
+        });
+
+        match protection_status(data_path, "bk-1") {
+            ProtectionStatus::Reapable(rec) => assert_eq!(rec.retained.len(), 1),
+            other => panic!("expired orphan must be Reapable, got {other:?}"),
+        }
+        // Reapable is still not a licence for an ordinary caller to rm -rf: the freeze is
+        // registered with ClickHouse and needs a real UNFREEZE first.
+        assert!(blocks_destructive_op(data_path, "bk-1", "test"));
+    }
+
+    #[test]
+    fn test_record_survives_for_retry_semantics() {
+        // Documents the invariant that upload's finaliser relies on for 1b: after a failed
+        // upload the record must still be loadable, because upload.state.json survives and
+        // the retry needs the objects still pinned. A released freeze would make every retry
+        // hit the NoSuchKey race.
+        let dir = tempfile::tempdir().unwrap();
+        let rec = DeferredFreezeRecord::new("bk-1", vec![info("db", "t")], DEFAULT_TTL_SECS);
+        publish(dir.path(), &rec).unwrap();
+
+        // Simulate "upload failed, finaliser kept the record" -- nothing deleted it.
+        assert!(record_path(dir.path()).exists());
+        match load(dir.path(), "bk-1") {
+            LoadOutcome::Usable(loaded) => assert_eq!(loaded.retained.len(), 1),
+            other => panic!("retry must still find the record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_no_record_is_not_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().to_str().unwrap();
+        std::fs::create_dir_all(tmp.path().join("backup").join("bk-1")).unwrap();
+        assert_eq!(
+            protection_status(data_path, "bk-1"),
+            ProtectionStatus::NotProtected
+        );
+        assert!(!blocks_destructive_op(data_path, "bk-1", "test"));
+    }
+
+    #[test]
+    fn test_corrupt_record_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();
         let data_path = tmp.path().to_str().unwrap();
         let backup_dir = tmp.path().join("backup").join("bk-1");
@@ -450,7 +584,7 @@ mod tests {
         std::fs::write(record_path(&backup_dir), b"garbage").unwrap();
 
         assert!(
-            blocks_shadow_cleanup(data_path, "bk-1"),
+            blocks_destructive_op(data_path, "bk-1", "test"),
             "unreadable record must fail closed, not assume the owner is dead"
         );
     }
