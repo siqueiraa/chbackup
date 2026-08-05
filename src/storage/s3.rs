@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use aws_sdk_s3::config::Region;
+use aws_config::sts::AssumeRoleProvider;
+use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, ServerSideEncryption,
@@ -151,6 +152,39 @@ pub struct S3Client {
     acl: String,
 }
 
+/// Build an auto-refreshing STS AssumeRole credentials provider.
+///
+/// The provider is lazy: it calls STS on first use and again whenever the temporary
+/// credentials near expiry, so long-running server and watch modes keep working past
+/// the (default 1 hour) session lifetime.
+///
+/// `base_credentials` are the credentials used to call STS itself; when `None` the
+/// default AWS credential chain (env vars, instance profile, ...) is used. `endpoint`
+/// is applied to the STS client too, so S3-compatible stacks that implement STS on
+/// their own endpoint (MinIO) are reachable.
+async fn assume_role_provider(
+    role_arn: &str,
+    region: &str,
+    endpoint: Option<&str>,
+    base_credentials: Option<Credentials>,
+) -> AssumeRoleProvider {
+    let mut loader = aws_config::from_env().region(Region::new(region.to_string()));
+    if let Some(endpoint) = endpoint {
+        loader = loader.endpoint_url(endpoint);
+    }
+    if let Some(credentials) = base_credentials {
+        loader = loader.credentials_provider(credentials);
+    }
+    let base_config = loader.load().await;
+
+    AssumeRoleProvider::builder(role_arn)
+        .session_name("chbackup")
+        .region(Region::new(region.to_string()))
+        .configure(&base_config)
+        .build()
+        .await
+}
+
 impl S3Client {
     /// Build a new `S3Client` from the given `S3Config`.
     ///
@@ -211,75 +245,39 @@ impl S3Client {
             loader = loader.endpoint_url(&effective_endpoint);
         }
 
-        // Set static credentials if access_key and secret_key are provided.
-        // Otherwise, the SDK falls back to env vars, instance profile, etc.
-        if !config.access_key.is_empty() && !config.secret_key.is_empty() {
-            let credentials = aws_sdk_s3::config::Credentials::new(
-                &config.access_key,
-                &config.secret_key,
-                None, // session token
-                None, // expiry
-                "chbackup-static",
-            );
+        // Static credentials from config, if provided. Otherwise the SDK falls back to
+        // env vars, instance profile, etc.
+        let static_credentials = (!config.access_key.is_empty() && !config.secret_key.is_empty())
+            .then(|| {
+                Credentials::new(
+                    &config.access_key,
+                    &config.secret_key,
+                    None, // session token
+                    None, // expiry
+                    "chbackup-static",
+                )
+            });
+
+        // With assume_role_arn set, the credentials on the loader are the refreshing STS
+        // provider (which uses the static credentials, if any, to call STS).
+        if !config.assume_role_arn.is_empty() {
+            info!(assume_role_arn = %config.assume_role_arn, "Assuming IAM role via STS");
+            let provider = assume_role_provider(
+                &config.assume_role_arn,
+                &config.region,
+                (!effective_endpoint.is_empty()).then_some(effective_endpoint.as_str()),
+                static_credentials,
+            )
+            .await;
+            loader = loader.credentials_provider(provider);
+        } else if let Some(credentials) = static_credentials {
             loader = loader.credentials_provider(credentials);
         }
 
         let sdk_config = loader.load().await;
 
-        // If assume_role_arn is set, use STS to assume the role and get temporary credentials.
-        let effective_sdk_config = if !config.assume_role_arn.is_empty() {
-            let arn = &config.assume_role_arn;
-            info!(assume_role_arn = %arn, "Assuming IAM role via STS");
-
-            let sts_client = aws_sdk_sts::Client::new(&sdk_config);
-            let sts_resp = sts_client
-                .assume_role()
-                .role_arn(arn)
-                .role_session_name("chbackup")
-                .send()
-                .await
-                .with_context(|| format!("STS AssumeRole failed for ARN: {}", arn))?;
-
-            let sts_creds = sts_resp.credentials().ok_or_else(|| {
-                anyhow::anyhow!("STS AssumeRole returned no credentials for ARN: {}", arn)
-            })?;
-
-            let access_key = sts_creds.access_key_id().to_string();
-            let secret_key = sts_creds.secret_access_key().to_string();
-            let session_token = sts_creds.session_token().to_string();
-
-            // STS credentials have a limited TTL (default 1 hour, max 12 hours).
-            // In long-running server mode they will expire and S3 operations will fail.
-            // Use POST /api/v1/restart to refresh credentials before expiry.
-            warn!(
-                assume_role_arn = %arn,
-                "STS temporary credentials obtained -- they will expire (default 1h). \
-                 In server mode, use POST /api/v1/restart to refresh before expiry"
-            );
-            info!(assume_role_arn = %arn, "Successfully assumed IAM role");
-
-            // Rebuild SDK config with the temporary credentials from STS
-            let assumed_credentials = aws_sdk_s3::config::Credentials::new(
-                &access_key,
-                &secret_key,
-                Some(session_token),
-                None, // expiry handled by caller if needed
-                "chbackup-assume-role",
-            );
-
-            let mut assumed_loader =
-                aws_config::from_env().region(Region::new(config.region.clone()));
-            if !effective_endpoint.is_empty() {
-                assumed_loader = assumed_loader.endpoint_url(&effective_endpoint);
-            }
-            assumed_loader = assumed_loader.credentials_provider(assumed_credentials);
-            assumed_loader.load().await
-        } else {
-            sdk_config
-        };
-
         // Build S3-specific config with force_path_style.
-        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&effective_sdk_config)
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&sdk_config)
             .force_path_style(config.force_path_style);
 
         // Re-apply endpoint at the S3 config level if provided, since the SDK
@@ -1516,6 +1514,22 @@ pub fn calculate_chunk_size(data_len: u64, config_chunk_size: u64, max_parts_cou
 mod tests {
     use super::*;
     use crate::config::S3Config;
+
+    /// The provider must construct without contacting STS -- it resolves credentials
+    /// lazily, which is what makes it refresh them in long-running modes.
+    #[tokio::test]
+    async fn test_assume_role_provider_constructs_without_network() {
+        let provider = assume_role_provider(
+            "arn:aws:iam::123456789012:role/chbackup-test",
+            "us-east-1",
+            Some("http://127.0.0.1:9000"),
+            Some(Credentials::new("ak", "sk", None, None, "test")),
+        )
+        .await;
+
+        // The provider is opaque; its Debug output carries the role it will assume.
+        assert!(format!("{provider:?}").contains("chbackup-test"));
+    }
 
     #[test]
     fn test_s3_config_defaults() {
