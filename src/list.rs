@@ -706,10 +706,133 @@ pub fn clean_broken_local(data_path: &str) -> Result<usize> {
     Ok(deleted)
 }
 
-/// Delete all broken remote backups (missing or corrupt metadata.json).
+/// What `clean_broken` should do with one broken remote backup.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CleanBrokenPlan {
+    /// Leave the backup completely intact, for the stated reason.
+    Skip { reason: String },
+    /// Delete exactly these keys, and nothing else.
+    Delete { keys: Vec<String> },
+}
+
+/// Decide what to do with one backup that `list_remote` reported as broken.
+///
+/// "Broken" only means "no readable manifest", and upload writes the manifest
+/// **last**, so an upload still in flight is indistinguishable from a backup
+/// that will never gain one. This encodes all three guards that tell them apart,
+/// in one place, so the caller has no decision left to make:
+///
+/// - `lock_is_live` -- the backup's PID lock is held by a live process, so some
+///   process is still writing it.
+/// - `newest_last_modified` / `min_age_secs` -- nothing under the prefix may have
+///   been written within the last `min_age_secs`. An absent timestamp means the
+///   age cannot be established, which is treated exactly like "too young".
+/// - `protected` -- keys a surviving manifest still references are excluded from
+///   the deletion, so a broken backup that shares data with a healthy one cannot
+///   take that data down with it (see [`is_key_protected`]).
+pub fn plan_clean_broken_deletion(
+    candidate_keys: &[String],
+    newest_last_modified: Option<i64>,
+    now_secs: i64,
+    min_age_secs: u64,
+    lock_is_live: bool,
+    protected: &HashSet<String>,
+) -> CleanBrokenPlan {
+    if lock_is_live {
+        return CleanBrokenPlan::Skip {
+            reason: "its PID lock is held by a live process, an operation is still writing it"
+                .to_string(),
+        };
+    }
+
+    let Some(newest) = newest_last_modified else {
+        return CleanBrokenPlan::Skip {
+            reason: "its age is unknown (no object under the prefix carries a last_modified \
+                     timestamp)"
+                .to_string(),
+        };
+    };
+    let age_secs = now_secs.saturating_sub(newest).max(0) as u64;
+    if age_secs < min_age_secs {
+        return CleanBrokenPlan::Skip {
+            reason: format!(
+                "its newest object is {age_secs}s old, younger than \
+                 clean_broken_min_age_secs ({min_age_secs}s), so an upload may still be in flight"
+            ),
+        };
+    }
+
+    let keys: Vec<String> = candidate_keys
+        .iter()
+        .filter(|key| !is_key_protected(key, protected))
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        return CleanBrokenPlan::Skip {
+            reason: "every key under its prefix is still referenced by a surviving backup"
+                .to_string(),
+        };
+    }
+
+    CleanBrokenPlan::Delete { keys }
+}
+
+/// Carry out `plan` for one backup, deleting exactly the keys it names.
+///
+/// The deletion is injected because an `S3Client` cannot be constructed in a unit
+/// test, and "the keys that reach S3 are the planned ones" is the property worth
+/// testing (see `clean_broken_deletes_only_planned`). Returns whether the backup
+/// was deleted; a `Skip` and a failed deletion are both logged and counted as not
+/// deleted, the latter being retried by the next `clean_broken` run.
+async fn apply_clean_broken_plan<DK, DKFut>(
+    backup_name: &str,
+    plan: CleanBrokenPlan,
+    delete_keys: DK,
+) -> bool
+where
+    DK: FnOnce(Vec<String>) -> DKFut,
+    DKFut: Future<Output = Result<()>>,
+{
+    match plan {
+        CleanBrokenPlan::Skip { reason } => {
+            info!(
+                backup = %backup_name,
+                reason = %reason,
+                "clean_broken: kept broken remote backup"
+            );
+            false
+        }
+        CleanBrokenPlan::Delete { keys } => match delete_keys(keys).await {
+            Ok(()) => {
+                info!(backup = %backup_name, "Deleted broken remote backup");
+                true
+            }
+            Err(e) => {
+                warn!(
+                    backup = %backup_name,
+                    error = %e,
+                    "Failed to delete broken remote backup"
+                );
+                false
+            }
+        },
+    }
+}
+
+/// Delete broken remote backups (missing or corrupt metadata.json) that
+/// [`plan_clean_broken_deletion`] clears for deletion.
+///
+/// `min_age_secs` is `general.clean_broken_min_age_secs`. Every deletion decision
+/// is the planner's; this function only gathers its inputs -- the keys under each
+/// broken prefix, their newest `last_modified`, the backup's PID lock state, and
+/// the keys the surviving *valid* manifests still reference.
+///
+/// Like `retention_remote_inner`, the protected-key collection fails **closed**:
+/// an unreadable valid manifest aborts the whole run before anything is deleted,
+/// because its keys are exactly the ones we would otherwise fail to protect.
 ///
 /// Returns the count of deleted broken backups.
-pub async fn clean_broken_remote(s3: &S3Client) -> Result<usize> {
+pub async fn clean_broken_remote(s3: &S3Client, min_age_secs: u64) -> Result<usize> {
     let backups = list_remote(s3).await?;
     let broken: Vec<&BackupSummary> = backups.iter().filter(|b| b.is_broken).collect();
 
@@ -718,20 +841,73 @@ pub async fn clean_broken_remote(s3: &S3Client) -> Result<usize> {
         return Ok(0);
     }
 
+    let mut protected: HashSet<String> = HashSet::new();
+    for valid in backups.iter().filter(|b| !b.is_broken) {
+        let manifest = s3
+            .get_object(&format!("{}/metadata.json", valid.name))
+            .await
+            .and_then(|data| BackupManifest::from_json_bytes(&data))
+            .with_context(|| {
+                format!(
+                    "clean_broken aborted before deleting anything: cannot read the manifest of \
+                     valid backup '{}', so its keys cannot be protected",
+                    valid.name
+                )
+            })?;
+        protected.extend(collect_key_prefixes_from_manifest(&manifest));
+    }
+
+    let now_secs = Utc::now().timestamp();
+    let s3_prefix = s3.prefix();
     let mut deleted = 0;
+
     for b in &broken {
-        match delete_remote(s3, &b.name).await {
-            Ok(()) => {
-                info!(backup = %b.name, "Deleted broken remote backup");
-                deleted += 1;
-            }
+        let objects = match s3.list_objects(&format!("{}/", b.name)).await {
+            Ok(objects) => objects,
             Err(e) => {
+                warn!(backup = %b.name, error = %e, "clean_broken: failed to list keys");
+                continue;
+            }
+        };
+        let candidate_keys: Vec<String> = objects
+            .iter()
+            .map(|obj| strip_s3_prefix(&obj.key, s3_prefix))
+            .collect();
+        // `None` when any object lacks a timestamp: the most recent write is what
+        // proves an upload has finished, so one unknown timestamp makes the age of
+        // the prefix as a whole unknown.
+        let newest_last_modified = objects
+            .iter()
+            .map(|obj| obj.last_modified.map(|t| t.timestamp()))
+            .collect::<Option<Vec<i64>>>()
+            .and_then(|stamps| stamps.into_iter().max());
+        let lock_is_live = crate::lock::lock_path_for_scope(
+            crate::lock::default_lock_dir(),
+            &crate::lock::LockScope::Backup(b.name.clone()),
+        )
+        .is_some_and(|path| crate::lock::is_lock_file_active(&path));
+
+        let plan = plan_clean_broken_deletion(
+            &candidate_keys,
+            newest_last_modified,
+            now_secs,
+            min_age_secs,
+            lock_is_live,
+            &protected,
+        );
+        if apply_clean_broken_plan(&b.name, plan, |keys| async move {
+            let failed = s3.delete_objects(keys).await?;
+            if failed > 0 {
                 warn!(
-                    backup = %b.name,
-                    error = %e,
-                    "Failed to delete broken remote backup"
+                    failed_count = failed,
+                    "clean_broken: some S3 deletions failed, retried on the next run"
                 );
             }
+            Ok(())
+        })
+        .await
+        {
+            deleted += 1;
         }
     }
 
@@ -740,14 +916,19 @@ pub async fn clean_broken_remote(s3: &S3Client) -> Result<usize> {
 }
 
 /// Clean broken backups by location (local or remote).
-pub async fn clean_broken(data_path: &str, s3: &S3Client, location: &Location) -> Result<()> {
+pub async fn clean_broken(
+    data_path: &str,
+    s3: &S3Client,
+    location: &Location,
+    min_age_secs: u64,
+) -> Result<()> {
     match location {
         Location::Local => {
             let count = clean_broken_local(data_path)?;
             info!(count = count, "Clean broken local complete");
         }
         Location::Remote => {
-            let count = clean_broken_remote(s3).await?;
+            let count = clean_broken_remote(s3, min_age_secs).await?;
             info!(count = count, "Clean broken remote complete");
         }
     }
@@ -2763,6 +2944,195 @@ mod tests {
 
         assert_eq!(outcome.skipped, vec!["old"]);
         assert!(log.calls().is_empty(), "nothing may be deleted");
+    }
+
+    // -- plan_clean_broken_deletion tests --
+
+    /// Fixed "now" and a prefix holding two keys, one of them older than an hour.
+    const NOW: i64 = 1_700_000_000;
+    const HOUR: u64 = 3600;
+
+    fn broken_keys() -> Vec<String> {
+        vec![
+            "broken/data/default/trades/default/202401_1_1_0.tar.lz4".to_string(),
+            "broken/metadata.json".to_string(),
+        ]
+    }
+
+    #[test]
+    fn plan_clean_broken_deletion_skips_while_the_lock_is_live() {
+        // Old enough and nothing is protected, but a live process holds the lock.
+        let plan = plan_clean_broken_deletion(
+            &broken_keys(),
+            Some(NOW - 10 * HOUR as i64),
+            NOW,
+            HOUR,
+            true,
+            &HashSet::new(),
+        );
+
+        match plan {
+            CleanBrokenPlan::Skip { reason } => assert!(
+                reason.contains("PID lock"),
+                "the reason must name the live lock, got: {reason}"
+            ),
+            CleanBrokenPlan::Delete { keys } => {
+                panic!("a live lock must never plan a deletion, planned: {keys:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn plan_clean_broken_deletion_skips_a_prefix_younger_than_the_threshold() {
+        // Written 5 minutes ago: this is what an in-flight upload looks like,
+        // because upload writes the manifest last.
+        let plan = plan_clean_broken_deletion(
+            &broken_keys(),
+            Some(NOW - 300),
+            NOW,
+            HOUR,
+            false,
+            &HashSet::new(),
+        );
+
+        match plan {
+            CleanBrokenPlan::Skip { reason } => assert!(
+                reason.contains("300s old"),
+                "the reason must state the age, got: {reason}"
+            ),
+            CleanBrokenPlan::Delete { keys } => {
+                panic!("a young prefix must never plan a deletion, planned: {keys:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn plan_clean_broken_deletion_skips_when_the_timestamp_is_absent() {
+        let plan =
+            plan_clean_broken_deletion(&broken_keys(), None, NOW, HOUR, false, &HashSet::new());
+
+        match plan {
+            CleanBrokenPlan::Skip { reason } => assert!(
+                reason.contains("age is unknown"),
+                "the reason must say the age could not be established, got: {reason}"
+            ),
+            CleanBrokenPlan::Delete { keys } => {
+                panic!("an unknown age must never plan a deletion, planned: {keys:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn plan_clean_broken_deletion_deletes_an_old_unlocked_prefix() {
+        let plan = plan_clean_broken_deletion(
+            &broken_keys(),
+            Some(NOW - 2 * HOUR as i64),
+            NOW,
+            HOUR,
+            false,
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            plan,
+            CleanBrokenPlan::Delete {
+                keys: broken_keys()
+            }
+        );
+    }
+
+    #[test]
+    fn plan_clean_broken_deletion_never_deletes_a_protected_key() {
+        // The broken prefix holds one key a surviving backup still references
+        // (carried into its manifest by an incremental) and one it does not.
+        let shared = "broken/data/default/trades/default/202401_1_1_0.tar.lz4".to_string();
+        let own = "broken/metadata.json".to_string();
+        let protected = protected_set(&[
+            shared.as_str(),
+            "keeper/data/default/trades/s3/202401_1_1_0/",
+        ]);
+
+        let plan = plan_clean_broken_deletion(
+            &[shared, own.clone()],
+            Some(NOW - 2 * HOUR as i64),
+            NOW,
+            HOUR,
+            false,
+            &protected,
+        );
+
+        // The protected key is absent: only the broken backup's own key is planned.
+        assert_eq!(plan, CleanBrokenPlan::Delete { keys: vec![own] });
+    }
+
+    #[tokio::test]
+    async fn clean_broken_deletes_only_planned() {
+        // The keys that reach S3 must be exactly the ones the planner returned:
+        // a planner that excludes protected keys is worthless if the caller then
+        // deletes the whole prefix anyway.
+        let candidates = vec![
+            "broken/data/default/trades/default/202401_1_1_0.tar.lz4".to_string(),
+            "broken/data/default/trades/default/202402_1_1_0.tar.lz4".to_string(),
+            "broken/metadata.json".to_string(),
+        ];
+        let protected = protected_set(&[&candidates[0]]);
+
+        let plan = plan_clean_broken_deletion(
+            &candidates,
+            Some(NOW - 2 * HOUR as i64),
+            NOW,
+            HOUR,
+            false,
+            &protected,
+        );
+        let planned_keys = match &plan {
+            CleanBrokenPlan::Delete { keys } => keys.clone(),
+            CleanBrokenPlan::Skip { reason } => panic!("expected a deletion, got skip: {reason}"),
+        };
+
+        let log = DeleteLog::default();
+        let deleted = apply_clean_broken_plan("broken", plan, |keys| {
+            let log = &log;
+            async move {
+                log.0.lock().expect("delete log poisoned").push(keys);
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(deleted, "an old, unlocked backup is reported as deleted");
+        assert_eq!(
+            log.deleted_keys(),
+            planned_keys,
+            "exactly the planned keys are deleted"
+        );
+        assert!(
+            !log.deleted_keys().contains(&candidates[0]),
+            "the protected key survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_broken_skip_deletes_nothing() {
+        let log = DeleteLog::default();
+
+        let deleted = apply_clean_broken_plan(
+            "broken",
+            CleanBrokenPlan::Skip {
+                reason: "an upload may still be in flight".to_string(),
+            },
+            |keys| {
+                let log = &log;
+                async move {
+                    log.0.lock().expect("delete log poisoned").push(keys);
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert!(!deleted, "a skipped backup is not counted as deleted");
+        assert!(log.calls().is_empty(), "a skip issues no deletion at all");
     }
 
     #[test]

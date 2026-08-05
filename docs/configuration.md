@@ -87,6 +87,14 @@ Controls logging, concurrency, retry behavior, and progress tracking. These appl
 | `retries_jitter` | int | `30` | Percent jitter on retry pause (0-100) |
 | `use_resumable_state` | bool | `true` | Track progress in state files for `--resume` |
 | `remote_cache_ttl_secs` | int | `300` | TTL for in-memory remote manifest cache (server mode). 0 = disabled |
+| `clean_broken_min_age_secs` | int | `3600` | Minimum age of a broken remote backup's newest object before `clean_broken` deletes it. 0 = delete regardless of age |
+
+Upload writes `metadata.json` **last**, so a backup still being uploaded is
+indistinguishable from a broken one. `clean_broken remote` therefore skips a broken backup
+when its PID lock is held by a live process, when its newest object was written less than
+`clean_broken_min_age_secs` ago (or carries no timestamp at all), and never deletes a key
+that a surviving backup's manifest still references. Every skip is logged with its reason.
+Lower `clean_broken_min_age_secs` only if no upload can outlive the window.
 
 ## ClickHouse
 
@@ -267,6 +275,7 @@ The most common config parameters can be overridden via environment variables. O
 | `CHBACKUP_RETRIES_ON_FAILURE` | `general.retries_on_failure` |
 | `CHBACKUP_RETRIES_PAUSE` | `general.retries_pause` |
 | `CHBACKUP_REMOTE_CACHE_TTL_SECS` | `general.remote_cache_ttl_secs` |
+| `CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS` | `general.clean_broken_min_age_secs` |
 
 ### ClickHouse
 

@@ -767,6 +767,7 @@ async fn dispatch_action_command(
         }
         "clean_broken" => {
             let location = parts.get(1).map(String::as_str).unwrap_or("");
+            let min_age_secs = config.general.clean_broken_min_age_secs;
             match location {
                 "local" => {
                     let data_path = config.clickhouse.data_path.clone();
@@ -775,9 +776,11 @@ async fn dispatch_action_command(
                         .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
                         .map(|_| ())
                 }
-                "remote" => list::clean_broken_remote(s3).await.map(|_| ()),
+                "remote" => list::clean_broken_remote(s3, min_age_secs)
+                    .await
+                    .map(|_| ()),
                 _ => {
-                    let s3_result = list::clean_broken_remote(s3).await;
+                    let s3_result = list::clean_broken_remote(s3, min_age_secs).await;
                     let data_path = config.clickhouse.data_path.clone();
                     let local_result =
                         tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
@@ -1710,9 +1713,10 @@ pub async fn clean_remote_broken(
         "clean_broken_remote",
         None, // no specific backup name
         true, // invalidate cache
-        |_config, _ch, s3, _cancel| async move {
+        |config, _ch, s3, _cancel| async move {
             info!("Starting clean_broken_remote operation");
-            let count = list::clean_broken_remote(&s3).await?;
+            let count =
+                list::clean_broken_remote(&s3, config.general.clean_broken_min_age_secs).await?;
             info!(count = count, "clean_broken_remote operation completed");
             Ok(())
         },

@@ -94,6 +94,13 @@ pub struct GeneralConfig {
     /// Used in server mode to avoid redundant S3 list calls. 0 = disabled.
     #[serde(default = "default_remote_cache_ttl_secs")]
     pub remote_cache_ttl_secs: u64,
+
+    /// Minimum age of a broken remote backup's newest object before
+    /// `clean_broken` may delete it. Because upload writes the manifest last, a
+    /// backup that is still being uploaded looks exactly like a broken one, so
+    /// young prefixes are left alone. 0 = delete regardless of age.
+    #[serde(default = "default_clean_broken_min_age_secs")]
+    pub clean_broken_min_age_secs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +536,7 @@ impl Default for GeneralConfig {
             retries_jitter: default_retries_jitter_30(),
             use_resumable_state: true,
             remote_cache_ttl_secs: default_remote_cache_ttl_secs(),
+            clean_broken_min_age_secs: default_clean_broken_min_age_secs(),
         }
     }
 }
@@ -714,6 +722,12 @@ fn default_streaming_upload_threshold() -> u64 {
 /// Default TTL for remote manifest cache: 300 seconds (5 minutes) per design 8.4.
 fn default_remote_cache_ttl_secs() -> u64 {
     300
+}
+
+/// Default minimum age of a broken remote backup before `clean_broken` deletes
+/// it: 3600 seconds (1 hour), comfortably longer than a manifest write.
+fn default_clean_broken_min_age_secs() -> u64 {
+    3600
 }
 
 fn default_retries_pause() -> String {
@@ -981,6 +995,16 @@ impl Config {
             } else {
                 warn!(
                     "CHBACKUP_REMOTE_CACHE_TTL_SECS='{}' is not a valid u64, ignoring",
+                    v
+                );
+            }
+        }
+        if let Ok(v) = std::env::var("CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.general.clean_broken_min_age_secs = n;
+            } else {
+                warn!(
+                    "CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS='{}' is not a valid u64, ignoring",
                     v
                 );
             }
@@ -1419,6 +1443,9 @@ impl Config {
             "general.remote_cache_ttl_secs" => {
                 self.general.remote_cache_ttl_secs = value.parse().context("Invalid u64")?
             }
+            "general.clean_broken_min_age_secs" => {
+                self.general.clean_broken_min_age_secs = value.parse().context("Invalid u64")?
+            }
 
             // ClickHouse
             "clickhouse.host" => self.clickhouse.host = value.to_string(),
@@ -1800,6 +1827,7 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CHBACKUP_RETRIES_ON_FAILURE" => Some("general.retries_on_failure"),
         "CHBACKUP_RETRIES_PAUSE" => Some("general.retries_pause"),
         "CHBACKUP_REMOTE_CACHE_TTL_SECS" => Some("general.remote_cache_ttl_secs"),
+        "CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS" => Some("general.clean_broken_min_age_secs"),
 
         // ClickHouse
         "CLICKHOUSE_HOST" => Some("clickhouse.host"),

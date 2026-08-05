@@ -605,7 +605,9 @@ async fn run() -> Result<()> {
                 }
                 list::Location::Remote => {
                     let s3 = S3Client::new(&config.s3).await?;
-                    let count = list::clean_broken_remote(&s3).await?;
+                    let count =
+                        list::clean_broken_remote(&s3, config.general.clean_broken_min_age_secs)
+                            .await?;
                     info!(count = count, "CleanBroken remote complete");
                 }
             }
