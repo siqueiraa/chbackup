@@ -31,8 +31,10 @@ use walkdir::WalkDir;
 
 use crate::backup::collect::resolve_shadow_part_path;
 use crate::clickhouse::client::ChClient;
-use crate::manifest::PartInfo;
-use crate::object_disk::{is_s3_disk, parse_metadata, rewrite_metadata};
+use crate::manifest::{PartInfo, S3ObjectInfo};
+use crate::object_disk::{
+    is_s3_disk, parse_metadata, restore_object_keys, rewrite_metadata, ObjectDiskMetadata,
+};
 use crate::path_encoding::encode_path_component;
 use crate::resume::{save_state_graceful, RestoreState};
 use crate::storage::{parse_s3_uri, S3Client};
@@ -195,6 +197,12 @@ struct S3RestoreParams<'a> {
 /// `clickhouse-disks/`). We create a data-disk-targeted S3Client per disk to
 /// handle the prefix difference correctly.
 async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
+    /// `restore_object_keys` needs a metadata version to spell `metadata_key`, but the
+    /// CopyObject destination it derives is the same for every version. The metadata pass
+    /// reads the real version out of each file; this only makes that independence explicit
+    /// where the destination is computed.
+    const ANY_VERSION: u32 = 1;
+
     let s3 = p.s3;
     let db = p.db;
     let table = p.table;
@@ -337,8 +345,12 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
                 }
 
                 // Destination key relative to data disk prefix:
-                // store/{uuid_hex[0..3]}/{uuid_with_dashes}/{relative_path}
-                let dest_key = format!("{}/{}", uuid_prefix, s3_obj.path);
+                // store/{uuid_hex[0..3]}/{uuid_with_dashes}/{relative_path}.
+                // Derived through the same helper the metadata rewrite below uses, so the
+                // object created here and the key ClickHouse is told to read cannot drift.
+                let dest_key =
+                    restore_object_keys(ANY_VERSION, &s3_obj.path, &uuid_prefix, &data_prefix)
+                        .copy_dest_relative_key;
 
                 debug!(
                     s3_obj_path = %s3_obj.path,
@@ -533,8 +545,11 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
                                         uuid_prefix = %uuid_prefix,
                                         "Rewriting S3 disk metadata file"
                                     );
-                                    let rewritten =
-                                        rewrite_metadata(&metadata, &uuid_prefix, &data_prefix);
+                                    let rewritten = rewrite_metadata(
+                                        &to_disk_relative_keys(&metadata, s3_objects)?,
+                                        &uuid_prefix,
+                                        &data_prefix,
+                                    );
                                     std::fs::write(&dest_path, &rewritten).with_context(|| {
                                         format!(
                                             "Failed to write rewritten metadata: {}",
@@ -580,6 +595,70 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
     }
 
     Ok(skipped_count)
+}
+
+/// Restate a v5 metadata file's object keys in the disk-relative form the manifest records.
+///
+/// A v5 file names each object by its complete key, source disk prefix included, while the
+/// manifest -- and therefore the CopyObject destination above -- names it relative to the
+/// disk key prefix. The source disk's prefix belongs to the machine the backup was taken on
+/// and is not known here, so the part's own manifest entries are what recover that form: a
+/// stored key corresponds to the manifest key it ends with on a path-component boundary.
+///
+/// v2-v4 files already store disk-relative keys, so they are returned untouched.
+///
+/// Fails when a v5 key matches no manifest key, or matches several that size cannot tell
+/// apart. Writing an unresolved key would name an object CopyObject never created, pointing
+/// ClickHouse at a key that does not exist, so this fails closed instead.
+fn to_disk_relative_keys(
+    metadata: &ObjectDiskMetadata,
+    manifest_objects: &[S3ObjectInfo],
+) -> Result<ObjectDiskMetadata> {
+    if metadata.version < 5 {
+        return Ok(metadata.clone());
+    }
+
+    let mut normalized = metadata.clone();
+    for obj in &mut normalized.objects {
+        let mut candidates: Vec<&S3ObjectInfo> = manifest_objects
+            .iter()
+            .filter(|m| {
+                obj.relative_path == m.path
+                    || obj
+                        .relative_path
+                        .strip_suffix(&m.path)
+                        .is_some_and(|prefix| prefix.ends_with('/'))
+            })
+            .collect();
+
+        // Two objects can end in the same components ("b/data.bin" and "a/b/data.bin"), so
+        // fall back to size to tell them apart.
+        if candidates.len() > 1 {
+            candidates.retain(|m| m.size == obj.size);
+        }
+
+        match candidates.as_slice() {
+            [only] => obj.relative_path = only.path.clone(),
+            [] => anyhow::bail!(
+                "v5 object key {} matches no object recorded for this part in the manifest, \
+                 so the key it was copied to is unknown",
+                obj.relative_path
+            ),
+            ambiguous => anyhow::bail!(
+                "v5 object key {} matches {} manifest keys of size {} ({}), so the key it was \
+                 copied to is ambiguous",
+                obj.relative_path,
+                ambiguous.len(),
+                obj.size,
+                ambiguous
+                    .iter()
+                    .map(|m| m.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+    Ok(normalized)
 }
 
 /// Attach parts for a single table using owned parameters.
@@ -1401,6 +1480,130 @@ mod tests {
         assert!(reparsed.objects[1]
             .relative_path
             .contains("5f3a7b2c-1234-5678-9abc-def012345678"));
+    }
+
+    #[test]
+    fn test_to_disk_relative_keys_matches_copy_destination() {
+        // A v5 file names the complete source key; the manifest (and the CopyObject
+        // destination) name it relative to the disk prefix. After normalizing, the key
+        // written into the metadata must be the key the object was copied to.
+        let content = "5\n1\t500\n500\tsource-disks/tier1/abc/xyzdatafile\n0\n0\n\n";
+        let metadata = parse_metadata(content).unwrap();
+        let manifest_objects = vec![S3ObjectInfo {
+            path: "abc/xyzdatafile".to_string(),
+            size: 500,
+            backup_key: "daily/objects/abc/xyzdatafile".to_string(),
+        }];
+
+        let normalized = to_disk_relative_keys(&metadata, &manifest_objects).unwrap();
+        assert_eq!(normalized.objects[0].relative_path, "abc/xyzdatafile");
+
+        let uuid_prefix = uuid_s3_prefix("5f3a7b2c-1234-5678-9abc-def012345678");
+        let dest_prefix = "clickhouse-disks";
+        let rewritten = rewrite_metadata(&normalized, &uuid_prefix, dest_prefix);
+        let copy_dest = restore_object_keys(
+            metadata.version,
+            &manifest_objects[0].path,
+            &uuid_prefix,
+            dest_prefix,
+        )
+        .copy_dest_relative_key;
+
+        let reparsed = parse_metadata(&rewritten).unwrap();
+        assert_eq!(
+            reparsed.objects[0].relative_path,
+            format!("{}/{}", dest_prefix, copy_dest)
+        );
+    }
+
+    #[test]
+    fn test_to_disk_relative_keys_matches_equal_key() {
+        // A v5 disk whose key prefix is empty stores keys that already equal the manifest's.
+        // That must resolve as a match, not fall through to the "unresolved key" error.
+        let content = "5\n1\t500\n500\tabc/xyzdatafile\n0\n0\n\n";
+        let metadata = parse_metadata(content).unwrap();
+        let manifest_objects = vec![S3ObjectInfo {
+            path: "abc/xyzdatafile".to_string(),
+            size: 500,
+            backup_key: String::new(),
+        }];
+
+        let normalized = to_disk_relative_keys(&metadata, &manifest_objects).unwrap();
+        assert_eq!(normalized.objects[0].relative_path, "abc/xyzdatafile");
+    }
+
+    #[test]
+    fn test_to_disk_relative_keys_leaves_v2_keys_alone() {
+        // v2-v4 keys are already disk-relative, so the version gate returns them untouched
+        // without consulting the manifest at all.
+        let content = "2\n1\t500\n500\tabc/xyzdatafile\n0\n";
+        let metadata = parse_metadata(content).unwrap();
+
+        assert_eq!(to_disk_relative_keys(&metadata, &[]).unwrap(), metadata);
+    }
+
+    #[test]
+    fn test_to_disk_relative_keys_rejects_unmatched_v5_key() {
+        // Leaving the source-prefixed key in place would name an object CopyObject never
+        // created, so an unresolvable key must fail the part instead.
+        let content = "5\n1\t500\n500\tsource-disks/tier1/abc/xyzdatafile\n0\n0\n\n";
+        let metadata = parse_metadata(content).unwrap();
+        let manifest_objects = vec![S3ObjectInfo {
+            path: "def/otherfile".to_string(),
+            size: 500,
+            backup_key: String::new(),
+        }];
+
+        let err = to_disk_relative_keys(&metadata, &manifest_objects)
+            .expect_err("unmatched v5 key must fail");
+        assert!(format!("{err:#}").contains("matches no object"), "{err:#}");
+    }
+
+    #[test]
+    fn test_to_disk_relative_keys_disambiguates_nested_keys_by_size() {
+        // "b/data.bin" is a component-boundary suffix of "a/b/data.bin", so both manifest
+        // entries match the stored key and only size can tell them apart.
+        let content = "5\n1\t500\n500\tsource-disks/a/b/data.bin\n0\n0\n\n";
+        let metadata = parse_metadata(content).unwrap();
+        let manifest_objects = vec![
+            S3ObjectInfo {
+                path: "b/data.bin".to_string(),
+                size: 700,
+                backup_key: String::new(),
+            },
+            S3ObjectInfo {
+                path: "a/b/data.bin".to_string(),
+                size: 500,
+                backup_key: String::new(),
+            },
+        ];
+
+        let normalized = to_disk_relative_keys(&metadata, &manifest_objects).unwrap();
+        assert_eq!(normalized.objects[0].relative_path, "a/b/data.bin");
+    }
+
+    #[test]
+    fn test_to_disk_relative_keys_rejects_ambiguous_v5_key() {
+        // Same-size candidates survive the tiebreak, so the pairing is genuinely ambiguous
+        // and picking one arbitrarily could point ClickHouse at the wrong object.
+        let content = "5\n1\t500\n500\tsource-disks/a/b/data.bin\n0\n0\n\n";
+        let metadata = parse_metadata(content).unwrap();
+        let manifest_objects = vec![
+            S3ObjectInfo {
+                path: "b/data.bin".to_string(),
+                size: 500,
+                backup_key: String::new(),
+            },
+            S3ObjectInfo {
+                path: "a/b/data.bin".to_string(),
+                size: 500,
+                backup_key: String::new(),
+            },
+        ];
+
+        let err = to_disk_relative_keys(&metadata, &manifest_objects)
+            .expect_err("ambiguous v5 key must fail");
+        assert!(format!("{err:#}").contains("ambiguous"), "{err:#}");
     }
 
     #[test]

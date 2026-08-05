@@ -573,6 +573,7 @@ pub async fn create(
         let table_row_clone = table_row.clone();
         let disk_type_map_clone = disk_type_map.clone();
         let disk_map_clone = disk_map.clone();
+        let disk_remote_paths_clone = disk_remote_paths.clone();
         let skip_disks_clone = config.clickhouse.skip_disks.clone();
         let skip_disk_types_clone = config.clickhouse.skip_disk_types.clone();
         let skip_projections_clone = skip_projections.to_vec();
@@ -748,6 +749,7 @@ pub async fn create(
                     &tables_for_collect,
                     &disk_type_map_clone,
                     &disk_map_clone,
+                    &disk_remote_paths_clone,
                     &skip_disks_clone,
                     &skip_disk_types_clone,
                     &skip_projections_clone,

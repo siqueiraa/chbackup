@@ -34,7 +34,7 @@ use crate::concurrency::{
 use crate::config::Config;
 use crate::error::ChBackupError;
 use crate::manifest::{BackupManifest, PartInfo, S3ObjectInfo};
-use crate::object_disk::is_s3_disk;
+use crate::object_disk::{is_s3_disk, upload_source_key};
 use crate::path_encoding::encode_path_component;
 use crate::progress::ProgressTracker;
 use crate::rate_limiter::RateLimiter;
@@ -1074,12 +1074,11 @@ async fn upload_inner(
                     continue;
                 }
 
-                // Source key: {remote_path_prefix}/{relative_path}
-                let source_key = if item.source_prefix.is_empty() {
-                    s3_obj.path.clone()
-                } else {
-                    format!("{}/{}", item.source_prefix, s3_obj.path)
-                };
+                // Source key: the manifest records keys relative to the source disk's key
+                // prefix, whatever metadata version wrote them, so putting the prefix back
+                // reconstructs the key the disk actually uses -- including v5 keys whose
+                // disk-relative part is not just the last two components.
+                let source_key = upload_source_key(&s3_obj.path, &item.source_prefix);
 
                 // Dest key: {backup_name}/objects/{relative_path}
                 let dest_key = format!("{}/objects/{}", item.backup_name, s3_obj.path);
@@ -1505,6 +1504,7 @@ async fn upload_simple_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_disk::{disk_relative_key, parse_metadata, restore_object_keys};
 
     #[test]
     fn test_should_use_multipart() {
@@ -1799,8 +1799,47 @@ mod tests {
         assert_eq!(dest_key, "daily-2024-01-15/objects/store/abc/def/data.bin");
 
         // Verify source key format: {source_prefix}/{relative_path}
-        let source_key = format!("{}/{}", source_prefix, obj_path);
+        let source_key = upload_source_key(obj_path, &source_prefix);
         assert_eq!(source_key, "ch-data/store/abc/def/data.bin");
+    }
+
+    #[test]
+    fn object_key_contract_end_to_end() {
+        // Three keys must denote the same object: the key v5 metadata stores, the key
+        // upload copies FROM, and the key restore copies TO / writes into the rewritten
+        // metadata. Walk one multi-segment v5 key through every step and assert they agree.
+        let source_disk_prefix = "clickhouse-disks/tier1";
+        let stored_v5_key = "clickhouse-disks/tier1/nested/seg/abc/xyzdatafile";
+        let metadata = format!("5\n1\t500\n500\t{stored_v5_key}\n0\n0\n\n");
+
+        let parsed = parse_metadata(&metadata).expect("v5 metadata parses");
+        assert_eq!(parsed.version, 5);
+        assert_eq!(parsed.objects[0].relative_path, stored_v5_key);
+
+        // What the manifest records.
+        let disk_relative = disk_relative_key(&parsed.objects[0].relative_path, source_disk_prefix);
+        assert_eq!(disk_relative, "nested/seg/abc/xyzdatafile");
+
+        // (a) Upload reconstructs the original source key exactly -- no lost segments.
+        assert_eq!(
+            upload_source_key(&disk_relative, source_disk_prefix),
+            stored_v5_key
+        );
+
+        // (b) and (c): the object restore copies to is the object ClickHouse will read.
+        let dest_disk_prefix = "other-disks/tierX";
+        let uuid_prefix = "store/abc/abcdef12-3456-7890-abcd-ef1234567890";
+        let keys = restore_object_keys(5, &disk_relative, uuid_prefix, dest_disk_prefix);
+        assert_eq!(
+            format!("{}/{}", dest_disk_prefix, keys.copy_dest_relative_key),
+            keys.metadata_key,
+            "v5 metadata must name the copied object by its complete key"
+        );
+
+        // v2-v4 keys are resolved relative to the disk prefix by ClickHouse itself, so the
+        // metadata must NOT bake the prefix in.
+        let v4_keys = restore_object_keys(4, &disk_relative, uuid_prefix, dest_disk_prefix);
+        assert_eq!(v4_keys.metadata_key, v4_keys.copy_dest_relative_key);
     }
 
     #[test]

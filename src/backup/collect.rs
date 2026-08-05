@@ -28,6 +28,7 @@ use crate::clickhouse::client::TableRow;
 use crate::manifest::{PartInfo, S3ObjectInfo};
 use crate::object_disk;
 use crate::path_encoding::encode_path_component;
+use crate::storage::parse_s3_uri;
 use crate::table_filter::is_disk_excluded;
 
 /// Lookup map for remote base parts: (table_key, disk_name, part_name) -> (crc64, size).
@@ -252,6 +253,10 @@ pub struct CollectedPart {
 ///
 /// Walks ALL disk paths (not just `data_path`) to discover parts on every disk.
 ///
+/// `disk_remote_paths` maps each S3 disk to its `s3://bucket/prefix` URI. The key prefix
+/// is what makes a v5 metadata key (stored complete) comparable to a v2-v4 one (stored
+/// relative to the disk prefix) in the manifest -- see [`object_disk::disk_relative_key`].
+///
 /// Returns a mapping of "db.table" -> Vec<CollectedPart> with disk_name populated.
 #[allow(clippy::too_many_arguments)]
 pub fn collect_parts(
@@ -261,6 +266,7 @@ pub fn collect_parts(
     tables: &[TableRow],
     disk_type_map: &BTreeMap<String, String>,
     disk_paths: &BTreeMap<String, String>,
+    disk_remote_paths: &BTreeMap<String, String>,
     skip_disks: &[String],
     skip_disk_types: &[String],
     skip_projections: &[String],
@@ -346,6 +352,15 @@ pub fn collect_parts(
 
         let is_s3 = object_disk::is_s3_disk(disk_type);
 
+        // Key prefix of this disk's own S3 location. v5 metadata stores complete object
+        // keys, so the prefix has to come off before the manifest records them.
+        let (_, source_key_prefix) = parse_s3_uri(
+            disk_remote_paths
+                .get(disk_name)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
+
         if is_s3 {
             info!(
                 disk = %disk_name,
@@ -413,6 +428,7 @@ pub fn collect_parts(
                             disk_name,
                             disk_path,
                             is_s3,
+                            &source_key_prefix,
                             backup_name,
                             skip_projections,
                             base_parts,
@@ -484,6 +500,7 @@ pub fn collect_parts(
                             disk_name,
                             disk_path,
                             is_s3,
+                            &source_key_prefix,
                             backup_name,
                             skip_projections,
                             base_parts,
@@ -513,6 +530,7 @@ fn process_shadow_part(
     disk_name: &str,
     disk_path: &str,
     is_s3: bool,
+    source_key_prefix: &str,
     backup_name: &str,
     skip_projections: &[String],
     base_parts: Option<&BasePartsMap>,
@@ -584,7 +602,7 @@ fn process_shadow_part(
         let mut part_info = PartInfo::new(part_name, base_size, crc64);
         // For S3 disk parts, we still need the object refs from shadow
         if is_s3 {
-            let (s3_objects, _) = collect_s3_part_metadata(&part_entry.path())?;
+            let (s3_objects, _) = collect_s3_part_metadata(&part_entry.path(), source_key_prefix)?;
             part_info = part_info.with_s3_objects(s3_objects);
         }
         result
@@ -601,7 +619,8 @@ fn process_shadow_part(
 
     if is_s3 {
         // S3 disk part: parse metadata files to extract object references
-        let (s3_objects, part_size) = collect_s3_part_metadata(&part_entry.path())?;
+        let (s3_objects, part_size) =
+            collect_s3_part_metadata(&part_entry.path(), source_key_prefix)?;
 
         info!(
             table = %full_table_name,
@@ -684,7 +703,15 @@ fn process_shadow_part(
 /// Reads all files in the part directory as metadata files,
 /// parses them using the object disk metadata parser, and builds a list of
 /// S3ObjectInfo entries. Returns the list and the total size of all objects.
-fn collect_s3_part_metadata(part_dir: &Path) -> Result<(Vec<S3ObjectInfo>, u64)> {
+///
+/// `source_key_prefix` is the disk's own S3 key prefix. Keys are recorded relative to
+/// it so that upload can rebuild the source key with
+/// [`object_disk::upload_source_key`] and restore can place the object under the
+/// destination disk's prefix, whichever metadata version wrote them.
+fn collect_s3_part_metadata(
+    part_dir: &Path,
+    source_key_prefix: &str,
+) -> Result<(Vec<S3ObjectInfo>, u64)> {
     let mut s3_objects = Vec::new();
     let mut total_size: u64 = 0;
 
@@ -712,7 +739,10 @@ fn collect_s3_part_metadata(part_dir: &Path) -> Result<(Vec<S3ObjectInfo>, u64)>
             Ok(metadata) => {
                 for obj_ref in &metadata.objects {
                     s3_objects.push(S3ObjectInfo {
-                        path: obj_ref.relative_path.clone(),
+                        path: object_disk::disk_relative_key(
+                            &obj_ref.relative_path,
+                            source_key_prefix,
+                        ),
                         size: obj_ref.size,
                         backup_key: String::new(), // Set during upload
                     });
@@ -998,6 +1028,7 @@ mod tests {
             "default".to_string(),
             data_path.to_string_lossy().to_string(),
         )]);
+        let disk_remote_paths = BTreeMap::new();
 
         let result = collect_parts(
             &data_path.to_string_lossy(),
@@ -1006,6 +1037,7 @@ mod tests {
             &tables,
             &disk_type_map,
             &disk_paths,
+            &disk_remote_paths,
             &[],
             &[],
             &[],
@@ -1083,6 +1115,10 @@ mod tests {
                 s3_disk_path.to_string_lossy().to_string(),
             ),
         ]);
+        let disk_remote_paths = BTreeMap::from([(
+            "s3disk".to_string(),
+            "s3://data-bucket/clickhouse-disks".to_string(),
+        )]);
 
         let result = collect_parts(
             &local_data.to_string_lossy(),
@@ -1091,6 +1127,7 @@ mod tests {
             &tables,
             &disk_type_map,
             &disk_paths,
+            &disk_remote_paths,
             &[],
             &[],
             &[],
@@ -1108,6 +1145,8 @@ mod tests {
 
         let s3_objs = parts[0].part_info.s3_objects.as_ref().unwrap();
         assert_eq!(s3_objs.len(), 1);
+        // v2 metadata is already disk-relative: the disk's key prefix must not be stripped
+        // from it a second time.
         assert_eq!(s3_objs[0].path, "store/abc/def/data.bin");
         assert_eq!(s3_objs[0].size, 500);
         assert_eq!(parts[0].part_info.size, 500); // Size from metadata, not dir_size
@@ -1260,6 +1299,7 @@ mod tests {
             ("default".to_string(), disk1.to_string_lossy().to_string()),
             ("nvme1".to_string(), disk2.to_string_lossy().to_string()),
         ]);
+        let disk_remote_paths = BTreeMap::new();
 
         let result = collect_parts(
             &disk1.to_string_lossy(),
@@ -1268,6 +1308,7 @@ mod tests {
             &tables,
             &disk_type_map,
             &disk_paths,
+            &disk_remote_paths,
             &[],
             &[],
             &[],
@@ -1637,7 +1678,7 @@ mod tests {
         std::fs::write(part_dir.join("data.bin"), b"not metadata").unwrap();
         std::fs::write(part_dir.join("checksums.txt"), b"checksum data").unwrap();
 
-        let (objects, total_size) = collect_s3_part_metadata(&part_dir).unwrap();
+        let (objects, total_size) = collect_s3_part_metadata(&part_dir, "").unwrap();
         assert!(objects.is_empty());
         assert_eq!(total_size, 0);
     }
@@ -1655,10 +1696,29 @@ mod tests {
         // checksums.txt is not a metadata file -- will fail to parse and be skipped
         std::fs::write(part_dir.join("checksums.txt"), b"checksum data").unwrap();
 
-        let (objects, total_size) = collect_s3_part_metadata(&part_dir).unwrap();
+        let (objects, total_size) = collect_s3_part_metadata(&part_dir, "").unwrap();
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].path, "store/abc/data.bin");
         assert_eq!(objects[0].size, 500);
+        assert_eq!(total_size, 500);
+    }
+
+    #[test]
+    fn test_collect_s3_part_metadata_strips_v5_disk_prefix() {
+        // v5 stores the complete object key. The manifest must record it relative to the
+        // disk's key prefix, otherwise upload would prepend the prefix a second time and
+        // restore would copy to a key the rewritten metadata does not name.
+        let tmp = tempfile::tempdir().unwrap();
+        let part_dir = tmp.path().join("part_1_1_0");
+        std::fs::create_dir_all(&part_dir).unwrap();
+
+        let metadata = "5\n1\t500\n500\tclickhouse-disks/tier1/abc/xyzdata\n0\n0\n\n";
+        std::fs::write(part_dir.join("data.bin"), metadata).unwrap();
+
+        let (objects, total_size) =
+            collect_s3_part_metadata(&part_dir, "clickhouse-disks/tier1").unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].path, "abc/xyzdata");
         assert_eq!(total_size, 500);
     }
 }
