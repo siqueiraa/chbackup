@@ -145,7 +145,7 @@ mod tests {
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.objects.len(), 1);
 
-        let rewritten = rewrite_metadata(&parsed, "store/new_prefix");
+        let rewritten = rewrite_metadata(&parsed, "store/new_prefix", "clickhouse-disks");
         assert!(!rewritten.is_empty());
     }
 

@@ -533,7 +533,8 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
                                         uuid_prefix = %uuid_prefix,
                                         "Rewriting S3 disk metadata file"
                                     );
-                                    let rewritten = rewrite_metadata(&metadata, &uuid_prefix);
+                                    let rewritten =
+                                        rewrite_metadata(&metadata, &uuid_prefix, &data_prefix);
                                     std::fs::write(&dest_path, &rewritten).with_context(|| {
                                         format!(
                                             "Failed to write rewritten metadata: {}",
@@ -1385,7 +1386,7 @@ mod tests {
 
         let uuid = "5f3a7b2c-1234-5678-9abc-def012345678";
         let new_prefix = uuid_s3_prefix(uuid);
-        let rewritten = rewrite_metadata(&metadata, &new_prefix);
+        let rewritten = rewrite_metadata(&metadata, &new_prefix, "clickhouse-disks");
 
         let reparsed = parse_metadata(&rewritten).unwrap();
         assert_eq!(reparsed.version, 3);

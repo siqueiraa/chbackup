@@ -10,7 +10,15 @@
 //! | 2       | VersionRelativePath   | Relative to disk root                |
 //! | 3       | VersionReadOnlyFlag   | v2 + ReadOnly flag                   |
 //! | 4       | VersionInlineData     | Small data inlined (ObjectSize=0)    |
-//! | 5       | VersionFullObjectKey  | Full object key (CH 25.10+)          |
+//! | 5       | VersionFullObjectKey  | Complete object key (CH 24.1+)       |
+//!
+//! Version 5 (`VERSION_FULL_OBJECT_KEY`) has existed since ClickHouse 24.1 --
+//! including 24.8, which this project CI-tests. ClickHouse reads those keys via
+//! `ObjectStorageKey::createAsAbsolute`, meaning the stored string is the COMPLETE
+//! object key and is *not* joined with the disk's key prefix. For versions 1-4 the
+//! stored string is relative and ClickHouse joins it with the disk prefix itself.
+//! Any key written back into a metadata file must respect that split -- see
+//! [`restore_object_keys`].
 //!
 //! Metadata file format:
 //! ```text
@@ -50,7 +58,9 @@ pub struct ObjectDiskMetadata {
 /// Reference to a single S3 object within a part.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectRef {
-    /// Object path (relative to disk root for v2+, absolute for v1).
+    /// Object key exactly as stored in the metadata file: relative to the disk
+    /// key prefix for v2-v4, a complete object key for v5, an absolute S3 URL
+    /// for v1. Use [`disk_relative_key`] to normalize it to a disk-relative key.
     pub relative_path: String,
     /// Object size in bytes.
     pub size: u64,
@@ -58,9 +68,9 @@ pub struct ObjectRef {
 
 /// Parse a ClickHouse object disk metadata file.
 ///
-/// Handles all 5 format versions per design doc section 3.7.
-/// For version 5 (FullObjectKey), extracts the last 2 path components
-/// to normalize to a relative path.
+/// Handles all 5 format versions per design doc section 3.7. Object keys are
+/// kept exactly as written in the file -- truncating a v5 key would discard
+/// path components that are part of the key ClickHouse reads.
 pub fn parse_metadata(content: &str) -> Result<ObjectDiskMetadata> {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
@@ -117,17 +127,8 @@ pub fn parse_metadata(content: &str) -> Result<ObjectDiskMetadata> {
             .trim()
             .parse()
             .context("Failed to parse object size")?;
-        let path = obj_parts[1].trim().to_string();
-
-        // Version 5: extract last 2 path components for relative path
-        let relative_path = if version == 5 {
-            extract_relative_path_v5(&path)
-        } else {
-            path
-        };
-
         objects.push(ObjectRef {
-            relative_path,
+            relative_path: obj_parts[1].trim().to_string(),
             size,
         });
     }
@@ -174,27 +175,90 @@ pub fn parse_metadata(content: &str) -> Result<ObjectDiskMetadata> {
     })
 }
 
-/// Extract the last 2 path components from a full S3 key (version 5).
-///
-/// Example: `s3://bucket/store/abc/def/data.bin` -> `def/data.bin`
-/// Example: `store/abc/def/ghi/data.bin` -> `ghi/data.bin`
-fn extract_relative_path_v5(full_path: &str) -> String {
-    let parts: Vec<&str> = full_path.rsplitn(3, '/').collect();
-    if parts.len() >= 2 {
-        // rsplitn gives: [last, second_to_last, rest...]
-        format!("{}/{}", parts[1], parts[0])
+/// Join a disk key prefix with a disk-relative key, tolerating an empty prefix
+/// and stray slashes on either side of the join.
+fn join_disk_key(disk_key_prefix: &str, disk_relative: &str) -> String {
+    let prefix = disk_key_prefix.trim_matches('/');
+    if prefix.is_empty() {
+        disk_relative.to_string()
     } else {
-        full_path.to_string()
+        format!("{}/{}", prefix, disk_relative)
     }
 }
 
-/// Rewrite metadata with a new path prefix for restore.
+/// Normalize a stored object key to a key relative to the disk's key prefix.
 ///
-/// Updates object paths to use the new prefix, sets RefCount=0 and
-/// ReadOnly=false per design doc section 5.4 step 5.
+/// A v5 key is stored complete, so it starts with the source disk's key prefix;
+/// stripping that prefix yields the same disk-relative form v2-v4 store directly.
+/// Keys that do not carry the prefix (v2-v4, or a v5 disk whose prefix is empty)
+/// are returned unchanged. This is what the manifest records, which is what makes
+/// [`upload_source_key`] able to rebuild the source key without a new manifest field.
+pub fn disk_relative_key(stored_key: &str, disk_key_prefix: &str) -> String {
+    let prefix = disk_key_prefix.trim_matches('/');
+    if prefix.is_empty() {
+        return stored_key.to_string();
+    }
+    stored_key
+        .strip_prefix(&format!("{}/", prefix))
+        .unwrap_or(stored_key)
+        .to_string()
+}
+
+/// Rebuild the CopyObject source key for an object stored on a source disk.
+///
+/// Inverse of [`disk_relative_key`]: `upload_source_key(disk_relative_key(k, p), p) == k`
+/// for any key `k` that lives under prefix `p`.
+pub fn upload_source_key(disk_relative: &str, source_prefix: &str) -> String {
+    join_disk_key(source_prefix, disk_relative)
+}
+
+/// The two keys a restored object must agree on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreObjectKeys {
+    /// Destination of the CopyObject, relative to the destination disk's key prefix.
+    pub copy_dest_relative_key: String,
+    /// Key to write into the rewritten metadata file, in the form ClickHouse
+    /// interprets for this metadata version.
+    pub metadata_key: String,
+}
+
+/// Derive the restore-side keys for one object: where it is copied to, and how
+/// that destination must be spelled inside the metadata file.
+///
+/// Both keys denote the same object. They differ in spelling because ClickHouse
+/// resolves a v5 key with `createAsAbsolute` (the metadata carries the complete
+/// key, prefix included) but a v2-v4 key relative to the disk key prefix (which
+/// ClickHouse prepends itself). Emitting the relative form for v5 -- or the
+/// absolute form for v2-v4 -- points the restored part at a key that does not exist.
+pub fn restore_object_keys(
+    version: u32,
+    disk_relative: &str,
+    uuid_prefix: &str,
+    dest_disk_key_prefix: &str,
+) -> RestoreObjectKeys {
+    let copy_dest_relative_key = format!("{}/{}", uuid_prefix.trim_end_matches('/'), disk_relative);
+    let metadata_key = if version >= 5 {
+        join_disk_key(dest_disk_key_prefix, &copy_dest_relative_key)
+    } else {
+        copy_dest_relative_key.clone()
+    };
+    RestoreObjectKeys {
+        copy_dest_relative_key,
+        metadata_key,
+    }
+}
+
+/// Rewrite metadata to point at the restored objects.
+///
+/// Object keys are re-derived through [`restore_object_keys`], so v5 files get the
+/// complete destination key and v2-v4 files keep the bare disk-relative form.
+/// Sets RefCount=0 and ReadOnly=false per design doc section 5.4 step 5.
 /// Preserves inline data for v4+ objects.
-pub fn rewrite_metadata(metadata: &ObjectDiskMetadata, new_prefix: &str) -> String {
-    let new_prefix = new_prefix.trim_end_matches('/');
+pub fn rewrite_metadata(
+    metadata: &ObjectDiskMetadata,
+    uuid_prefix: &str,
+    dest_disk_key_prefix: &str,
+) -> String {
     let mut result = String::new();
 
     // Version
@@ -208,10 +272,15 @@ pub fn rewrite_metadata(metadata: &ObjectDiskMetadata, new_prefix: &str) -> Stri
         metadata.total_size
     ));
 
-    // Object lines with rewritten paths
+    // Object lines with rewritten keys
     for obj in &metadata.objects {
-        let new_path = format!("{}/{}", new_prefix, obj.relative_path);
-        result.push_str(&format!("{}\t{}\n", obj.size, new_path));
+        let keys = restore_object_keys(
+            metadata.version,
+            &obj.relative_path,
+            uuid_prefix,
+            dest_disk_key_prefix,
+        );
+        result.push_str(&format!("{}\t{}\n", obj.size, keys.metadata_key));
     }
 
     // RefCount = 0 (per design doc)
@@ -539,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_parse_v5_full_object_key() {
-        // Version 5: full absolute key, we extract last 2 path components
+        // Version 5: the stored string is the complete object key, kept verbatim
         let content = "5\n\
                         1\t1024\n\
                         1024\tstore/abc/def/ghi/data.bin\n\
@@ -549,23 +618,8 @@ mod tests {
         let meta = parse_metadata(content).unwrap();
         assert_eq!(meta.version, 5);
         assert_eq!(meta.objects.len(), 1);
-        // Last 2 path components: ghi/data.bin
-        assert_eq!(meta.objects[0].relative_path, "ghi/data.bin");
+        assert_eq!(meta.objects[0].relative_path, "store/abc/def/ghi/data.bin");
         assert_eq!(meta.objects[0].size, 1024);
-    }
-
-    #[test]
-    fn test_parse_v5_long_path() {
-        let content = "5\n\
-                        1\t2048\n\
-                        2048\ts3://mybucket/prefix/store/abc/def/202401_1_50_3/data.bin\n\
-                        0\n\
-                        0\n\
-                        \n";
-        let meta = parse_metadata(content).unwrap();
-        assert_eq!(meta.version, 5);
-        // Last 2 components: 202401_1_50_3/data.bin
-        assert_eq!(meta.objects[0].relative_path, "202401_1_50_3/data.bin");
     }
 
     #[test]
@@ -576,7 +630,7 @@ mod tests {
                         200\tstore/abc/def/index.mrk\n\
                         3\n";
         let meta = parse_metadata(content).unwrap();
-        let rewritten = rewrite_metadata(&meta, "store/new_uuid/xyz");
+        let rewritten = rewrite_metadata(&meta, "store/new_uuid/xyz", "");
 
         let lines: Vec<&str> = rewritten.lines().collect();
         assert_eq!(lines[0], "2");
@@ -596,7 +650,7 @@ mod tests {
         let meta = parse_metadata(content).unwrap();
         assert!(meta.read_only);
 
-        let rewritten = rewrite_metadata(&meta, "store/new");
+        let rewritten = rewrite_metadata(&meta, "store/new", "");
         let lines: Vec<&str> = rewritten.lines().collect();
         // line 0: version, 1: header, 2: object, 3: ref_count, 4: read_only
         assert_eq!(lines[3], "0"); // RefCount = 0
@@ -612,7 +666,7 @@ mod tests {
                         0\n\
                         SGVsbG8gV29ybGQ=\n";
         let meta = parse_metadata(content).unwrap();
-        let rewritten = rewrite_metadata(&meta, "store/new");
+        let rewritten = rewrite_metadata(&meta, "store/new", "");
 
         let lines: Vec<&str> = rewritten.lines().collect();
         // line 0: version, 1: header, 2: object, 3: ref_count, 4: read_only, 5: inline_data
@@ -719,16 +773,108 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_relative_path_v5() {
+    fn test_object_key_v4_rewrite_is_prefix_free() {
+        // v2-v4 metadata is relative: ClickHouse joins the disk key prefix itself,
+        // so the rewritten bytes must carry only {uuid_prefix}/{disk_relative} --
+        // identical to the behavior before v5 handling was introduced.
+        let content = "4\n\
+                        1\t500\n\
+                        500\tstore/abc/202401_1_50_3/data.bin\n\
+                        7\n\
+                        1\n\
+                        SGVsbG8gV29ybGQ=\n";
+        let meta = parse_metadata(content).unwrap();
+        let rewritten = rewrite_metadata(&meta, "store/5f3/5f3a-uuid", "clickhouse-disks");
+
         assert_eq!(
-            extract_relative_path_v5("store/abc/def/data.bin"),
-            "def/data.bin"
+            rewritten,
+            "4\n\
+             1\t500\n\
+             500\tstore/5f3/5f3a-uuid/store/abc/202401_1_50_3/data.bin\n\
+             0\n\
+             0\n\
+             SGVsbG8gV29ybGQ=\n"
+        );
+    }
+
+    #[test]
+    fn test_object_key_v5_full_key_survives_round_trip() {
+        // A v5 key keeps every component: truncating it to the last two would make
+        // the upload source key unreconstructible.
+        let content = "5\n\
+                        1\t2048\n\
+                        2048\tclickhouse-disks/store/abc/abcdef-1234/data.bin\n\
+                        1\n\
+                        0\n\
+                        \n";
+        let meta = parse_metadata(content).unwrap();
+        let stored_key = &meta.objects[0].relative_path;
+        assert_eq!(
+            stored_key,
+            "clickhouse-disks/store/abc/abcdef-1234/data.bin"
+        );
+
+        let relative = disk_relative_key(stored_key, "clickhouse-disks");
+        assert_eq!(relative, "store/abc/abcdef-1234/data.bin");
+        assert_eq!(
+            &upload_source_key(&relative, "clickhouse-disks"),
+            stored_key
+        );
+    }
+
+    #[test]
+    fn test_object_key_disk_relative_key_without_prefix() {
+        // v2-v4 keys (and any key not under the prefix) pass through unchanged.
+        assert_eq!(
+            disk_relative_key("store/abc/data.bin", "clickhouse-disks"),
+            "store/abc/data.bin"
         );
         assert_eq!(
-            extract_relative_path_v5("s3://mybucket/prefix/store/abc/def/202401_1_50_3/data.bin"),
-            "202401_1_50_3/data.bin"
+            disk_relative_key("store/abc/data.bin", ""),
+            "store/abc/data.bin"
         );
-        assert_eq!(extract_relative_path_v5("data.bin"), "data.bin");
+    }
+
+    #[test]
+    fn test_object_key_restore_keys_are_version_aware() {
+        let v5 = restore_object_keys(5, "store/abc/part/data.bin", "store/5f3/5f3a-uuid", "disks");
+        assert_eq!(
+            v5.copy_dest_relative_key,
+            "store/5f3/5f3a-uuid/store/abc/part/data.bin"
+        );
+        assert_eq!(
+            v5.metadata_key,
+            "disks/store/5f3/5f3a-uuid/store/abc/part/data.bin"
+        );
+
+        let v4 = restore_object_keys(4, "store/abc/part/data.bin", "store/5f3/5f3a-uuid", "disks");
+        assert_eq!(v4.metadata_key, v4.copy_dest_relative_key);
+    }
+
+    #[test]
+    fn test_object_key_v5_rewrite_emits_absolute_key() {
+        let content = "5\n\
+                        1\t2048\n\
+                        2048\tclickhouse-disks/store/abc/abcdef-1234/data.bin\n\
+                        1\n\
+                        0\n\
+                        \n";
+        let meta = parse_metadata(content).unwrap();
+        let relative = disk_relative_key(&meta.objects[0].relative_path, "clickhouse-disks");
+        let meta = ObjectDiskMetadata {
+            objects: vec![ObjectRef {
+                relative_path: relative,
+                size: meta.objects[0].size,
+            }],
+            ..meta
+        };
+
+        let rewritten = rewrite_metadata(&meta, "store/5f3/5f3a-uuid", "clickhouse-disks");
+        let lines: Vec<&str> = rewritten.lines().collect();
+        assert_eq!(
+            lines[2],
+            "2048\tclickhouse-disks/store/5f3/5f3a-uuid/store/abc/abcdef-1234/data.bin"
+        );
     }
 
     #[test]
@@ -738,7 +884,7 @@ mod tests {
                         500\tstore/abc/data.bin\n\
                         1\n";
         let meta = parse_metadata(content).unwrap();
-        let rewritten = rewrite_metadata(&meta, "store/new/");
+        let rewritten = rewrite_metadata(&meta, "store/new/", "");
 
         let lines: Vec<&str> = rewritten.lines().collect();
         // Should not have double slash
@@ -841,7 +987,7 @@ mod tests {
             read_only: false,
             inline_data: None,
         };
-        let rewritten = rewrite_metadata(&meta, "store/new");
+        let rewritten = rewrite_metadata(&meta, "store/new", "");
         let lines: Vec<&str> = rewritten.lines().collect();
         assert_eq!(lines[0], "4"); // version
         assert_eq!(lines[1], "1\t500"); // object count + total size
