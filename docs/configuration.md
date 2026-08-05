@@ -115,6 +115,7 @@ Connection settings and backup/restore behavior. chbackup must run on the same h
 | `tls_ca` | string | _(empty)_ | TLS custom CA file path |
 | `sync_replicated_tables` | bool | `true` | Run SYSTEM SYNC REPLICA before FREEZE |
 | `check_replicas_before_attach` | bool | `true` | Verify replicas are synced before ATTACH |
+| `strict_replica_sync` | bool | `true` | With the default, when `check_replicas_before_attach` polling **completes and reports the replica is still behind**, that table is **not attached** and all of its parts are reported as skipped, so the restore exits 3 — matching Go's `CheckReplicationInProgress`, which returns before attaching. The rationale is partial restore, not row duplication: a table brought live while the other replica's parts are still arriving is incomplete and inconsistent for readers, and a loud exit 3 is better than a table that silently looks restored. (Attaching a backup's parts on a second replica does **not** duplicate rows — ClickHouse derives the `/blocks` deduplication key from part content, not from the block number assigned at ATTACH time, identically in 23.8–25.1. A residual, *unconfirmed* path exists via `/blocks` window eviction when a restore attaches more parts than `replicated_deduplication_window`, but that is a different mechanism and is not what this flag is justified by.) Set to `false` to restore the old behaviour — warn and attach anyway. A sync check that **fails** (e.g. `system.replicas` unreachable) is indeterminate and always warns and proceeds, in both modes |
 | `check_parts_columns` | bool | `false` | Validate column type consistency before backup |
 | `mutation_wait_timeout` | string | `5m` | Timeout for waiting on mutations to complete |
 | `restore_as_attach` | bool | `false` | Use DETACH/ATTACH TABLE mode for full restores |
@@ -295,6 +296,7 @@ The most common config parameters can be overridden via environment variables. O
 | `CLICKHOUSE_TLS_CERT` | `clickhouse.tls_cert` |
 | `CLICKHOUSE_TLS_CA` | `clickhouse.tls_ca` |
 | `CLICKHOUSE_SYNC_REPLICATED_TABLES` | `clickhouse.sync_replicated_tables` |
+| `CLICKHOUSE_STRICT_REPLICA_SYNC` | `clickhouse.strict_replica_sync` (default `true` skips a table's attach when replica-sync polling completes and reports the replica is still behind, matching Go's `CheckReplicationInProgress`; set `false` for the old behaviour of warning and attaching anyway) |
 | `CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE` | `clickhouse.attach_table_require_complete` (default `true` refuses to attach a Replicated table whose parts are not all present) |
 | `CLICKHOUSE_ZK_CHECK_STRICT` | `clickhouse.zk_check_strict` (default `true` fails a Replicated table whose ZooKeeper state could not be verified; set `false` for the old permissive behaviour of creating it without conflict resolution) |
 | `CLICKHOUSE_MAX_CONNECTIONS` | `clickhouse.max_connections` |

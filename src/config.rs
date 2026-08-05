@@ -159,6 +159,11 @@ pub struct ClickHouseConfig {
     #[serde(default = "default_check_replicas_timeout")]
     pub check_replicas_before_attach_timeout: u64,
 
+    /// skip a table's attach when replication sync polling times out
+    /// (false = warn and attach anyway)
+    #[serde(default = "default_true")]
+    pub strict_replica_sync: bool,
+
     /// validate column type consistency before backup
     #[serde(default)]
     pub check_parts_columns: bool,
@@ -567,6 +572,7 @@ impl Default for ClickHouseConfig {
             sync_replicated_tables: false,
             check_replicas_before_attach: true,
             check_replicas_before_attach_timeout: default_check_replicas_timeout(),
+            strict_replica_sync: true,
             check_parts_columns: false,
             mutation_wait_timeout: default_mutation_wait_timeout(),
             restore_as_attach: false,
@@ -1096,6 +1102,16 @@ impl Config {
                 );
             }
         }
+        if let Ok(v) = std::env::var("CLICKHOUSE_STRICT_REPLICA_SYNC") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.clickhouse.strict_replica_sync = b;
+            } else {
+                warn!(
+                    "CLICKHOUSE_STRICT_REPLICA_SYNC='{}' is not a valid bool, ignoring",
+                    v
+                );
+            }
+        }
         if let Ok(v) = std::env::var("CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE") {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.attach_table_require_complete = b;
@@ -1507,6 +1523,9 @@ impl Config {
                 self.clickhouse.check_replicas_before_attach_timeout =
                     value.parse().context("Invalid u64")?
             }
+            "clickhouse.strict_replica_sync" => {
+                self.clickhouse.strict_replica_sync = value.parse().context("Invalid bool")?
+            }
             "clickhouse.check_parts_columns" => {
                 self.clickhouse.check_parts_columns = value.parse().context("Invalid bool")?
             }
@@ -1882,6 +1901,7 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CLICKHOUSE_CHECK_REPLICAS_BEFORE_ATTACH_TIMEOUT" => {
             Some("clickhouse.check_replicas_before_attach_timeout")
         }
+        "CLICKHOUSE_STRICT_REPLICA_SYNC" => Some("clickhouse.strict_replica_sync"),
         "CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE" => {
             Some("clickhouse.attach_table_require_complete")
         }
@@ -2113,6 +2133,35 @@ mod tests {
             !config.clickhouse.check_parts_columns,
             "check_parts_columns should default to false per §12 (opt-in)"
         );
+    }
+
+    #[test]
+    fn test_strict_replica_sync_default_and_overrides() {
+        // Default is on: an unsynced replica skips that table's attach.
+        assert!(Config::default().clickhouse.strict_replica_sync);
+
+        // set_field round-trip (the path used by --config-override and the API).
+        let mut config = Config::default();
+        config
+            .set_field("clickhouse.strict_replica_sync", "false")
+            .unwrap();
+        assert!(!config.clickhouse.strict_replica_sync);
+
+        assert_eq!(
+            env_key_to_dot_notation("CLICKHOUSE_STRICT_REPLICA_SYNC"),
+            Some("clickhouse.strict_replica_sync")
+        );
+
+        // SAFETY: single-threaded test, no concurrent env reads
+        unsafe {
+            std::env::set_var("CLICKHOUSE_STRICT_REPLICA_SYNC", "false");
+        }
+        let mut config = Config::default();
+        config.apply_env_overlay();
+        unsafe {
+            std::env::remove_var("CLICKHOUSE_STRICT_REPLICA_SYNC");
+        }
+        assert!(!config.clickhouse.strict_replica_sync);
     }
 
     #[test]

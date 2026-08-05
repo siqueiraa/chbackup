@@ -704,14 +704,36 @@ pub async fn restore(
     }
 
     // 5a-2. check_replicas_before_attach: poll replication sync with timeout
+    let mut unsynced_parts = 0u64;
     if config.clickhouse.check_replicas_before_attach {
         let timeout = config.clickhouse.check_replicas_before_attach_timeout;
+        let strict = config.clickhouse.strict_replica_sync;
+        let mut unsynced: HashSet<String> = HashSet::new();
+
         for (table_key, params) in &restore_items {
-            if is_replicated_engine(&params.engine) {
-                match ch
-                    .check_replica_sync_with_timeout(&params.db, &params.table, timeout)
-                    .await
-                {
+            if !is_replicated_engine(&params.engine) {
+                continue;
+            }
+            let synced = ch
+                .check_replica_sync_with_timeout(&params.db, &params.table, timeout)
+                .await;
+
+            match decide_replica_sync(&synced, strict) {
+                ReplicaSyncDecision::Skip => {
+                    error!(
+                        table = %table_key,
+                        db = %params.db,
+                        table_name = %params.table,
+                        timeout_secs = timeout,
+                        parts = params.parts.len(),
+                        "Replica is NOT in sync after polling timeout. Not attaching this \
+                         table; all of its parts count as skipped. Set \
+                         clickhouse.strict_replica_sync=false to attach anyway"
+                    );
+                    unsynced_parts += params.parts.len() as u64;
+                    unsynced.insert(table_key.clone());
+                }
+                ReplicaSyncDecision::Attach => match &synced {
                     Ok(true) => {
                         debug!(table = %table_key, "Replica is in sync");
                     }
@@ -732,9 +754,11 @@ pub async fn restore(
                             "Failed to check replica sync status, proceeding with restore"
                         );
                     }
-                }
+                },
             }
         }
+
+        restore_items.retain(|(table_key, _)| !unsynced.contains(table_key));
     }
 
     // 5b. ATTACH TABLE mode: for Replicated tables when restore_as_attach is enabled.
@@ -836,10 +860,11 @@ pub async fn restore(
     // Merge ATTACH TABLE mode results
     results.extend(attach_table_results);
 
-    // 7. Tally totals. Parts of tables the pre-flight refused count as skipped, so the
-    // PartialRestore contract below fires and the CLI exits 3.
+    // 7. Tally totals. Parts of tables the pre-flight refused, and of tables whose replicas
+    // were not in sync, count as skipped, so the PartialRestore contract below fires and the
+    // CLI exits 3.
     let mut total_attached = 0u64;
-    let mut total_skipped = attach_preflight.refused_parts;
+    let mut total_skipped = attach_preflight.refused_parts + unsynced_parts;
     let tables_restored = results.len() as u64;
     for (_table_key, attached, skipped) in &results {
         total_attached += attached;
@@ -1130,6 +1155,33 @@ fn part_matches_partitions(part_name: &str, partition_filter: &[String]) -> bool
     match PartSortKey::from_part_name(part_name) {
         Some(key) => partition_filter.contains(&key.partition),
         None => true,
+    }
+}
+
+/// What a replica-sync check outcome means for one table's attach.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplicaSyncDecision {
+    /// Attach the table's parts.
+    Attach,
+    /// Leave the table alone; its parts count as skipped.
+    Skip,
+}
+
+/// Decide whether a table may be attached, given the outcome of its replica-sync poll.
+///
+/// `Ok(false)` is the only outcome that can skip: polling ran to completion and the replica
+/// was still behind, so bringing the table up now yields a table that is incomplete for
+/// readers while the other replica's parts are still arriving. Go's
+/// `CheckReplicationInProgress` returns before attaching in that case, and
+/// `clickhouse.strict_replica_sync` (default true) matches it.
+///
+/// An `Err` is *indeterminate* — the check itself failed, which is not evidence that
+/// replication is behind — and keeps its pre-existing non-fatal warn-and-proceed behaviour
+/// in both modes.
+fn decide_replica_sync<E>(synced: &Result<bool, E>, strict: bool) -> ReplicaSyncDecision {
+    match synced {
+        Ok(false) if strict => ReplicaSyncDecision::Skip,
+        _ => ReplicaSyncDecision::Attach,
     }
 }
 
@@ -1507,6 +1559,36 @@ async fn try_attach_table_mode(
 mod tests {
     use super::*;
     use crate::clickhouse::client::TableRow;
+
+    /// A completed poll that reports "not synced" is the only outcome that may skip, and
+    /// only in strict mode. `Err` is indeterminate and attaches in both modes.
+    #[test]
+    fn strict_replica_sync_decides_skip_only_on_completed_unsynced_poll() {
+        let unsynced: Result<bool, ()> = Ok(false);
+        let synced: Result<bool, ()> = Ok(true);
+        let failed: Result<bool, ()> = Err(());
+
+        assert_eq!(
+            decide_replica_sync(&unsynced, true),
+            ReplicaSyncDecision::Skip
+        );
+        assert_eq!(
+            decide_replica_sync(&unsynced, false),
+            ReplicaSyncDecision::Attach
+        );
+        assert_eq!(
+            decide_replica_sync(&synced, true),
+            ReplicaSyncDecision::Attach
+        );
+        assert_eq!(
+            decide_replica_sync(&failed, true),
+            ReplicaSyncDecision::Attach
+        );
+        assert_eq!(
+            decide_replica_sync(&failed, false),
+            ReplicaSyncDecision::Attach
+        );
+    }
 
     #[test]
     fn test_find_table_data_path_from_live_tables() {
