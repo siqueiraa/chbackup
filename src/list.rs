@@ -5,6 +5,7 @@
 //! backups from local disk or S3.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -985,202 +986,6 @@ pub fn is_key_protected(relative_key: &str, protected: &HashSet<String>) -> bool
             .any(|entry| entry.ends_with('/') && relative_key.starts_with(entry))
 }
 
-/// Collect all S3 keys referenced by surviving remote backups (excluding one).
-///
-/// Downloads and parses each surviving backup's manifest, then unions all
-/// referenced keys. Used by GC to determine which keys must not be deleted.
-///
-/// `exclude_backup` is the backup currently being deleted -- its manifest
-/// is not loaded (it would reference its own keys).
-///
-/// `cached_backups` -- when provided, uses the pre-fetched backup list instead
-/// of calling `list_remote` again.  This avoids redundant S3 LIST calls when
-/// the caller (e.g. `retention_remote`) already holds the backup list and no
-/// mutations have occurred between iterations.
-pub async fn gc_collect_referenced_keys(
-    s3: &S3Client,
-    exclude_backup: &str,
-    cached_backups: Option<&[BackupSummary]>,
-) -> Result<HashSet<String>> {
-    // Use the pre-fetched list when available; otherwise fall back to a fresh listing.
-    let owned_backups;
-    let backups: &[BackupSummary] = match cached_backups {
-        Some(list) => list,
-        None => {
-            owned_backups = list_remote(s3).await?;
-            &owned_backups
-        }
-    };
-
-    let mut all_keys = HashSet::new();
-    let mut manifest_count = 0;
-
-    for backup in backups {
-        // Skip the backup being deleted
-        if backup.name == exclude_backup {
-            continue;
-        }
-        // Skip broken backups (no valid manifest to load)
-        if backup.is_broken {
-            continue;
-        }
-
-        let manifest_key = format!("{}/metadata.json", backup.name);
-        match s3.get_object(&manifest_key).await {
-            Ok(data) => match BackupManifest::from_json_bytes(&data) {
-                Ok(manifest) => {
-                    let keys = collect_key_prefixes_from_manifest(&manifest);
-                    all_keys.extend(keys);
-                    manifest_count += 1;
-                }
-                Err(e) => {
-                    warn!(
-                        backup = %backup.name,
-                        error = %e,
-                        "gc: failed to parse manifest, skipping"
-                    );
-                }
-            },
-            Err(e) => {
-                warn!(
-                    backup = %backup.name,
-                    error = %e,
-                    "gc: failed to download manifest, skipping"
-                );
-            }
-        }
-    }
-
-    info!(
-        manifest_count = manifest_count,
-        key_count = all_keys.len(),
-        "gc: collected N referenced keys from M manifests"
-    );
-
-    Ok(all_keys)
-}
-
-/// Delete a remote backup with GC-safe key filtering.
-///
-/// Lists all S3 keys under the backup prefix, partitions them into manifest
-/// key and data keys, filters out data keys that are still referenced by other
-/// backups, deletes unreferenced data keys first, then deletes the manifest last.
-///
-/// The `referenced_keys` set should be produced by `gc_collect_referenced_keys()`.
-/// Keys are compared as relative keys (matching `PartInfo.backup_key` format).
-pub async fn gc_delete_backup(
-    s3: &S3Client,
-    backup_name: &str,
-    referenced_keys: &HashSet<String>,
-) -> Result<()> {
-    let prefix = format!("{}/", backup_name);
-    let objects = s3.list_objects(&prefix).await?;
-
-    if objects.is_empty() {
-        return Err(ChBackupError::BackupNotFound(format!(
-            "remote backup '{}' not found (no objects under prefix '{}')",
-            backup_name, prefix
-        ))
-        .into());
-    }
-
-    let s3_prefix = s3.prefix();
-
-    // Partition keys: manifest key vs data keys
-    let manifest_relative = format!("{}/metadata.json", backup_name);
-    let mut manifest_key: Option<String> = None;
-    let mut unreferenced_keys: Vec<String> = Vec::new();
-    let mut referenced_count: usize = 0;
-
-    for obj in &objects {
-        let relative_key = strip_s3_prefix(&obj.key, s3_prefix);
-
-        if relative_key == manifest_relative {
-            manifest_key = Some(relative_key);
-            continue;
-        }
-
-        // Check if this data key is referenced by another surviving backup
-        if referenced_keys.contains(&relative_key) {
-            referenced_count += 1;
-        } else {
-            unreferenced_keys.push(relative_key);
-        }
-    }
-
-    info!(
-        total_keys = objects.len(),
-        unreferenced = unreferenced_keys.len(),
-        referenced = referenced_count,
-        "gc: deleting N unreferenced keys, preserving N referenced"
-    );
-
-    // Delete unreferenced data keys first
-    if !unreferenced_keys.is_empty() {
-        let failed = s3.delete_objects(unreferenced_keys).await?;
-        if failed > 0 {
-            warn!(
-                failed_count = failed,
-                "Some S3 objects failed to delete, will be retried on next GC"
-            );
-        }
-    }
-
-    // Delete the manifest key last (makes the backup "broken" first, then gone)
-    if let Some(mk) = manifest_key {
-        let _failed = s3.delete_objects(vec![mk]).await?;
-    }
-
-    info!(backup = %backup_name, "gc: remote backup deleted");
-    Ok(())
-}
-
-/// Collect the set of backup names referenced as incremental bases by a list of backups.
-///
-/// Scans the `source` field of every `PartInfo` in the given manifests. Parts with
-/// `source = "carried:{base_name}"` indicate that the backup depends on `{base_name}`
-/// for its data. Returns the set of all such base names.
-async fn collect_incremental_bases(s3: &S3Client, surviving_names: &[&str]) -> HashSet<String> {
-    let mut bases = HashSet::new();
-
-    for name in surviving_names {
-        let manifest_key = format!("{}/metadata.json", name);
-        let manifest = match s3.get_object(&manifest_key).await {
-            Ok(data) => match BackupManifest::from_json_bytes(&data) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(
-                        backup = %name,
-                        error = %e,
-                        "retention_remote: failed to parse surviving manifest for incremental check"
-                    );
-                    continue;
-                }
-            },
-            Err(e) => {
-                warn!(
-                    backup = %name,
-                    error = %e,
-                    "retention_remote: failed to download surviving manifest for incremental check"
-                );
-                continue;
-            }
-        };
-
-        for table in manifest.tables.values() {
-            for parts in table.parts.values() {
-                for part in parts {
-                    if let Some(base_name) = part.source.strip_prefix("carried:") {
-                        bases.insert(base_name.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    bases
-}
-
 /// Which backups a retention pass should delete, and which it keeps.
 #[derive(Debug)]
 pub struct RetentionPlan {
@@ -1220,20 +1025,171 @@ pub fn plan_retention_deletions(summaries: &[BackupSummary], keep: usize) -> Ret
     }
 }
 
+/// Backup names a manifest names directly as an incremental base
+/// (`PartInfo.source == "carried:{base}"`).
+///
+/// This is only a cheap extra guard, and it is one hop: it sees the bases a
+/// surviving manifest names, not the bases of *those* bases. Key-prefix
+/// protection via `is_key_protected` is the real mechanism, and unlike this it
+/// is transitively complete over a chain (see
+/// `collect_key_prefixes_from_manifest`).
+fn collect_incremental_bases(manifest: &BackupManifest) -> HashSet<String> {
+    let mut bases = HashSet::new();
+
+    for table in manifest.tables.values() {
+        for parts in table.parts.values() {
+            for part in parts {
+                if let Some(base_name) = part.source.strip_prefix("carried:") {
+                    bases.insert(base_name.to_string());
+                }
+            }
+        }
+    }
+
+    bases
+}
+
+/// What a retention pass did to the backups it was asked to delete.
+///
+/// A planned backup that appears in neither list is one whose own S3 calls
+/// failed; that is logged and retried by the next pass.
+#[derive(Debug, Default)]
+pub struct RetentionOutcome {
+    /// Backups whose keys and manifest were deleted.
+    pub deleted: Vec<String>,
+    /// Backups deliberately left intact, manifest included.
+    pub skipped: Vec<String>,
+}
+
+/// Run one retention pass over `plan`, with the S3 operations injected.
+///
+/// The three operations are parameters rather than direct `S3Client` calls
+/// because an `S3Client` cannot be constructed in a unit test, and the
+/// fail-closed abort below is precisely what needs a test:
+///
+/// - `fetch_manifest(backup_name)` -- parsed manifest of a surviving backup.
+/// - `list_prefix(prefix)` -- keys under a prefix, relative to the S3 prefix.
+/// - `delete_keys(keys)` -- batch delete, keys relative to the S3 prefix.
+///
+/// The pass fails **closed**: if any surviving backup's manifest cannot be
+/// fetched or parsed, it returns `Err` before deleting anything at all. An
+/// unreadable manifest is one whose keys we cannot protect, so continuing would
+/// let GC delete data a survivor still points at -- and skipping just that
+/// manifest, or just that candidate, is not enough, because every later
+/// candidate would then be judged against the same short protected set.
+///
+/// For each candidate, deletion is all-or-nothing: if *any* key under its prefix
+/// is still protected, the backup is left completely intact. Deleting the
+/// unreferenced keys and the manifest anyway would manufacture a backup that
+/// still owns live data but has no manifest -- exactly the broken-but-referenced
+/// state `clean_broken` later destroys.
+pub async fn retention_remote_inner<FM, FMFut, LP, LPFut, DK, DKFut>(
+    plan: &RetentionPlan,
+    fetch_manifest: FM,
+    list_prefix: LP,
+    delete_keys: DK,
+) -> Result<RetentionOutcome>
+where
+    FM: Fn(String) -> FMFut,
+    FMFut: Future<Output = Result<BackupManifest>>,
+    LP: Fn(String) -> LPFut,
+    LPFut: Future<Output = Result<Vec<String>>>,
+    DK: Fn(Vec<String>) -> DKFut,
+    DKFut: Future<Output = Result<()>>,
+{
+    let mut protected: HashSet<String> = HashSet::new();
+    let mut incremental_bases: HashSet<String> = HashSet::new();
+
+    for name in &plan.surviving {
+        let manifest = fetch_manifest(name.clone()).await.with_context(|| {
+            format!(
+                "retention aborted before deleting anything: cannot read the manifest of \
+                 surviving backup '{}', so its keys cannot be protected",
+                name
+            )
+        })?;
+        protected.extend(collect_key_prefixes_from_manifest(&manifest));
+        incremental_bases.extend(collect_incremental_bases(&manifest));
+    }
+
+    let mut outcome = RetentionOutcome::default();
+
+    for name in &plan.to_delete {
+        if incremental_bases.contains(name) {
+            warn!(
+                backup = %name,
+                "retention_remote: kept, a surviving backup names it as an incremental base"
+            );
+            outcome.skipped.push(name.clone());
+            continue;
+        }
+
+        let keys = match list_prefix(format!("{}/", name)).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!(backup = %name, error = %e, "retention_remote: failed to list keys");
+                continue;
+            }
+        };
+        if keys.is_empty() {
+            warn!(backup = %name, "retention_remote: no objects under its prefix, nothing to delete");
+            continue;
+        }
+
+        let manifest_key = format!("{}/metadata.json", name);
+        let mut data_keys: Vec<String> = Vec::new();
+        let mut protected_count: usize = 0;
+        for key in keys {
+            if key == manifest_key {
+                continue;
+            }
+            if is_key_protected(&key, &protected) {
+                protected_count += 1;
+            } else {
+                data_keys.push(key);
+            }
+        }
+
+        if protected_count > 0 {
+            warn!(
+                backup = %name,
+                protected_keys = protected_count,
+                "retention_remote: kept intact, some of its keys are still referenced"
+            );
+            outcome.skipped.push(name.clone());
+            continue;
+        }
+
+        if let Err(e) = delete_keys(data_keys).await {
+            warn!(backup = %name, error = %e, "retention_remote: failed to delete data keys");
+            continue;
+        }
+        // Manifest last: a crash in between leaves a broken backup `clean_broken`
+        // can finish off, never a manifest pointing at keys that are already gone.
+        if let Err(e) = delete_keys(vec![manifest_key]).await {
+            warn!(backup = %name, error = %e, "retention_remote: failed to delete manifest");
+            continue;
+        }
+
+        info!(backup = %name, "retention_remote: deleted old remote backup");
+        outcome.deleted.push(name.clone());
+    }
+
+    Ok(outcome)
+}
+
 /// Delete oldest remote backups exceeding the `keep` count with GC-safe deletion.
 ///
-/// For each backup to delete, collects referenced keys from all surviving
-/// manifests fresh (per design 8.2 race protection), then uses `gc_delete_backup`
-/// to only delete unreferenced keys.
+/// Thin wrapper: it lists the remote backups, plans the pass with
+/// `plan_retention_deletions`, and hands `retention_remote_inner` the real
+/// S3-backed operations. All the policy -- fail-closed key protection,
+/// all-or-nothing candidate deletion, manifest-last ordering -- lives there.
 ///
-/// Before deleting a backup, checks whether any SURVIVING backup references it as
-/// an incremental base (via `carried:{name}` in `PartInfo.source`). If so, the
-/// deletion is skipped to prevent orphaned incremental backups.
+/// Broken backups are neither counted towards `keep` nor deleted (that is
+/// `clean_broken`'s job); they have no manifest to protect keys from, so each is
+/// logged as ignored.
 ///
-/// Broken backups are excluded from retention counting (not deleted by retention).
-/// Errors on individual backup deletions are logged as warnings, not fatal.
-///
-/// - `keep == 0`: unlimited, no retention action.
+/// - `keep <= 0`: unlimited, no retention action.
 /// - `keep > 0`: keep the N newest valid backups, delete the rest.
 ///
 /// Returns the number of successfully deleted backups.
@@ -1243,80 +1199,52 @@ pub async fn retention_remote(s3: &S3Client, keep: i32) -> Result<usize> {
     }
 
     let backups = list_remote(s3).await?;
+    for broken in backups.iter().filter(|b| b.is_broken) {
+        warn!(
+            backup = %broken.name,
+            "retention_remote: ignoring broken backup, it has no manifest to read"
+        );
+    }
 
-    // Filter to valid (non-broken) backups
-    let mut valid: Vec<&BackupSummary> = backups.iter().filter(|b| !b.is_broken).collect();
-
-    let keep = keep as usize;
-    if valid.len() <= keep {
+    let plan = plan_retention_deletions(&backups, keep as usize);
+    if plan.to_delete.is_empty() {
         return Ok(0);
     }
 
-    // Sort by timestamp ascending (oldest first)
-    valid.sort_by_key(|s| s.timestamp);
-
-    let to_delete = valid.len() - keep;
-    let total = backups.len();
-
-    // Determine surviving backups (those that will be kept)
-    let surviving_names: Vec<&str> = valid
-        .iter()
-        .skip(to_delete)
-        .map(|b| b.name.as_str())
-        .collect();
-
-    // Collect all backup names referenced as incremental bases by surviving backups
-    let incremental_bases = collect_incremental_bases(s3, &surviving_names).await;
-
-    let mut deleted = 0;
-
-    for b in valid.iter().take(to_delete) {
-        // Check if this backup is referenced as an incremental base by any surviving backup
-        if incremental_bases.contains(&b.name) {
-            warn!(
-                backup = %b.name,
-                "Skipping deletion of {}: referenced as incremental base by surviving backup(s)",
-                b.name
-            );
-            continue;
-        }
-
-        // Collect referenced keys for each deletion using the pre-fetched backup list
-        // to avoid redundant S3 LIST calls. The list is stable because we hold the
-        // global lock and no other mutations happen between iterations.
-        let referenced_keys = match gc_collect_referenced_keys(s3, &b.name, Some(&backups)).await {
-            Ok(keys) => keys,
-            Err(e) => {
+    let s3_prefix = s3.prefix();
+    let outcome = retention_remote_inner(
+        &plan,
+        |name: String| async move {
+            let data = s3.get_object(&format!("{}/metadata.json", name)).await?;
+            BackupManifest::from_json_bytes(&data)
+        },
+        |prefix: String| async move {
+            let objects = s3.list_objects(&prefix).await?;
+            Ok(objects
+                .iter()
+                .map(|obj| strip_s3_prefix(&obj.key, s3_prefix))
+                .collect())
+        },
+        |keys: Vec<String>| async move {
+            let failed = s3.delete_objects(keys).await?;
+            if failed > 0 {
                 warn!(
-                    backup = %b.name,
-                    error = %e,
-                    "retention_remote: failed to collect referenced keys, skipping backup"
-                );
-                continue;
-            }
-        };
-
-        match gc_delete_backup(s3, &b.name, &referenced_keys).await {
-            Ok(()) => {
-                info!(backup = %b.name, "retention_remote: deleted old remote backup");
-                deleted += 1;
-            }
-            Err(e) => {
-                warn!(
-                    backup = %b.name,
-                    error = %e,
-                    "retention_remote: failed to delete remote backup"
+                    failed_count = failed,
+                    "retention_remote: some S3 deletions failed, GC retries them next pass"
                 );
             }
-        }
-    }
+            Ok(())
+        },
+    )
+    .await?;
 
     info!(
-        deleted = deleted,
-        total = total,
+        deleted = outcome.deleted.len(),
+        skipped = outcome.skipped.len(),
+        total = backups.len(),
         "retention_remote: deleted N of M remote backups"
     );
-    Ok(deleted)
+    Ok(outcome.deleted.len())
 }
 
 // -- Shadow cleanup functions --
@@ -2640,56 +2568,201 @@ mod tests {
         assert_eq!(plan.surviving, vec!["b"]);
     }
 
-    // -- GC filtering tests --
+    // -- retention_remote_inner tests --
 
-    #[test]
-    fn test_gc_filter_unreferenced_keys() {
-        // Simulate the GC filtering logic from gc_delete_backup:
-        // Given a set of S3 keys for a backup and a referenced set from other backups,
-        // only unreferenced data keys should be candidates for deletion.
+    /// Manifest whose single part lives at `backup_key`, optionally carried from
+    /// an incremental base.
+    fn manifest_with_key(name: &str, backup_key: &str, source: Option<&str>) -> BackupManifest {
+        use crate::manifest::{PartInfo, TableManifest};
 
-        let all_keys = vec![
-            "backup-a/data/default/trades/default/part1.tar.lz4".to_string(),
-            "backup-a/data/default/trades/default/part2.tar.lz4".to_string(),
-            "backup-a/objects/store/abc/data.bin".to_string(),
-            "backup-a/metadata.json".to_string(),
-        ];
-
-        // part1 is referenced by another backup (shared via incremental)
-        let mut referenced = HashSet::new();
-        referenced.insert("backup-a/data/default/trades/default/part1.tar.lz4".to_string());
-
-        let manifest_key = "backup-a/metadata.json";
-
-        // Apply the same filtering logic as gc_delete_backup
-        let mut unreferenced: Vec<&String> = Vec::new();
-        let mut referenced_count = 0;
-        let mut found_manifest = false;
-
-        for key in &all_keys {
-            if key == manifest_key {
-                found_manifest = true;
-                continue;
-            }
-            if referenced.contains(key.as_str()) {
-                referenced_count += 1;
-            } else {
-                unreferenced.push(key);
-            }
+        let mut part = PartInfo::new("202401_1_1_0", 100, 42);
+        part.backup_key = backup_key.to_string();
+        if let Some(source) = source {
+            part.source = source.to_string();
         }
 
-        // part1 is referenced, so only part2 and objects/store/abc/data.bin are unreferenced
-        assert_eq!(unreferenced.len(), 2, "Should have 2 unreferenced keys");
-        assert_eq!(referenced_count, 1, "Should have 1 referenced key");
-        assert!(found_manifest, "Should have found the manifest key");
+        let mut parts = BTreeMap::new();
+        parts.insert("default".to_string(), vec![part]);
 
-        assert!(unreferenced
-            .contains(&&"backup-a/data/default/trades/default/part2.tar.lz4".to_string()));
-        assert!(unreferenced.contains(&&"backup-a/objects/store/abc/data.bin".to_string()));
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "default.trades".to_string(),
+            TableManifest::test_new("MergeTree").with_parts(parts),
+        );
 
-        // part1 should NOT be in unreferenced (it's still needed by another backup)
-        assert!(!unreferenced
-            .contains(&&"backup-a/data/default/trades/default/part1.tar.lz4".to_string()));
+        BackupManifest::test_new(name).with_tables(tables)
+    }
+
+    /// Records every `delete_keys` call so a test can assert nothing was deleted.
+    #[derive(Default)]
+    struct DeleteLog(std::sync::Mutex<Vec<Vec<String>>>);
+
+    impl DeleteLog {
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.0.lock().expect("delete log poisoned").clone()
+        }
+
+        fn deleted_keys(&self) -> Vec<String> {
+            self.calls().into_iter().flatten().collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_abort_on_manifest_error() {
+        // Two candidates, and a surviving backup whose manifest cannot be read.
+        // The pass must abort before deleting anything -- including "old-b", which
+        // is ordered after the failure.
+        let plan = RetentionPlan {
+            to_delete: vec!["old-a".to_string(), "old-b".to_string()],
+            surviving: vec!["keeper".to_string()],
+        };
+        let log = DeleteLog::default();
+
+        let result = retention_remote_inner(
+            &plan,
+            |name: String| async move { Err(anyhow::anyhow!("S3 timeout reading {}", name)) },
+            |_prefix: String| async { Ok(vec!["old-a/data/x.tar.lz4".to_string()]) },
+            |keys: Vec<String>| {
+                let log = &log;
+                async move {
+                    log.0.lock().expect("delete log poisoned").push(keys);
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        let err = result.expect_err("an unreadable surviving manifest must abort the pass");
+        assert!(
+            err.to_string().contains("keeper"),
+            "error should name the unreadable backup: {}",
+            err
+        );
+        assert!(
+            log.calls().is_empty(),
+            "no candidate may be deleted after a manifest error, got {:?}",
+            log.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_preserved_when_referenced() {
+        // "old" shares a part with the surviving backup, which carried it forward.
+        // The whole backup must survive, manifest included.
+        let shared_key = "old/data/default/trades/default/202401_1_1_0.tar.lz4";
+        let plan = RetentionPlan {
+            to_delete: vec!["old".to_string()],
+            surviving: vec!["keeper".to_string()],
+        };
+        let log = DeleteLog::default();
+
+        let outcome = retention_remote_inner(
+            &plan,
+            |_name: String| async move { Ok(manifest_with_key("keeper", shared_key, None)) },
+            |_prefix: String| async move {
+                Ok(vec![
+                    shared_key.to_string(),
+                    "old/metadata.json".to_string(),
+                ])
+            },
+            |keys: Vec<String>| {
+                let log = &log;
+                async move {
+                    log.0.lock().expect("delete log poisoned").push(keys);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("a protected candidate is skipped, not an error");
+
+        assert_eq!(outcome.skipped, vec!["old"]);
+        assert!(
+            outcome.deleted.is_empty(),
+            "the backup must be reported skipped, not deleted"
+        );
+        assert!(
+            !log.deleted_keys()
+                .contains(&"old/metadata.json".to_string()),
+            "the manifest must stay in place, deleted keys: {:?}",
+            log.deleted_keys()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retention_inner_deletes_unreferenced_backup_manifest_last() {
+        let plan = RetentionPlan {
+            to_delete: vec!["old".to_string()],
+            surviving: vec!["keeper".to_string()],
+        };
+        let log = DeleteLog::default();
+
+        let outcome = retention_remote_inner(
+            &plan,
+            |_name: String| async move {
+                Ok(manifest_with_key("keeper", "keeper/data/own.tar.lz4", None))
+            },
+            |_prefix: String| async move {
+                Ok(vec![
+                    "old/metadata.json".to_string(),
+                    "old/data/x.tar.lz4".to_string(),
+                ])
+            },
+            |keys: Vec<String>| {
+                let log = &log;
+                async move {
+                    log.0.lock().expect("delete log poisoned").push(keys);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("nothing protects 'old'");
+
+        assert_eq!(outcome.deleted, vec!["old"]);
+        assert_eq!(
+            log.calls(),
+            vec![
+                vec!["old/data/x.tar.lz4".to_string()],
+                vec!["old/metadata.json".to_string()],
+            ],
+            "data keys first, manifest last"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retention_inner_skips_incremental_base_by_name() {
+        // The name-chain guard: the survivor carried parts from "old" but the
+        // physical keys it names live under its own prefix.
+        let plan = RetentionPlan {
+            to_delete: vec!["old".to_string()],
+            surviving: vec!["keeper".to_string()],
+        };
+        let log = DeleteLog::default();
+
+        let outcome = retention_remote_inner(
+            &plan,
+            |_name: String| async move {
+                Ok(manifest_with_key(
+                    "keeper",
+                    "keeper/data/x.tar.lz4",
+                    Some("carried:old"),
+                ))
+            },
+            |_prefix: String| async move { Ok(vec!["old/metadata.json".to_string()]) },
+            |keys: Vec<String>| {
+                let log = &log;
+                async move {
+                    log.0.lock().expect("delete log poisoned").push(keys);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("a named incremental base is skipped, not an error");
+
+        assert_eq!(outcome.skipped, vec!["old"]);
+        assert!(log.calls().is_empty(), "nothing may be deleted");
     }
 
     #[test]
