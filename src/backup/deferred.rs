@@ -40,10 +40,20 @@ use super::freeze::FreezeInfo;
 /// File name of the record, stored beside `metadata.json` in the backup directory.
 const RECORD_FILE: &str = "deferred_freeze.json";
 
-/// Default maximum time a deferred freeze may be held before the owning upload must give
-/// up and release it. Holding a freeze pins obsolete S3 objects while merges continue, so
-/// the hold has to be bounded.
-pub const DEFAULT_TTL_SECS: u64 = 6 * 60 * 60;
+/// Default maximum age at which an *orphaned* deferred freeze becomes reapable.
+///
+/// The hold has to be bounded: it pins the objects of parts merged away during the hold. But
+/// the cost is asymmetric, so the bound is generous. Releasing too early turns the next upload
+/// into a hard `NoSuchKey` failure and loses a backup, while holding too long pins only a
+/// delta of the object-disk data.
+///
+/// Sized against real timings: a full backup's upload alone takes >4h on a multi-TiB object
+/// disk, and in server mode the clock runs from *create* end (the record is never re-adopted,
+/// because create and upload share the process), so a queued or retried upload adds more on
+/// top. 6h was measurably too tight; 24h leaves room for a retry cycle on a daily schedule.
+///
+/// Overridable via `clickhouse.deferred_freeze_ttl_secs`.
+pub const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// A freeze intentionally held past the end of `create`, awaiting object upload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +297,25 @@ pub enum ProtectionStatus {
 ///
 /// Fails **closed** on an unreadable record: ownership cannot be established from corrupt
 /// data, so assume it is protected.
+///
+/// # Three independent signals, deliberately
+///
+/// Protection holds if *any* of: the per-backup lock is active, the recorded owner process is
+/// alive, or the TTL has not expired. That layering is what makes the cancellation window safe
+/// without transferring lock ownership into the upload task:
+///
+/// - Cancelling an operation drops the caller's `PidLock` while `upload`'s spawned task keeps
+///   running to finalise. The lock signal is gone for that window.
+/// - **Server mode**: the record's owner is the long-lived server process, still alive, so
+///   signal 2 protects it.
+/// - **CLI cross-process**: the creator has exited, but the TTL has not expired, so signal 3
+///   protects it.
+///
+/// A single-signal predicate keyed only on the lock would need the guard handed into the
+/// finalising task — which `run_operation` cannot do (it is generic over a closure and does not
+/// know it is calling upload), and which `create_remote` would break (it holds the lock across
+/// create *and* upload, so upload acquiring its own would fail). The layered predicate gets the
+/// same safety for less machinery. See the tests named for the cancellation window.
 pub fn protection_status(data_path: &str, backup_name: &str) -> ProtectionStatus {
     let path = record_path_for(data_path, backup_name);
     if !path.exists() {
@@ -368,6 +397,92 @@ pub fn blocks_destructive_op(data_path: &str, backup_name: &str, op: &str) -> bo
             true
         }
     }
+}
+
+/// Release expired, orphaned deferred freezes across all local backups.
+///
+/// Returns the number of backups whose freeze was released.
+///
+/// # Where this runs, and why
+///
+/// A `create` whose `upload` never arrives leaves a live freeze that nothing else releases.
+/// This is called from **`create` pre-flight** as well as `clean`, because the deployment that
+/// motivated the mechanism never runs `clean` — its CronJob only does create and upload — so a
+/// clean-only reaper would let orphans accumulate indefinitely.
+///
+/// # Locking
+///
+/// For each candidate the per-backup PID lock is **acquired and held** across the whole
+/// sequence — re-read the record, UNFREEZE, delete the record — and the record is re-read
+/// *after* acquiring. A point-in-time liveness check would be a TOCTOU gap: an upload could
+/// start between the check and the UNFREEZE, and we would release a freeze it still needs.
+/// A backup whose lock cannot be acquired is simply skipped; it is in use.
+pub async fn reap_expired(ch: &crate::clickhouse::client::ChClient, data_path: &str) -> usize {
+    let backups_dir = PathBuf::from(data_path).join("backup");
+    let entries = match std::fs::read_dir(&backups_dir) {
+        Ok(e) => e,
+        Err(_) => return 0, // no local backups at all
+    };
+
+    let mut reaped = 0usize;
+    for entry in entries.flatten() {
+        let backup_dir = entry.path();
+        if !backup_dir.is_dir() || !record_path(&backup_dir).exists() {
+            continue;
+        }
+        let backup_name = match backup_dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Cheap pre-check before taking the lock; the authoritative read happens below.
+        if !matches!(
+            protection_status(data_path, &backup_name),
+            ProtectionStatus::Reapable(_)
+        ) {
+            continue;
+        }
+
+        // Acquire and HOLD the per-backup lock for the whole release.
+        let scope = crate::lock::LockScope::Backup(backup_name.clone());
+        let lock_path = match crate::lock::lock_path_for_scope(&scope) {
+            Some(p) => p,
+            None => continue,
+        };
+        let _lock = match crate::lock::PidLock::acquire(&lock_path, "reap_deferred_freeze") {
+            Ok(l) => l,
+            Err(_) => continue, // in use -- leave it alone
+        };
+
+        // Re-read under the lock: the state may have changed while we were acquiring.
+        let record = match protection_status(data_path, &backup_name) {
+            ProtectionStatus::Reapable(r) => r,
+            _ => continue,
+        };
+
+        warn!(
+            backup = %backup_name,
+            tables = record.retained.len(),
+            age_secs = now_secs().saturating_sub(record.created_at_secs),
+            "Reaping expired deferred S3 object-disk freeze -- its upload never completed"
+        );
+
+        let mut guard = super::freeze::FreezeGuard::from_frozen(record.retained);
+        match guard.unfreeze_all_checked(ch).await {
+            Ok(()) => {
+                if let Err(e) = delete(&backup_dir) {
+                    warn!(error = %e, "Failed to remove deferred-freeze record after reaping");
+                }
+                reaped += 1;
+            }
+            Err(failed) => {
+                // Keep the still-frozen entries so the next run retries them.
+                retain_failed(&backup_dir, &backup_name, failed);
+            }
+        }
+    }
+
+    reaped
 }
 
 /// Whether some operation currently holds this backup's PID lock.
@@ -564,6 +679,50 @@ mod tests {
     }
 
     #[test]
+    fn test_cancellation_window_server_mode_stays_protected() {
+        // Cancelling an operation drops the caller's PidLock while upload's spawned task keeps
+        // running to finalise. In server mode the record's owner is the long-lived server
+        // process, so owner-liveness must protect the freeze even with no lock held --
+        // otherwise the reaper could release it mid-copy.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().to_str().unwrap();
+        publish_at(tmp.path(), "bk-1", |_| {}); // owner = current (live) process
+
+        assert!(
+            !backup_lock_is_active("bk-1"),
+            "no lock held, as after a cancel"
+        );
+        match protection_status(data_path, "bk-1") {
+            ProtectionStatus::Protected { reason, .. } => {
+                assert!(
+                    reason.contains("alive"),
+                    "expected owner-liveness to protect: {reason}"
+                );
+            }
+            other => panic!("cancellation window must stay protected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cancellation_window_cli_stays_protected_until_ttl() {
+        // Cross-process CLI: the creator has exited, so owner-liveness cannot help. The TTL is
+        // the signal that keeps the freeze protected across a cancelled upload.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().to_str().unwrap();
+        publish_at(tmp.path(), "bk-1", |r| r.owner_pid = 0); // dead creator, TTL unexpired
+
+        match protection_status(data_path, "bk-1") {
+            ProtectionStatus::Protected { reason, .. } => {
+                assert!(
+                    reason.contains("expired"),
+                    "expected TTL to protect: {reason}"
+                );
+            }
+            other => panic!("cancellation window must stay protected, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_no_record_is_not_protected() {
         let tmp = tempfile::tempdir().unwrap();
         let data_path = tmp.path().to_str().unwrap();
@@ -587,6 +746,49 @@ mod tests {
             blocks_destructive_op(data_path, "bk-1", "test"),
             "unreadable record must fail closed, not assume the owner is dead"
         );
+    }
+
+    #[test]
+    fn test_reap_candidate_selection() {
+        // reap_expired needs a live ChClient to UNFREEZE, so exercise the selection predicate
+        // it uses rather than the unfreeze itself (that path is covered by integration T75).
+        let tmp = tempfile::tempdir().unwrap();
+        let data_path = tmp.path().to_str().unwrap();
+
+        // Reapable: orphaned and expired.
+        publish_at(tmp.path(), "expired-orphan", |r| {
+            r.owner_pid = 0;
+            r.created_at_secs = 1;
+            r.ttl_secs = 0;
+        });
+        // Not reapable: orphaned but within TTL.
+        publish_at(tmp.path(), "fresh-orphan", |r| r.owner_pid = 0);
+        // Not reapable: owner alive.
+        publish_at(tmp.path(), "live-owner", |_| {});
+
+        assert!(matches!(
+            protection_status(data_path, "expired-orphan"),
+            ProtectionStatus::Reapable(_)
+        ));
+        assert!(matches!(
+            protection_status(data_path, "fresh-orphan"),
+            ProtectionStatus::Protected { .. }
+        ));
+        assert!(matches!(
+            protection_status(data_path, "live-owner"),
+            ProtectionStatus::Protected { .. }
+        ));
+    }
+
+    #[test]
+    fn test_ttl_is_configurable_and_generous_by_default() {
+        // 6h was measurably too tight: upload alone took 4h17m in production, and in server
+        // mode the clock runs from create-end because the record is never re-adopted.
+        // const block: the value is compile-time known, and clippy rejects a plain assert!.
+        const { assert!(DEFAULT_TTL_SECS >= 12 * 60 * 60) };
+        // Honoured per-record, not read from the constant at check time.
+        let rec = DeferredFreezeRecord::new("bk", vec![], 42);
+        assert_eq!(rec.ttl_secs, 42);
     }
 
     #[test]

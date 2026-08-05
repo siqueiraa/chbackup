@@ -1436,6 +1436,18 @@ async fn clean_shadow_inner(
     name: Option<&str>,
     force: bool,
 ) -> Result<usize> {
+    // Release expired orphaned deferred freezes first, so their shadow directories become
+    // eligible for removal below. Without this, `clean` could never clear them: the guard
+    // (correctly) refuses to rm -rf shadow data whose freeze is still registered with
+    // ClickHouse, since that is not an UNFREEZE.
+    let reaped = crate::backup::deferred::reap_expired(ch, data_path).await;
+    if reaped > 0 {
+        info!(
+            count = reaped,
+            "Released expired deferred S3 object-disk freezes before shadow cleanup"
+        );
+    }
+
     // Backstop: refuse to delete shadow data that another live process is deliberately
     // holding frozen so its S3 object-disk objects stay pinned until upload copies them.
     //

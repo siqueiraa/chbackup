@@ -181,7 +181,9 @@ async fn run() -> Result<()> {
                 configs,
                 named_collections,
                 &effective_skip_projections,
-                false, // defer_unfreeze_s3: standalone create -- nothing would release a held freeze
+                // defer_unfreeze_s3: a later `upload` adopts the persisted record and
+                // releases the freeze; an expired orphan is reaped at the next `create`.
+                true,
                 CancellationToken::new(),
             )
             .await?;

@@ -117,6 +117,7 @@ Connection settings and backup/restore behavior. chbackup must run on the same h
 | `ignore_not_exists_error_during_freeze` | bool | `true` | Skip tables dropped during backup |
 | `freeze_by_part` | bool | `false` | Freeze individual partitions instead of whole table. IDs are discovered from `system.parts.partition_id` and issued as `FREEZE PARTITION ID` |
 | `freeze_by_part_where` | string | _(empty)_ | Additional WHERE filter on `system.parts` for partition selection |
+| `deferred_freeze_ttl_secs` | int | `86400` (24h) | How long an *orphaned* S3 object-disk freeze is held before it may be reaped. Tables with object-disk parts stay FROZEN between `create` and `upload` so their remote objects cannot be garbage-collected before CopyObject reads them. Raise it if uploads can exceed it; lowering it risks releasing a freeze a retrying upload still needs, which surfaces as CopyObject `NoSuchKey` |
 | `backup_mutations` | bool | `true` | Backup pending mutations from `system.mutations` |
 | `restart_command` | string | `exec:systemctl restart clickhouse-server` | Command after RBAC/config restore |
 | `debug` | bool | `false` | Verbose ClickHouse client debug logging |

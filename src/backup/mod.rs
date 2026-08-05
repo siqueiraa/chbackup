@@ -183,6 +183,23 @@ pub async fn create(
 ) -> Result<BackupManifest> {
     let start_time = Instant::now();
 
+    // Pre-flight: release any expired, orphaned deferred freeze left by an earlier backup
+    // whose upload never completed.
+    //
+    // This runs here rather than only in `clean` because scheduled deployments typically run
+    // only create and upload -- never `clean` -- so a clean-only reaper would let orphans
+    // accumulate forever. It also covers the same-name case: publishing below would otherwise
+    // overwrite an existing record and strand whatever it described.
+    //
+    // Best-effort by design: a failure here must not block taking a backup.
+    let reaped = deferred::reap_expired(ch, &config.clickhouse.data_path).await;
+    if reaped > 0 {
+        info!(
+            count = reaped,
+            "Released expired deferred S3 object-disk freezes from earlier backups"
+        );
+    }
+
     info!(
         backup_name = %backup_name,
         table_pattern = ?table_pattern,
@@ -962,7 +979,7 @@ pub async fn create(
         let record = deferred::DeferredFreezeRecord::new(
             backup_name,
             retained.clone(),
-            deferred::DEFAULT_TTL_SECS,
+            config.clickhouse.deferred_freeze_ttl_secs,
         );
         if let Err(e) = deferred::publish(&backup_dir, &record) {
             // Do NOT defer without a record -- an unrecorded freeze is strictly worse than
@@ -983,11 +1000,13 @@ pub async fn create(
             );
         }
     } else if !s3_tables.is_empty() {
+        // Only reachable when a caller explicitly opts out of deferral. Every built-in path
+        // now defers, so this means the objects are unprotected until upload copies them.
         warn!(
             tables = s3_tables.len(),
-            "Backup contains S3 object-disk tables but the freeze is not being deferred. \
-             Their objects are unprotected between now and upload; use `create_remote` so \
-             create and upload run in one operation."
+            "Backup contains S3 object-disk tables but the freeze is NOT being deferred. \
+             Their objects can be garbage-collected before upload copies them, which surfaces \
+             as CopyObject NoSuchKey."
         );
     }
 

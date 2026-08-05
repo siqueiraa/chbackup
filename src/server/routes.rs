@@ -579,7 +579,10 @@ async fn dispatch_action_command(
             flags.configs,
             false, // named_collections
             &config.backup.skip_projections,
-            false, // defer_unfreeze_s3: create-only, no upload will release the freeze
+            // defer_unfreeze_s3: THIS is the production path -- the k8s CronJob enqueues
+            // `create` and `upload` as two separate commands, so the freeze must survive
+            // between them or the upload's CopyObject races ClickHouse's object GC.
+            true,
             cancel,
         )
         .await
@@ -1226,7 +1229,8 @@ pub async fn create_backup(
                 req.skip_projections
                     .as_ref()
                     .unwrap_or(&config.backup.skip_projections),
-                false, // defer_unfreeze_s3: create-only, no upload will release the freeze
+                // defer_unfreeze_s3: a later `upload` adopts the record and releases it.
+                true,
                 cancel,
             )
             .await?;

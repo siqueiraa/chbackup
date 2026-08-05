@@ -191,6 +191,16 @@ pub struct ClickHouseConfig {
     #[serde(default)]
     pub freeze_by_part_where: String,
 
+    /// how long an orphaned deferred S3 object-disk freeze is held before it may be reaped
+    ///
+    /// Tables with S3 object-disk parts stay FROZEN between `create` and `upload` so their
+    /// remote objects cannot be garbage-collected before CopyObject reads them. If the upload
+    /// never runs, this bounds how long that freeze lingers. Raise it if uploads can take
+    /// longer than this; lowering it risks releasing a freeze a queued or retrying upload
+    /// still needs, which surfaces as CopyObject NoSuchKey.
+    #[serde(default = "default_deferred_freeze_ttl_secs")]
+    pub deferred_freeze_ttl_secs: u64,
+
     /// backup pending mutations from system.mutations
     #[serde(default = "default_true")]
     pub backup_mutations: bool,
@@ -550,6 +560,7 @@ impl Default for ClickHouseConfig {
             ignore_not_exists_error_during_freeze: true,
             freeze_by_part: false,
             freeze_by_part_where: String::new(),
+            deferred_freeze_ttl_secs: default_deferred_freeze_ttl_secs(),
             backup_mutations: true,
             restart_command: default_restart_command(),
             debug: false,
@@ -654,6 +665,10 @@ impl Default for ApiConfig {
 // ---------------------------------------------------------------------------
 // Default value helper functions
 // ---------------------------------------------------------------------------
+
+fn default_deferred_freeze_ttl_secs() -> u64 {
+    crate::backup::deferred::DEFAULT_TTL_SECS
+}
 
 fn default_true() -> bool {
     true

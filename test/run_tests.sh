@@ -72,6 +72,8 @@ drop_all_tables() {
     clickhouse-client -q "DROP TABLE IF EXISTS default.app_log SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_unpart SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS default.fbp_tuple SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.race_s3 SYNC"
+    clickhouse-client -q "DROP TABLE IF EXISTS default.sep_s3 SYNC"
     clickhouse-client -q "DROP TABLE IF EXISTS tmpdata.scratch SYNC" 2>/dev/null || true
     clickhouse-client -q "DROP DATABASE IF EXISTS tmpdata SYNC" 2>/dev/null || true
 }
@@ -4874,6 +4876,84 @@ if should_run "test_s3_disk_freeze_race"; then
     info "  Cleanup"
     cleanup_backup "${RACE_NAME}"
     clickhouse-client -q "DROP TABLE IF EXISTS ${RACE_TBL} SYNC"
+fi
+
+# ---------------------------------------------------------------------------
+# T76: S3 object-disk freeze race with SEPARATE create and upload
+# ---------------------------------------------------------------------------
+# T75 only exercises create_remote, which is why it passed while production kept failing:
+# the k8s CronJob enqueues `create` and `upload` as two separate commands, so the freeze has
+# to survive the gap between them. This is the shape that actually broke.
+if should_run "test_s3_disk_freeze_race_separate"; then
+    info "T76: S3 object-disk freeze race, separate create + upload"
+    SEP_NAME="sep_test_$$"
+    SEP_TBL="default.sep_s3"
+
+    info "  Step 0: S3-disk table with merge bait"
+    clickhouse-client -q "DROP TABLE IF EXISTS ${SEP_TBL} SYNC"
+    clickhouse-client -q "
+        CREATE TABLE ${SEP_TBL} (id UInt64, payload String)
+        ENGINE = MergeTree ORDER BY id
+        SETTINGS storage_policy = 's3_policy'
+    "
+    for i in $(seq 1 10); do
+        clickhouse-client -q "INSERT INTO ${SEP_TBL} SELECT number + ${i}*1000, repeat('z', 512) FROM numbers(300)"
+    done
+    PRE_SEP=$(clickhouse-client -q "SELECT count() FROM ${SEP_TBL}")
+
+    info "  Step 1: create (local only)"
+    run_cmd "create ${SEP_NAME}" chbackup create "${SEP_NAME}" -t "${SEP_TBL}"
+
+    # The freeze must be HELD across the gap, evidenced by the record and a live shadow dir.
+    RECORD="/var/lib/clickhouse/backup/${SEP_NAME}/deferred_freeze.json"
+    if [ -f "$RECORD" ]; then
+        pass "deferred-freeze record published by create"
+    else
+        fail "no deferred-freeze record after create -- the freeze was released, upload will race"
+    fi
+    SHADOWS=$(find /var/lib/clickhouse/disks/s3/shadow -maxdepth 1 -name "chbackup*" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$SHADOWS" -gt 0 ]]; then
+        pass "shadow directory still present between create and upload"
+    else
+        fail "shadow directory gone after create -- objects are unprotected"
+    fi
+
+    info "  Step 2: force merges in the gap, then upload separately"
+    for _ in $(seq 1 15); do
+        clickhouse-client -q "OPTIMIZE TABLE ${SEP_TBL} FINAL" >/dev/null 2>&1 || true
+    done
+    clickhouse-client -q "INSERT INTO ${SEP_TBL} SELECT number + 800000, repeat('w', 512) FROM numbers(200)"
+    for _ in $(seq 1 15); do
+        clickhouse-client -q "OPTIMIZE TABLE ${SEP_TBL} FINAL" >/dev/null 2>&1 || true
+    done
+
+    if RUST_LOG=error chbackup upload "${SEP_NAME}" 2>&1; then
+        pass "separate upload survived merges in the create->upload gap"
+    else
+        fail "separate upload failed (NoSuchKey race not closed for this pattern)"
+    fi
+
+    info "  Step 3: freeze released after upload"
+    if [ -f "$RECORD" ]; then
+        fail "deferred-freeze record still present after successful upload"
+    else
+        pass "deferred-freeze record cleaned up"
+    fi
+
+    info "  Step 4: round-trip the data back"
+    clickhouse-client -q "DROP TABLE IF EXISTS ${SEP_TBL} SYNC"
+    run_cmd "download ${SEP_NAME}" chbackup download "${SEP_NAME}"
+    run_cmd "restore ${SEP_NAME}" chbackup restore "${SEP_NAME}" -t "${SEP_TBL}"
+    POST_SEP=$(clickhouse-client -q "SELECT count() FROM ${SEP_TBL}" 2>/dev/null || echo "MISSING")
+    if [[ "$POST_SEP" == "$PRE_SEP" ]]; then
+        pass "separate create+upload round-trip rows: ${POST_SEP}"
+    else
+        fail "row mismatch: expected=${PRE_SEP} got=${POST_SEP}"
+    fi
+
+    info "  Cleanup"
+    cleanup_backup "${SEP_NAME}"
+    clickhouse-client -q "DROP TABLE IF EXISTS ${SEP_TBL} SYNC"
 fi
 
 # ---------------------------------------------------------------------------
