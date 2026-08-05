@@ -949,30 +949,33 @@ async fn attach_parts_inner(
     }
 
     // ATTACH PART phase: sequential for dedup engines, parallel otherwise
-    // Each branch returns (attached_count, attach_skipped_count).
-    // attach_skipped tracks NO_SUCH_DATA_PART errors (source existed but CH can't find it).
-    let (attached_count, attach_skipped) =
-        if let (false, Some(global_sem)) = (sequential, attach_semaphore) {
-            // Parallel ATTACH for non-dedup engines.
-            // Each part's ATTACH is spawned as a tokio task with a semaphore permit.
-            let sem = global_sem.clone();
-            let ch_clone = params.ch.clone();
-            let db_owned = db.to_string();
-            let table_owned = table.to_string();
-            let resume_key_owned = resume_table_key.clone();
-            let resume_state_clone = params.resume_state.cloned();
+    // Each branch returns (attached_count, attach_skipped_count, attach_benign_count).
+    // attach_skipped tracks missing-part errors (the data is genuinely absent) and feeds
+    // the caller's partial-restore error; attach_benign tracks already-present/locked
+    // parts, which are reported but must not fail an idempotent re-restore.
+    let (attached_count, attach_skipped, attach_benign) = if let (false, Some(global_sem)) =
+        (sequential, attach_semaphore)
+    {
+        // Parallel ATTACH for non-dedup engines.
+        // Each part's ATTACH is spawned as a tokio task with a semaphore permit.
+        let sem = global_sem.clone();
+        let ch_clone = params.ch.clone();
+        let db_owned = db.to_string();
+        let table_owned = table.to_string();
+        let resume_key_owned = resume_table_key.clone();
+        let resume_state_clone = params.resume_state.cloned();
 
-            let mut handles = Vec::with_capacity(work_parts.len());
-            for part in &work_parts {
-                let sem = sem.clone();
-                let ch = ch_clone.clone();
-                let db = db_owned.clone();
-                let table = table_owned.clone();
-                let part_name = part.name.clone();
-                let resume_key = resume_key_owned.clone();
-                let resume_state = resume_state_clone.clone();
+        let mut handles = Vec::with_capacity(work_parts.len());
+        for part in &work_parts {
+            let sem = sem.clone();
+            let ch = ch_clone.clone();
+            let db = db_owned.clone();
+            let table = table_owned.clone();
+            let part_name = part.name.clone();
+            let resume_key = resume_key_owned.clone();
+            let resume_state = resume_state_clone.clone();
 
-                handles.push(tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let _permit = sem
                     .acquire()
                     .await
@@ -993,106 +996,103 @@ async fn attach_parts_inner(
                             let state_path = guard.1.clone();
                             save_state_graceful(&state_path, &guard.0);
                         }
-                        // (attached=true, skipped=false)
-                        Ok((true, false))
+                        // None = attached; Some(class) = not attached, with its classification.
+                        Ok(None)
                     }
                     Err(e) => {
-                        if is_benign_attach_error(&e) {
-                            warn!(
-                                db = %db, table = %table, part = %part_name,
-                                error = %format!("{:#}", e),
-                                "Part already exists or overlaps, skipping"
-                            );
-                            Ok((false, false))
-                        } else if is_missing_part_error(&e) {
-                            warn!(
-                                db = %db, table = %table, part = %part_name,
-                                error = %format!("{:#}", e),
-                                "NO_SUCH_DATA_PART during ATTACH, counting as skipped"
-                            );
-                            Ok((false, true))
-                        } else {
-                            Err(e).with_context(|| {
+                        let err_str = format!("{:#}", e);
+                        match classify_attach_error(&err_str) {
+                            AttachErrorClass::Unknown => Err(e).with_context(|| {
                                 format!("Failed to ATTACH PART '{}' to {}.{}", part_name, db, table)
-                            })
+                            }),
+                            class => {
+                                warn!(
+                                    db = %db, table = %table, part = %part_name,
+                                    class = ?class, error = %err_str,
+                                    "Part was not attached"
+                                );
+                                Ok(Some(class))
+                            }
                         }
                     }
                 }
             }));
-            }
+        }
 
-            let results = try_join_all(handles)
-                .await
-                .context("ATTACH task panicked")?;
-            let mut count = 0u64;
-            let mut skip_count = 0u64;
-            for result in results {
-                let (attached, skipped) = result?;
-                if attached {
+        let results = try_join_all(handles)
+            .await
+            .context("ATTACH task panicked")?;
+        let mut count = 0u64;
+        let mut skip_count = 0u64;
+        let mut benign_count = 0u64;
+        for result in results {
+            match result? {
+                None => count += 1,
+                Some(class) if class.counts_as_missing_data() => skip_count += 1,
+                Some(_) => benign_count += 1,
+            }
+        }
+        (count, skip_count, benign_count)
+    } else {
+        // Sequential ATTACH: one part at a time (for dedup engines or no semaphore)
+        let mut count = 0u64;
+        let mut skip_count = 0u64;
+        let mut benign_count = 0u64;
+        for part in &work_parts {
+            // Acquire global permit if semaphore is provided
+            let _permit = if let Some(sem) = attach_semaphore {
+                Some(
+                    sem.acquire()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Semaphore closed"))?,
+                )
+            } else {
+                None
+            };
+
+            debug!(db = %db, table = %table, part = %part.name, "Attaching part");
+
+            match params.ch.attach_part(db, table, &part.name).await {
+                Ok(()) => {
                     count += 1;
-                }
-                if skipped {
-                    skip_count += 1;
-                }
-            }
-            (count, skip_count)
-        } else {
-            // Sequential ATTACH: one part at a time (for dedup engines or no semaphore)
-            let mut count = 0u64;
-            let mut skip_count = 0u64;
-            for part in &work_parts {
-                // Acquire global permit if semaphore is provided
-                let _permit = if let Some(sem) = attach_semaphore {
-                    Some(
-                        sem.acquire()
-                            .await
-                            .map_err(|_| anyhow::anyhow!("Semaphore closed"))?,
-                    )
-                } else {
-                    None
-                };
-
-                debug!(db = %db, table = %table, part = %part.name, "Attaching part");
-
-                match params.ch.attach_part(db, table, &part.name).await {
-                    Ok(()) => {
-                        count += 1;
-                        if let Some(state_mutex) = &params.resume_state {
-                            let mut guard = state_mutex.lock().await;
-                            guard
-                                .0
-                                .attached_parts
-                                .entry(resume_table_key.clone())
-                                .or_default()
-                                .push(part.name.clone());
-                            let state_path = guard.1.clone();
-                            save_state_graceful(&state_path, &guard.0);
-                        }
+                    if let Some(state_mutex) = &params.resume_state {
+                        let mut guard = state_mutex.lock().await;
+                        guard
+                            .0
+                            .attached_parts
+                            .entry(resume_table_key.clone())
+                            .or_default()
+                            .push(part.name.clone());
+                        let state_path = guard.1.clone();
+                        save_state_graceful(&state_path, &guard.0);
                     }
-                    Err(e) => {
-                        if is_benign_attach_error(&e) {
-                            warn!(
-                                db = %db, table = %table, part = %part.name,
-                                error = %format!("{:#}", e),
-                                "Part already exists or overlaps, skipping"
-                            );
-                        } else if is_missing_part_error(&e) {
-                            warn!(
-                                db = %db, table = %table, part = %part.name,
-                                error = %format!("{:#}", e),
-                                "NO_SUCH_DATA_PART during ATTACH, counting as skipped"
-                            );
-                            skip_count += 1;
-                        } else {
+                }
+                Err(e) => {
+                    let err_str = format!("{:#}", e);
+                    match classify_attach_error(&err_str) {
+                        AttachErrorClass::Unknown => {
                             return Err(e).with_context(|| {
                                 format!("Failed to ATTACH PART '{}' to {}.{}", part.name, db, table)
                             });
                         }
+                        class => {
+                            warn!(
+                                db = %db, table = %table, part = %part.name,
+                                class = ?class, error = %err_str,
+                                "Part was not attached"
+                            );
+                            if class.counts_as_missing_data() {
+                                skip_count += 1;
+                            } else {
+                                benign_count += 1;
+                            }
+                        }
                     }
                 }
             }
-            (count, skip_count)
-        };
+        }
+        (count, skip_count, benign_count)
+    };
 
     if skipped_resume > 0 {
         info!(
@@ -1110,6 +1110,7 @@ async fn attach_parts_inner(
         table = %table,
         attached = attached_count,
         skipped = total_skipped,
+        already_present = attach_benign,
         total = sorted_parts.len(),
         "Parts attached"
     );
@@ -1127,29 +1128,69 @@ async fn attach_parts_inner(
 pub(crate) struct AttachResult {
     /// Number of parts successfully attached.
     pub attached: u64,
-    /// Number of parts skipped (missing source, NO_SUCH_DATA_PART, missing S3 remote_path).
+    /// Number of parts whose data is genuinely absent: missing source dir,
+    /// missing S3 remote_path, or an ATTACH classified as
+    /// [`AttachErrorClass::MissingPart`]. The caller turns a non-zero value into
+    /// a partial-restore error, so parts that merely already exist
+    /// (`DuplicatePart`/`TemporarilyLocked`) are deliberately excluded -- they
+    /// are logged per part and tallied in the per-table summary instead, which
+    /// keeps an idempotent re-restore from reporting failure.
     pub skipped: u64,
 }
 
-/// Check if an ATTACH PART error is a benign warning (232/233 overlap/duplicate).
-///
-/// These errors mean the part already exists or is temporarily locked,
-/// and can be safely skipped without counting as a "skipped" part.
-fn is_benign_attach_error(e: &anyhow::Error) -> bool {
-    let err_str = format!("{:#}", e);
-    err_str.contains("DUPLICATE_DATA_PART")
-        || err_str.contains("PART_IS_TEMPORARILY_LOCKED")
-        || err_str.contains("Code: 232")
-        || err_str.contains("Code: 233")
+/// Classification of an `ALTER TABLE ATTACH PART` failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachErrorClass {
+    /// ClickHouse could not find the part (232 `NO_SUCH_DATA_PART`) or rejected
+    /// its name (233 `BAD_DATA_PART_NAME`). The data is genuinely absent.
+    MissingPart,
+    /// 235 `DUPLICATE_DATA_PART`: an identically named part is already active.
+    DuplicatePart,
+    /// 384 `PART_IS_TEMPORARILY_LOCKED`: the part exists but is being removed.
+    TemporarilyLocked,
+    /// Anything else. Must be treated as a hard failure, never as benign.
+    Unknown,
 }
 
-/// Check if an ATTACH PART error indicates a missing part.
+impl AttachErrorClass {
+    /// Whether this class means the part's data is missing from the table.
+    ///
+    /// Only these parts feed the caller's partial-restore error. A part that is
+    /// already present (`DuplicatePart`) or is being removed by a concurrent
+    /// operation (`TemporarilyLocked`) is reported but must not make an
+    /// idempotent re-restore look like a failure.
+    fn counts_as_missing_data(self) -> bool {
+        matches!(self, AttachErrorClass::MissingPart)
+    }
+}
+
+/// Classify an ATTACH PART error string. Missing-part is decided FIRST.
 ///
-/// NO_SUCH_DATA_PART means the source existed but ClickHouse couldn't find
-/// the data part during ATTACH. This counts as a "skipped" part.
-fn is_missing_part_error(e: &anyhow::Error) -> bool {
-    let err_str = format!("{:#}", e);
-    err_str.contains("NO_SUCH_DATA_PART")
+/// The ordering is part of the contract: both ATTACH call sites match on this
+/// single function so neither can reintroduce the precedence bug where a
+/// missing part was reported as "already exists", left out of the skipped
+/// tally, and a failed restore therefore exited 0.
+///
+/// Codes and symbolic names are traced to ClickHouse's `ErrorCodes.cpp` at all
+/// four CI matrix versions (23.8, 24.3, 24.8, 25.1) in
+/// `docs/verification/h1-error-codes.json`: 232 = `NO_SUCH_DATA_PART`,
+/// 233 = `BAD_DATA_PART_NAME`, 235 = `DUPLICATE_DATA_PART`,
+/// 384 = `PART_IS_TEMPORARILY_LOCKED`. 232/233 are *missing-part* errors and
+/// must never be classified as benign duplicates.
+fn classify_attach_error(err: &str) -> AttachErrorClass {
+    if err.contains("NO_SUCH_DATA_PART")
+        || err.contains("Code: 232")
+        || err.contains("BAD_DATA_PART_NAME")
+        || err.contains("Code: 233")
+    {
+        AttachErrorClass::MissingPart
+    } else if err.contains("DUPLICATE_DATA_PART") || err.contains("Code: 235") {
+        AttachErrorClass::DuplicatePart
+    } else if err.contains("PART_IS_TEMPORARILY_LOCKED") || err.contains("Code: 384") {
+        AttachErrorClass::TemporarilyLocked
+    } else {
+        AttachErrorClass::Unknown
+    }
 }
 
 /// Hardlink all files from source directory to destination directory.
@@ -1996,76 +2037,123 @@ mod tests {
         );
     }
 
-    // ---- is_benign_attach_error tests ----
+    // ---- attach_error_classification tests ----
+    //
+    // The error strings below are the `example_error_string` values recorded in
+    // `docs/verification/h1-error-codes.json`, which renders each code with its
+    // symbolic name in ClickHouse's exception wire format.
 
     #[test]
-    fn test_is_benign_attach_error_duplicate_data_part() {
-        let err = anyhow::anyhow!(
-            "Code: 232. DB::Exception: Unexpected part all_1_1_0 already exists. DUPLICATE_DATA_PART"
+    fn attach_error_classification_no_such_data_part_is_missing() {
+        assert_eq!(
+            classify_attach_error(
+                "Code: 232. DB::Exception: No part all_1_1_0 in committed state. \
+                 (NO_SUCH_DATA_PART) (version 24.8.14.39 (official build))"
+            ),
+            AttachErrorClass::MissingPart
         );
-        assert!(is_benign_attach_error(&err));
     }
 
     #[test]
-    fn test_is_benign_attach_error_part_temporarily_locked() {
-        let err = anyhow::anyhow!("Code: 233. PART_IS_TEMPORARILY_LOCKED");
-        assert!(is_benign_attach_error(&err));
+    fn attach_error_classification_bad_data_part_name_is_missing() {
+        assert_eq!(
+            classify_attach_error(
+                "Code: 233. DB::Exception: Unexpected part name: all_1_1_0_broken for \
+                 format version: 1. (BAD_DATA_PART_NAME) (version 24.8.14.39 (official build))"
+            ),
+            AttachErrorClass::MissingPart
+        );
     }
 
     #[test]
-    fn test_is_benign_attach_error_no_such_data_part_not_benign() {
-        // NO_SUCH_DATA_PART is NOT benign -- it's a missing part error
-        let err = anyhow::anyhow!("NO_SUCH_DATA_PART in table");
-        assert!(!is_benign_attach_error(&err));
+    fn attach_error_classification_duplicate_data_part() {
+        assert_eq!(
+            classify_attach_error(
+                "Code: 235. DB::Exception: Part all_1_1_0 (state Active) already exists. \
+                 (DUPLICATE_DATA_PART) (version 24.8.14.39 (official build))"
+            ),
+            AttachErrorClass::DuplicatePart
+        );
     }
 
     #[test]
-    fn test_is_benign_attach_error_code_232_only() {
-        let err = anyhow::anyhow!("Code: 232");
-        assert!(is_benign_attach_error(&err));
+    fn attach_error_classification_part_is_temporarily_locked() {
+        assert_eq!(
+            classify_attach_error(
+                "Code: 384. DB::Exception: Part all_1_1_0 (state Deleting) already exists, \
+                 but it will be deleted soon. (PART_IS_TEMPORARILY_LOCKED) \
+                 (version 24.8.14.39 (official build))"
+            ),
+            AttachErrorClass::TemporarilyLocked
+        );
     }
 
     #[test]
-    fn test_is_benign_attach_error_code_233_only() {
-        let err = anyhow::anyhow!("Code: 233");
-        assert!(is_benign_attach_error(&err));
+    fn attach_error_classification_missing_part_wins_over_duplicate() {
+        // A 232 message that also says "already exists" must still be MissingPart:
+        // the old benign-first ordering is what made a failed restore exit 0.
+        assert_eq!(
+            classify_attach_error(
+                "Code: 232. DB::Exception: No part all_1_1_0 in committed state, \
+                 but a part with that name already exists. (NO_SUCH_DATA_PART)"
+            ),
+            AttachErrorClass::MissingPart
+        );
     }
 
     #[test]
-    fn test_is_benign_attach_error_other_error() {
-        let err = anyhow::anyhow!("Code: 60. UNKNOWN_TABLE");
-        assert!(!is_benign_attach_error(&err));
+    fn attach_error_classification_missing_part_counts_as_missing_data() {
+        for err in [
+            "Code: 232. DB::Exception: No part all_1_1_0 in committed state. \
+             (NO_SUCH_DATA_PART) (version 24.8.14.39 (official build))",
+            "Code: 233. DB::Exception: Unexpected part name: all_1_1_0_broken for \
+             format version: 1. (BAD_DATA_PART_NAME) (version 24.8.14.39 (official build))",
+        ] {
+            assert!(
+                classify_attach_error(err).counts_as_missing_data(),
+                "missing-part error must feed the partial-restore tally: {err}"
+            );
+        }
     }
 
     #[test]
-    fn test_is_benign_attach_error_connection_error() {
-        let err = anyhow::anyhow!("Connection refused");
-        assert!(!is_benign_attach_error(&err));
+    fn attach_error_classification_already_present_does_not_count_as_missing_data() {
+        // These must stay out of the failing tally so a re-restore over
+        // already-attached parts still exits 0.
+        for err in [
+            "Code: 235. DB::Exception: Part all_1_1_0 (state Active) already exists. \
+             (DUPLICATE_DATA_PART) (version 24.8.14.39 (official build))",
+            "Code: 384. DB::Exception: Part all_1_1_0 (state Deleting) already exists, \
+             but it will be deleted soon. (PART_IS_TEMPORARILY_LOCKED) \
+             (version 24.8.14.39 (official build))",
+        ] {
+            assert!(
+                !classify_attach_error(err).counts_as_missing_data(),
+                "already-present part must not fail the restore: {err}"
+            );
+        }
     }
 
     #[test]
-    fn test_is_benign_attach_error_empty_error() {
-        let err = anyhow::anyhow!("");
-        assert!(!is_benign_attach_error(&err));
-    }
-
-    // ---- is_missing_part_error tests ----
-
-    #[test]
-    fn test_is_missing_part_error_no_such_data_part() {
-        let err = anyhow::anyhow!("NO_SUCH_DATA_PART in table");
-        assert!(is_missing_part_error(&err));
+    fn attach_error_classification_unrecognized_error_is_unknown() {
+        assert_eq!(
+            classify_attach_error(
+                "Code: 60. DB::Exception: Table default.events does not exist. (UNKNOWN_TABLE)"
+            ),
+            AttachErrorClass::Unknown
+        );
     }
 
     #[test]
-    fn test_is_missing_part_error_other_error() {
-        let err = anyhow::anyhow!("Code: 232. DUPLICATE_DATA_PART");
-        assert!(!is_missing_part_error(&err));
+    fn attach_error_classification_transport_error_is_unknown() {
+        assert_eq!(
+            classify_attach_error("Connection refused"),
+            AttachErrorClass::Unknown
+        );
     }
 
     #[test]
-    fn test_is_missing_part_error_connection_error() {
-        let err = anyhow::anyhow!("Connection refused");
-        assert!(!is_missing_part_error(&err));
+    fn attach_error_classification_empty_error_is_unknown() {
+        assert_eq!(classify_attach_error(""), AttachErrorClass::Unknown);
     }
 }
