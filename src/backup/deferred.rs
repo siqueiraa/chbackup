@@ -445,10 +445,11 @@ pub async fn reap_expired(ch: &crate::clickhouse::client::ChClient, data_path: &
 
         // Acquire and HOLD the per-backup lock for the whole release.
         let scope = crate::lock::LockScope::Backup(backup_name.clone());
-        let lock_path = match crate::lock::lock_path_for_scope(&scope) {
-            Some(p) => p,
-            None => continue,
-        };
+        let lock_path =
+            match crate::lock::lock_path_for_scope(crate::lock::default_lock_dir(), &scope) {
+                Some(p) => p,
+                None => continue,
+            };
         let _lock = match crate::lock::PidLock::acquire(&lock_path, "reap_deferred_freeze") {
             Ok(l) => l,
             Err(_) => continue, // in use -- leave it alone
@@ -488,7 +489,7 @@ pub async fn reap_expired(ch: &crate::clickhouse::client::ChClient, data_path: &
 /// Whether some operation currently holds this backup's PID lock.
 fn backup_lock_is_active(backup_name: &str) -> bool {
     let scope = crate::lock::LockScope::Backup(backup_name.to_string());
-    match crate::lock::lock_path_for_scope(&scope) {
+    match crate::lock::lock_path_for_scope(crate::lock::default_lock_dir(), &scope) {
         Some(p) => crate::lock::is_lock_file_active(&p),
         None => false,
     }
