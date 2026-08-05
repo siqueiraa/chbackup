@@ -119,6 +119,7 @@ Connection settings and backup/restore behavior. chbackup must run on the same h
 | `mutation_wait_timeout` | string | `5m` | Timeout for waiting on mutations to complete |
 | `restore_as_attach` | bool | `false` | Use DETACH/ATTACH TABLE mode for full restores |
 | `attach_table_require_complete` | bool | `true` | With the default, restore **refuses to attach a Replicated table whose parts are not all present**: the table is not created, not attached, and all of its parts are reported as skipped, so the restore exits 3. Set to `false` to attach whatever parts are staged and count the deficit as skipped — that brings the table live with known-missing data. Only affects `restore_as_attach` mode |
+| `zk_check_strict` | bool | `true` | With the default, when `system.zookeeper` cannot be queried for a Replicated table, that table is **not created** and the restore fails for it: an unreachable ZooKeeper is not evidence that no stale replica is registered, and creating the table anyway is exactly the case ZK conflict resolution exists to catch. Set to `false` to restore the old permissive behaviour — the table is created without conflict resolution, with a warning saying the check was skipped (a stale replica, if any, is left in place, so CREATE may fail with an existing-replica error). Verified-clean ZooKeeper (proceed) and a found conflict (`SYSTEM DROP REPLICA`) are unaffected either way |
 | `restore_schema_on_cluster` | string | _(empty)_ | Execute DDL with ON CLUSTER clause. Set to cluster name |
 | `restore_distributed_cluster` | string | _(empty)_ | Rewrite Distributed engine cluster name during restore |
 | `max_connections` | int | `1` | Concurrent restore table operations |
@@ -295,6 +296,7 @@ The most common config parameters can be overridden via environment variables. O
 | `CLICKHOUSE_TLS_CA` | `clickhouse.tls_ca` |
 | `CLICKHOUSE_SYNC_REPLICATED_TABLES` | `clickhouse.sync_replicated_tables` |
 | `CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE` | `clickhouse.attach_table_require_complete` (default `true` refuses to attach a Replicated table whose parts are not all present) |
+| `CLICKHOUSE_ZK_CHECK_STRICT` | `clickhouse.zk_check_strict` (default `true` fails a Replicated table whose ZooKeeper state could not be verified; set `false` for the old permissive behaviour of creating it without conflict resolution) |
 | `CLICKHOUSE_MAX_CONNECTIONS` | `clickhouse.max_connections` |
 | `CLICKHOUSE_TIMEOUT` | `clickhouse.timeout` |
 | `CLICKHOUSE_DEBUG` | `clickhouse.debug` |

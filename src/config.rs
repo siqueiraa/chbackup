@@ -174,6 +174,11 @@ pub struct ClickHouseConfig {
     #[serde(default = "default_true")]
     pub attach_table_require_complete: bool,
 
+    /// fail a Replicated table's restore when `system.zookeeper` cannot be queried
+    /// for it (false = create it anyway, skipping ZK conflict resolution)
+    #[serde(default = "default_true")]
+    pub zk_check_strict: bool,
+
     /// execute DDL with ON CLUSTER clause
     #[serde(default)]
     pub restore_schema_on_cluster: String,
@@ -566,6 +571,7 @@ impl Default for ClickHouseConfig {
             mutation_wait_timeout: default_mutation_wait_timeout(),
             restore_as_attach: false,
             attach_table_require_complete: true,
+            zk_check_strict: true,
             restore_schema_on_cluster: String::new(),
             restore_distributed_cluster: String::new(),
             max_connections: default_max_connections(),
@@ -1100,6 +1106,16 @@ impl Config {
                 );
             }
         }
+        if let Ok(v) = std::env::var("CLICKHOUSE_ZK_CHECK_STRICT") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.clickhouse.zk_check_strict = b;
+            } else {
+                warn!(
+                    "CLICKHOUSE_ZK_CHECK_STRICT='{}' is not a valid bool, ignoring",
+                    v
+                );
+            }
+        }
         if let Ok(v) = std::env::var("CLICKHOUSE_MAX_CONNECTIONS") {
             if let Ok(n) = v.parse::<u32>() {
                 self.clickhouse.max_connections = n;
@@ -1504,6 +1520,9 @@ impl Config {
                 self.clickhouse.attach_table_require_complete =
                     value.parse().context("Invalid bool")?
             }
+            "clickhouse.zk_check_strict" => {
+                self.clickhouse.zk_check_strict = value.parse().context("Invalid bool")?
+            }
             "clickhouse.restore_schema_on_cluster" => {
                 self.clickhouse.restore_schema_on_cluster = value.to_string()
             }
@@ -1866,6 +1885,7 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE" => {
             Some("clickhouse.attach_table_require_complete")
         }
+        "CLICKHOUSE_ZK_CHECK_STRICT" => Some("clickhouse.zk_check_strict"),
         "CLICKHOUSE_MAX_CONNECTIONS" => Some("clickhouse.max_connections"),
         "CLICKHOUSE_TIMEOUT" => Some("clickhouse.timeout"),
         "CLICKHOUSE_CONFIG_DIR" => Some("clickhouse.config_dir"),

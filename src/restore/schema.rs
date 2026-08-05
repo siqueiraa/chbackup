@@ -10,10 +10,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::clickhouse::client::ChClient;
+use crate::clickhouse::client::{ChClient, ZkReplicaCheck};
 use crate::manifest::{BackupManifest, DatabaseInfo};
 
 use super::remap::{
@@ -385,20 +385,51 @@ pub async fn drop_databases(
 // ZK conflict resolution and DatabaseReplicated detection
 // ---------------------------------------------------------------------------
 
+/// What to do about a Replicated table's ZooKeeper state before its CREATE runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZkAction {
+    /// A stale replica is registered: `SYSTEM DROP REPLICA`, then CREATE.
+    DropReplica,
+    /// ZooKeeper holds no conflicting replica: CREATE as-is.
+    Proceed,
+    /// ZooKeeper state is unknown: refuse to create this table.
+    FailTable,
+}
+
+/// Map a ZooKeeper check outcome onto the action to take, given strictness.
+///
+/// The load-bearing cell is `Indeterminate` under the default `strict`: it maps to
+/// [`ZkAction::FailTable`], deliberately *not* to [`ZkAction::Proceed`]. Mapping it to
+/// `Proceed` would make an unreachable ZooKeeper take the same clean path as a
+/// ZooKeeper that was queried and found free of conflicting replicas -- the stale
+/// replica this check exists to catch would go undropped.
+pub fn zk_check_action(check: ZkReplicaCheck, strict: bool) -> ZkAction {
+    match check {
+        ZkReplicaCheck::Exists => ZkAction::DropReplica,
+        ZkReplicaCheck::Absent => ZkAction::Proceed,
+        ZkReplicaCheck::Indeterminate if strict => ZkAction::FailTable,
+        ZkReplicaCheck::Indeterminate => ZkAction::Proceed,
+    }
+}
+
 /// Check and resolve ZK replica path conflicts for a Replicated table.
 ///
 /// 1. Parse ZK path + replica name from DDL
 /// 2. Resolve macros using provided macro map
 /// 3. Check `system.zookeeper` for existing replica
-/// 4. If conflict: `SYSTEM DROP REPLICA`
+/// 4. Route the outcome through [`zk_check_action`]
 ///
-/// Returns `Ok(())` on success or if not a Replicated table.
-/// Logs warnings for conflicts and failures (non-fatal).
+/// Returns `Ok(())` if not a Replicated table, if ZooKeeper is clean, or if a
+/// conflicting replica was found (a failed `SYSTEM DROP REPLICA` stays non-fatal --
+/// the subsequent CREATE reports the conflict itself). Returns `Err` only for
+/// [`ZkAction::FailTable`], which the caller must let block the table's CREATE.
 pub async fn resolve_zk_conflict(
     ch: &ChClient,
     ddl: &str,
     macros: &std::collections::HashMap<String, String>,
     table_uuid: Option<&str>,
+    table: &str,
+    strict: bool,
 ) -> Result<()> {
     // Only applies to Replicated engines
     let (zk_path_template, replica_template) = match parse_replicated_params(ddl) {
@@ -418,36 +449,60 @@ pub async fn resolve_zk_conflict(
     let resolved_replica = resolve_zk_macros(&replica_template, &resolve_macros);
 
     // Check if replica already exists in ZK
-    let exists = ch
+    let check = ch
         .check_zk_replica_exists(&resolved_path, &resolved_replica)
-        .await?;
+        .await;
 
-    if exists {
-        warn!(
-            zk_path = %resolved_path,
-            replica = %resolved_replica,
-            "ZK replica conflict detected, dropping existing replica"
-        );
-        if let Err(e) = ch
-            .drop_replica_from_zkpath(&resolved_replica, &resolved_path)
-            .await
-        {
+    match zk_check_action(check, strict) {
+        ZkAction::DropReplica => {
             warn!(
-                error = %e,
                 zk_path = %resolved_path,
                 replica = %resolved_replica,
-                "SYSTEM DROP REPLICA failed (non-fatal, table creation may still succeed)"
+                "ZK replica conflict detected, dropping existing replica"
             );
-        } else {
-            info!(
-                zk_path = %resolved_path,
-                replica = %resolved_replica,
-                "SYSTEM DROP REPLICA successful"
-            );
+            if let Err(e) = ch
+                .drop_replica_from_zkpath(&resolved_replica, &resolved_path)
+                .await
+            {
+                warn!(
+                    error = %e,
+                    zk_path = %resolved_path,
+                    replica = %resolved_replica,
+                    "SYSTEM DROP REPLICA failed (non-fatal, table creation may still succeed)"
+                );
+            } else {
+                info!(
+                    zk_path = %resolved_path,
+                    replica = %resolved_replica,
+                    "SYSTEM DROP REPLICA successful"
+                );
+            }
+            Ok(())
         }
+        ZkAction::Proceed => {
+            if check == ZkReplicaCheck::Indeterminate {
+                warn!(
+                    table = %table,
+                    zk_path = %resolved_path,
+                    replica = %resolved_replica,
+                    "ZK conflict resolution SKIPPED because system.zookeeper could not be \
+                     queried (clickhouse.zk_check_strict is false). Whether a stale replica \
+                     is registered at this path is unknown; none was dropped"
+                );
+            }
+            Ok(())
+        }
+        ZkAction::FailTable => Err(anyhow!(
+            "cannot verify ZooKeeper state for {}: system.zookeeper could not be queried for \
+             replica '{}' at ZK path '{}', so a stale replica there would go undropped. \
+             Refusing to create the table against unverified ZK state -- set \
+             clickhouse.zk_check_strict to false to create it anyway, skipping conflict \
+             resolution",
+            table,
+            resolved_replica,
+            resolved_path
+        )),
     }
-
-    Ok(())
 }
 
 /// Query which databases use the Replicated engine.
@@ -520,6 +575,11 @@ pub fn is_replicated_engine(engine: &str) -> bool {
 /// table's database is in `replicated_databases`. For Replicated tables,
 /// ZK conflict resolution runs before CREATE. For Distributed tables,
 /// `dist_cluster` rewrites the cluster name.
+///
+/// `zk_check_strict` (`clickhouse.zk_check_strict`) decides what happens when
+/// `system.zookeeper` cannot be queried for a Replicated table: when true, that
+/// table is not created and the error propagates; when false, CREATE proceeds
+/// without conflict resolution. See [`zk_check_action`].
 #[allow(clippy::too_many_arguments)]
 pub async fn create_tables(
     ch: &ChClient,
@@ -531,6 +591,7 @@ pub async fn create_tables(
     replicated_databases: &HashSet<String>,
     macros: &HashMap<String, String>,
     dist_cluster: &str,
+    zk_check_strict: bool,
 ) -> Result<()> {
     if data_only {
         debug!("Data-only mode, skipping table creation");
@@ -614,7 +675,11 @@ pub async fn create_tables(
             }
         }
 
-        // ZK conflict resolution for Replicated tables (after DDL rewrite)
+        let dst_key = format!("{}.{}", dst_db, dst_table);
+
+        // ZK conflict resolution for Replicated tables (after DDL rewrite).
+        // A FailTable outcome must reach the caller: swallowing it here and creating the
+        // table anyway is what made the check fail open in the first place.
         if is_replicated_engine(&table_manifest.engine) {
             // Build macro map with database/table context
             let mut table_macros = macros.clone();
@@ -625,18 +690,17 @@ pub async fn create_tables(
                 .entry("table".to_string())
                 .or_insert_with(|| dst_table.clone());
 
-            if let Err(e) =
-                resolve_zk_conflict(ch, &ddl, &table_macros, table_manifest.uuid.as_deref()).await
-            {
-                warn!(
-                    table = %format!("{}.{}", dst_db, dst_table),
-                    error = %e,
-                    "ZK conflict resolution failed (non-fatal, proceeding with CREATE)"
-                );
-            }
+            resolve_zk_conflict(
+                ch,
+                &ddl,
+                &table_macros,
+                table_manifest.uuid.as_deref(),
+                &dst_key,
+                zk_check_strict,
+            )
+            .await?;
         }
 
-        let dst_key = format!("{}.{}", dst_db, dst_table);
         info!(table = %dst_key, "Creating table");
         ch.execute_ddl(&ddl)
             .await
@@ -1103,6 +1167,88 @@ mod tests {
 
         let resolved_path = resolve_zk_macros(&path_template, &macros);
         assert_eq!(resolved_path, "/clickhouse/tables/abc-123-def");
+    }
+
+    /// All four (check, strict) combinations map as specified.
+    #[test]
+    fn zk_conflict_indeterminate_action_mapping() {
+        for strict in [true, false] {
+            assert_eq!(
+                zk_check_action(ZkReplicaCheck::Exists, strict),
+                ZkAction::DropReplica
+            );
+            assert_eq!(
+                zk_check_action(ZkReplicaCheck::Absent, strict),
+                ZkAction::Proceed
+            );
+        }
+        assert_eq!(
+            zk_check_action(ZkReplicaCheck::Indeterminate, true),
+            ZkAction::FailTable
+        );
+        assert_eq!(
+            zk_check_action(ZkReplicaCheck::Indeterminate, false),
+            ZkAction::Proceed
+        );
+    }
+
+    /// An unqueryable ZooKeeper must not take the same path as a ZooKeeper that was
+    /// queried and found clean -- that equivalence is the fail-open bug itself.
+    #[test]
+    fn zk_conflict_indeterminate_differs_from_absent_under_strict() {
+        assert_ne!(
+            zk_check_action(ZkReplicaCheck::Indeterminate, true),
+            zk_check_action(ZkReplicaCheck::Absent, true)
+        );
+    }
+
+    /// The opt-out restores the old permissive behavior.
+    #[test]
+    fn zk_conflict_indeterminate_proceeds_when_not_strict() {
+        assert_eq!(
+            zk_check_action(ZkReplicaCheck::Indeterminate, false),
+            ZkAction::Proceed
+        );
+    }
+
+    /// A ZooKeeper check that could not run must stop the table's CREATE by default.
+    ///
+    /// `create_tables` reaches `ch.execute_ddl(&ddl)` only after
+    /// `resolve_zk_conflict(..).await?` returns `Ok`, so an `Err` here means the table is
+    /// not created. Pointing the client at a closed port makes the `system.zookeeper`
+    /// query fail for real, which is exactly what yields `Indeterminate`.
+    #[tokio::test]
+    async fn zk_strict_indeterminate_blocks_create() {
+        let ch = ChClient::new(&crate::config::ClickHouseConfig {
+            port: 1,
+            ..Default::default()
+        })
+        .expect("client construction does not connect");
+
+        let ddl = "CREATE TABLE default.t (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/01/default/t', 'r1') ORDER BY id";
+        let macros = HashMap::new();
+
+        let strict = resolve_zk_conflict(&ch, ddl, &macros, None, "default.t", true).await;
+        let err = strict.expect_err("strict mode must refuse to create the table");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default.t"),
+            "message must name the table: {msg}"
+        );
+        assert!(
+            msg.contains("/clickhouse/tables/01/default/t") && msg.contains("r1"),
+            "message must name the resolved ZK path and replica: {msg}"
+        );
+        assert!(
+            msg.contains("zk_check_strict"),
+            "message must name the overriding config flag: {msg}"
+        );
+
+        let permissive = resolve_zk_conflict(&ch, ddl, &macros, None, "default.t", false).await;
+        assert!(
+            permissive.is_ok(),
+            "with zk_check_strict=false the table is still created"
+        );
     }
 
     // -----------------------------------------------------------------------

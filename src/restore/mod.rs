@@ -272,6 +272,7 @@ pub async fn restore(
         &replicated_databases,
         &macros,
         dist_cluster,
+        config.clickhouse.zk_check_strict,
     )
     .await?;
 
@@ -308,6 +309,7 @@ pub async fn restore(
                 &replicated_databases,
                 &macros,
                 dist_cluster,
+                config.clickhouse.zk_check_strict,
             )
             .await?;
         }
@@ -877,6 +879,7 @@ pub async fn restore(
             &replicated_databases,
             &macros,
             dist_cluster,
+            config.clickhouse.zk_check_strict,
         )
         .await?;
     }

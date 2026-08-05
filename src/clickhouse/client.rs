@@ -148,6 +148,22 @@ struct CreateQueryRow {
     create_query: String,
 }
 
+/// Outcome of [`ChClient::check_zk_replica_exists`].
+///
+/// `Indeterminate` is deliberately a value of its own rather than folded into
+/// `Absent`: "ZooKeeper said there is no replica" and "we could not ask ZooKeeper"
+/// justify opposite decisions, and conflating them silently skips the conflict
+/// resolution the check exists to trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZkReplicaCheck {
+    /// A replica is registered at the ZK path.
+    Exists,
+    /// ZooKeeper was queried successfully and holds no such replica.
+    Absent,
+    /// The query failed, so ZK state is unknown.
+    Indeterminate,
+}
+
 impl ChClient {
     /// Build a new `ChClient` from the given `ClickHouseConfig`.
     ///
@@ -1154,8 +1170,13 @@ impl ChClient {
     ///
     /// SQL: `SELECT count() FROM system.zookeeper WHERE path='{zk_path}/replicas' AND name='{replica_name}'`
     ///
-    /// Returns `false` on query error (system.zookeeper may not be accessible).
-    pub async fn check_zk_replica_exists(&self, zk_path: &str, replica_name: &str) -> Result<bool> {
+    /// A failed query yields [`ZkReplicaCheck::Indeterminate`] -- `system.zookeeper`
+    /// being inaccessible is not evidence that the replica is absent.
+    pub async fn check_zk_replica_exists(
+        &self,
+        zk_path: &str,
+        replica_name: &str,
+    ) -> ZkReplicaCheck {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct CountRow {
             cnt: u64,
@@ -1170,7 +1191,8 @@ impl ChClient {
         self.log_sql(&sql, "Executing check_zk_replica_exists");
 
         match self.inner.query(&sql).fetch_one::<CountRow>().await {
-            Ok(row) => Ok(row.cnt > 0),
+            Ok(row) if row.cnt > 0 => ZkReplicaCheck::Exists,
+            Ok(_) => ZkReplicaCheck::Absent,
             Err(e) => {
                 warn!(
                     error = %e,
@@ -1178,7 +1200,7 @@ impl ChClient {
                     replica = %replica_name,
                     "Failed to check ZK replica existence (system.zookeeper may be unavailable)"
                 );
-                Ok(false)
+                ZkReplicaCheck::Indeterminate
             }
         }
     }
