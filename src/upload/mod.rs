@@ -813,10 +813,11 @@ async fn upload_inner(
 
                 // Pipeline: bridge the sync mpsc::Receiver (compression thread) to async
                 // upload via a tokio channel.  Compression and upload run concurrently:
-                // as soon as a chunk is ready it is uploaded, so only one chunk_size of
-                // memory is held at a time instead of all chunks.
+                // as soon as a chunk is ready it is uploaded.  Both channels are bounded,
+                // so at most stream::MAX_IN_FLIGHT_CHUNKS chunk buffers exist at once --
+                // MAX_IN_FLIGHT_CHUNKS * chunk_size bytes, whatever the part size.
                 let (tokio_tx, mut tokio_rx) =
-                    tokio::sync::mpsc::channel::<Result<Vec<u8>>>(2);
+                    tokio::sync::mpsc::channel::<Result<Vec<u8>>>(stream::BRIDGE_CHANNEL_BOUND);
 
                 let bridge = tokio::task::spawn_blocking(move || {
                     for chunk_result in receiver.iter() {

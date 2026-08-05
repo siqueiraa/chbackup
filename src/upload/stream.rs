@@ -17,6 +17,30 @@ use anyhow::{Context, Result};
 /// Minimum S3 multipart chunk size (5 MiB).
 pub const MIN_MULTIPART_CHUNK: usize = 5 * 1024 * 1024;
 
+/// Chunks the compression thread in [`compress_part_streaming`] may queue ahead of
+/// its consumer before `send` blocks.
+pub const STREAM_CHANNEL_BOUND: usize = 1;
+
+/// Capacity of the tokio channel that bridges the compression thread to the async
+/// upload loop in `upload()`.
+pub const BRIDGE_CHANNEL_BOUND: usize = 2;
+
+/// Chunk buffers the streaming upload pipeline may hold at once, across *both* of
+/// its channels. Peak memory for a streamed part is
+/// `MAX_IN_FLIGHT_CHUNKS * chunk_size` (30 MiB at the 5 MiB minimum chunk size),
+/// no matter how large the part is.
+///
+/// The budget, one `chunk_size` buffer per slot:
+/// - `STREAM_CHANNEL_BOUND` queued in the compression thread's `sync_channel`
+/// - 1 held by the compression thread while blocked in `send`
+/// - `BRIDGE_CHANNEL_BOUND` queued in the tokio bridge channel
+/// - 1 held by the bridge thread between `recv` and `blocking_send`
+/// - 1 held by the upload loop while being sent to S3
+///
+/// Both channel capacities feed this expression, so neither can be raised without
+/// the stated ceiling moving with it.
+pub const MAX_IN_FLIGHT_CHUNKS: usize = STREAM_CHANNEL_BOUND + 1 + BRIDGE_CHANNEL_BOUND + 1 + 1;
+
 /// Return the archive file extension for the given compression format.
 ///
 /// Maps format names to their conventional tar extension:
@@ -128,16 +152,17 @@ fn compress_none(part_dir: &Path, archive_name: &str) -> Result<Vec<u8>> {
 /// A writer that buffers bytes and sends fixed-size chunks through a channel.
 ///
 /// When the internal buffer reaches `chunk_size` bytes, the full chunk is sent
-/// through the `mpsc::Sender`. On `flush()` or `Drop`, any remaining bytes in the
-/// buffer are sent as the final (possibly smaller) chunk.
+/// through the `mpsc::SyncSender`, blocking while the channel is full so the
+/// compressor cannot run ahead of the consumer. On `flush()` or `Drop`, any
+/// remaining bytes in the buffer are sent as the final (possibly smaller) chunk.
 struct ChunkedWriter {
     buffer: Vec<u8>,
     chunk_size: usize,
-    sender: mpsc::Sender<Result<Vec<u8>>>,
+    sender: mpsc::SyncSender<Result<Vec<u8>>>,
 }
 
 impl ChunkedWriter {
-    fn new(chunk_size: usize, sender: mpsc::Sender<Result<Vec<u8>>>) -> Self {
+    fn new(chunk_size: usize, sender: mpsc::SyncSender<Result<Vec<u8>>>) -> Self {
         Self {
             buffer: Vec::with_capacity(chunk_size),
             chunk_size,
@@ -192,6 +217,10 @@ impl Drop for ChunkedWriter {
 /// fixed-size chunks (at least 5MB each for S3 multipart) via a channel.
 /// Returns a receiver that yields `Vec<u8>` chunks.
 ///
+/// The channel is bounded at `STREAM_CHANNEL_BOUND`, so a slow consumer stalls the
+/// compression thread instead of letting it buffer the whole compressed part in
+/// memory; see [`MAX_IN_FLIGHT_CHUNKS`] for the pipeline-wide memory ceiling.
+///
 /// The `chunk_size` parameter controls how large each chunk is. It must be
 /// at least `MIN_MULTIPART_CHUNK` (5 MiB) for S3 multipart compatibility.
 ///
@@ -217,7 +246,7 @@ pub fn compress_part_streaming(
         );
     }
 
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(STREAM_CHANNEL_BOUND);
 
     // Clone owned data for the spawned thread
     let part_dir_owned: PathBuf = part_dir.to_path_buf();
@@ -235,7 +264,8 @@ pub fn compress_part_streaming(
         );
 
         if let Err(e) = result {
-            // Send the error through the channel so the receiver can observe it
+            // Send the error through the channel so the receiver can observe it.
+            // Blocks if the channel is full; ignored if the receiver is already gone.
             let _ = sender.send(Err(e));
         }
         // sender is dropped here, closing the channel
@@ -255,7 +285,7 @@ fn streaming_compress_inner(
     data_format: &str,
     compression_level: u32,
     chunk_size: usize,
-    sender: &mpsc::Sender<Result<Vec<u8>>>,
+    sender: &mpsc::SyncSender<Result<Vec<u8>>>,
 ) -> Result<()> {
     // NOTE: Each match arm cannot fully share tar_into_writer because the encoder
     // types (FrameEncoder, zstd::Encoder, GzEncoder, ChunkedWriter) each have
@@ -618,6 +648,75 @@ mod tests {
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("chunk_size"));
         assert!(err.contains("MIN_MULTIPART_CHUNK"));
+    }
+
+    #[test]
+    fn test_streaming_backpressure_bounds_in_flight_chunks() {
+        // Enough data for many chunks: an unbounded channel would let the
+        // compression thread queue all of them while the consumer dawdles.
+        const TOTAL_CHUNKS: usize = 16;
+
+        let dir = tempfile::tempdir().unwrap();
+        let part_dir = dir.path().join("backpressure_part");
+        fs::create_dir_all(&part_dir).unwrap();
+        fs::write(
+            part_dir.join("big.bin"),
+            vec![0u8; TOTAL_CHUNKS * MIN_MULTIPART_CHUNK],
+        )
+        .unwrap();
+
+        let rx = compress_part_streaming(
+            &part_dir,
+            "backpressure_part",
+            "none", // no compression, so output size tracks input size
+            0,
+            MIN_MULTIPART_CHUNK,
+        )
+        .unwrap();
+
+        // Chunks sent but not yet received are exactly the channel's backlog, which
+        // `try_recv` drains without blocking. Sleeping first gives the compression
+        // thread every chance to run ahead, so the backlog we then observe is its
+        // high-water mark of in-flight chunks.
+        let mut received = 0usize;
+        let mut max_in_flight = 0usize;
+        let mut disconnected = false;
+        while !disconnected {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            let mut in_flight = 0usize;
+            loop {
+                match rx.try_recv() {
+                    Ok(chunk) => {
+                        chunk.unwrap();
+                        in_flight += 1;
+                        received += 1;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            max_in_flight = max_in_flight.max(in_flight);
+        }
+
+        assert!(
+            received >= TOTAL_CHUNKS,
+            "Expected at least {} chunks, got {}",
+            TOTAL_CHUNKS,
+            received
+        );
+        assert!(
+            max_in_flight >= 1,
+            "No chunk was ever observed in flight, so the bound was not exercised"
+        );
+        assert!(
+            max_in_flight <= MAX_IN_FLIGHT_CHUNKS,
+            "Observed {} chunks in flight, exceeding the MAX_IN_FLIGHT_CHUNKS budget of {}",
+            max_in_flight,
+            MAX_IN_FLIGHT_CHUNKS
+        );
     }
 
     #[test]
