@@ -7,7 +7,9 @@ use anyhow::{bail, Context, Result};
 use chbackup::clickhouse::{ChClient, TableRow};
 use chbackup::config::Config;
 use chbackup::error::exit_code_from_error;
-use chbackup::lock::{lock_for_command, lock_path_for_scope, PidLock};
+use chbackup::lock::{
+    acquire_scoped, default_lock_dir, lock_for_command, lock_path_for_scope, PidLock,
+};
 use chbackup::logging;
 use chbackup::manifest::BackupManifest;
 use chbackup::restore::remap;
@@ -41,10 +43,10 @@ fn backup_name_from_command(cmd: &Command) -> Option<&str> {
 /// When `None`, the lock is global (for commands like `clean` and `clean_broken`).
 fn acquire_lock(cmd_name: &str, backup_name: Option<&str>) -> Result<Option<PidLock>> {
     let scope = lock_for_command(cmd_name, backup_name);
-    match lock_path_for_scope(&scope) {
+    match lock_path_for_scope(default_lock_dir(), &scope) {
         Some(ref path) => {
             info!(command = cmd_name, lock_path = %path.display(), "Acquiring lock");
-            let guard = PidLock::acquire(path, cmd_name)?;
+            let guard = acquire_scoped(default_lock_dir(), &scope, cmd_name)?;
             info!("Lock acquired");
             Ok(Some(guard))
         }

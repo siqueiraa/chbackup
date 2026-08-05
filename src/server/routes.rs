@@ -914,17 +914,17 @@ async fn execute_action_command(
             let op = validated.parts[0].as_str();
 
             let lock_scope = crate::lock::lock_for_command(op, Some(&backup_name));
-            let _pid_lock = if let Some(lock_path) = crate::lock::lock_path_for_scope(&lock_scope) {
-                match crate::lock::PidLock::acquire(&lock_path, op) {
-                    Ok(lock) => Some(lock),
-                    Err(e) => {
-                        warn!(id = id, error = %e, "post_actions: failed to acquire PID lock");
-                        state.fail_op(id, e.to_string()).await;
-                        return;
-                    }
+            let _pid_lock = match crate::lock::acquire_scoped(
+                crate::lock::default_lock_dir(),
+                &lock_scope,
+                op,
+            ) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    warn!(id = id, error = %e, "post_actions: failed to acquire PID lock");
+                    state.fail_op(id, e.to_string()).await;
+                    return;
                 }
-            } else {
-                None
             };
 
             let config = state.config.load();
@@ -1058,17 +1058,13 @@ pub async fn go_post_actions(
 
                     // PID lock per-command
                     let lock_scope = crate::lock::lock_for_command(op, Some(&backup_name));
-                    let _pid_lock = if let Some(lock_path) = crate::lock::lock_path_for_scope(&lock_scope) {
-                        match crate::lock::PidLock::acquire(&lock_path, op) {
-                            Ok(lock) => Some(lock),
-                            Err(e) => {
-                                warn!(command = %command_str, error = %e, "Failed to acquire PID lock");
-                                state_clone.fail_op(cmd_id, e.to_string()).await;
-                                return;
-                            }
+                    let _pid_lock = match crate::lock::acquire_scoped(crate::lock::default_lock_dir(), &lock_scope, op) {
+                        Ok(lock) => lock,
+                        Err(e) => {
+                            warn!(command = %command_str, error = %e, "Failed to acquire PID lock");
+                            state_clone.fail_op(cmd_id, e.to_string()).await;
+                            return;
                         }
-                    } else {
-                        None
                     };
 
                     let config = state_clone.config.load();

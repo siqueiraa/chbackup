@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,17 @@ pub fn is_lock_file_active(path: &Path) -> bool {
 /// - `Backup(name)` -- per-backup lock (`/tmp/chbackup.{name}.pid`)
 /// - `Global` -- global lock (`/tmp/chbackup.global.pid`)
 /// - `None` -- no lock required (read-only commands)
+///
+/// The two locking tiers are mutually exclusive, and [`acquire_scoped`] is the
+/// only place that rule is enforced:
+///
+/// - a `Global` acquisition fails while ANY per-backup lock is live, because
+///   destructive admin commands (`clean`, `clean_broken`, `delete`) may delete
+///   data another backup is still writing;
+/// - a `Backup(name)` acquisition fails while the global lock is live;
+/// - a `Backup(name)` acquisition fails while the same name is already held.
+///
+/// Locks whose recorded PID is dead are stale and never block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockScope {
     /// Per-backup lock for mutating backup commands.
@@ -176,15 +188,158 @@ pub fn lock_for_command(command: &str, backup_name: Option<&str>) -> LockScope {
     }
 }
 
-/// Resolve a [`LockScope`] to an optional filesystem path.
+/// Filename prefix shared by every scope lock file.
+const LOCK_PREFIX: &str = "chbackup.";
+/// Filename suffix shared by every scope lock file.
+const LOCK_SUFFIX: &str = ".pid";
+/// Scope-lock filename stem of the global tier.
+const GLOBAL_STEM: &str = "global";
+/// Filename of the short-lived gate that serialises scope acquisitions.
+///
+/// Deliberately not a `chbackup.*.pid` name: the scan in
+/// [`check_cross_tier_exclusion`] (and `list::active_freeze_prefixes`) would
+/// otherwise read the gate as a per-backup lock for a backup named "acquire".
+const GATE_LOCK_FILE: &str = "chbackup.acquire.lock";
+
+/// Attempts to take the gate before giving up, and the retry backoff bounds.
+/// The gate is held only for a handful of filesystem calls, so contention is
+/// resolved in the first retry or two; the cap exists so a pathological case
+/// fails with a `LockError` instead of hanging.
+const GATE_MAX_ATTEMPTS: u32 = 40;
+const GATE_RETRY_DELAY: Duration = Duration::from_millis(5);
+const GATE_MAX_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// The lock directory used in production; tests pass a `TempDir` instead.
+pub fn default_lock_dir() -> &'static Path {
+    Path::new("/tmp")
+}
+
+/// Resolve a [`LockScope`] to an optional lock file path under `lock_dir`.
 ///
 /// Returns `None` for `LockScope::None`.
-pub fn lock_path_for_scope(scope: &LockScope) -> Option<PathBuf> {
-    match scope {
-        LockScope::Backup(name) => Some(PathBuf::from(format!("/tmp/chbackup.{name}.pid"))),
-        LockScope::Global => Some(PathBuf::from("/tmp/chbackup.global.pid")),
-        LockScope::None => None,
+pub fn lock_path_for_scope(lock_dir: &Path, scope: &LockScope) -> Option<PathBuf> {
+    let stem = match scope {
+        LockScope::Backup(name) => name.as_str(),
+        LockScope::Global => GLOBAL_STEM,
+        LockScope::None => return None,
+    };
+    Some(lock_dir.join(format!("{LOCK_PREFIX}{stem}{LOCK_SUFFIX}")))
+}
+
+/// Acquire the lock for `scope` under `lock_dir`, enforcing mutual exclusion
+/// between the global and per-backup tiers (see [`LockScope`]).
+///
+/// Exclusion cannot be established by scanning for conflicts and then creating
+/// the lock file: two processes would both scan, both see nothing, and both
+/// acquire. So the scan and the create both happen while holding a gate lock,
+/// which makes the pair atomic against every other process using the same
+/// `lock_dir`. The gate is released before this function returns, so it never
+/// serialises the long-running operations themselves -- only their acquisition.
+///
+/// Returns [`ChBackupError::LockError`] naming the conflicting holder, which
+/// maps to CLI exit code 4 and HTTP 423. Callers must skip `LockScope::None`
+/// themselves; it has no lock file.
+pub fn acquire_scoped(
+    lock_dir: &Path,
+    scope: &LockScope,
+    command: &str,
+) -> Result<PidLock, ChBackupError> {
+    let path = lock_path_for_scope(lock_dir, scope).ok_or_else(|| {
+        ChBackupError::LockError("LockScope::None has no lock file to acquire".to_string())
+    })?;
+
+    let _gate = acquire_gate(lock_dir, command)?;
+    check_cross_tier_exclusion(lock_dir, scope)?;
+    PidLock::acquire(&path, command)
+}
+
+/// Take the gate lock, retrying with exponential backoff while another process
+/// holds it.
+///
+/// The gate is an ordinary [`PidLock`], so a gate left behind by a crashed
+/// process is stale-takeover-eligible and cannot wedge the tool.
+fn acquire_gate(lock_dir: &Path, command: &str) -> Result<PidLock, ChBackupError> {
+    let gate_path = lock_dir.join(GATE_LOCK_FILE);
+    let mut delay = GATE_RETRY_DELAY;
+    let mut attempt = 1;
+    loop {
+        match PidLock::acquire(&gate_path, command) {
+            Ok(gate) => return Ok(gate),
+            Err(e) if attempt >= GATE_MAX_ATTEMPTS => {
+                return Err(ChBackupError::LockError(format!(
+                    "gave up waiting for the acquisition gate {}: {e}",
+                    gate_path.display()
+                )));
+            }
+            Err(_) => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(GATE_MAX_RETRY_DELAY);
+                attempt += 1;
+            }
+        }
     }
+}
+
+/// Reject an acquisition that conflicts with a live lock in the other tier.
+///
+/// The caller must hold the gate; without it this scan is a TOCTOU check.
+/// Same-tier conflicts are left to [`PidLock::acquire`], whose `O_EXCL` create
+/// is already atomic.
+fn check_cross_tier_exclusion(lock_dir: &Path, scope: &LockScope) -> Result<(), ChBackupError> {
+    match scope {
+        LockScope::Global => {
+            let entries = fs::read_dir(lock_dir).map_err(|e| {
+                ChBackupError::LockError(format!(
+                    "failed to scan lock directory {}: {e}",
+                    lock_dir.display()
+                ))
+            })?;
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let Some(backup) = file_name.to_str().and_then(backup_name_from_lock_file) else {
+                    continue;
+                };
+                if let Some(holder) = live_lock_holder(&entry.path()) {
+                    return Err(ChBackupError::LockError(format!(
+                        "global lock blocked by backup '{backup}' held by {holder}"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        LockScope::Backup(name) => {
+            let global = lock_dir.join(format!("{LOCK_PREFIX}{GLOBAL_STEM}{LOCK_SUFFIX}"));
+            match live_lock_holder(&global) {
+                Some(holder) => Err(ChBackupError::LockError(format!(
+                    "lock for backup '{name}' blocked by the global lock held by {holder}"
+                ))),
+                None => Ok(()),
+            }
+        }
+        LockScope::None => Ok(()),
+    }
+}
+
+/// Extract the backup name from a per-backup lock filename, or `None` if the
+/// name belongs to another tier or is not a scope lock at all.
+fn backup_name_from_lock_file(file_name: &str) -> Option<&str> {
+    let stem = file_name
+        .strip_prefix(LOCK_PREFIX)?
+        .strip_suffix(LOCK_SUFFIX)?;
+    (!stem.is_empty() && stem != GLOBAL_STEM).then_some(stem)
+}
+
+/// Describe the live holder of the lock file at `path`, or `None` if the file
+/// is missing, unreadable, malformed, or owned by a dead PID.
+fn live_lock_holder(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let info: LockInfo = serde_json::from_str(&contents).ok()?;
+    is_pid_alive(info.pid).then(|| {
+        format!(
+            "PID {} (command: {}, since: {})",
+            info.pid, info.command, info.timestamp
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -362,5 +517,166 @@ mod tests {
         assert_eq!(lock_for_command("print-config", None), LockScope::None);
         assert_eq!(lock_for_command("watch", None), LockScope::None);
         assert_eq!(lock_for_command("server", None), LockScope::None);
+    }
+
+    /// A PID that is not alive on any realistic system (Linux `pid_max`
+    /// defaults to 32768, macOS to 99998).
+    const DEAD_PID: u32 = 4_000_000;
+
+    /// Write a lock file as if another process had created it.
+    fn write_foreign_lock(path: &Path, pid: u32) {
+        let info = LockInfo {
+            pid,
+            command: "foreign".to_string(),
+            timestamp: "2020-01-01T00:00:00Z".to_string(),
+        };
+        fs::write(path, serde_json::to_string(&info).unwrap()).unwrap();
+    }
+
+    fn backup_scope(name: &str) -> LockScope {
+        LockScope::Backup(name.to_string())
+    }
+
+    #[test]
+    fn lock_cross_tier_global_blocked_by_live_backup() {
+        let dir = TempDir::new().unwrap();
+        let _backup = acquire_scoped(dir.path(), &backup_scope("daily"), "upload").unwrap();
+
+        let err = acquire_scoped(dir.path(), &LockScope::Global, "clean_broken").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("daily"), "error should name the backup: {msg}");
+        assert!(
+            !lock_path_for_scope(dir.path(), &LockScope::Global)
+                .unwrap()
+                .exists(),
+            "a rejected global acquisition must not leave a lock file behind"
+        );
+    }
+
+    #[test]
+    fn lock_cross_tier_backup_blocked_by_live_global() {
+        let dir = TempDir::new().unwrap();
+        let _global = acquire_scoped(dir.path(), &LockScope::Global, "clean_broken").unwrap();
+
+        let err = acquire_scoped(dir.path(), &backup_scope("daily"), "upload").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("global lock"),
+            "error should name the global lock: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_cross_tier_stale_backup_does_not_block_global() {
+        let dir = TempDir::new().unwrap();
+        write_foreign_lock(
+            &lock_path_for_scope(dir.path(), &backup_scope("crashed")).unwrap(),
+            DEAD_PID,
+        );
+
+        let lock = acquire_scoped(dir.path(), &LockScope::Global, "clean_broken").unwrap();
+        assert!(lock.path().exists());
+    }
+
+    #[test]
+    fn lock_cross_tier_stale_global_does_not_block_backup() {
+        let dir = TempDir::new().unwrap();
+        write_foreign_lock(
+            &lock_path_for_scope(dir.path(), &LockScope::Global).unwrap(),
+            DEAD_PID,
+        );
+
+        let lock = acquire_scoped(dir.path(), &backup_scope("daily"), "upload").unwrap();
+        assert!(lock.path().exists());
+    }
+
+    #[test]
+    fn lock_cross_tier_same_backup_name_still_blocks() {
+        let dir = TempDir::new().unwrap();
+        let _first = acquire_scoped(dir.path(), &backup_scope("daily"), "upload").unwrap();
+
+        let err = acquire_scoped(dir.path(), &backup_scope("daily"), "download").unwrap_err();
+        assert!(
+            err.to_string().contains("lock held by PID"),
+            "same-name conflict should still be reported: {err}"
+        );
+    }
+
+    #[test]
+    fn lock_gate_stale_recovery() {
+        let dir = TempDir::new().unwrap();
+        let gate_path = dir.path().join(GATE_LOCK_FILE);
+        // A gate left behind by a crashed acquirer must not wedge the tool.
+        write_foreign_lock(&gate_path, DEAD_PID);
+
+        let lock = acquire_scoped(dir.path(), &backup_scope("daily"), "create").unwrap();
+
+        assert!(lock.path().exists());
+        assert!(
+            !gate_path.exists(),
+            "the gate must be released before the operation begins"
+        );
+    }
+
+    /// Hammer both tiers from many threads and assert the invariant that a
+    /// global holder and a per-backup holder never coexist. Per-direction
+    /// sequential tests cannot catch an interleaving of scan and create.
+    #[test]
+    fn lock_cross_tier_mutual_exclusion_concurrent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let lock_dir = dir.path().to_path_buf();
+        let globals_held = Arc::new(AtomicUsize::new(0));
+        let backups_held = Arc::new(AtomicUsize::new(0));
+        let violations = Arc::new(AtomicUsize::new(0));
+
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let lock_dir = lock_dir.clone();
+                let globals_held = Arc::clone(&globals_held);
+                let backups_held = Arc::clone(&backups_held);
+                let violations = Arc::clone(&violations);
+                std::thread::spawn(move || {
+                    let global = t % 2 == 0;
+                    let scope = if global {
+                        LockScope::Global
+                    } else {
+                        backup_scope(&format!("backup-{t}"))
+                    };
+                    for _ in 0..25 {
+                        // A rejected acquisition is a legitimate outcome here;
+                        // only a granted one can violate the invariant.
+                        let Ok(lock) = acquire_scoped(&lock_dir, &scope, "concurrent") else {
+                            continue;
+                        };
+                        let (mine, theirs) = if global {
+                            (&globals_held, &backups_held)
+                        } else {
+                            (&backups_held, &globals_held)
+                        };
+                        mine.fetch_add(1, Ordering::SeqCst);
+                        // With SeqCst, if two holders overlap at least one of
+                        // them observes the other's increment.
+                        if theirs.load(Ordering::SeqCst) > 0 {
+                            violations.fetch_add(1, Ordering::SeqCst);
+                        }
+                        std::thread::yield_now();
+                        mine.fetch_sub(1, Ordering::SeqCst);
+                        drop(lock);
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "a global holder and a per-backup holder must never coexist"
+        );
     }
 }

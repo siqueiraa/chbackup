@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::clickhouse::ChClient;
 use crate::config::Config;
 use crate::list::ManifestCache;
-use crate::lock::{lock_for_command, lock_path_for_scope, PidLock};
+use crate::lock::{acquire_scoped, default_lock_dir, lock_for_command, LockScope};
 use crate::storage::S3Client;
 
 use tracing::{info, warn};
@@ -442,8 +442,10 @@ where
                 // Acquire PID lock before loading clients or running the operation.
                 // This provides cross-process exclusion (CLI vs server) per design §9.
                 let lock_scope = lock_for_command(&command_for_lock, backup_name_for_lock.as_deref());
-                let _pid_lock = if let Some(lock_path) = lock_path_for_scope(&lock_scope) {
-                    match PidLock::acquire(&lock_path, &command_for_lock) {
+                let _pid_lock = if lock_scope == LockScope::None {
+                    None
+                } else {
+                    match acquire_scoped(default_lock_dir(), &lock_scope, &command_for_lock) {
                         Ok(lock) => Some(lock),
                         Err(e) => {
                             warn!(op = %op_label_owned, error = %e, "Failed to acquire PID lock");
@@ -451,8 +453,6 @@ where
                             return;
                         }
                     }
-                } else {
-                    None
                 };
 
                 let config = state_clone.config.load_full();
@@ -658,17 +658,13 @@ pub async fn auto_resume(state: &AppState) {
                         }
                         _ = async {
                             let lock_scope = lock_for_command("upload", Some(&backup_name));
-                            let _pid_lock = if let Some(lock_path) = lock_path_for_scope(&lock_scope) {
-                                match PidLock::acquire(&lock_path, "upload") {
-                                    Ok(l) => Some(l),
-                                    Err(e) => {
-                                        tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: upload PID lock failed");
-                                        state_clone.fail_op(id, e.to_string()).await;
-                                        return;
-                                    }
+                            let _pid_lock = match acquire_scoped(default_lock_dir(), &lock_scope, "upload") {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: upload PID lock failed");
+                                    state_clone.fail_op(id, e.to_string()).await;
+                                    return;
                                 }
-                            } else {
-                                None
                             };
 
                             let config = state_clone.config.load();
@@ -729,17 +725,13 @@ pub async fn auto_resume(state: &AppState) {
                         }
                         _ = async {
                             let lock_scope = lock_for_command("download", Some(&backup_name));
-                            let _pid_lock = if let Some(lock_path) = lock_path_for_scope(&lock_scope) {
-                                match PidLock::acquire(&lock_path, "download") {
-                                    Ok(l) => Some(l),
-                                    Err(e) => {
-                                        tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: download PID lock failed");
-                                        state_clone.fail_op(id, e.to_string()).await;
-                                        return;
-                                    }
+                            let _pid_lock = match acquire_scoped(default_lock_dir(), &lock_scope, "download") {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: download PID lock failed");
+                                    state_clone.fail_op(id, e.to_string()).await;
+                                    return;
                                 }
-                            } else {
-                                None
                             };
 
                             let config = state_clone.config.load();
@@ -822,17 +814,13 @@ pub async fn auto_resume(state: &AppState) {
                         }
                         _ = async {
                             let lock_scope = lock_for_command("restore", Some(&backup_name));
-                            let _pid_lock = if let Some(lock_path) = lock_path_for_scope(&lock_scope) {
-                                match PidLock::acquire(&lock_path, "restore") {
-                                    Ok(l) => Some(l),
-                                    Err(e) => {
-                                        tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: restore PID lock failed");
-                                        state_clone.fail_op(id, e.to_string()).await;
-                                        return;
-                                    }
+                            let _pid_lock = match acquire_scoped(default_lock_dir(), &lock_scope, "restore") {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    tracing::warn!(backup_name = %backup_name, error = %e, "Auto-resume: restore PID lock failed");
+                                    state_clone.fail_op(id, e.to_string()).await;
+                                    return;
                                 }
-                            } else {
-                                None
                             };
 
                             let config = state_clone.config.load();

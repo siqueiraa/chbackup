@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use crate::clickhouse::ChClient;
 use crate::config::{parse_duration_secs, Config};
 use crate::list::{BackupSummary, ManifestCache};
-use crate::lock::PidLock;
+use crate::lock::{acquire_scoped, default_lock_dir, LockScope};
 use crate::server::metrics::Metrics;
 use crate::server::state::{validate_backup_name, WatchStatus};
 use crate::storage::S3Client;
@@ -537,9 +537,10 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
         }
 
         // Acquire per-backup PID lock before mutating operations (design §2).
-        // Enables orphan shadow-dir cleanup to detect in-progress watch backups.
-        let lock_path = std::path::PathBuf::from(format!("/tmp/chbackup.{backup_name}.pid"));
-        let _pid_lock = match PidLock::acquire(&lock_path, "watch") {
+        // Enables orphan shadow-dir cleanup to detect in-progress watch backups,
+        // and excludes concurrent global-scope commands (clean, delete).
+        let lock_scope = LockScope::Backup(backup_name.clone());
+        let _pid_lock = match acquire_scoped(default_lock_dir(), &lock_scope, "watch") {
             Ok(l) => l,
             Err(e) => {
                 warn!(error = %e, backup_name = %backup_name, "watch: failed to acquire backup lock");
