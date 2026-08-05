@@ -6,4 +6,11 @@ cobertura.xml
 *.profraw
 *.profdata
 .env
+
+# macOS
+.DS_Store
+
+# Local planning / verification scratch work -- session-scoped, not project docs
 docs/plans/
+docs/verification/
+.wildz-data-planning-active.json
