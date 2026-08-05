@@ -926,11 +926,24 @@ pub async fn apply_retention_after_upload(
 
 // -- GC functions --
 
-/// Extract all referenced S3 keys from a backup manifest.
+/// Extract everything a backup manifest references, as a set of key *prefixes*.
 ///
-/// Collects `backup_key` from every `PartInfo` and every `S3ObjectInfo`
-/// within each table's parts. Returns a set of relative S3 keys.
-fn collect_keys_from_manifest(manifest: &BackupManifest) -> HashSet<String> {
+/// Collects `backup_key` from every `PartInfo` and every `S3ObjectInfo` within
+/// each table's parts. Most entries are whole object keys (a local part's
+/// archive, an S3-disk data object), but an S3-disk part's metadata key is
+/// directory-like and ends in `/` (see the key built in `upload::upload_inner`,
+/// `{backup}/data/{db}/{table}/{disk}/{part}/`): it stands for every metadata
+/// file uploaded under it. That trailing `/` is load-bearing and must be
+/// preserved -- `is_key_protected` uses it to distinguish an exact key from a
+/// prefix that covers its children.
+///
+/// A set built from the surviving manifests is transitively complete over an
+/// incremental chain, so no chain walk (and no new manifest field) is needed:
+/// `backup::diff::diff_parts` copies the base part's *physical* `backup_key`
+/// into the incremental's `PartInfo`, so a surviving incremental manifest
+/// already names every key its data lives at -- including keys first written by
+/// an intermediate backup that has itself since been deleted.
+pub fn collect_key_prefixes_from_manifest(manifest: &BackupManifest) -> HashSet<String> {
     let mut keys = HashSet::new();
 
     for table in manifest.tables.values() {
@@ -951,6 +964,25 @@ fn collect_keys_from_manifest(manifest: &BackupManifest) -> HashSet<String> {
     }
 
     keys
+}
+
+/// Whether a relative S3 key is still referenced, and so must not be deleted.
+///
+/// A key is protected when it is itself a protected entry, or when it lives
+/// under a protected entry that ends in `/`. The prefix case is what makes
+/// S3-disk metadata safe: a manifest references the part's metadata *directory*
+/// (`.../{part}/`), never the individual `.../{part}/checksums.txt` files
+/// underneath it, so exact set membership alone would report every one of those
+/// files as unreferenced and delete a surviving backup's metadata.
+///
+/// Protected entries without a trailing `/` match exactly and never by prefix,
+/// so a key under a sibling part (`a/b/part10/x` vs protected `a/b/part1/`) is
+/// not accidentally protected.
+pub fn is_key_protected(relative_key: &str, protected: &HashSet<String>) -> bool {
+    protected.contains(relative_key)
+        || protected
+            .iter()
+            .any(|entry| entry.ends_with('/') && relative_key.starts_with(entry))
 }
 
 /// Collect all S3 keys referenced by surviving remote backups (excluding one).
@@ -997,7 +1029,7 @@ pub async fn gc_collect_referenced_keys(
         match s3.get_object(&manifest_key).await {
             Ok(data) => match BackupManifest::from_json_bytes(&data) {
                 Ok(manifest) => {
-                    let keys = collect_keys_from_manifest(&manifest);
+                    let keys = collect_key_prefixes_from_manifest(&manifest);
                     all_keys.extend(keys);
                     manifest_count += 1;
                 }
@@ -1147,6 +1179,45 @@ async fn collect_incremental_bases(s3: &S3Client, surviving_names: &[&str]) -> H
     }
 
     bases
+}
+
+/// Which backups a retention pass should delete, and which it keeps.
+#[derive(Debug)]
+pub struct RetentionPlan {
+    /// Names of the backups to delete, oldest first.
+    pub to_delete: Vec<String>,
+    /// Names of the backups that survive the pass, oldest first.
+    pub surviving: Vec<String>,
+}
+
+/// Decide which backups to delete to bring the valid backup count down to `keep`.
+///
+/// Broken backups are ignored entirely: they neither count towards `keep` nor
+/// appear in either list, because retention does not delete them (that is
+/// `clean_broken`'s job).
+///
+/// `keep` is the literal number of newest valid backups to keep -- `keep == 0`
+/// plans every valid backup for deletion. The `keep == 0` means "unlimited"
+/// config sentinel is the caller's concern, handled before calling this.
+pub fn plan_retention_deletions(summaries: &[BackupSummary], keep: usize) -> RetentionPlan {
+    let mut valid: Vec<&BackupSummary> = summaries.iter().filter(|b| !b.is_broken).collect();
+
+    // Oldest first, so the deletions are the leading slice.
+    valid.sort_by_key(|s| s.timestamp);
+
+    let to_delete = valid.len().saturating_sub(keep);
+    RetentionPlan {
+        to_delete: valid
+            .iter()
+            .take(to_delete)
+            .map(|b| b.name.clone())
+            .collect(),
+        surviving: valid
+            .iter()
+            .skip(to_delete)
+            .map(|b| b.name.clone())
+            .collect(),
+    }
 }
 
 /// Delete oldest remote backups exceeding the `keep` count with GC-safe deletion.
@@ -2394,7 +2465,7 @@ mod tests {
             .with_compressed_size(350)
             .with_metadata_size(256);
 
-        let keys = collect_keys_from_manifest(&manifest);
+        let keys = collect_key_prefixes_from_manifest(&manifest);
 
         // Should have 5 keys total: 2 local parts + 1 s3 disk part + 2 s3 objects
         assert_eq!(keys.len(), 5);
@@ -2415,8 +2486,158 @@ mod tests {
     fn test_collect_keys_from_empty_manifest() {
         let manifest = BackupManifest::test_new("empty");
 
-        let keys = collect_keys_from_manifest(&manifest);
+        let keys = collect_key_prefixes_from_manifest(&manifest);
         assert!(keys.is_empty(), "Empty manifest should produce no keys");
+    }
+
+    #[test]
+    fn test_collect_key_prefixes_preserves_trailing_slash() {
+        use crate::manifest::{PartInfo, TableManifest};
+
+        let mut parts = BTreeMap::new();
+        parts.insert("s3disk".to_string(), {
+            let mut p = PartInfo::new("202401_1_1_0", 100, 0);
+            // S3-disk metadata keys are directory-like (upload::upload_inner).
+            p.backup_key = "daily/data/default/trades/s3disk/202401_1_1_0/".to_string();
+            vec![p]
+        });
+
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "default.trades".to_string(),
+            TableManifest::test_new("MergeTree").with_parts(parts),
+        );
+
+        let keys = collect_key_prefixes_from_manifest(
+            &BackupManifest::test_new("daily").with_tables(tables),
+        );
+
+        assert!(keys.contains("daily/data/default/trades/s3disk/202401_1_1_0/"));
+    }
+
+    // -- is_key_protected tests --
+
+    fn protected_set(entries: &[&str]) -> HashSet<String> {
+        entries.iter().map(|e| e.to_string()).collect()
+    }
+
+    #[test]
+    fn test_is_key_protected_exact_key() {
+        let protected = protected_set(&["daily/data/default/trades/part1.tar.lz4"]);
+
+        assert!(is_key_protected(
+            "daily/data/default/trades/part1.tar.lz4",
+            &protected
+        ));
+        assert!(!is_key_protected(
+            "daily/data/default/trades/part2.tar.lz4",
+            &protected
+        ));
+    }
+
+    #[test]
+    fn test_is_key_protected_directory_prefix() {
+        // An S3-disk metadata directory protects the files uploaded under it.
+        let protected = protected_set(&["daily/data/default/trades/s3disk/202401_1_1_0/"]);
+
+        assert!(is_key_protected(
+            "daily/data/default/trades/s3disk/202401_1_1_0/checksums.txt",
+            &protected
+        ));
+        assert!(is_key_protected(
+            "daily/data/default/trades/s3disk/202401_1_1_0/",
+            &protected
+        ));
+    }
+
+    #[test]
+    fn test_is_key_protected_sibling_prefix_does_not_match() {
+        let protected = protected_set(&["a/b/part1/"]);
+
+        assert!(!is_key_protected("a/b/part10/x", &protected));
+    }
+
+    #[test]
+    fn test_is_key_protected_exact_entry_does_not_match_by_prefix() {
+        // Without a trailing '/' an entry is a whole object key, not a directory.
+        let protected = protected_set(&["a/b/part1"]);
+
+        assert!(!is_key_protected("a/b/part1/x", &protected));
+    }
+
+    // -- plan_retention_deletions tests --
+
+    fn retention_summary(name: &str, timestamp_secs: i64, is_broken: bool) -> BackupSummary {
+        BackupSummary {
+            name: name.to_string(),
+            timestamp: DateTime::from_timestamp(timestamp_secs, 0),
+            size: 0,
+            compressed_size: 0,
+            table_count: 0,
+            metadata_size: 0,
+            rbac_size: 0,
+            config_size: 0,
+            object_disk_size: 0,
+            required: String::new(),
+            is_broken,
+            broken_reason: None,
+        }
+    }
+
+    #[test]
+    fn test_plan_retention_deletions_deletes_oldest_first() {
+        let summaries = [
+            retention_summary("newest", 300, false),
+            retention_summary("oldest", 100, false),
+            retention_summary("middle", 200, false),
+        ];
+
+        let plan = plan_retention_deletions(&summaries, 1);
+
+        assert_eq!(plan.to_delete, vec!["oldest", "middle"]);
+        assert_eq!(plan.surviving, vec!["newest"]);
+    }
+
+    #[test]
+    fn test_plan_retention_deletions_keep_zero_deletes_all() {
+        let summaries = [
+            retention_summary("a", 100, false),
+            retention_summary("b", 200, false),
+        ];
+
+        let plan = plan_retention_deletions(&summaries, 0);
+
+        assert_eq!(plan.to_delete, vec!["a", "b"]);
+        assert!(plan.surviving.is_empty());
+    }
+
+    #[test]
+    fn test_plan_retention_deletions_keep_at_least_len_deletes_nothing() {
+        let summaries = [
+            retention_summary("a", 100, false),
+            retention_summary("b", 200, false),
+        ];
+
+        for keep in [2, 3, 100] {
+            let plan = plan_retention_deletions(&summaries, keep);
+            assert!(plan.to_delete.is_empty(), "keep={} deleted something", keep);
+            assert_eq!(plan.surviving, vec!["a", "b"]);
+        }
+    }
+
+    #[test]
+    fn test_plan_retention_deletions_excludes_broken_backups() {
+        let summaries = [
+            retention_summary("broken-old", 50, true),
+            retention_summary("a", 100, false),
+            retention_summary("b", 200, false),
+        ];
+
+        // The broken backup neither counts towards `keep` nor gets planned.
+        let plan = plan_retention_deletions(&summaries, 1);
+
+        assert_eq!(plan.to_delete, vec!["a"]);
+        assert_eq!(plan.surviving, vec!["b"]);
     }
 
     // -- GC filtering tests --
@@ -3686,7 +3907,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // collect_keys_from_manifest edge cases
+    // collect_key_prefixes_from_manifest edge cases
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3717,7 +3938,7 @@ mod tests {
         );
 
         let manifest = BackupManifest::test_new("test").with_tables(tables);
-        let keys = collect_keys_from_manifest(&manifest);
+        let keys = collect_key_prefixes_from_manifest(&manifest);
 
         assert_eq!(keys.len(), 1);
         assert!(keys.contains("backup/data/part.tar.lz4"));
