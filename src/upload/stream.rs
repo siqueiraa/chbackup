@@ -25,21 +25,34 @@ pub const STREAM_CHANNEL_BOUND: usize = 1;
 /// upload loop in `upload()`.
 pub const BRIDGE_CHANNEL_BOUND: usize = 2;
 
-/// Chunk buffers the streaming upload pipeline may hold at once, across *both* of
-/// its channels. Peak memory for a streamed part is
-/// `MAX_IN_FLIGHT_CHUNKS * chunk_size` (30 MiB at the 5 MiB minimum chunk size),
-/// no matter how large the part is.
+/// Every point in the streaming upload pipeline that owns a `chunk_size` buffer,
+/// and how many it can own at once. This is the enumeration `MAX_IN_FLIGHT_CHUNKS`
+/// budgets for; `test_in_flight_budget_matches_enumerated_slots` holds the two in
+/// step, so a slot added here without updating the constant fails the build's tests.
+#[cfg(test)]
+const CHUNK_BUFFER_SLOTS: [(&str, usize); 7] = [
+    ("ChunkedWriter::buffer, accumulating the next chunk", 1),
+    (
+        "queued in the compression thread's sync_channel",
+        STREAM_CHANNEL_BOUND,
+    ),
+    ("held by the compression thread while blocked in send", 1),
+    ("queued in the tokio bridge channel", BRIDGE_CHANNEL_BOUND),
+    ("held by the bridge task between recv and blocking_send", 1),
+    ("held by the upload loop while a chunk is being uploaded", 1),
+    ("cloned per attempt by S3Client::upload_part_with_retry", 1),
+];
+
+/// Chunk buffers the streaming upload pipeline may hold at once, across both of
+/// its channels and the tasks on either side of them. Peak memory for a streamed
+/// part is `MAX_IN_FLIGHT_CHUNKS * chunk_size`, no matter how large the part is.
 ///
-/// The budget, one `chunk_size` buffer per slot:
-/// - `STREAM_CHANNEL_BOUND` queued in the compression thread's `sync_channel`
-/// - 1 held by the compression thread while blocked in `send`
-/// - `BRIDGE_CHANNEL_BOUND` queued in the tokio bridge channel
-/// - 1 held by the bridge thread between `recv` and `blocking_send`
-/// - 1 held by the upload loop while being sent to S3
-///
-/// Both channel capacities feed this expression, so neither can be raised without
-/// the stated ceiling moving with it.
-pub const MAX_IN_FLIGHT_CHUNKS: usize = STREAM_CHANNEL_BOUND + 1 + BRIDGE_CHANNEL_BOUND + 1 + 1;
+/// One `chunk_size` buffer per slot in the `CHUNK_BUFFER_SLOTS` enumeration above,
+/// which names where each one lives; the terms below are in that order. Both channel
+/// capacities feed this expression, so neither can be raised without the ceiling
+/// moving with it.
+pub const MAX_IN_FLIGHT_CHUNKS: usize =
+    1 + STREAM_CHANNEL_BOUND + 1 + BRIDGE_CHANNEL_BOUND + 1 + 1 + 1;
 
 /// Return the archive file extension for the given compression format.
 ///
@@ -648,6 +661,19 @@ mod tests {
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("chunk_size"));
         assert!(err.contains("MIN_MULTIPART_CHUNK"));
+    }
+
+    #[test]
+    fn test_in_flight_budget_matches_enumerated_slots() {
+        let enumerated: usize = CHUNK_BUFFER_SLOTS.iter().map(|(_, slots)| slots).sum();
+        assert_eq!(
+            MAX_IN_FLIGHT_CHUNKS,
+            enumerated,
+            "MAX_IN_FLIGHT_CHUNKS budgets {} chunk buffers but CHUNK_BUFFER_SLOTS enumerates {}: {:?}",
+            MAX_IN_FLIGHT_CHUNKS,
+            enumerated,
+            CHUNK_BUFFER_SLOTS
+        );
     }
 
     #[test]
