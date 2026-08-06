@@ -6,8 +6,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
@@ -99,6 +100,71 @@ pub struct FreezeInfo {
     pub database: String,
     pub table: String,
     pub freeze_name: String,
+}
+
+/// Record a table's freeze in the registry the cleanup paths drain.
+///
+/// Call this the instant *any* FREEZE for the table succeeds -- the whole-table one, or each
+/// `FREEZE PARTITION`. From that moment the table is frozen in ClickHouse regardless of what
+/// the rest of the backup does, and every later step can fail: another partition's FREEZE can
+/// return a non-ignorable error, the evidence scan can reject a mistyped ID, `collect_parts`
+/// can fail. Recording at each success is what keeps a live freeze from being left with
+/// nothing tracking it.
+///
+/// One entry per table -- the freeze name covers every partition -- so a repeat call for the
+/// same table is a no-op rather than a duplicate the cleanup would try to unfreeze twice.
+pub fn record_freeze(registry: &Mutex<Vec<FreezeInfo>>, info: &FreezeInfo) {
+    let mut frozen = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if !frozen.contains(info) {
+        frozen.push(info.clone());
+    }
+}
+
+/// Verify that the partitions frozen under `info` actually staged parts.
+///
+/// `requested` holds only the IDs whose `FREEZE PARTITION` succeeded; the caller must already
+/// have recorded the freeze with [`record_freeze`], because this function can fail and the
+/// table stays frozen when it does. Returns how many requested IDs have parts staged.
+/// Blocking filesystem I/O -- call from `spawn_blocking`.
+pub fn verify_partitions_staged(
+    info: &FreezeInfo,
+    disk_paths: &BTreeMap<String, String>,
+    requested: &[String],
+    explicitly_requested: bool,
+) -> Result<usize> {
+    let with_evidence = partitions_with_shadow_evidence(disk_paths, &info.freeze_name, requested);
+
+    let mut frozen = 0usize;
+    for partition_id in requested {
+        match freeze_evidence_outcome(
+            partition_id,
+            with_evidence.contains(partition_id),
+            explicitly_requested,
+        ) {
+            FreezeOutcome::Frozen => frozen += 1,
+            FreezeOutcome::FailExplicitZeroMatch { partition_id } => {
+                bail!(
+                    "FREEZE PARTITION ID '{}' on {}.{} froze nothing: no part for that \
+                     partition was staged in the shadow directory. Check the --partitions \
+                     value against system.parts.partition_id",
+                    partition_id,
+                    info.database,
+                    info.table
+                );
+            }
+            FreezeOutcome::WarnDiscoveryZeroMatch { partition_id } => {
+                warn!(
+                    db = %info.database,
+                    table = %info.table,
+                    partition = %partition_id,
+                    "freeze_by_part: FREEZE PARTITION staged no parts (the partition was \
+                     likely merged away since system.parts was queried)"
+                );
+            }
+        }
+    }
+
+    Ok(frozen)
 }
 
 /// Guard holding references to frozen tables. The caller MUST call
@@ -430,6 +496,111 @@ mod tests {
         assert!(
             partitions_with_shadow_evidence(&disks, "never_frozen", &["202401".to_string()])
                 .is_empty()
+        );
+    }
+
+    /// A staged part for `partition_id`, in a shadow tree the evidence scan will walk.
+    fn stage_part(disk: &std::path::Path, freeze_name: &str, partition_id: &str) {
+        std::fs::create_dir_all(
+            disk.join("shadow")
+                .join(freeze_name)
+                .join("data/db/t")
+                .join(format!("{partition_id}_1_1_0")),
+        )
+        .unwrap();
+    }
+
+    fn test_info() -> FreezeInfo {
+        FreezeInfo {
+            database: "db".to_string(),
+            table: "t".to_string(),
+            freeze_name: "chbackup__db__t".to_string(),
+        }
+    }
+
+    #[test]
+    fn freeze_leak_one_frozen_partition_registers_the_table_immediately() {
+        let registry = Mutex::new(Vec::new());
+        let info = test_info();
+
+        // The FREEZE of the first partition succeeded. Whatever happens to the partitions
+        // after it -- a non-ignorable error such as 248 INVALID_PARTITION_VALUE aborting the
+        // table's task before any verification runs -- the table is frozen now and cleanup
+        // has to be able to find it.
+        record_freeze(&registry, &info);
+
+        assert_eq!(
+            registry.lock().unwrap().as_slice(),
+            std::slice::from_ref(&info),
+            "the table must be tracked from its first successful FREEZE, not once the \
+             whole partition loop has finished"
+        );
+
+        // Later partitions of the same table freeze under the same name.
+        record_freeze(&registry, &info);
+        assert_eq!(
+            registry.lock().unwrap().len(),
+            1,
+            "one entry per table -- a duplicate would be unfrozen twice"
+        );
+    }
+
+    #[test]
+    fn freeze_leak_rejected_partition_leaves_the_table_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disks = BTreeMap::from([("disk1".to_string(), tmp.path().display().to_string())]);
+        let registry = Mutex::new(Vec::new());
+        let info = test_info();
+
+        record_freeze(&registry, &info);
+        // Nothing staged: an operator-supplied ID that matched no partition.
+        let err =
+            verify_partitions_staged(&info, &disks, &["20240i".to_string()], true).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("20240i"),
+            "error must name the partition: {msg}"
+        );
+        assert!(msg.contains("db.t"), "error must name the table: {msg}");
+        assert_eq!(
+            registry.into_inner().unwrap().as_slice(),
+            std::slice::from_ref(&info),
+            "verification does not unregister -- the table is still frozen after it fails"
+        );
+    }
+
+    #[test]
+    fn freeze_evidence_staged_partition_is_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = test_info();
+        stage_part(tmp.path(), &info.freeze_name, "202401");
+        let disks = BTreeMap::from([("disk1".to_string(), tmp.path().display().to_string())]);
+
+        let frozen =
+            verify_partitions_staged(&info, &disks, &["202401".to_string()], true).unwrap();
+
+        assert_eq!(frozen, 1);
+    }
+
+    #[test]
+    fn freeze_evidence_discovered_partition_with_no_parts_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = test_info();
+        stage_part(tmp.path(), &info.freeze_name, "202401");
+        let disks = BTreeMap::from([("disk1".to_string(), tmp.path().display().to_string())]);
+
+        let frozen = verify_partitions_staged(
+            &info,
+            &disks,
+            &["202401".to_string(), "202402".to_string()],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            frozen, 1,
+            "a discovered partition merged away since system.parts was queried only warns"
         );
     }
 

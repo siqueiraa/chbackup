@@ -40,10 +40,7 @@ use crate::table_filter::{is_engine_excluded, is_excluded, TableFilter};
 
 use self::collect::collect_parts;
 use self::diff::diff_parts;
-use self::freeze::{
-    freeze_evidence_outcome, partitions_with_shadow_evidence, FreezeGuard, FreezeInfo,
-    FreezeOutcome,
-};
+use self::freeze::{record_freeze, verify_partitions_staged, FreezeGuard, FreezeInfo};
 
 fn normalize_uuid(uuid: &str) -> Option<String> {
     if uuid.is_empty() || uuid == "00000000-0000-0000-0000-000000000000" {
@@ -642,6 +639,17 @@ pub async fn create(
                 PartitionSpec::Unspecified => Vec::new(),
             };
 
+            // Handed to `record_freeze` after every successful FREEZE below, ahead of the
+            // next step that can fail. Every cleanup path drains that registry, so a live
+            // freeze is never left with nothing tracking it. It is a std::sync::Mutex, so
+            // recording is synchronous: no yield point between the FREEZE returning and the
+            // entry becoming visible.
+            let freeze_info = FreezeInfo {
+                database: db.clone(),
+                table: table.clone(),
+                freeze_name: fname.clone(),
+            };
+
             // FREEZE the table (whole-table or per-partition)
             let frozen = if effective_partitions.is_empty() {
                 // Whole-table FREEZE
@@ -654,7 +662,10 @@ pub async fn create(
 
                 let freeze_result = ch.freeze_table(&db, &table, &fname).await;
                 match freeze_result {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        record_freeze(&frozen_so_far_clone, &freeze_info);
+                        true
+                    }
                     Err(e) => {
                         let err_msg = format!("{e:#}");
                         if ignore_not_exists && is_ignorable_freeze_error(&err_msg) {
@@ -690,6 +701,10 @@ pub async fn create(
                         ch.freeze_partition(&db, &table, partition_id, &fname).await;
                     match freeze_result {
                         Ok(()) => {
+                            // Before the next partition's FREEZE, which can fail
+                            // non-ignorably (code 248 on a malformed ID) and abort this
+                            // task -- the table is already frozen at this point.
+                            record_freeze(&frozen_so_far_clone, &freeze_info);
                             attempted.push(partition_id);
                         }
                         Err(e) => {
@@ -709,46 +724,24 @@ pub async fn create(
                     }
                 }
                 let requested: Vec<String> = attempted.iter().map(|id| (*id).clone()).collect();
-                let disks_for_evidence = disk_map_clone.clone();
-                let fname_for_evidence = fname.clone();
-                let with_evidence = tokio::task::spawn_blocking(move || {
-                    partitions_with_shadow_evidence(
-                        &disks_for_evidence,
-                        &fname_for_evidence,
-                        &requested,
-                    )
-                })
-                .await
-                .context("spawn_blocking panicked during freeze evidence scan")?;
-
-                let mut frozen_partitions = 0usize;
-                for partition_id in attempted {
-                    match freeze_evidence_outcome(
-                        partition_id,
-                        with_evidence.contains(partition_id),
-                        !from_discovery,
-                    ) {
-                        FreezeOutcome::Frozen => frozen_partitions += 1,
-                        FreezeOutcome::FailExplicitZeroMatch { partition_id } => {
-                            return Err(anyhow::anyhow!(
-                                "FREEZE PARTITION ID '{partition_id}' on {full_name} froze \
-                                 nothing: no part for that partition was staged in the shadow \
-                                 directory. Check the --partitions value against \
-                                 system.parts.partition_id"
-                            ));
-                        }
-                        FreezeOutcome::WarnDiscoveryZeroMatch { partition_id } => {
-                            warn!(
-                                db = %db,
-                                table = %table,
-                                partition = %partition_id,
-                                "freeze_by_part: FREEZE PARTITION staged no parts (the \
-                                 partition was likely merged away since system.parts was \
-                                 queried)"
-                            );
-                        }
-                    }
-                }
+                let frozen_partitions = if requested.is_empty() {
+                    // Every FREEZE PARTITION failed ignorably -- nothing to verify.
+                    0
+                } else {
+                    let info_for_evidence = freeze_info.clone();
+                    let disks_for_evidence = disk_map_clone.clone();
+                    let explicitly_requested = !from_discovery;
+                    tokio::task::spawn_blocking(move || {
+                        verify_partitions_staged(
+                            &info_for_evidence,
+                            &disks_for_evidence,
+                            &requested,
+                            explicitly_requested,
+                        )
+                    })
+                    .await
+                    .context("spawn_blocking panicked during freeze evidence scan")??
+                };
 
                 if frozen_partitions == 0 && from_discovery {
                     // The IDs came from this table's own system.parts, so freezing none
@@ -773,20 +766,6 @@ pub async fn create(
                 );
                 return Ok(None);
             }
-
-            let freeze_info = FreezeInfo {
-                database: db.clone(),
-                table: table.clone(),
-                freeze_name: fname.clone(),
-            };
-
-            // Register freeze_info in the shared vec immediately after FREEZE so the
-            // cancel path can find and unfreeze it even if this task is still running
-            // collect_parts. Uses std::sync::Mutex::lock() (sync, no yield point).
-            frozen_so_far_clone
-                .lock()
-                .unwrap()
-                .push(freeze_info.clone());
 
             // Collect parts from shadow using spawn_blocking for filesystem I/O
             let fname_for_collect = fname;
@@ -850,12 +829,7 @@ pub async fn create(
                 dependencies: deps_clone.get(&full_name).cloned().unwrap_or_default(),
             };
 
-            Ok(Some((
-                freeze_info,
-                full_name,
-                table_manifest,
-                stripped_projections,
-            )))
+            Ok(Some((full_name, table_manifest, stripped_projections)))
         });
 
         // Collect an AbortHandle before moving the JoinHandle into try_join_all,
@@ -908,8 +882,16 @@ pub async fn create(
         }
     };
 
-    // Build FreezeGuard from successful results for cleanup, and aggregate table manifests
-    let mut freeze_guard = FreezeGuard::new();
+    // Build the cleanup guard from the shared vec, not from the task results: a task that
+    // failed *after* its FREEZE succeeded (a rejected --partitions ID) has no result to read
+    // a FreezeInfo out of, and its table would stay frozen with nothing tracking it.
+    let mut freeze_guard = FreezeGuard::from_frozen(
+        frozen_so_far
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect(),
+    );
     let mut had_error = false;
     let mut first_error: Option<anyhow::Error> = None;
     let mut zero_parts_with_data: Vec<String> = Vec::new();
@@ -919,8 +901,7 @@ pub async fn create(
 
     for result in results {
         match result {
-            Ok(Some((freeze_info, full_name, table_manifest, table_stripped))) => {
-                freeze_guard.add(freeze_info);
+            Ok(Some((full_name, table_manifest, table_stripped))) => {
                 stripped_projections.extend(table_stripped);
                 // Track data tables with zero parts but reported bytes
                 if !table_manifest.metadata_only
