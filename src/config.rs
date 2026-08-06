@@ -184,6 +184,12 @@ pub struct ClickHouseConfig {
     #[serde(default = "default_true")]
     pub zk_check_strict: bool,
 
+    /// substitute the manifest's recorded table UUID for a literal `{uuid}` in a
+    /// Replicated engine's ZooKeeper path before CREATE (opt-in, see
+    /// docs/configuration.md)
+    #[serde(default)]
+    pub replace_uuid_macro: bool,
+
     /// execute DDL with ON CLUSTER clause
     #[serde(default)]
     pub restore_schema_on_cluster: String,
@@ -578,6 +584,7 @@ impl Default for ClickHouseConfig {
             restore_as_attach: false,
             attach_table_require_complete: true,
             zk_check_strict: true,
+            replace_uuid_macro: false,
             restore_schema_on_cluster: String::new(),
             restore_distributed_cluster: String::new(),
             max_connections: default_max_connections(),
@@ -1132,6 +1139,16 @@ impl Config {
                 );
             }
         }
+        if let Ok(v) = std::env::var("CLICKHOUSE_REPLACE_UUID_MACRO") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.clickhouse.replace_uuid_macro = b;
+            } else {
+                warn!(
+                    "CLICKHOUSE_REPLACE_UUID_MACRO='{}' is not a valid bool, ignoring",
+                    v
+                );
+            }
+        }
         if let Ok(v) = std::env::var("CLICKHOUSE_MAX_CONNECTIONS") {
             if let Ok(n) = v.parse::<u32>() {
                 self.clickhouse.max_connections = n;
@@ -1542,6 +1559,9 @@ impl Config {
             "clickhouse.zk_check_strict" => {
                 self.clickhouse.zk_check_strict = value.parse().context("Invalid bool")?
             }
+            "clickhouse.replace_uuid_macro" => {
+                self.clickhouse.replace_uuid_macro = value.parse().context("Invalid bool")?
+            }
             "clickhouse.restore_schema_on_cluster" => {
                 self.clickhouse.restore_schema_on_cluster = value.to_string()
             }
@@ -1906,6 +1926,7 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
             Some("clickhouse.attach_table_require_complete")
         }
         "CLICKHOUSE_ZK_CHECK_STRICT" => Some("clickhouse.zk_check_strict"),
+        "CLICKHOUSE_REPLACE_UUID_MACRO" => Some("clickhouse.replace_uuid_macro"),
         "CLICKHOUSE_MAX_CONNECTIONS" => Some("clickhouse.max_connections"),
         "CLICKHOUSE_TIMEOUT" => Some("clickhouse.timeout"),
         "CLICKHOUSE_CONFIG_DIR" => Some("clickhouse.config_dir"),
@@ -2133,6 +2154,37 @@ mod tests {
             !config.clickhouse.check_parts_columns,
             "check_parts_columns should default to false per §12 (opt-in)"
         );
+    }
+
+    #[test]
+    fn test_replace_uuid_macro_default_and_overrides() {
+        // Opt-in: the conservative behaviour is to pass the manifest DDL through
+        // unchanged, since the {uuid} rewrite itself changes a Replicated table's
+        // ZooKeeper path.
+        assert!(!Config::default().clickhouse.replace_uuid_macro);
+
+        // set_field round-trip (the path used by --config-override and the API).
+        let mut config = Config::default();
+        config
+            .set_field("clickhouse.replace_uuid_macro", "true")
+            .unwrap();
+        assert!(config.clickhouse.replace_uuid_macro);
+
+        assert_eq!(
+            env_key_to_dot_notation("CLICKHOUSE_REPLACE_UUID_MACRO"),
+            Some("clickhouse.replace_uuid_macro")
+        );
+
+        // SAFETY: single-threaded test, no concurrent env reads
+        unsafe {
+            std::env::set_var("CLICKHOUSE_REPLACE_UUID_MACRO", "true");
+        }
+        let mut config = Config::default();
+        config.apply_env_overlay();
+        unsafe {
+            std::env::remove_var("CLICKHOUSE_REPLACE_UUID_MACRO");
+        }
+        assert!(config.clickhouse.replace_uuid_macro);
     }
 
     #[test]

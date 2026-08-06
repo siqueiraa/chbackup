@@ -273,6 +273,7 @@ pub async fn restore(
         &macros,
         dist_cluster,
         config.clickhouse.zk_check_strict,
+        config.clickhouse.replace_uuid_macro,
     )
     .await?;
 
@@ -310,6 +311,7 @@ pub async fn restore(
                 &macros,
                 dist_cluster,
                 config.clickhouse.zk_check_strict,
+                config.clickhouse.replace_uuid_macro,
             )
             .await?;
         }
@@ -905,6 +907,7 @@ pub async fn restore(
             &macros,
             dist_cluster,
             config.clickhouse.zk_check_strict,
+            config.clickhouse.replace_uuid_macro,
         )
         .await?;
     }

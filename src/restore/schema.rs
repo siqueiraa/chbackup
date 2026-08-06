@@ -9,6 +9,7 @@
 //! - DatabaseReplicated detection
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info, warn};
@@ -592,6 +593,7 @@ pub async fn create_tables(
     macros: &HashMap<String, String>,
     dist_cluster: &str,
     zk_check_strict: bool,
+    replace_uuid_macro_enabled: bool,
 ) -> Result<()> {
     if data_only {
         debug!("Data-only mode, skipping table creation");
@@ -676,6 +678,21 @@ pub async fn create_tables(
         }
 
         let dst_key = format!("{}.{}", dst_db, dst_table);
+
+        // Substitute the recorded table UUID for a literal {uuid} in the Replicated
+        // ZooKeeper path. Placed after the remap/Distributed/ON CLUSTER rewrites and
+        // before ZK conflict resolution, so the conflict check queries the concrete
+        // path CREATE will use -- the unexpanded form names a path that never exists.
+        if replace_uuid_macro_enabled {
+            let rewritten = replace_uuid_macro(&ddl, table_manifest.uuid.as_deref());
+            if rewritten != ddl {
+                info!(
+                    table = %dst_key,
+                    "Substituting recorded table UUID for the uuid macro in the Replicated ZooKeeper path"
+                );
+                ddl = rewritten;
+            }
+        }
 
         // ZK conflict resolution for Replicated tables (after DDL rewrite).
         // A FailTable outcome must reach the caller: swallowing it here and creating the
@@ -933,9 +950,168 @@ fn ensure_if_not_exists_table(ddl: &str) -> String {
     ddl.to_string()
 }
 
+/// Substitute the backed-up table UUID for a literal `{uuid}` in a Replicated
+/// engine's ZooKeeper path.
+///
+/// ClickHouse only expands `{uuid}` when the CREATE is `ON CLUSTER`, runs inside a
+/// DatabaseReplicated database, is an ATTACH, or carries an explicit UUID clause;
+/// otherwise the table UUID is `UUIDHelpers::Nil` and the expansion fails with
+/// BAD_ARGUMENTS (error 36), so the table is never created. Substituting the UUID
+/// the manifest recorded lets such a per-host CREATE succeed. Traced from
+/// ClickHouse 23.8-25.1 sources; see
+/// `docs/verification/h3-h4-replicated-semantics.json`.
+///
+/// The substitution is confined to the ZooKeeper path found by
+/// [`replicated_zk_path_span`], so a `{uuid}` elsewhere in the DDL -- in a column
+/// DEFAULT expression, a comment, or `SETTINGS` -- is left for ClickHouse to
+/// interpret. Returns the DDL unchanged when `table_uuid` is absent or empty, when
+/// no Replicated engine ZooKeeper path is found, or when that path has no `{uuid}`.
+pub fn replace_uuid_macro(ddl: &str, table_uuid: Option<&str>) -> String {
+    let uuid = match table_uuid {
+        Some(u) if !u.is_empty() => u,
+        _ => return ddl.to_string(),
+    };
+
+    match replicated_zk_path_span(ddl) {
+        Some(span) => {
+            let path = ddl[span.clone()].replace("{uuid}", uuid);
+            format!("{}{}{}", &ddl[..span.start], path, &ddl[span.end..])
+        }
+        None => ddl.to_string(),
+    }
+}
+
+/// Byte range of the ZooKeeper path inside a `Replicated*` engine's parameter
+/// list -- the contents of its first single-quoted argument, quotes excluded.
+///
+/// The scan anchors on the `ENGINE =` clause and steps over string literals, so
+/// neither a column named e.g. `ReplicatedCol` nor a `(` or `'` inside a column
+/// DEFAULT expression can be mistaken for the engine or its parameter list.
+/// Returns `None` when the engine is not `Replicated*`, when its parameter list
+/// has no quoted argument (the `ReplicatedMergeTree()` short syntax), or when a
+/// literal is unterminated.
+fn replicated_zk_path_span(ddl: &str) -> Option<Range<usize>> {
+    let mut i = 0;
+    let engine_name = loop {
+        let rest = ddl.get(i..)?;
+        if let Some(after) = rest.strip_prefix("ENGINE") {
+            if let Some(name) = after.trim_start().strip_prefix('=') {
+                break name.trim_start();
+            }
+        }
+        i = match rest.chars().next()? {
+            '\'' => string_literal_end(ddl, i)? + 1,
+            c => i + c.len_utf8(),
+        };
+    };
+
+    if !engine_name.starts_with("Replicated") {
+        return None;
+    }
+
+    // The ZooKeeper path is the first quoted token of the parameter list.
+    let args = engine_name
+        .trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
+        .trim_start()
+        .strip_prefix('(')?;
+    let mut i = ddl.len() - args.len();
+    loop {
+        match ddl.get(i..)?.chars().next()? {
+            '\'' => return Some((i + 1)..string_literal_end(ddl, i)?),
+            ')' => return None,
+            c => i += c.len_utf8(),
+        }
+    }
+}
+
+/// Index of the closing quote of the string literal opening at `open`, honouring
+/// ClickHouse's `''` and `\'` escapes. `None` if the literal is unterminated.
+fn string_literal_end(ddl: &str, open: usize) -> Option<usize> {
+    let bytes = ddl.as_bytes();
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\'' if bytes.get(i + 1) == Some(&b'\'') => i += 2,
+            b'\'' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UUID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+
+    #[test]
+    fn test_replace_uuid_macro_substitutes_zk_path() {
+        let ddl = "CREATE TABLE db.t (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}') ORDER BY id";
+        let result = replace_uuid_macro(ddl, Some(UUID));
+        assert_eq!(
+            result,
+            format!("CREATE TABLE db.t (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{}/{{shard}}', '{{replica}}') ORDER BY id", UUID)
+        );
+    }
+
+    #[test]
+    fn test_replace_uuid_macro_without_manifest_uuid_is_noop() {
+        let ddl = "CREATE TABLE db.t (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{uuid}', '{replica}') ORDER BY id";
+        assert_eq!(replace_uuid_macro(ddl, None), ddl);
+        assert_eq!(replace_uuid_macro(ddl, Some("")), ddl);
+    }
+
+    #[test]
+    fn test_replace_uuid_macro_without_macro_is_noop() {
+        let ddl = "CREATE TABLE db.t (id UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/db/t', '{replica}') ORDER BY id";
+        assert_eq!(replace_uuid_macro(ddl, Some(UUID)), ddl);
+    }
+
+    #[test]
+    fn test_replace_uuid_macro_non_replicated_engine_is_noop() {
+        // A plain MergeTree has no ZooKeeper path, so there is nothing to expand.
+        let ddl = "CREATE TABLE db.t (id UInt64, tag String DEFAULT '{uuid}') ENGINE = MergeTree ORDER BY id";
+        assert_eq!(replace_uuid_macro(ddl, Some(UUID)), ddl);
+    }
+
+    #[test]
+    fn test_replace_uuid_macro_ignores_macro_outside_engine_args() {
+        // Only the ZooKeeper path argument is rewritten: {uuid} in a column default
+        // and in SETTINGS is left for ClickHouse to interpret.
+        let ddl = "CREATE TABLE db.t (id UInt64, tag String DEFAULT '{uuid}') ENGINE = ReplicatedMergeTree('/clickhouse/tables/db/t', '{replica}') ORDER BY id SETTINGS storage_policy = '{uuid}'";
+        assert_eq!(replace_uuid_macro(ddl, Some(UUID)), ddl);
+    }
+
+    #[test]
+    fn test_replace_uuid_macro_decoy_before_non_replicated_engine_is_noop() {
+        // "Replicated" occurs in a column name before the real ENGINE, and the
+        // DEFAULT expression's parens and literal must not be read as the engine's
+        // parameter list. The engine is plain MergeTree, so there is nothing to expand.
+        let ddl = "CREATE TABLE db.t (id UInt64, ReplicatedCol String DEFAULT concatFn('/x/{uuid}')) ENGINE = MergeTree ORDER BY id";
+        assert_eq!(replace_uuid_macro(ddl, Some(UUID)), ddl);
+    }
+
+    #[test]
+    fn test_replace_uuid_macro_rewrites_zk_path_past_decoy_column() {
+        // Same decoy, but the engine really is Replicated: the ZooKeeper path is the
+        // one rewritten, and the DEFAULT expression is left alone.
+        let ddl = "CREATE TABLE db.t (id UInt64, ReplicatedCol String DEFAULT concatFn('/x/{uuid}')) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}') ORDER BY id";
+        let result = replace_uuid_macro(ddl, Some(UUID));
+        assert_eq!(
+            result,
+            format!("CREATE TABLE db.t (id UInt64, ReplicatedCol String DEFAULT concatFn('/x/{{uuid}}')) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{}/{{shard}}', '{{replica}}') ORDER BY id", UUID)
+        );
+    }
+
+    #[test]
+    fn test_replace_uuid_macro_short_syntax_is_noop() {
+        // ReplicatedMergeTree() takes its path from server config, so there is no
+        // path argument to rewrite -- and the later quoted value must not be touched.
+        let ddl = "CREATE TABLE db.t (id UInt64) ENGINE = ReplicatedMergeTree() ORDER BY id SETTINGS storage_policy = '{uuid}'";
+        assert_eq!(replace_uuid_macro(ddl, Some(UUID)), ddl);
+    }
 
     #[test]
     fn test_ensure_if_not_exists_database() {
