@@ -53,6 +53,7 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - For each shadow directory, determines the owning disk by matching against `disk_paths`
 - S3 disk detection: uses `object_disk::is_s3_disk(disk_type)` to check if a disk is "s3" or "object_storage"
 - For S3 disk parts: reads metadata files from shadow, calls `object_disk::parse_metadata()` to extract S3 object references, populates `PartInfo.s3_objects: Some(Vec<S3ObjectInfo>)`, skips hardlinking data files
+- `S3ObjectInfo.path` is normalised to a **disk-relative** key via `object_disk::disk_relative_key(stored_key, source_key_prefix)`. This matters because v5 metadata stores the *complete* object key (prefix included) while v2-v4 store the relative one; recording one form lets upload rebuild the source with `upload_source_key()` and restore re-spell it per version with `restore_object_keys()`
 - For local disk parts: existing hardlink behavior unchanged, `s3_objects: None`
 - `CollectedPart` struct includes `disk_name: String` for proper per-disk grouping in `mod.rs`
 - CRC64 checksum computed from `checksums.txt` for both local and S3 disk parts
@@ -67,6 +68,7 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - `should_skip_projection(stem, patterns)` helper performs the glob matching
 - `merge_skip_projections()` in `main.rs` merges CLI flag with config list (CLI takes precedence)
 - Empty pattern list means all projections are preserved (default behavior)
+- The projections **actually stripped** (not the patterns requested) are recorded in `manifest.stripped_projections`. Restore reads that field to decide whether the target server can tolerate the resulting parts -- see `src/restore/CLAUDE.md`. An empty list therefore has to mean "nothing was stripped", so do not populate it from the pattern list
 
 ### Directory Size Computation (collect.rs, Phase 8)
 - `pub fn dir_size(path: &Path) -> Result<u64>` -- Recursively computes the total size of all files in a directory using `walkdir`. Made public in Phase 8 (was private prior).
@@ -111,11 +113,20 @@ The `FreezeGuard` tracks frozen tables and provides explicit `unfreeze_all()`. S
 - `parse_partition_list()` returns a tri-state `PartitionSpec`:
   - `Unspecified` -- no flag (or only whitespace/empty entries); `clickhouse.freeze_by_part` discovery may still apply
   - `WholeTable` -- `--partitions all` alone; takes the whole-table FREEZE path and deliberately does NOT fall through to discovery, otherwise the explicit flag would be silently overridden by config
-  - `Ids(..)` -- explicit list, with `"all"` retained as a valid ID (mixed lists like `all,202401` freeze exactly the listed set; `all` is skipped as 218 on partitioned tables, which requires the default `ignore_not_exists_error_during_freeze: true`)
+  - `Ids(..)` -- explicit list, with `"all"` retained as a valid ID (mixed lists like `all,202401` freeze exactly the listed set; on a partitioned table `all` errors and is swallowed only under the default `ignore_not_exists_error_during_freeze: true`)
 - Multiple partitions are frozen sequentially within a single table task (partition-level parallelism not needed)
 - The freeze_name is the same regardless of whether whole-table or per-partition
 - Shadow walk proceeds identically (frozen parts end up in same shadow directory)
-- When IDs came from discovery but none could be frozen, a `warn!` fires -- the table would otherwise be dropped from the manifest with only an `info!`, a silent data gap
+- **Error 218 is `TABLE_IS_DROPPED`.** There is no `CANNOT_FREEZE_PARTITION` code in ClickHouse; the codes are traced to `ErrorCodes.cpp` and are identical across the four CI matrix versions. `is_ignorable_freeze_error()` groups 218 with `UNKNOWN_TABLE` (60) and `UNKNOWN_DATABASE` (81), all ignorable only under `ignore_not_exists_error_during_freeze`. Ignoring it is not the same as it being harmless: the table was dropped mid-backup and will be absent from the manifest. Code 248 `INVALID_PARTITION_VALUE` is deliberately **not** in that set
+
+### Freeze Evidence Check (freeze.rs + mod.rs)
+A successful `ALTER TABLE ... FREEZE PARTITION` is **not** evidence that anything was frozen: ClickHouse's `MergeTreeData::freezePartitionsByMatcher` returns success with an empty result when the matcher selects no partition. Trusting the SQL result turns a mistyped partition ID into a quietly partial backup, so per-partition freezes are judged by what actually landed on disk.
+
+- `partitions_with_shadow_evidence(disk_paths, freeze_name, requested) -> HashSet<String>` walks `{disk_path}/shadow/{freeze_name}` on every disk and returns which requested IDs have at least one part staged. Part directories sit at depth four in both shadow layouts (`data/{db}/{table}/{part}` and `store/{3char}/{uuid}/{part}`) and a part name always begins with `{partition_id}_`. Blocking I/O -- `create()` calls it inside `spawn_blocking`.
+- `freeze_evidence_outcome(partition_id, evidence_present, explicitly_requested) -> FreezeOutcome` decides what a zero-match means, and the two cases differ deliberately:
+  - `FailExplicitZeroMatch` -- an operator-supplied `--partitions` ID staged nothing. **Hard error**, naming the partition and the table and pointing at `system.parts.partition_id`. That is a typo, and continuing would publish a backup silently missing the requested data.
+  - `WarnDiscoveryZeroMatch` -- an ID discovered from `system.parts` staged nothing. Non-fatal: it may legitimately have been merged away between the query and the FREEZE.
+- When discovery produced IDs but *none* could be frozen, a further `warn!` fires -- the table would otherwise be dropped from the manifest with only an `info!`, a silent data gap
 
 ### Disk Filtering (Phase 2d)
 - Applied at **whole-disk granularity during the shadow walk**, NOT per part: `collect_parts` checks each disk once (`collect.rs`, inside the per-disk loop) and `continue`s past excluded disks entirely

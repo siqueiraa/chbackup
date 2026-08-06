@@ -4,21 +4,31 @@
 
 **chbackup** — Drop-in Rust replacement for Altinity/clickhouse-backup. Single static binary, S3-only storage, non-destructive restore.
 
-## Authoritative Documents
+## Reference Documentation
 
-**ALWAYS read these before planning or implementing:**
+`docs/` holds the user-facing reference. Read the relevant one before planning work that
+changes externally visible behaviour:
 
-| Document | Path | Purpose |
-|----------|------|---------|
-| Design | `docs/design.md` | Full technical spec (~1800 lines, 17 sections). Covers deployment, backup/restore flows, S3 layout, manifest format, config, CLI commands, error handling. |
-| Roadmap | `docs/roadmap.md` | Implementation phases (0-4). Each phase produces a working binary. Maps design sections to deliverables. |
+| Document | Covers |
+|----------|--------|
+| `docs/commands.md` | Every CLI command and its flags |
+| `docs/configuration.md` | Every config parameter, its default, and its env-var override |
+| `docs/backup.md` | create/upload, incremental backups, watch mode, retention |
+| `docs/restore.md` | restore modes, remap, partial-restore semantics |
+| `docs/s3.md` | S3 layout, object disks, credentials |
+| `docs/api.md` | HTTP API endpoints |
+| `docs/docker.md`, `docs/kubernetes.md` | Deployment |
+| `docs/migration.md` | Migrating from Go clickhouse-backup |
 
 **Rules:**
-- Before creating any plan, read both documents for the relevant sections
-- Design doc sections are numbered (e.g., §3.1 mutations, §5.2 restore modes) — reference them in plans
-- Roadmap phases are sequential — check which phase we're on before starting work
+- Those documents describe *user-facing* behaviour only. For internals, read the module
+  `CLAUDE.md` named in the Source Module Map below, then the code it points at.
+- Where a doc and the code disagree, the code is authoritative — and the doc is a bug to
+  fix in the same change.
+- Older commit messages and comments cite numbered "design §N" sections. That document is
+  gone; treat such a reference as a historical note, never as a spec to look up.
 
-## Key Architecture Decisions (from design)
+## Key Architecture Decisions
 
 - **Must run on same host as ClickHouse** — FREEZE creates hardlinks requiring local filesystem access
 - **Streaming by default** — upload/download by individual data part, no full-archive mode
@@ -26,7 +36,7 @@
 - **ClickHouse 23.8+** required (CI-tested: 23.8, 24.3, 24.8, 25.1; 21.8-23.7 untested)
 - **Static musl binary** — zero runtime dependencies, ~15MB
 
-## Tech Stack (from §11.3)
+## Tech Stack
 
 | Component | Crate |
 |-----------|-------|
@@ -48,13 +58,12 @@
 | Progress bar | `indicatif` (v0.17, TTY-aware, disabled in server mode) |
 | Hot-swap state | `arc-swap` (v1, atomic pointer swap for server restart) |
 
-## Design Doc Gotchas
+## CLI Gotchas
 
-Things that are easy to get wrong when reading the design doc:
+Things that are easy to get wrong:
 
-- **Config param count**: Design says "~40 params" but actual count from §12 YAML block is **~106 params** across 7 sections (general:15, clickhouse:37, s3:20, backup:13, retention:2, watch:8, api:13)
-- **CreateRemote != Create**: `create_remote` has a DIFFERENT flag set than `create` — no `--diff-from`, `--partitions`, `--schema`. Uses `--diff-from-remote` instead. Always check the §2 flag reference table.
-- **RestoreRemote != Restore**: `restore_remote` has no `--partitions`, `--schema`, `--data-only`. But DOES have `--as` (per flag table).
+- **CreateRemote != Create**: `create_remote` has a DIFFERENT flag set than `create` — no `--diff-from`, `--partitions`, `--schema`. Uses `--diff-from-remote` instead. Check `docs/commands.md` or `cli.rs` rather than assuming.
+- **RestoreRemote != Restore**: `restore_remote` has no `--partitions`, `--schema`, `--data-only`. But DOES have `--as`.
 - **Logging mode**: JSON mode is triggered by `server` command OR `general.log_format: json` config. Not just server mode.
 
 ## Current Implementation Status
@@ -88,7 +97,7 @@ src/
   concurrency.rs     -- Effective concurrency accessors (upload, download, max_connections, object_disk_copy)
   config.rs          -- Config loader (~106 params, env overlay)
   error.rs           -- ChBackupError (thiserror), exit_code_from_error() for structured exit codes
-  lock.rs            -- PidLock (three-tier scope)
+  lock.rs            -- PidLock (three-tier scope), acquire_scoped() cross-tier exclusion via a gate lock
   logging.rs         -- tracing init (text/JSON)
   manifest.rs        -- BackupManifest, TableManifest, PartInfo, S3ObjectInfo, DatabaseInfo (serde JSON)
   object_disk.rs     -- ClickHouse S3 object disk metadata parser (5 format versions)
@@ -96,7 +105,7 @@ src/
   resume.rs          -- Resume state types (UploadState, DownloadState, RestoreState), atomic save/load, graceful degradation
   table_filter.rs    -- Glob pattern matching for -t flag, disk exclusion checks
   progress.rs        -- ProgressTracker (indicatif wrapper, TTY-aware, Clone for spawned tasks)
-  list.rs            -- list + delete + clean_broken + retention + GC + clean_shadow (local dir scan + S3), --format output (json/yaml/csv/tsv), latest/previous shortcuts, ManifestCache (TTL-based remote summary cache)
+  list.rs            -- list + delete + clean_broken + retention (with key-prefix GC) + clean_shadow (local dir scan + S3), --format output (json/yaml/csv/tsv), latest/previous shortcuts, ManifestCache (TTL-based remote summary cache)
   backup/            -- create command: parallel FREEZE, disk-aware shadow walk, hardlink/S3 metadata, CRC64, UNFREEZE
   upload/            -- upload command: parallel tar+LZ4 compress, S3 PutObject/multipart, CopyObject for S3 disk parts
   download/          -- download command: parallel S3 GetObject, LZ4+untar decompress, metadata-only for S3 disk parts
@@ -118,9 +127,9 @@ download: S3Client.get_object(manifest) -> [disk space pre-flight] -> BackupMani
 restore:  BackupManifest(JSON) -> [load resume state + query system.parts] -> [Phase 0: DROP tables/dbs if --rm] -> [detect DatabaseReplicated] -> CREATE DB/TABLE (with ON CLUSTER, ZK conflict resolution, Distributed cluster rewrite) -> [ATTACH TABLE mode for Replicated] | local parts: hardlink to detached/ | S3 disk parts: CopyObject to UUID paths + rewrite metadata -> ATTACH PART -> [mutation re-apply] -> [save state per-part] -> chown -> [delete state]
 list:     scan local dirs + S3Client.list -> display (with broken backup detection)
 delete:   rm local dir or S3Client.delete_objects
-clean_broken: list -> filter is_broken -> delete each
+clean_broken: list -> filter is_broken -> per backup: plan_clean_broken_deletion(age, live lock, protected keys) -> delete planned keys
 retention_local: list_local -> filter out broken -> sort by timestamp asc -> delete oldest exceeding keep count
-retention_remote: list_remote -> filter out broken -> sort by timestamp asc -> for each to delete: gc_collect_referenced_keys (load all surviving manifests) -> gc_delete_backup (delete unreferenced keys, manifest last)
+retention_remote: list_remote -> plan_retention_deletions (keep newest N valid) -> retention_remote_inner: fetch EVERY surviving manifest (abort the pass on any failure) -> collect protected key prefixes -> per candidate: list its keys, keep it intact if any is protected, else delete data keys then manifest
 clean_shadow: ChClient.get_disks -> filter out backup-type disks -> for each disk: scan shadow/ for chbackup_* dirs -> remove_dir_all
 watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|FullNow|IncrNow] -> resolve_name_template -> backup::create -> upload::upload -> [delete_local] -> [retention_local + retention_remote] -> sleep(watch_interval) -> loop
 ```
@@ -138,6 +147,7 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **Rate limiting**: Token-bucket `RateLimiter` (shared via `Clone`/`Arc`) gates bytes per second for uploads and downloads; 0 = unlimited
 - **OwnedAttachParams**: Owned variant of `AttachParams` for crossing `tokio::spawn` boundaries (no lifetime constraints); extended with S3 fields for Phase 2c
 - **Object disk metadata parsing**: `object_disk.rs` parses all 5 ClickHouse metadata format versions (v1-v5) to extract S3 object references from frozen shadow files
+- **Version-aware object-disk keys**: v5 (`VERSION_FULL_OBJECT_KEY`, ClickHouse 24.1+ and present in the CI-tested 24.8) stores the **complete** object key, prefix included, which ClickHouse resolves with `createAsAbsolute`; v1-v4 store a key relative to the disk key prefix, which ClickHouse joins itself. The manifest normalises to the disk-relative form via `disk_relative_key()`, and the two spellings are reconstructed from it: `upload_source_key()` rebuilds the CopyObject source, and `restore_object_keys()` returns both the copy destination and the spelling to write back into the metadata file for that version. Emitting the wrong one points the restored part at a key that does not exist. On restore, `to_disk_relative_keys()` matches a v5 key back to the part's own manifest entries (on a path-component boundary, disambiguated by size) and **fails closed** if the match is missing or ambiguous, rather than writing a key CopyObject never created.
 - **Disk-aware routing**: Each command pipeline checks `disk_type_map` to route parts: local disks use hardlink+compress, S3 disks ("s3"/"object_storage") use CopyObject
 - **CopyObject with retry+fallback**: `S3Client.copy_object_with_retry()` retries 3x with exponential backoff; conditional streaming fallback gated by `allow_object_disk_streaming` config
 - **UUID-isolated S3 restore**: Copies S3 objects to `store/{3char}/{uuid_with_dashes}/` paths derived from destination table UUID; same-name optimization skips objects that already exist with matching size
@@ -147,11 +157,11 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **Disk filtering**: `is_disk_excluded()` in `table_filter.rs` checks parts against `skip_disks` and `skip_disk_types` config before processing
 - **Partition-level FREEZE**: `--partitions` flag triggers `ALTER TABLE FREEZE PARTITION ID '<id>'` per partition instead of whole-table FREEZE. Values are `system.parts.partition_id` literals, NOT partition key expressions -- the ID form is required because the two diverge for unpartitioned (`all`), multi-column (`2024-29`), and `String` (hashed) keys. `parse_partition_list()` returns a tri-state `PartitionSpec` (`Unspecified` / `WholeTable` / `Ids`) so an explicit `--partitions all` (whole-table) is distinguishable from no flag at all (which may still fall through to `freeze_by_part` discovery)
 - **Parts column consistency check**: Pre-flight check queries `system.parts_columns` for type inconsistencies before FREEZE; filters benign Enum/Tuple/Nullable drift
-- **Broken backup cleanup**: `clean_broken` command deletes broken backups (missing/corrupt metadata.json) from local or remote storage
+- **Broken backup cleanup**: `clean_broken` deletes backups with a missing or corrupt `metadata.json`. Remotely, "broken" is indistinguishable from "still uploading" — upload writes the manifest last — so `plan_clean_broken_deletion()` makes the whole decision from three guards and the caller only gathers inputs: the backup's PID lock must not be held by a live process; the newest object under the prefix must be at least `general.clean_broken_min_age_secs` old (an *unknown* age counts as too young); and keys a surviving valid manifest references are excluded from the deletion. Collecting those protected keys fails closed, exactly like `retention_remote_inner`.
 - **Local retention**: `retention_local()` follows the list->filter->sort->delete pattern; broken backups are excluded from counting; `keep=0` means unlimited, `keep=-1` is upload module's concern
-- **Remote retention with GC**: `retention_remote()` calls `gc_collect_referenced_keys()` fresh per-backup-deletion to build a set of all S3 keys referenced by surviving backups, then `gc_delete_backup()` only deletes unreferenced keys (manifest deleted last). Design 8.2 race protection satisfied by fresh key collection each iteration.
+- **Remote retention with key-prefix protection**: `plan_retention_deletions()` (pure) picks the backups to delete; `retention_remote_inner()` runs the pass with `fetch_manifest`/`list_prefix`/`delete_keys` injected, so the interesting behaviour is unit-testable without an `S3Client`. Two rules make it safe. **Fail closed**: every surviving manifest is fetched up front and *any* fetch or parse failure aborts the pass before a single deletion — an unreadable manifest is one whose keys cannot be protected, and skipping just that one would leave every later candidate judged against a short protected set. **key-prefix protection**: `is_key_protected()` treats a protected entry ending in `/` as a prefix, because a manifest references an S3-disk part's metadata *directory*, never the files inside it; exact set membership alone would delete a survivor's metadata. Deletion is all-or-nothing per backup — if any of its keys is protected the backup is left completely intact, since deleting the rest plus the manifest would manufacture a broken-but-referenced backup that `clean_broken` later destroys.
 - **Config resolution for retention**: `effective_retention_local/remote()` resolves `retention.*` vs `general.*` config -- `retention.*` overrides when non-zero, else falls back to `general.*`
-- **Shadow directory cleanup**: `clean_shadow()` queries `get_disks()`, filters out backup-type disks, then removes `chbackup_*` directories from each disk's `shadow/` path; optional name filter matches `chbackup_{sanitized_name}_*`
+- **Shadow directory cleanup**: `clean_shadow()` queries `get_disks()`, filters out backup-type disks, then removes `chbackup_*` directories from each disk's `shadow/` path, skipping any that belong to a backup whose PID lock is held by a live process. An optional name filter matches both the current collision-free `chbackup__{enc(name)}__*` prefix and the legacy `chbackup_{sanitize_name(name)}_*` one, so shadows written by older binaries are still reaped
 - **Watch state machine**: `run_watch_loop()` cycles through resume -> create -> upload -> delete_local -> retention -> sleep; uses `tokio::select!` for interruptible sleep (shutdown/reload signals); `WatchState` enum maps to Prometheus IntGauge values (1-7)
 - **Watch error recovery**: `force_next_full` flag forces full backup after any error; `consecutive_errors` counter resets to 0 on success; `max_consecutive_errors` (0 = unlimited) triggers loop exit
 - **Watch name templates**: `resolve_name_template()` substitutes `{type}`, `{time:FORMAT}`, and ClickHouse `system.macros` values; `resolve_template_prefix()` extracts the static prefix for backup filtering
@@ -160,23 +170,25 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **Watch env var overlay**: `WATCH_INTERVAL` and `FULL_INTERVAL` env vars are mapped in `apply_env_overlay()` for K8s deployments where config file overlay is less ergonomic than environment variables
 - **Mode A restore (--rm)**: Phase 0 DROP phase uses reverse engine priority order (Distributed first, data tables last) with retry loop for dependency failures. `drop_tables()` and `drop_databases()` in `schema.rs` follow the same retry pattern as `create_ddl_objects()`. System databases are never dropped.
 - **ON CLUSTER DDL**: `add_on_cluster_clause()` injects `ON CLUSTER '{cluster}'` into CREATE/DROP DDL when `restore_schema_on_cluster` config is set. Skipped for DatabaseReplicated databases (detected via `query_database_engine()`).
-- **ZK conflict resolution**: Before creating Replicated tables, `resolve_zk_conflict()` parses ZK path + replica from DDL, resolves macros via `system.macros`, checks `system.zookeeper` for existing replicas, and `SYSTEM DROP REPLICA` if conflict. All ZK failures are non-fatal.
-- **ATTACH TABLE mode**: When `restore_as_attach` config is true, Replicated*MergeTree tables use DETACH TABLE SYNC -> DROP REPLICA -> hardlink to data dir -> ATTACH TABLE -> SYSTEM RESTORE REPLICA instead of per-part ATTACH. Falls back to normal flow on failure.
+- **ZK conflict resolution**: Before creating Replicated tables, `resolve_zk_conflict()` parses ZK path + replica from DDL, resolves macros via `system.macros`, and asks `check_zk_replica_exists()`, which answers `Exists` / `Absent` / `Indeterminate`. `zk_check_action(check, strict)` maps that to `DropReplica` / `Proceed` / `FailTable`. Under the default `clickhouse.zk_check_strict = true`, `Indeterminate` means `FailTable`: the check does **not** fail open, because "ZooKeeper says there is no replica" and "we could not reach ZooKeeper" justify opposite decisions, and conflating them skips exactly the stale-replica drop the check exists to perform. A failed `SYSTEM DROP REPLICA` stays non-fatal (the CREATE reports the conflict itself).
+- **ATTACH TABLE mode**: When `restore_as_attach` config is true, Replicated*MergeTree tables use DETACH TABLE SYNC -> DROP REPLICA -> hardlink to data dir -> ATTACH TABLE -> SYSTEM RESTORE REPLICA instead of per-part ATTACH; it falls back to the per-part flow if a step fails. A pre-flight resolves every part's staged source first, and under the default `clickhouse.attach_table_require_complete = true` a table with any unresolved part is refused outright — neither created nor attached — with its parts counted as skipped.
 - **Mutation re-apply**: After all data attached, `reapply_pending_mutations()` re-applies `pending_mutations` from manifest via `ALTER TABLE ... {command} SETTINGS mutations_sync=2`. Sequential per-table, failures are warnings (not fatal per design 5.7).
 - **Distributed cluster rewrite**: `rewrite_distributed_cluster()` changes the cluster name in Distributed engine DDL when `restore_distributed_cluster` config is set
 - **ArcSwap hot-swap** (Phase 5): `AppState.config`, `AppState.ch`, `AppState.s3` use `Arc<ArcSwap<T>>` for atomic pointer swap via `store()`/`load()`. The `/api/v1/restart` endpoint reloads config, creates new clients, pings ClickHouse, then atomically swaps all three. On error, old clients remain active (no partial state).
 - **ProgressTracker** (Phase 5): `progress.rs` wraps `indicatif::ProgressBar` with TTY detection and `disable` flag. `Clone` via `Arc<ProgressBar>`. Integrated into upload and download parallel pipelines -- each spawned task calls `tracker.inc()` after successful part processing. Disabled in non-TTY (server mode, piped output) or when `config.general.disable_progress_bar` is true.
-- **Structured exit codes** (Phase 5): `main()` wraps `run()` and maps errors to exit codes via `exit_code_from_error()` in `error.rs`. Downcasts `anyhow::Error` to `ChBackupError` for variant-specific codes: `LockError` -> 4, `BackupError`/`ManifestError` containing "not found" -> 3, all others -> 1. Clap handles code 2 (usage). SIGINT/SIGTERM handled by tokio signal handlers for codes 130/143.
+- **Structured exit codes** (Phase 5): `main()` wraps `run()` and maps errors to exit codes via `exit_code_from_error()` in `error.rs`. Downcasts `anyhow::Error` to `ChBackupError` for variant-specific codes: `LockError` -> 4, `BackupNotFound`/`PartialRestore` -> 3, all others -> 1. Clap handles code 2 (usage). **chbackup itself never returns 130 or 143.** One-shot CLI commands install no signal handler at all, so SIGINT/SIGTERM kill the process outright and the *shell* reports 128+signal. `server` (SIGINT and SIGTERM) and standalone `watch` (SIGINT) do install handlers, but they use them for graceful shutdown and then exit normally.
+- **Cross-tier lock exclusion**: `acquire_scoped(lock_dir, scope, command)` in `lock.rs` enforces that the `Global` and `Backup(name)` tiers are mutually exclusive. Scanning for a conflict and then creating the lock file is not enough — two processes would both scan, both see nothing, and both acquire — so the scan and the create happen while holding a short-lived gate lock (`chbackup.acquire.lock`, deliberately not a `chbackup.*.pid` name so scanners do not read it as a backup lock). The gate is released before `acquire_scoped` returns, so it serialises only acquisition, never the operation. Same-tier conflicts are still left to `PidLock::acquire`'s atomic `O_EXCL` create. Failure is a `LockError` naming the conflicting holder (CLI exit 4, HTTP 423). `lock_path_for_scope()` takes the `lock_dir` so tests can use a `TempDir`.
 - **Hardlink dedup** (Phase 5): `--hardlink-exists-files` flag enables post-download deduplication. `find_existing_part()` scans `{data_path}/backup/*/shadow/{table_key}/{part_name}/` (excluding current backup), computes CRC64 of `checksums.txt`, returns first match. `hardlink_existing_part()` creates hardlinks (with EXDEV fallback). Checked before each part download in the parallel pipeline.
-- **Skip projections** (Phase 5): `--skip-projections` flag (CLI comma-separated or `config.backup.skip_projections` list) filters `.proj` subdirectories during `hardlink_dir()` shadow walk. `should_skip_projection()` uses `glob::Pattern` matching on the stem (name without `.proj`). Special value `*` skips all projections. `WalkDir::skip_current_dir()` prevents descending into skipped directories.
-- **STS AssumeRole** (Phase 6): When `s3.assume_role_arn` is non-empty, `S3Client::new()` creates an STS client, calls `assume_role()` with session name "chbackup", extracts temporary credentials, and rebuilds the SDK config with them. Enables cross-account S3 access.
+- **Skip projections** (Phase 5): `--skip-projections` flag (CLI comma-separated or `config.backup.skip_projections` list) filters `.proj` subdirectories during `hardlink_dir()` shadow walk. `should_skip_projection()` uses `glob::Pattern` matching on the stem (name without `.proj`). Special value `*` skips all projections. `WalkDir::skip_current_dir()` prevents descending into skipped directories. The projections actually stripped are recorded in `manifest.stripped_projections`; on restore, `projection_gate_error()` refuses such a backup against a server older than 24.3, where the part's `checksums.txt` still names the absent `.proj` entries and ATTACH rejects the whole part with `Code: 107 FILE_DOESNT_EXIST`. Gated by `backup.strict_projection_gate` (default true); an empty list (including manifests written before the field existed) and an unparseable server version always proceed.
+- **STS AssumeRole** (Phase 6): When `s3.assume_role_arn` is non-empty, `S3Client::new()` installs an `aws_config::sts::AssumeRoleProvider` (session name "chbackup") as the credentials provider on the SDK loader. The provider is lazy and **auto-refreshing** — it calls STS on first use and again as the temporary credentials near expiry — so long-running `server` and `watch` processes keep working past the (default 1 hour) session lifetime with no restart. Static config credentials, when present, are the base credentials used to call STS; a custom endpoint is applied to the STS client too, for stacks like MinIO.
 - **Multipart CopyObject** (Phase 6): `copy_object()` checks source object size via `head_object()`; objects >5GB (5,368,709,120 bytes) use `copy_object_multipart()` with `UploadPartCopy` API (auto-calculated chunk sizes, max 10000 parts). On error, the multipart upload is aborted. Falls through to single CopyObject on `head_object` failure.
 - **Retry jitter** (Phase 6): `effective_retries()` resolves `backup.retries_*` vs `general.retries_*` config (backup overrides when non-zero). `apply_jitter()` uses `SystemTime` nanos as PRNG to avoid `rand` dependency. `copy_object_with_retry_jitter()` extends retry with configurable jitter factor. Wired into upload CopyObject, restore CopyObject, and download CRC64 retry paths.
-- **Freeze-by-part** (Phase 6): When `clickhouse.freeze_by_part` is true and no `--partitions` flag is given, `query_distinct_partitions()` reads `system.parts.partition_id` and each is frozen via `ALTER TABLE FREEZE PARTITION ID '<id>'` instead of whole-table FREEZE. `freeze_by_part_where` adds a WHERE filter on `system.parts` to select partitions. Error code 218 (CANNOT_FREEZE_PARTITION) is caught and logged as a non-fatal warning; **code 248 (INVALID_PARTITION_VALUE) is deliberately NOT ignorable** -- it means chbackup generated a partition reference ClickHouse could not interpret, and must stay fatal rather than yield a silently empty backup. When discovery returns IDs but none can be frozen, a `warn!` fires (the table would otherwise vanish from the manifest with only an `info!`).
+- **Freeze-by-part** (Phase 6): When `clickhouse.freeze_by_part` is true and no `--partitions` flag is given, `query_distinct_partitions()` reads `system.parts.partition_id` and each is frozen via `ALTER TABLE FREEZE PARTITION ID '<id>'` instead of whole-table FREEZE. `freeze_by_part_where` adds a WHERE filter on `system.parts` to select partitions. Error codes, traced to ClickHouse's `ErrorCodes.cpp` and identical across the four CI matrix versions: **218 is `TABLE_IS_DROPPED`** — there is no `CANNOT_FREEZE_PARTITION` identifier upstream — and `is_ignorable_freeze_error()` groups it with `UNKNOWN_TABLE`/`UNKNOWN_DATABASE`, ignorable *only* under `ignore_not_exists_error_during_freeze`. It is not a benign no-op: the table went away mid-backup and will be absent from the manifest. **Code 248 (`INVALID_PARTITION_VALUE`) is deliberately NOT ignorable** — it means chbackup generated a partition reference ClickHouse could not interpret, and must stay fatal rather than yield a silently empty backup.
+- **Freeze evidence check**: `ALTER TABLE ... FREEZE PARTITION` returning success proves nothing — ClickHouse's `freezePartitionsByMatcher` succeeds with an empty result when the matcher selects no partition. So after freezing, `partitions_with_shadow_evidence()` walks the shadow tree for parts actually staged, and `freeze_evidence_outcome()` judges each requested ID: an explicitly requested `--partitions` ID that staged nothing is a **hard error** naming the partition and the table (that is a typo, and carrying on would yield a backup silently missing the requested data), while an ID that came from `system.parts` discovery only warns (it may legitimately have been merged away since the query).
 - **Backup failure cleanup** (Phase 6): On `backup::create()` failure, `cleanup_failed_backup()` removes the local backup directory and calls `clean_shadow()` for the backup name, matching Go behavior.
 - **Restore partitions** (Phase 6): `--partitions` on restore filters parts during ATTACH. `PartInfo` has no partition field, so the partition is re-derived from each part-name prefix via `PartSortKey::from_part_name()` (`restore/sort.rs`) and compared against the filter set (`restore/mod.rs`). `"all"` matches unpartitioned tables (tuple()). `--skip-empty-tables` skips CREATE DDL for tables with no matching parts.
-- **Check replicas before attach** (Phase 6): When `clickhouse.check_replicas_before_attach` is true, queries `system.replicas` to verify all replicas are synced (zero queue/inserts_in_queue) before attaching parts. Logs warning and continues on sync failure (non-fatal).
-- **Incremental chain protection** (Phase 6): `retention_remote()` calls `collect_incremental_bases()` which scans `PartInfo.source` for `"carried:{base}"` prefixes; backups referenced as diff-from bases by surviving backups are protected from deletion regardless of age.
+- **Check replicas before attach** (Phase 6): When `clickhouse.check_replicas_before_attach` is true, polls `system.replicas` (up to `check_replicas_before_attach_timeout`) to verify all replicas are synced before attaching a Replicated table's parts. `decide_replica_sync()` skips the table only on `Ok(false)` — polling completed and the replica is still behind — and only under the default `clickhouse.strict_replica_sync = true`; its parts then count as skipped, which makes the restore exit 3. An `Err` is indeterminate (the check failed, which is not evidence of lag) and always warns and proceeds. The risk being avoided is a *partial* restore, not duplicate rows: ATTACH PART deduplicates on a content-derived key, so re-attaching an identical part does not duplicate data.
+- **Incremental chain protection** (Phase 6): `collect_incremental_bases()` scans `PartInfo.source` for `"carried:{base}"` prefixes; a backup named as a diff-from base by a survivor is kept regardless of age. This is only a cheap extra guard and it is one hop deep — key-prefix protection above is the real mechanism, and unlike this one it is transitively complete over a chain.
 - **API parity** (Phase 6): HTTP 423 (not 409) for concurrent op rejection. Health endpoint returns JSON `{"status":"ok"}`. `POST /api/v1/actions` dispatches commands (create, upload, download, restore, delete, clean, create_remote, restore_remote). List API includes `desc` (reverse sort) query param.
 - **Watch exit behavior** (Phase 6): When `api.watch_is_main_process` is true and the watch loop ends (max errors or channel close), the server process calls `std::process::exit(1)` to terminate.
 - **List format flag** (Phase 6): `--format` flag supports `text` (default), `json`, `yaml`, `csv`, `tsv` output. `latest` and `previous` are shortcut aliases for the most recent and second-most-recent backup names.
@@ -187,12 +199,27 @@ watch:    list_remote -> resume_state(filter by template prefix) -> [SleepThen|F
 - **ManifestCache** (Phase 8): `ManifestCache` in `list.rs` caches remote backup summaries in memory with TTL-based expiry (default 5 min, configurable via `general.remote_cache_ttl_secs`). `list_remote_cached()` checks cache before falling back to S3. Stored in `AppState` as `Arc<tokio::sync::Mutex<ManifestCache>>`. Invalidated explicitly after upload, delete, clean_broken_remote, and watch retention operations.
 - **Tables pagination** (Phase 8): `TablesParams` includes `offset: Option<usize>` and `limit: Option<usize>`. Applied as `.skip(offset).take(limit)` after building the full result set. `X-Total-Count` response header reports pre-pagination count.
 - **SIGQUIT stack dump** (Phase 8): Unix-only signal handler (`SignalKind::quit()`) spawned in both `server/mod.rs` and `main.rs` (standalone watch). Captures `std::backtrace::Backtrace::force_capture()` and prints to stderr. Follows existing SIGHUP handler pattern. Non-terminating (runs in a loop).
-- **Streaming multipart upload** (Phase 8): `compress_part_streaming()` in `upload/stream.rs` spawns a background thread that tars+compresses a part directory and sends fixed-size chunks (>= 5 MiB) via `std::sync::mpsc` channel. Used by the upload pipeline for parts exceeding `backup.streaming_upload_threshold` (default 256 MiB). Coexists with the buffered `compress_part()` path for smaller parts. Each chunk is uploaded as an S3 multipart part via `upload_part_with_retry()`.
+- **Streaming multipart upload** (Phase 8): `compress_part_streaming()` in `upload/stream.rs` spawns a background thread that tars+compresses a part directory and sends fixed-size chunks (>= 5 MiB) via a bounded `std::sync::mpsc::sync_channel`. Used by the upload pipeline for parts exceeding `backup.streaming_upload_threshold` (default 256 MiB). Coexists with the buffered `compress_part()` path for smaller parts. Each chunk is uploaded as an S3 multipart part via `upload_part_with_retry()`. Peak memory is `MAX_IN_FLIGHT_CHUNKS * chunk_size` (30 MiB at the 5 MiB minimum) regardless of part size — more than one chunk is in flight, and the constant is derived from both channel bounds so raising either moves the stated ceiling with it.
 - **Per-disk backup directories**: Eliminates EXDEV cross-device hardlink fallbacks on multi-NVMe setups by staging backup shadow data on the same filesystem as the source disk. `per_disk_backup_dir(disk_path, backup_name) -> PathBuf` helper in `collect.rs` computes `{disk_path}/backup/{backup_name}`. `resolve_shadow_part_path()` provides a 4-step fallback chain for shadow path resolution (per-disk encoded -> legacy encoded -> legacy plain -> None). `collect_parts` stages to `{disk_path}/backup/{name}/shadow/...` per-disk instead of a single backup_dir. All consumers (upload/download/restore/delete) resolve per-disk paths via `manifest.disks`. Backward compat: single-disk setups where `disk_path == data_path` produce identical layout. `DownloadState.disk_map` persisted unconditionally for cleanup safety (allows `delete_local` to find per-disk dirs even without manifest). Delete paths (upload delete_local, list delete_local, backup error cleanup) use `std::fs::canonicalize()` + `HashSet` dedup to prevent double-delete via symlinks.
 
 - **ActionFlags parsing** (Go drop-in): `parse_action_flags()` in `routes.rs` extracts CLI-style flags from `POST /api/v1/actions` command strings. Supports `--flag=VALUE` and `--flag VALUE` forms. `--restore-table-mapping` auto-infers database prefix from `--table` when the mapping lacks dots and `--table` is a single concrete `db.table` (no wildcards). Used by create, upload, restore, create_remote, restore_remote branches; delete and clean_broken skip flag parsing.
 - **Integration table Go-compat** (Go drop-in): `integration_table_ddl()` generates DDL pointing to `/backup/list` (not `/api/v1/list`) and `/backup/actions` (not `/api/v1/actions`). `backup_list` uses `Int64` for `size` and includes `desc String` column. `create_integration_tables()` DROPs existing tables before CREATE to handle schema/URL migration on upgrade. `GoListResponse.desc` shows `"broken: {reason}"` for broken backups, `"tar, regular"` for full, `"tar, incremental"` for incremental.
 - **create --diff-from-remote** (Go drop-in): `create()` accepts `s3: Option<&S3Client>` and `diff_from_remote: Option<&str>`. When set, downloads `{base_name}/metadata.json` from S3 early in create, builds `BasePartsMap` (`HashMap<(table_key, disk_name, part_name), (crc64, size)>`), passes into `collect_parts()`. Parts matching by CRC64 skip `hardlink_dir()` during shadow walk (saves disk I/O). The downloaded manifest is also used as the diff base for `diff_parts()` (same as local `--diff-from`). Falls back to full backup on download/parse failure with warning.
+
+## Safety Config Flags
+
+Six flags govern whether an ambiguous situation is treated as safe. Five default to the
+strict answer; changing one trades a loud failure for a quiet partial result, so treat a
+non-default value as a deliberate operator decision, not a workaround to suggest.
+
+| Flag | Default | Strict behaviour |
+|------|---------|------------------|
+| `general.clean_broken_min_age_secs` | `3600` | `clean_broken` leaves a broken remote backup alone until its newest object is this old, since an in-flight upload is indistinguishable from a broken backup. `0` deletes regardless of age. |
+| `clickhouse.attach_table_require_complete` | `true` | ATTACH TABLE mode refuses a table whose staged parts do not all resolve, instead of bringing it up with missing data. |
+| `clickhouse.zk_check_strict` | `true` | A Replicated table whose `system.zookeeper` state cannot be queried fails, instead of being created against unverified ZK state. |
+| `clickhouse.strict_replica_sync` | `true` | A table whose replica is still behind after the sync poll is not attached; its parts count as skipped. |
+| `clickhouse.replace_uuid_macro` | `false` | Off by default. When on, the manifest's recorded table UUID is substituted for a literal `{uuid}` in a Replicated engine's ZooKeeper path before CREATE. It is needed only for a per-host CREATE, where ClickHouse does not expand `{uuid}` and the CREATE fails outright with BAD_ARGUMENTS (error 36) — it does not fix a silent misconfiguration, so the default is to leave the DDL alone. The substitution is confined to the ZK path; a `{uuid}` elsewhere in the DDL is left for ClickHouse. |
+| `backup.strict_projection_gate` | `true` | Restoring a backup with stripped projections onto a pre-24.3 server is refused up front rather than failing partway through ATTACH. |
 
 ## Remaining Limitations
 

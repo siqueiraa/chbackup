@@ -48,8 +48,9 @@ src/clickhouse/
 All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 
 ### SQL Generation Helpers
-- `sanitize_name(name) -> String` -- Replaces non-alphanumeric/underscore chars with underscore
-- `freeze_name(backup_name, db, table) -> String` -- Format: `chbackup_{backup}_{db}_{table}`
+- `encode_freeze_component(s) -> String` -- Injective per-component escape: ASCII alphanumerics pass through, every other byte becomes `_<HEX>`. Distinct inputs always produce distinct outputs
+- `freeze_name(backup_name, db, table) -> String` -- Format: `chbackup__{backup}__{db}__{table}`, each component escaped by `encode_freeze_component`. The `__` separator cannot occur inside a component, so the whole triple is injective -- one backup's shadow cleanup can no longer match another's live shadow directory
+- `sanitize_name(name) -> String` -- Legacy many-to-one collapse of non-alphanumeric/underscore chars to `_`. Retained only so shadow cleanup still reaps directories written by older binaries; do not use it for new freeze names
 - `freeze_sql(db, table, freeze_name) -> String` -- ALTER TABLE FREEZE WITH NAME
 - `unfreeze_sql(db, table, freeze_name) -> String` -- ALTER TABLE UNFREEZE WITH NAME
 - `freeze_partition_sql(db, table, partition_id, freeze_name) -> String` -- `ALTER TABLE ... FREEZE PARTITION ID '<id>'` (Phase 2d). Takes a literal `system.parts.partition_id`, NOT a partition key expression. The `PARTITION ID` form is required: the two forms coincide only for single-column numeric keys, and the expression form fails with error 248 for unpartitioned (`all`) and multi-column (`2024-29`) keys
@@ -93,7 +94,7 @@ All use `#[derive(clickhouse::Row, serde::Deserialize, Debug, Clone)]`.
 - `attach_table(db, table) -> Result<()>` -- ATTACH TABLE (entire table, not a part) (Phase 4d, ATTACH TABLE mode)
 - `system_restore_replica(db, table) -> Result<()>` -- SYSTEM RESTORE REPLICA, rebuilds replica metadata from local parts (Phase 4d, ATTACH TABLE mode)
 - `drop_replica_from_zkpath(replica_name, zk_path) -> Result<()>` -- SYSTEM DROP REPLICA FROM ZKPATH, removes replica from ZooKeeper (Phase 4d, ZK conflict resolution)
-- `check_zk_replica_exists(zk_path, replica_name) -> Result<bool>` -- Query system.zookeeper for replica existence; returns false on query error (system.zookeeper may be unavailable) (Phase 4d, ZK conflict resolution)
+- `check_zk_replica_exists(zk_path, replica_name) -> ZkReplicaCheck` -- Query system.zookeeper for replica existence. Returns the tri-state, **not** a bool and **not** a `Result`: `Exists`, `Absent` (queried successfully, no such replica), or `Indeterminate` (the query failed, so ZK state is unknown -- an unavailable `system.zookeeper` is not evidence that the replica is absent). Callers must route it through `restore::schema::zk_check_action()` rather than treating `Indeterminate` as `Absent`, which is what makes a stale replica go undropped (Phase 4d, ZK conflict resolution)
 - `query_database_engine(db) -> Result<String>` -- Query system.databases for engine type; returns empty string if not found (Phase 4d, DatabaseReplicated detection)
 - `execute_mutation(db, table, command) -> Result<()>` -- ALTER TABLE {command} SETTINGS mutations_sync=2; waits for mutation completion (Phase 4d, mutation re-apply)
 - `query_rbac_objects(entity_type: &str) -> Result<Vec<(String, String)>>` -- Query RBAC objects by entity type (USER/ROLE/ROW POLICY/SETTINGS PROFILE/QUOTA). Lists names from corresponding system table, then `SHOW CREATE {entity_type}` for each. Returns Vec of (name, DDL) tuples. Graceful degradation: returns empty Vec on query error (Phase 4e)

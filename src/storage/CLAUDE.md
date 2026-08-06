@@ -23,7 +23,15 @@ src/storage/
 - Storage class, SSE, and KMS key ID applied automatically to uploads
 - Support for custom endpoints (force_path_style for MinIO/R2)
 - Static credentials or default AWS credential chain
-- Optional `assume_role_arn` for cross-account access
+- Optional `assume_role_arn` for cross-account access (see below)
+
+### Auto-Refreshing AssumeRole Credentials (s3.rs)
+When `s3.assume_role_arn` is non-empty, `S3Client::new()` builds an `aws_config::sts::AssumeRoleProvider` (session name `chbackup`) via the private `assume_role_provider()` helper and installs it as the credentials provider on the primary SDK loader.
+
+- **The provider refreshes itself.** It is lazy: it calls STS on first use and again whenever the temporary credentials near expiry. There is no one-shot `assume_role()` call whose result is frozen into the config, so `server` and `watch` keep working past the (default 1 hour) session lifetime. Any advice to restart the process, or to call `POST /api/v1/restart`, to renew STS credentials is obsolete.
+- Static config credentials, when present, become the *base* credentials the provider uses to call STS; otherwise the default AWS chain (env vars, instance profile, ...) is used.
+- The effective endpoint is applied to the STS client too, so S3-compatible stacks implementing STS on their own endpoint (MinIO) are reachable.
+- `test_assume_role_provider_constructs_without_network` covers construction; the provider makes no network call until a request needs credentials.
 
 ### TLS / SSL Configuration (s3.rs)
 - **`disable_ssl=true`**: Rewrites `https://` endpoint to `http://` via `effective_endpoint` in `S3Client::new()`. When endpoint is empty (default AWS), logs a warning and continues (user may set endpoint via env var).

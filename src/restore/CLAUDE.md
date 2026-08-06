@@ -62,6 +62,8 @@ Phase 4c:  Restore RBAC              (DDL-based from access/*.jsonl, with rbac_r
 Phase 4d:  Restore config files      (file copy from configs/ to config_dir)
 Phase 4e:  Execute restart commands   (exec:/sql: prefixed commands, semicolon-separated)
 ```
+Before Phase 0, `projection_gate_error()` refuses the restore outright when the manifest's `stripped_projections` is non-empty and the server is older than `MIN_PROJECTION_TOLERANT_VERSION` (24.3). Those parts' `checksums.txt` still names the stripped `.proj` entries, and a pre-24.3 server runs a consistency pass that rejects the whole part with `Code: 107 FILE_DOESNT_EXIST`. Gated by `backup.strict_projection_gate` (default true). An empty `stripped_projections` -- which includes every manifest written before the field existed -- and an unparseable version string both proceed, so backups already in S3 restore exactly as before.
+
 - `classify_restore_tables()` splits filtered table keys into `RestorePhases` (data_tables, postponed_tables, ddl_only_tables)
 - Phase 0 (Mode A) runs `drop_tables()` (reverse engine priority with retry loop) then `drop_databases()`, gated by `rm && !data_only`
 - Phase 2 passes `phases.data_tables` to `create_tables()` and the data attach loop (instead of all table_keys)
@@ -78,7 +80,9 @@ Phase 4e:  Execute restart commands   (exec:/sql: prefixed commands, semicolon-s
 These features are wired into the restore orchestrator and affect multiple phases:
 - **ON CLUSTER DDL**: When `config.clickhouse.restore_schema_on_cluster` is non-empty, all CREATE/DROP DDL statements get `ON CLUSTER '{cluster}'` appended via `add_on_cluster_clause()`. Skipped for databases in `replicated_databases` set (DatabaseReplicated handles its own replication).
 - **DatabaseReplicated detection**: `detect_replicated_databases()` queries `ch.query_database_engine()` for each unique database in the manifest. Databases with engine == "Replicated" are added to a `HashSet<String>` that gates ON CLUSTER skipping.
-- **ZK conflict resolution**: Before creating Replicated tables in `create_tables()`, `resolve_zk_conflict()` parses ZK path + replica from DDL, resolves macros, checks `system.zookeeper` for existing replicas, and executes `SYSTEM DROP REPLICA` if conflict found. All ZK failures are non-fatal (warn + continue).
+- **ZK conflict resolution**: Before creating Replicated tables in `create_tables()`, `resolve_zk_conflict()` parses ZK path + replica from DDL, resolves macros, and calls `ch.check_zk_replica_exists()`, which returns the tri-state `ZkReplicaCheck` (`Exists` / `Absent` / `Indeterminate`). `zk_check_action(check, strict)` maps it to a `ZkAction`; see "ZK Check Tri-State" below. A failed `SYSTEM DROP REPLICA` remains non-fatal.
+- **`{uuid}` macro in ZK paths**: When `clickhouse.replace_uuid_macro` is true (default **false**), `replace_uuid_macro(ddl, table_uuid)` substitutes the manifest's recorded table UUID for a literal `{uuid}` inside the Replicated engine's ZooKeeper path before CREATE. ClickHouse expands `{uuid}` only for an `ON CLUSTER` CREATE, inside a DatabaseReplicated database, for an ATTACH, or with an explicit UUID clause; a plain per-host CREATE otherwise fails with BAD_ARGUMENTS (error 36), so this is an opt-in fix for that case rather than a guard against silent divergence. The substitution is confined to the byte span found by `replicated_zk_path_span()`, so a `{uuid}` in a column DEFAULT, a comment, or `SETTINGS` is left for ClickHouse to interpret. No-op when the manifest has no UUID, the engine is not Replicated, or the path has no `{uuid}`.
+- **Replica sync strictness**: `check_replicas_before_attach` polls `system.replicas` per Replicated table; `decide_replica_sync(&synced, strict)` turns the outcome into `Attach` or `Skip`. `Ok(false)` -- polling completed and the replica is still behind -- skips the table under the default `clickhouse.strict_replica_sync = true`, and all of its parts are added to `unsynced_parts`, which feeds `total_skipped` and therefore exit 3. `Err` is *indeterminate* (the check failed, which is not evidence of lag) and always warns and proceeds, in both modes. The hazard being avoided is a partial restore visible to readers, not row duplication: ATTACH PART deduplicates on a content-derived key, so re-attaching an identical part does not duplicate rows.
 - **Distributed cluster rewrite**: When `config.clickhouse.restore_distributed_cluster` is non-empty, `rewrite_distributed_cluster()` is applied during `create_tables()` to change the cluster name in Distributed engine DDL.
 - **Macros resolution**: `ch.get_macros()` is called once at restore start; result is passed to ZK resolution and ATTACH TABLE mode. Default `{database}` and `{table}` entries are added per-table from the destination names.
 
@@ -111,10 +115,30 @@ Key behaviors:
 - `create_functions()`: Phase 4 function creation. Iterates `manifest.functions` DDL entries, executes each via `ch.execute_ddl()`. Failures are logged as warnings and skipped (function may already exist). Logs creation count summary. Accepts `on_cluster` param (Phase 4d) for ON CLUSTER injection.
 - `drop_tables()` (Phase 4d): Mode A DROP phase. Sorts tables by `engine_drop_priority` (Distributed/Merge first, data tables last). Uses retry loop (max 10 rounds, same pattern as `create_ddl_objects()`). System databases are never dropped. Respects remap (drops destination names) and ON CLUSTER (skipped for DatabaseReplicated databases).
 - `drop_databases()` (Phase 4d): Mode A database DROP. Iterates manifest databases, skips system databases (`system`, `information_schema`, `INFORMATION_SCHEMA`). Uses `ch.drop_database()` with ON CLUSTER support.
-- `resolve_zk_conflict()` (Phase 4d, private): ZK conflict resolution for Replicated tables. Flow: `parse_replicated_params()` -> `resolve_zk_macros()` -> `ch.check_zk_replica_exists()` -> `ch.drop_replica_from_zkpath()` if conflict. All failures are non-fatal (warn + continue).
+- `resolve_zk_conflict(ch, ddl, macros, table_uuid, table, strict)`: ZK conflict resolution for Replicated tables. Flow: `parse_replicated_params()` -> `resolve_zk_macros()` -> `ch.check_zk_replica_exists()` -> `zk_check_action()` -> `ch.drop_replica_from_zkpath()` when a conflict is found. Returns `Err` only for `ZkAction::FailTable`, which the caller must let block that table's CREATE.
 - `detect_replicated_databases()` (Phase 4d): Queries `ch.query_database_engine()` for each unique database in the manifest. Returns `HashSet<String>` of databases using the "Replicated" engine (DatabaseReplicated).
 - `is_replicated_engine()` (Phase 4d): Returns true if engine name starts with "Replicated" (covers all Replicated*MergeTree variants). Used by ZK conflict resolution, ATTACH TABLE mode, and schema creation logic.
 - `SYSTEM_DATABASES` (Phase 4d): Constant `&[&str]` listing databases that must never be dropped: `["system", "information_schema", "INFORMATION_SCHEMA"]`.
+
+### ZK Check Tri-State (schema.rs + clickhouse/client.rs)
+`check_zk_replica_exists()` returns `ZkReplicaCheck`, not a bool. It **does not fail open**:
+
+| `ZkReplicaCheck` | Meaning | `zk_check_action` (strict) | (non-strict) |
+|------------------|---------|----------------------------|--------------|
+| `Exists` | A replica is registered at the path | `DropReplica` | `DropReplica` |
+| `Absent` | ZooKeeper was queried and holds no such replica | `Proceed` | `Proceed` |
+| `Indeterminate` | The query failed; ZK state is unknown | `FailTable` | `Proceed` (with a warning) |
+
+`Indeterminate` is the load-bearing cell. "ZooKeeper says there is no replica" and "we could not ask ZooKeeper" justify opposite decisions; folding the latter into `Absent` would send an unreachable ZooKeeper down the same clean path as a verified-clean one, and the stale replica this check exists to drop would go undropped. Under the default `clickhouse.zk_check_strict = true` it means `FailTable`, and `resolve_zk_conflict()` returns an `Err` naming the table, the replica, and the ZK path. Setting `zk_check_strict = false` restores the old create-anyway behaviour, logging that conflict resolution was skipped and that whether a stale replica exists is unknown.
+
+### ATTACH TABLE Completeness Pre-Check (mod.rs)
+ATTACH TABLE mode hardlinks a table's parts into its live data directory, so a table brought up with parts missing is silently short of data. The pre-flight resolves every part's staged source, and `decide_attach_table(resolved, require_complete)` returns one of:
+
+- `Attach(CompleteAttachPlan)` -- every part resolved.
+- `Refuse { missing, total }` -- parts are missing and `clickhouse.attach_table_require_complete` is true (the default). The table is **neither created nor attached**, and all of its parts are added to `AttachPreflight::refused_parts`, which feeds `total_skipped` and the exit-3 partial-restore error.
+- `AttachIncomplete { plan, missing, total }` -- parts are missing but the operator set `attach_table_require_complete = false`.
+
+`CompleteAttachPlan` lives in the private `mod attach_plan` with a module-private `sources` field, so the rest of `restore` cannot forge one with a struct literal; its only safe constructor, `try_new`, fails unless every part resolved. `try_attach_table_mode()` takes the plan **by value**, so holding one is proof it came from `decide_attach_table` — the incomplete case is reachable only through the `attach_available_anyway` escape hatch, which is private to that module. No DETACH TABLE, hardlink, ATTACH TABLE, or SYSTEM RESTORE REPLICA can run for a table with unresolved parts unless the operator opted out.
 
 ### Path Encoding (attach.rs, mod.rs)
 - `url_encode()` in attach.rs has been removed; all call sites (including those in mod.rs that previously referenced `attach::url_encode`) now use `crate::path_encoding::encode_path_component()`
@@ -129,7 +153,16 @@ Key behaviors:
 - This fixes a pre-existing inconsistency: previously `attach_parts_inner()` used destination db/table names for shadow lookup, which broke under remap (`--as`). Now both `attach_parts_inner()` and `try_attach_table_mode()` consistently use source names.
 - Falls back to file copy on EXDEV (cross-device error code 18)
 - Chowns to ClickHouse uid/gid detected from `stat()` on data_path; skips chown if not root
-- `ALTER TABLE ATTACH PART` errors 232/233 (overlapping range, already exists) are logged as warnings and skipped
+
+### ATTACH PART Error Classification (attach.rs)
+Both ATTACH call sites route their error string through the single `classify_attach_error()`, which returns an `AttachErrorClass`. The codes are traced to ClickHouse's `ErrorCodes.cpp` and are identical across the four CI matrix versions:
+
+- `MissingPart` -- 232 `NO_SUCH_DATA_PART` or 233 `BAD_DATA_PART_NAME`. The data is genuinely absent.
+- `DuplicatePart` -- 235 `DUPLICATE_DATA_PART`. An identically named part is already active.
+- `TemporarilyLocked` -- 384 `PART_IS_TEMPORARILY_LOCKED`. The part exists but is being removed.
+- `Unknown` -- anything else. **Fatal.** Never treat an unrecognised ATTACH failure as benign.
+
+**Missing-part is tested FIRST, and that ordering is part of the contract.** Only `MissingPart` sets `counts_as_missing_data()`, and only those parts feed `AttachResult.skipped`, which the caller turns into `ChBackupError::PartialRestore` and CLI exit 3. `DuplicatePart` and `TemporarilyLocked` are logged per part and tallied separately, so an idempotent re-restore over already-present parts still exits 0. Testing duplicate before missing is what previously let a missing part be reported as "already exists", omitted from the tally, and a failed restore exit 0.
 
 ### UUID-Isolated S3 Restore (attach.rs, Phase 2c)
 - S3 disk parts are restored via CopyObject instead of hardlink
@@ -138,7 +171,7 @@ Key behaviors:
 - **Same-name optimization**: Before copying, calls `ListObjectsV2(prefix=store/{uuid_hex[0..3]}/{uuid_with_dashes}/)` to get existing S3 objects. Objects matching both path and size are skipped (zero-copy). Single ListObjectsV2 per table, not per-object HeadObject.
 - S3 objects are copied from the backup bucket to the data bucket using `s3.copy_object_with_retry()`
 - Parallel S3 copies within a table bounded by `object_disk_server_side_copy_concurrency` semaphore (default 32)
-- After CopyObject: metadata files are rewritten using `object_disk::rewrite_metadata()` to update paths and set RefCount=0, ReadOnly=false
+- After CopyObject: metadata files are rewritten using `object_disk::rewrite_metadata()` to update paths and set RefCount=0, ReadOnly=false. Keys are re-derived per metadata version by `object_disk::restore_object_keys()`: a v5 file gets the complete destination key (ClickHouse resolves it with `createAsAbsolute`), a v2-v4 file keeps the bare disk-relative form. Before that, `to_disk_relative_keys()` maps each v5 key in the staged file back to the disk-relative key the manifest recorded (matching on a path-component boundary, disambiguated by size) and **fails the part** if the match is missing or ambiguous, rather than writing a key that CopyObject never created
 - Rewritten metadata files are written to `detached/{part_name}/` before ATTACH
 - InlineData (v4+): no CopyObject needed for inline objects; preserved during rewrite
 - `OwnedAttachParams` extended with S3-related fields: `s3_client`, `disk_type_map`, `object_disk_server_side_copy_concurrency`, `allow_object_disk_streaming`, `disk_remote_paths`
@@ -173,6 +206,7 @@ When `config.clickhouse.restore_as_attach` is true, Replicated*MergeTree tables 
 6. `ch.system_restore_replica(db, table)` -- rebuild replica metadata from local parts
 
 Key behaviors:
+- Eligibility is decided by the completeness pre-check above; a refused table never reaches step 1
 - Non-Replicated tables always use the normal per-part ATTACH flow
 - If any step fails, falls back to normal per-part ATTACH with a warning log
 - `try_attach_table_mode()` returns `Ok(true)` on success, `Ok(false)` if not eligible, `Err` on failure
@@ -261,7 +295,8 @@ Queries `system.tables` for `data_paths` column to find the table's data directo
 
 ### Error Handling
 - Uses `anyhow::Result` with `.context()` for error chain
-- ATTACH PART errors for overlapping/existing parts are warnings, not failures
+- ATTACH PART errors are classified by `classify_attach_error()`; only already-present parts are warnings, missing parts count as skipped, and an unrecognised error is fatal
+- Any skipped part makes `restore()` return `ChBackupError::PartialRestore` (CLI exit 3), and completion state is deliberately not persisted so a later `--resume` still retries those parts
 - Chown EPERM (not running as root) is silently skipped
 
 ## Parent Rules
