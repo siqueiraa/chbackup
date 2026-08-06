@@ -1,10 +1,12 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::error::ChBackupError;
 
@@ -30,6 +32,17 @@ pub struct PidLock {
     path: PathBuf,
 }
 
+/// Times an unparseable lock file is re-read before it is judged corrupt, and the pause
+/// between those reads. Bounded on purpose: a genuinely corrupt file must not wedge the tool.
+const CORRUPT_LOCK_MAX_READS: u32 = 3;
+const CORRUPT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
+/// Publish attempts before giving up. Every non-final outcome removes or waits out the
+/// blocking file, so exhausting this means one keeps reappearing.
+const ACQUIRE_MAX_ATTEMPTS: u32 = 6;
+
+/// Distinguishes serial numbers of concurrently published lock files within this process.
+static TEMP_LOCK_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl PidLock {
     /// Acquire a PID lock at `path` for the given `command`.
     ///
@@ -50,60 +63,137 @@ impl PidLock {
             fs::create_dir_all(parent)?;
         }
 
-        // Attempt atomic file creation via O_CREAT|O_EXCL (create_new).
-        // This eliminates the TOCTOU race between exists() and write().
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(mut file) => {
-                file.write_all(json.as_bytes())?;
-                Ok(PidLock {
-                    path: path.to_path_buf(),
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // File exists -- check whether the recorded PID is alive.
-                match fs::read_to_string(path) {
-                    Ok(contents) => {
-                        if let Ok(existing) = serde_json::from_str::<LockInfo>(&contents) {
-                            if is_pid_alive(existing.pid) {
-                                return Err(ChBackupError::LockError(format!(
-                                    "lock held by PID {} (command: {}, since: {})",
-                                    existing.pid, existing.command, existing.timestamp,
-                                )));
-                            }
-                            // PID is dead -- stale lock, remove and retry.
-                        }
-                        // Malformed JSON -- treat as stale, remove and retry.
-                    }
-                    Err(_) => {
-                        // Cannot read file -- treat as stale, remove and retry.
-                    }
+        let mut corrupt_reads = 0;
+        for _ in 0..ACQUIRE_MAX_ATTEMPTS {
+            match publish_lock_file(path, &json) {
+                Ok(()) => {
+                    return Ok(PidLock {
+                        path: path.to_path_buf(),
+                    })
                 }
-
-                // Remove stale lock and retry with create_new for atomicity.
-                let _ = fs::remove_file(path);
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                    .map_err(|e| {
-                        ChBackupError::LockError(format!(
-                            "failed to acquire lock after removing stale file: {e}"
-                        ))
-                    })?;
-                file.write_all(json.as_bytes())?;
-                Ok(PidLock {
-                    path: path.to_path_buf(),
-                })
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(ChBackupError::LockError(format!(
+                        "failed to create lock file: {e}"
+                    )))
+                }
             }
-            Err(e) => Err(ChBackupError::LockError(format!(
-                "failed to create lock file: {e}"
-            ))),
+
+            match inspect_lock_file(path) {
+                ExistingLock::Live(existing) => {
+                    return Err(ChBackupError::LockError(format!(
+                        "lock held by PID {} (command: {}, since: {})",
+                        existing.pid, existing.command, existing.timestamp,
+                    )))
+                }
+                // The recorded holder is dead: a stale lock never blocks.
+                ExistingLock::Stale => {
+                    let _ = fs::remove_file(path);
+                }
+                // Released while we were looking -- publish again straight away.
+                ExistingLock::Gone => {}
+                // Publication is atomic, so unparseable content can no longer be a racer's
+                // half-written file; it means genuine corruption. Re-read a few times before
+                // overriding, because deleting an unparseable lock on sight is exactly what
+                // let two acquirers both believe they held the same lock.
+                ExistingLock::Unreadable(_) if corrupt_reads < CORRUPT_LOCK_MAX_READS => {
+                    corrupt_reads += 1;
+                    std::thread::sleep(CORRUPT_LOCK_RETRY_DELAY);
+                }
+                ExistingLock::Unreadable(reason) => {
+                    warn!(
+                        path = %path.display(),
+                        %reason,
+                        "Removing corrupt lock file after repeated unreadable reads"
+                    );
+                    let _ = fs::remove_file(path);
+                }
+            }
         }
+
+        Err(ChBackupError::LockError(format!(
+            "failed to acquire lock {}: a conflicting lock file keeps reappearing",
+            path.display()
+        )))
     }
 
     /// Return the path to the lock file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// What an already-existing lock file turned out to be.
+#[derive(Debug)]
+enum ExistingLock {
+    /// Owned by a process that is still alive.
+    Live(LockInfo),
+    /// Owned by a dead process.
+    Stale,
+    /// Vanished between the failed publish and the read.
+    Gone,
+    /// Present but not parseable as a [`LockInfo`], with the reason.
+    Unreadable(String),
+}
+
+/// Classify the lock file at `path`.
+fn inspect_lock_file(path: &Path) -> ExistingLock {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ExistingLock::Gone,
+        Err(e) => return ExistingLock::Unreadable(e.to_string()),
+    };
+    match serde_json::from_str::<LockInfo>(&contents) {
+        Ok(info) if is_pid_alive(info.pid) => ExistingLock::Live(info),
+        Ok(_) => ExistingLock::Stale,
+        Err(e) => ExistingLock::Unreadable(e.to_string()),
+    }
+}
+
+/// Create the lock file at `path` carrying `json`, failing with
+/// [`ErrorKind::AlreadyExists`](std::io::ErrorKind::AlreadyExists) if it is already taken.
+///
+/// The payload is written to a uniquely named temp file in the same directory first, and only
+/// the finished file is linked into place. Creating the lock empty and writing it afterwards
+/// left a window in which every reader here — which judges unparseable content as "not a live
+/// lock" — would delete a lock another process had just been granted.
+///
+/// The publish step is `link(2)` rather than `rename(2)`: rename would silently clobber a live
+/// holder's lock, while link fails with `EEXIST`, keeping the `O_CREAT|O_EXCL` semantics that
+/// make exactly one racer the winner.
+fn publish_lock_file(path: &Path, json: &str) -> std::io::Result<()> {
+    let tmp = temp_lock_path(path);
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    let written = file.write_all(json.as_bytes());
+    drop(file);
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    let published = fs::hard_link(&tmp, path);
+    let _ = fs::remove_file(&tmp);
+    published
+}
+
+/// A sibling path for the temp file a lock is staged in.
+///
+/// Same directory, so the link is never cross-device, and deliberately not a
+/// `chbackup.*.pid` name: [`check_cross_tier_exclusion`] would otherwise read it as a
+/// per-backup lock.
+fn temp_lock_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("chbackup.lock");
+    let unique = format!(
+        ".{stem}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_LOCK_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    match path.parent() {
+        Some(dir) => dir.join(unique),
+        None => PathBuf::from(unique),
     }
 }
 
@@ -487,6 +577,51 @@ mod tests {
     }
 
     #[test]
+    fn lock_publication_atomic() {
+        let dir = TempDir::new().unwrap();
+        let path = lock_path(&dir);
+
+        let lock = PidLock::acquire(&path, "publish").unwrap();
+
+        // A published lock is never observable empty: it parses the moment it exists.
+        let info: LockInfo = serde_json::from_str(&fs::read_to_string(lock.path()).unwrap())
+            .expect("the published lock file must parse");
+        assert_eq!(info.pid, std::process::id());
+
+        let strays: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name != "test.pid")
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "publication must leave no temp file behind: {strays:?}"
+        );
+    }
+
+    #[test]
+    fn lock_zero_byte_lock_not_stale() {
+        let dir = TempDir::new().unwrap();
+        let path = lock_path(&dir);
+        // Exactly what the old create-then-write window exposed to a concurrent acquirer.
+        fs::write(&path, b"").unwrap();
+
+        let started = std::time::Instant::now();
+        let lock = PidLock::acquire(&path, "corrupt").unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= CORRUPT_LOCK_RETRY_DELAY * CORRUPT_LOCK_MAX_READS,
+            "an unparseable lock must be re-read, not taken on sight (took {elapsed:?})"
+        );
+        // Bounded, though -- a corrupt file must not wedge the tool forever.
+        let info: LockInfo = serde_json::from_str(&fs::read_to_string(lock.path()).unwrap())
+            .expect("the corrupt lock must eventually be replaced by a valid one");
+        assert_eq!(info.pid, std::process::id());
+    }
+
+    #[test]
     fn test_lock_for_command_mapping() {
         // Backup-scoped commands
         assert_eq!(
@@ -645,7 +780,7 @@ mod tests {
                     } else {
                         backup_scope(&format!("backup-{t}"))
                     };
-                    for _ in 0..25 {
+                    for _ in 0..100 {
                         // A rejected acquisition is a legitimate outcome here;
                         // only a granted one can violate the invariant.
                         let Ok(lock) = acquire_scoped(&lock_dir, &scope, "concurrent") else {

@@ -416,7 +416,9 @@ pub fn blocks_destructive_op(data_path: &str, backup_name: &str, op: &str) -> bo
 /// sequence — re-read the record, UNFREEZE, delete the record — and the record is re-read
 /// *after* acquiring. A point-in-time liveness check would be a TOCTOU gap: an upload could
 /// start between the check and the UNFREEZE, and we would release a freeze it still needs.
-/// A backup whose lock cannot be acquired is simply skipped; it is in use.
+/// A backup whose lock cannot be acquired is simply skipped; it is in use. Acquisition also
+/// fails while the caller holds the global lock, since the two tiers are mutually exclusive,
+/// so a reap invoked from `clean` defers to the one at `create` pre-flight.
 pub async fn reap_expired(ch: &crate::clickhouse::client::ChClient, data_path: &str) -> usize {
     let backups_dir = PathBuf::from(data_path).join("backup");
     let entries = match std::fs::read_dir(&backups_dir) {
@@ -443,14 +445,16 @@ pub async fn reap_expired(ch: &crate::clickhouse::client::ChClient, data_path: &
             continue;
         }
 
-        // Acquire and HOLD the per-backup lock for the whole release.
+        // Acquire and HOLD the per-backup lock for the whole release. Going through
+        // `acquire_scoped` rather than `PidLock::acquire` keeps the reaper inside the
+        // acquisition gate, so it neither races the cross-tier scan nor publishes a lock file
+        // that a gated scan could observe mid-publication.
         let scope = crate::lock::LockScope::Backup(backup_name.clone());
-        let lock_path =
-            match crate::lock::lock_path_for_scope(crate::lock::default_lock_dir(), &scope) {
-                Some(p) => p,
-                None => continue,
-            };
-        let _lock = match crate::lock::PidLock::acquire(&lock_path, "reap_deferred_freeze") {
+        let _lock = match crate::lock::acquire_scoped(
+            crate::lock::default_lock_dir(),
+            &scope,
+            "reap_deferred_freeze",
+        ) {
             Ok(l) => l,
             Err(_) => continue, // in use -- leave it alone
         };
