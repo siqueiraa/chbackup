@@ -59,6 +59,60 @@ use schema::{
 use sort::PartSortKey;
 use topo::{classify_restore_tables, topological_sort};
 
+/// First ClickHouse minor release that tolerates a part whose `checksums.txt`
+/// names a `.proj` entry with no matching directory on disk -- exactly what a
+/// `--skip-projections` backup produces.
+///
+/// Traced to 24.3 in `docs/verification/h9-projection-gate.json` (verdict
+/// CONFIRMED): `IMergeTreeDataPart.cpp` gained `if (check_consistency &&
+/// !has_broken_projections)`, which skips the consistency pass that otherwise
+/// throws `Code: 107 FILE_DOESNT_EXIST` and rejects the whole part. It is also
+/// the threshold upstream clickhouse-backup uses.
+const MIN_PROJECTION_TOLERANT_VERSION: (u32, u32) = (24, 3);
+
+/// Parse the leading `major.minor` out of a ClickHouse version string such as
+/// `"23.8.16.40"`. Returns `None` when either component is missing or non-numeric.
+fn parse_major_minor(version: &str) -> Option<(u32, u32)> {
+    let mut fields = version.trim().split('.');
+    let major = fields.next()?.parse().ok()?;
+    let minor = fields.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Decide whether a restore must be refused because the backup had projection
+/// directories stripped and the target server predates the tolerating version.
+///
+/// Returns `Some(message)` to refuse, `None` to proceed. Proceeding is the answer
+/// whenever the gate is off, nothing is recorded as stripped -- which includes
+/// manifests written before `stripped_projections` existed, so backups already in
+/// S3 restore exactly as they do today -- or the server is new enough. An
+/// unparseable version is treated as unknown and let through, so a change in
+/// ClickHouse's version-string format can never block a working restore.
+fn projection_gate_error(
+    stripped_projections: &[String],
+    server_version: &str,
+    strict_projection_gate: bool,
+) -> Option<String> {
+    if !strict_projection_gate || stripped_projections.is_empty() {
+        return None;
+    }
+    let server = parse_major_minor(server_version)?;
+    if server >= MIN_PROJECTION_TOLERANT_VERSION {
+        return None;
+    }
+    let (min_major, min_minor) = MIN_PROJECTION_TOLERANT_VERSION;
+    Some(format!(
+        "backup was created with --skip-projections (stripped: {}) but its parts' \
+         checksums.txt still reference those projections, which ClickHouse {} rejects \
+         with FILE_DOESNT_EXIST during ATTACH; {}.{} or newer is required. Set \
+         backup.strict_projection_gate=false to attempt the restore anyway.",
+        stripped_projections.join(", "),
+        server_version,
+        min_major,
+        min_minor
+    ))
+}
+
 /// Restore a backup to ClickHouse.
 ///
 /// Implements Mode B (non-destructive) and Mode A (destructive `--rm`) restore.
@@ -133,6 +187,24 @@ pub async fn restore(
         databases = manifest.databases.len(),
         "Loaded manifest"
     );
+
+    // 1b. Refuse early if this backup's stripped projections cannot survive ATTACH
+    // on this server. Failing here beats failing per-part after the DDL phase.
+    match ch.get_version().await {
+        Ok(server_version) => {
+            if let Some(message) = projection_gate_error(
+                &manifest.stripped_projections,
+                &server_version,
+                config.backup.strict_projection_gate,
+            ) {
+                bail!(message);
+            }
+        }
+        Err(e) => warn!(
+            error = %e,
+            "Could not read the ClickHouse version; skipping the stripped-projection gate"
+        ),
+    }
 
     // 2. Filter tables by pattern
     let table_filter = match table_pattern {
@@ -1562,6 +1634,77 @@ async fn try_attach_table_mode(
 mod tests {
     use super::*;
     use crate::clickhouse::client::TableRow;
+
+    /// Full-version strings for the whole CI matrix, so the gate is exercised
+    /// against the same servers the project claims to support.
+    const CI_MATRIX: [&str; 4] = ["23.8.16.40", "24.3.18.7", "24.8.14.39", "25.1.5.31"];
+
+    #[test]
+    fn projection_gate_version_matrix_refuses_only_below_24_3() {
+        let stripped = ["daily_agg".to_string()];
+        for version in CI_MATRIX {
+            let refusal = projection_gate_error(&stripped, version, true);
+            if version.starts_with("23.8") {
+                let message = refusal.expect("23.8 must refuse a stripped-projection backup");
+                assert!(
+                    message.contains("daily_agg"),
+                    "message names what was stripped"
+                );
+                assert!(
+                    message.contains("24.3"),
+                    "message names the required version"
+                );
+            } else {
+                assert!(
+                    refusal.is_none(),
+                    "{version} tolerates stripped projections"
+                );
+            }
+        }
+    }
+
+    /// The backward-compat requirement: manifests already in S3 carry no
+    /// `stripped_projections`, which deserializes to an empty list. Those must
+    /// restore on every matrix version, 23.8 included, in either flag state.
+    #[test]
+    fn projection_gate_version_allows_empty_marker_everywhere() {
+        for version in CI_MATRIX {
+            for strict in [true, false] {
+                assert!(
+                    projection_gate_error(&[], version, strict).is_none(),
+                    "{version} (strict={strict}) must restore a backup with nothing recorded"
+                );
+            }
+        }
+        // Same server, same empty marker, spelled out for the one version that
+        // would otherwise refuse.
+        assert!(projection_gate_error(&[], "23.8.16.40", true).is_none());
+    }
+
+    #[test]
+    fn projection_gate_version_off_allows_23_8() {
+        let stripped = ["daily_agg".to_string()];
+        assert!(projection_gate_error(&stripped, "23.8.16.40", false).is_none());
+    }
+
+    #[test]
+    fn projection_gate_version_unparseable_is_treated_as_unknown() {
+        let stripped = ["daily_agg".to_string()];
+        for version in ["", "unknown", "23", "v23.8"] {
+            assert!(
+                projection_gate_error(&stripped, version, true).is_none(),
+                "an unreadable version {version:?} must not block a restore"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_gate_version_parses_major_minor() {
+        assert_eq!(parse_major_minor("23.8.16.40"), Some((23, 8)));
+        assert_eq!(parse_major_minor("24.3"), Some((24, 3)));
+        assert_eq!(parse_major_minor("24"), None);
+        assert_eq!(parse_major_minor("24.x"), None);
+    }
 
     /// A completed poll that reports "not synced" is the only outcome that may skip, and
     /// only in strict mode. `Err` is indeterminate and attaches in both modes.

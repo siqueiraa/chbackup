@@ -19,7 +19,7 @@ pub mod mutations;
 pub mod rbac;
 pub mod sync_replica;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -741,7 +741,7 @@ pub async fn create(
 
             // Collect parts from shadow using spawn_blocking for filesystem I/O
             let fname_for_collect = fname;
-            let parts_map = tokio::task::spawn_blocking(move || {
+            let (parts_map, stripped_projections) = tokio::task::spawn_blocking(move || {
                 collect_parts(
                     &data_path,
                     &fname_for_collect,
@@ -801,7 +801,12 @@ pub async fn create(
                 dependencies: deps_clone.get(&full_name).cloned().unwrap_or_default(),
             };
 
-            Ok(Some((freeze_info, full_name, table_manifest)))
+            Ok(Some((
+                freeze_info,
+                full_name,
+                table_manifest,
+                stripped_projections,
+            )))
         });
 
         // Collect an AbortHandle before moving the JoinHandle into try_join_all,
@@ -859,11 +864,15 @@ pub async fn create(
     let mut had_error = false;
     let mut first_error: Option<anyhow::Error> = None;
     let mut zero_parts_with_data: Vec<String> = Vec::new();
+    // Projections the shadow walk actually removed, across every table. A
+    // BTreeSet gives the manifest its sorted, deduplicated list for free.
+    let mut stripped_projections: BTreeSet<String> = BTreeSet::new();
 
     for result in results {
         match result {
-            Ok(Some((freeze_info, full_name, table_manifest))) => {
+            Ok(Some((freeze_info, full_name, table_manifest, table_stripped))) => {
                 freeze_guard.add(freeze_info);
+                stripped_projections.extend(table_stripped);
                 // Track data tables with zero parts but reported bytes
                 if !table_manifest.metadata_only
                     && table_manifest.parts.values().all(|v| v.is_empty())
@@ -1062,7 +1071,15 @@ pub async fn create(
             rbac: None,
             rbac_size: 0,
             config_size: 0,
+            stripped_projections: stripped_projections.into_iter().collect(),
         };
+
+        if !manifest.stripped_projections.is_empty() {
+            info!(
+                projections = %manifest.stripped_projections.join(", "),
+                "Backup omits projection directories; restore gates this on the ClickHouse version"
+            );
+        }
 
         // 13a. Backup RBAC, configs, named collections (populates manifest fields)
         rbac::backup_rbac_and_configs(

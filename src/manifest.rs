@@ -87,6 +87,17 @@ pub struct BackupManifest {
     /// Total size of ClickHouse config backup files in bytes.
     #[serde(default)]
     pub config_size: u64,
+
+    /// Projection names (the `.proj` directory name without its suffix) that the
+    /// shadow walk ACTUALLY removed from the staged parts, sorted and deduplicated.
+    /// A configured `skip_projections` pattern that matched nothing records an
+    /// empty list -- this field describes what was removed, not what was requested.
+    ///
+    /// Deliberately serialized even when empty: an ABSENT field then means only
+    /// "written by a chbackup that had no such field", i.e. nothing is known
+    /// about this backup's projections, which restore must treat as permissive.
+    #[serde(default)]
+    pub stripped_projections: Vec<String>,
 }
 
 /// Per-table metadata within a backup.
@@ -379,6 +390,7 @@ impl BackupManifest {
             rbac: None,
             rbac_size: 0,
             config_size: 0,
+            stripped_projections: Vec::new(),
         }
     }
 
@@ -495,6 +507,34 @@ mod tests {
         assert!(manifest.functions.is_empty());
         assert!(manifest.named_collections.is_empty());
         assert!(manifest.rbac.is_none());
+    }
+
+    #[test]
+    fn test_manifest_roundtrip_with_stripped_projections() {
+        let mut manifest = sample_manifest();
+        manifest.stripped_projections = vec!["daily_agg".to_string(), "hourly_agg".to_string()];
+
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        assert!(json.contains("\"stripped_projections\""));
+
+        let deserialized: BackupManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(manifest, deserialized);
+        assert_eq!(
+            deserialized.stripped_projections,
+            ["daily_agg", "hourly_agg"]
+        );
+    }
+
+    #[test]
+    fn test_manifest_without_stripped_projections_defaults_to_empty() {
+        // Manifests already in S3 predate the field entirely. They must load
+        // cleanly and record nothing, which restore reads as "unknown".
+        let json = r#"{
+            "name": "pre-existing",
+            "timestamp": "2024-01-15T02:00:00Z"
+        }"#;
+        let manifest: BackupManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.stripped_projections.is_empty());
     }
 
     #[test]
@@ -818,6 +858,7 @@ mod tests {
             }),
             rbac_size: 2048,
             config_size: 4096,
+            stripped_projections: Vec::new(),
         };
 
         // Round-trip

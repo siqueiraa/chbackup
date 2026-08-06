@@ -1263,6 +1263,7 @@ mod tests {
             rbac: None,
             rbac_size: 0,
             config_size: 0,
+            stripped_projections: Vec::new(),
         };
 
         let metadata_path = data_path

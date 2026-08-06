@@ -416,6 +416,13 @@ pub struct BackupConfig {
     #[serde(default)]
     pub skip_projections: Vec<String>,
 
+    /// Refuse to restore a backup whose manifest records stripped projections onto a
+    /// ClickHouse that predates the version tolerating them. Defaults to true: such a
+    /// restore is reported to fail outright on older servers, so refusing up front is
+    /// the conservative choice. Set false to attempt it anyway.
+    #[serde(default = "default_true")]
+    pub strict_projection_gate: bool,
+
     /// Parts with uncompressed size above this threshold (in bytes) use
     /// streaming compression+multipart upload instead of buffering in memory.
     /// Default: 256 MiB.
@@ -654,6 +661,7 @@ impl Default for BackupConfig {
             retries_duration: default_retries_duration(),
             retries_jitter: default_retries_jitter_01(),
             skip_projections: Vec::new(),
+            strict_projection_gate: true,
             streaming_upload_threshold: default_streaming_upload_threshold(),
         }
     }
@@ -1344,6 +1352,16 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_STRICT_PROJECTION_GATE") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.backup.strict_projection_gate = b;
+            } else {
+                warn!(
+                    "CHBACKUP_BACKUP_STRICT_PROJECTION_GATE='{}' is not a valid bool, ignoring",
+                    v
+                );
+            }
+        }
         if let Ok(v) = std::env::var("CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD") {
             if let Ok(n) = v.parse::<u64>() {
                 self.backup.streaming_upload_threshold = n;
@@ -1706,6 +1724,9 @@ impl Config {
                     .filter(|s| !s.is_empty())
                     .collect()
             }
+            "backup.strict_projection_gate" => {
+                self.backup.strict_projection_gate = value.parse().context("Invalid bool")?
+            }
             "backup.streaming_upload_threshold" => {
                 self.backup.streaming_upload_threshold = value
                     .parse()
@@ -1963,6 +1984,7 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CHBACKUP_BACKUP_RETRIES_DURATION" => Some("backup.retries_duration"),
         "CHBACKUP_BACKUP_TABLES" => Some("backup.tables"),
         "CHBACKUP_BACKUP_SKIP_PROJECTIONS" => Some("backup.skip_projections"),
+        "CHBACKUP_BACKUP_STRICT_PROJECTION_GATE" => Some("backup.strict_projection_gate"),
         "CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD" => Some("backup.streaming_upload_threshold"),
 
         // API

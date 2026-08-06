@@ -16,7 +16,7 @@
 //! instead of hardlinking data (the data lives on S3, not the local filesystem).
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -36,6 +36,10 @@ use crate::table_filter::is_disk_excluded;
 /// Used by `--diff-from-remote` to skip hardlinking parts that match the remote base
 /// during `collect_parts()`.
 pub type BasePartsMap = HashMap<(String, String, String), (u64, u64)>;
+
+/// What a shadow walk yields: parts keyed by "db.table", paired with the names of
+/// the projections the walk actually stripped (sorted and deduplicated by the set).
+pub type CollectedShadow = (HashMap<String, Vec<CollectedPart>>, BTreeSet<String>);
 
 /// Compute the per-disk backup directory for a given disk.
 ///
@@ -257,7 +261,9 @@ pub struct CollectedPart {
 /// is what makes a v5 metadata key (stored complete) comparable to a v2-v4 one (stored
 /// relative to the disk prefix) in the manifest -- see [`object_disk::disk_relative_key`].
 ///
-/// Returns a mapping of "db.table" -> Vec<CollectedPart> with disk_name populated.
+/// Returns a mapping of "db.table" -> Vec<CollectedPart> with disk_name populated,
+/// paired with the sorted set of projection names the walk actually stripped (empty
+/// when `skip_projections` matched nothing on disk).
 #[allow(clippy::too_many_arguments)]
 pub fn collect_parts(
     data_path: &str,
@@ -272,9 +278,10 @@ pub fn collect_parts(
     skip_projections: &[String],
     base_parts: Option<&BasePartsMap>,
     cache_disk_names: &HashSet<String>,
-) -> Result<HashMap<String, Vec<CollectedPart>>> {
+) -> Result<CollectedShadow> {
     let uuid_map = build_uuid_map(tables);
     let mut result: HashMap<String, Vec<CollectedPart>> = HashMap::new();
+    let mut stripped_projections: BTreeSet<String> = BTreeSet::new();
     // Track which disks have already been logged to avoid per-part log spam.
     let mut logged_disks: HashSet<String> = HashSet::new();
 
@@ -434,6 +441,7 @@ pub fn collect_parts(
                             base_parts,
                             &mut logged_disks,
                             &mut result,
+                            &mut stripped_projections,
                         )?;
                     }
                 }
@@ -506,6 +514,7 @@ pub fn collect_parts(
                             base_parts,
                             &mut logged_disks,
                             &mut result,
+                            &mut stripped_projections,
                         )?;
                     }
                 }
@@ -513,7 +522,7 @@ pub fn collect_parts(
         }
     }
 
-    Ok(result)
+    Ok((result, stripped_projections))
 }
 
 /// Process a single shadow part directory entry.
@@ -536,6 +545,7 @@ fn process_shadow_part(
     base_parts: Option<&BasePartsMap>,
     logged_disks: &mut HashSet<String>,
     result: &mut HashMap<String, Vec<CollectedPart>>,
+    stripped_projections: &mut BTreeSet<String>,
 ) -> Result<()> {
     let part_name = match part_entry.file_name().to_str() {
         Some(name) => name.to_string(),
@@ -648,7 +658,12 @@ fn process_shadow_part(
             .join(encode_path_component(db))
             .join(encode_path_component(table))
             .join(&part_name);
-        hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
+        hardlink_dir(
+            &part_entry.path(),
+            &staging_dir,
+            skip_projections,
+            stripped_projections,
+        )?;
 
         let part_info = PartInfo::new(part_name, part_size, crc64).with_s3_objects(s3_objects);
 
@@ -680,7 +695,12 @@ fn process_shadow_part(
             .join(encode_path_component(table))
             .join(&part_name);
 
-        hardlink_dir(&part_entry.path(), &staging_dir, skip_projections)?;
+        hardlink_dir(
+            &part_entry.path(),
+            &staging_dir,
+            skip_projections,
+            stripped_projections,
+        )?;
 
         let part_info = PartInfo::new(part_name, part_size, crc64);
 
@@ -772,7 +792,15 @@ fn collect_s3_part_metadata(
 /// If `skip_proj_patterns` is non-empty, any subdirectory ending in `.proj`
 /// whose stem matches one of the patterns is skipped entirely (not hardlinked).
 /// The special pattern `*` matches all projections.
-fn hardlink_dir(src_dir: &Path, dst_dir: &Path, skip_proj_patterns: &[String]) -> Result<()> {
+///
+/// The stem of every projection actually skipped is inserted into `stripped`, so
+/// the manifest can record what was removed rather than what was requested.
+fn hardlink_dir(
+    src_dir: &Path,
+    dst_dir: &Path,
+    skip_proj_patterns: &[String],
+    stripped: &mut BTreeSet<String>,
+) -> Result<()> {
     std::fs::create_dir_all(dst_dir)
         .with_context(|| format!("Failed to create staging dir: {}", dst_dir.display()))?;
 
@@ -800,6 +828,7 @@ fn hardlink_dir(src_dir: &Path, dst_dir: &Path, skip_proj_patterns: &[String]) -
                                 path = %entry.path().display(),
                                 "Skipping projection directory"
                             );
+                            stripped.insert(stem.to_string());
                             walker.skip_current_dir();
                             continue;
                         }
@@ -920,7 +949,7 @@ mod tests {
         std::fs::create_dir(src_dir.path().join("subdir")).unwrap();
         std::fs::write(src_dir.path().join("subdir/file2.txt"), b"world").unwrap();
 
-        hardlink_dir(src_dir.path(), &dst_path, &[]).unwrap();
+        hardlink_dir(src_dir.path(), &dst_path, &[], &mut BTreeSet::new()).unwrap();
 
         assert!(dst_path.join("file1.txt").exists());
         assert!(dst_path.join("subdir/file2.txt").exists());
@@ -1030,7 +1059,7 @@ mod tests {
         )]);
         let disk_remote_paths = BTreeMap::new();
 
-        let result = collect_parts(
+        let (result, _) = collect_parts(
             &data_path.to_string_lossy(),
             freeze,
             "test-backup",
@@ -1120,7 +1149,7 @@ mod tests {
             "s3://data-bucket/clickhouse-disks".to_string(),
         )]);
 
-        let result = collect_parts(
+        let (result, _) = collect_parts(
             &local_data.to_string_lossy(),
             freeze,
             "test-backup",
@@ -1174,7 +1203,13 @@ mod tests {
         std::fs::write(src_dir.path().join("my_agg.proj/data.bin"), b"proj data").unwrap();
 
         // Skip ALL projections
-        hardlink_dir(src_dir.path(), &dst_path, &["*".to_string()]).unwrap();
+        hardlink_dir(
+            src_dir.path(),
+            &dst_path,
+            &["*".to_string()],
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
 
         assert!(dst_path.join("data.bin").exists());
         assert!(dst_path.join("checksums.txt").exists());
@@ -1182,6 +1217,38 @@ mod tests {
             !dst_path.join("my_agg.proj").exists(),
             "Projection directory should be skipped"
         );
+    }
+
+    #[test]
+    fn test_hardlink_dir_records_only_stripped_projections() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir(src_dir.path().join("my_agg.proj")).unwrap();
+        std::fs::write(src_dir.path().join("my_agg.proj/data.bin"), b"proj data").unwrap();
+
+        // A pattern that matches an existing projection records its name.
+        let mut stripped = BTreeSet::new();
+        hardlink_dir(
+            src_dir.path(),
+            &dst_dir.path().join("matched"),
+            &["my_*".to_string()],
+            &mut stripped,
+        )
+        .unwrap();
+        assert_eq!(stripped.iter().cloned().collect::<Vec<_>>(), ["my_agg"]);
+
+        // A pattern that matches nothing on disk records nothing: the marker
+        // describes what was removed, not what was configured.
+        let mut stripped = BTreeSet::new();
+        hardlink_dir(
+            src_dir.path(),
+            &dst_dir.path().join("unmatched"),
+            &["absent_*".to_string()],
+            &mut stripped,
+        )
+        .unwrap();
+        assert!(stripped.is_empty());
     }
 
     #[test]
@@ -1195,7 +1262,7 @@ mod tests {
         std::fs::write(src_dir.path().join("my_agg.proj/data.bin"), b"proj data").unwrap();
 
         // Empty skip list -- keep all projections
-        hardlink_dir(src_dir.path(), &dst_path, &[]).unwrap();
+        hardlink_dir(src_dir.path(), &dst_path, &[], &mut BTreeSet::new()).unwrap();
 
         assert!(dst_path.join("data.bin").exists());
         assert!(
@@ -1218,7 +1285,13 @@ mod tests {
         std::fs::write(src_dir.path().join("other.proj/data.bin"), b"other proj").unwrap();
 
         // Skip only projections matching "my_*"
-        hardlink_dir(src_dir.path(), &dst_path, &["my_*".to_string()]).unwrap();
+        hardlink_dir(
+            src_dir.path(),
+            &dst_path,
+            &["my_*".to_string()],
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
 
         assert!(dst_path.join("data.bin").exists());
         assert!(
@@ -1301,7 +1374,7 @@ mod tests {
         ]);
         let disk_remote_paths = BTreeMap::new();
 
-        let result = collect_parts(
+        let (result, _) = collect_parts(
             &disk1.to_string_lossy(),
             freeze,
             "my-backup",

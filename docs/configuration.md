@@ -191,7 +191,30 @@ Controls compression, concurrency, and retry behavior specifically for backup da
 | `retries_duration` | string | _(empty)_ | Override retry wait (empty = use `general.retries_pause`) |
 | `retries_jitter` | float | `0.1` | Retry jitter fraction (0.0-1.0) |
 | `skip_projections` | list | `[]` | Projection patterns to skip |
+| `strict_projection_gate` | bool | `true` | Refuse to restore a backup that had projections stripped onto ClickHouse older than 24.3 |
 | `streaming_upload_threshold` | int | `268435456` | Parts larger than this (bytes, default 256 MiB) use streaming multipart upload |
+
+### Stripped projections and `strict_projection_gate`
+
+`skip_projections` omits matching `.proj` directories from the staged parts, but the
+part's `checksums.txt` is hardlinked verbatim and still lists them. Backups therefore
+record the projections that were **actually removed** in the manifest's
+`stripped_projections` field — a sorted, deduplicated list of projection names. A
+pattern that matched nothing on disk records an empty list, so the field describes the
+backup rather than the configuration.
+
+`strict_projection_gate` (default `true`) makes `restore` refuse such a backup when the
+target server is older than ClickHouse 24.3. Before 24.3 the missing directory fails an
+existence check while the parent part's checksums are validated, and ATTACH rejects the
+whole part with `Code: 107. FILE_DOESNT_EXIST`; 24.3 skips that consistency pass once a
+projection is known broken and attaches the part instead. This is traced in
+`docs/verification/h9-projection-gate.json` (verdict CONFIRMED) and is also the
+threshold upstream clickhouse-backup uses. Set it to `false` to attempt the restore
+anyway.
+
+Backups written before this field existed have no `stripped_projections` at all. That
+absence means "nothing recorded", never "projections were stripped", so they restore
+exactly as they did before in either flag state.
 
 ## Retention
 
@@ -342,6 +365,7 @@ The most common config parameters can be overridden via environment variables. O
 | `CHBACKUP_BACKUP_RETRIES_DURATION` | `backup.retries_duration` |
 | `CHBACKUP_BACKUP_TABLES` | `backup.tables` |
 | `CHBACKUP_BACKUP_SKIP_PROJECTIONS` | `backup.skip_projections` (comma-separated) |
+| `CHBACKUP_BACKUP_STRICT_PROJECTION_GATE` | `backup.strict_projection_gate` |
 | `CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD` | `backup.streaming_upload_threshold` |
 
 ### API
