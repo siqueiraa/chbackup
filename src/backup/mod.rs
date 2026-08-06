@@ -40,7 +40,10 @@ use crate::table_filter::{is_engine_excluded, is_excluded, TableFilter};
 
 use self::collect::collect_parts;
 use self::diff::diff_parts;
-use self::freeze::{FreezeGuard, FreezeInfo};
+use self::freeze::{
+    freeze_evidence_outcome, partitions_with_shadow_evidence, FreezeGuard, FreezeInfo,
+    FreezeOutcome,
+};
 
 fn normalize_uuid(uuid: &str) -> Option<String> {
     if uuid.is_empty() || uuid == "00000000-0000-0000-0000-000000000000" {
@@ -668,8 +671,12 @@ pub async fn create(
                     }
                 }
             } else {
-                // Per-partition FREEZE
-                let mut any_frozen = false;
+                // Per-partition FREEZE. A successful FREEZE PARTITION is not evidence that
+                // anything was frozen: ClickHouse's freezePartitionsByMatcher succeeds with
+                // an empty result when the matcher selects no partition, so trusting the SQL
+                // result turns a mistyped ID into a quietly partial backup. Freeze first,
+                // then judge each partition by what actually landed in the shadow tree.
+                let mut attempted: Vec<&String> = Vec::new();
                 for partition_id in &effective_partitions {
                     info!(
                         db = %db,
@@ -683,7 +690,7 @@ pub async fn create(
                         ch.freeze_partition(&db, &table, partition_id, &fname).await;
                     match freeze_result {
                         Ok(()) => {
-                            any_frozen = true;
+                            attempted.push(partition_id);
                         }
                         Err(e) => {
                             let err_msg = format!("{e:#}");
@@ -701,7 +708,49 @@ pub async fn create(
                         }
                     }
                 }
-                if !any_frozen && from_discovery {
+                let requested: Vec<String> = attempted.iter().map(|id| (*id).clone()).collect();
+                let disks_for_evidence = disk_map_clone.clone();
+                let fname_for_evidence = fname.clone();
+                let with_evidence = tokio::task::spawn_blocking(move || {
+                    partitions_with_shadow_evidence(
+                        &disks_for_evidence,
+                        &fname_for_evidence,
+                        &requested,
+                    )
+                })
+                .await
+                .context("spawn_blocking panicked during freeze evidence scan")?;
+
+                let mut frozen_partitions = 0usize;
+                for partition_id in attempted {
+                    match freeze_evidence_outcome(
+                        partition_id,
+                        with_evidence.contains(partition_id),
+                        !from_discovery,
+                    ) {
+                        FreezeOutcome::Frozen => frozen_partitions += 1,
+                        FreezeOutcome::FailExplicitZeroMatch { partition_id } => {
+                            return Err(anyhow::anyhow!(
+                                "FREEZE PARTITION ID '{partition_id}' on {full_name} froze \
+                                 nothing: no part for that partition was staged in the shadow \
+                                 directory. Check the --partitions value against \
+                                 system.parts.partition_id"
+                            ));
+                        }
+                        FreezeOutcome::WarnDiscoveryZeroMatch { partition_id } => {
+                            warn!(
+                                db = %db,
+                                table = %table,
+                                partition = %partition_id,
+                                "freeze_by_part: FREEZE PARTITION staged no parts (the \
+                                 partition was likely merged away since system.parts was \
+                                 queried)"
+                            );
+                        }
+                    }
+                }
+
+                if frozen_partitions == 0 && from_discovery {
                     // The IDs came from this table's own system.parts, so freezing none
                     // of them means the table is about to be dropped from the manifest
                     // despite having active parts -- a silent data gap, not a no-op.
@@ -713,7 +762,7 @@ pub async fn create(
                          discovered in system.parts -- table will be MISSING from the backup"
                     );
                 }
-                any_frozen
+                frozen_partitions > 0
             };
 
             if !frozen {

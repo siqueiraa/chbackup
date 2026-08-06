@@ -4,10 +4,90 @@
 //! MUST call `unfreeze()` explicitly since Drop is synchronous and cannot
 //! await async operations.
 
+use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
+
 use anyhow::Result;
 use tracing::{debug, warn};
+use walkdir::WalkDir;
 
 use crate::clickhouse::client::ChClient;
+
+/// What a single requested partition ID turned out to be after FREEZE PARTITION.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreezeOutcome {
+    /// Parts for the partition are staged in the shadow tree.
+    Frozen,
+    /// An operator-supplied `--partitions` ID matched nothing. That is a typo, and
+    /// carrying on would produce a backup silently missing the requested data.
+    FailExplicitZeroMatch { partition_id: String },
+    /// A partition discovered from `system.parts` matched nothing. It may legitimately
+    /// have been merged away between the query and the FREEZE, so this is non-fatal.
+    WarnDiscoveryZeroMatch { partition_id: String },
+}
+
+/// Decide what a zero-match partition means.
+///
+/// `ALTER TABLE ... FREEZE PARTITION` is not a witness that anything was frozen:
+/// ClickHouse's `MergeTreeData::freezePartitionsByMatcher` returns success with an empty
+/// result when the matcher selects no partition. `evidence_present` must therefore come
+/// from the staged shadow tree (see [`partitions_with_shadow_evidence`]), not from the
+/// SQL result.
+pub fn freeze_evidence_outcome(
+    requested_partition: &str,
+    evidence_present: bool,
+    explicitly_requested: bool,
+) -> FreezeOutcome {
+    if evidence_present {
+        FreezeOutcome::Frozen
+    } else if explicitly_requested {
+        FreezeOutcome::FailExplicitZeroMatch {
+            partition_id: requested_partition.to_string(),
+        }
+    } else {
+        FreezeOutcome::WarnDiscoveryZeroMatch {
+            partition_id: requested_partition.to_string(),
+        }
+    }
+}
+
+/// Which of `requested` partition IDs have at least one part staged under this freeze.
+///
+/// Walks `{disk_path}/shadow/{freeze_name}` on every disk. Part directories sit at depth
+/// four in both shadow layouts (`data/{db}/{table}/{part}` and
+/// `store/{3char}/{uuid}/{part}`), and a part name always begins with
+/// `{partition_id}_`. Blocking filesystem I/O -- call from `spawn_blocking`.
+pub fn partitions_with_shadow_evidence(
+    disk_paths: &BTreeMap<String, String>,
+    freeze_name: &str,
+    requested: &[String],
+) -> HashSet<String> {
+    let prefixes: Vec<(String, String)> = requested
+        .iter()
+        .map(|id| (id.clone(), format!("{id}_")))
+        .collect();
+    let mut found = HashSet::new();
+
+    for disk_path in disk_paths.values() {
+        let shadow_dir = PathBuf::from(disk_path).join("shadow").join(freeze_name);
+        for entry in WalkDir::new(&shadow_dir)
+            .min_depth(4)
+            .max_depth(4)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_dir())
+        {
+            let name = entry.file_name().to_string_lossy();
+            for (id, prefix) in &prefixes {
+                if name.starts_with(prefix.as_str()) {
+                    found.insert(id.clone());
+                }
+            }
+        }
+    }
+
+    found
+}
 
 /// Metadata for a frozen table. Used to track what needs unfreezing.
 ///
@@ -277,6 +357,80 @@ mod tests {
         }];
         let guard = FreezeGuard::from_frozen(entries.clone());
         assert_eq!(guard.frozen_tables(), entries.as_slice());
+    }
+
+    #[test]
+    fn freeze_evidence_present_is_frozen() {
+        assert_eq!(
+            freeze_evidence_outcome("202401", true, true),
+            FreezeOutcome::Frozen
+        );
+        assert_eq!(
+            freeze_evidence_outcome("202401", true, false),
+            FreezeOutcome::Frozen,
+            "evidence wins regardless of where the ID came from"
+        );
+    }
+
+    #[test]
+    fn freeze_evidence_absent_for_explicit_id_fails() {
+        assert_eq!(
+            freeze_evidence_outcome("20240i", false, true),
+            FreezeOutcome::FailExplicitZeroMatch {
+                partition_id: "20240i".to_string()
+            },
+            "a mistyped --partitions value must fail rather than back up nothing"
+        );
+    }
+
+    #[test]
+    fn freeze_evidence_absent_during_discovery_warns() {
+        assert_eq!(
+            freeze_evidence_outcome("202401", false, false),
+            FreezeOutcome::WarnDiscoveryZeroMatch {
+                partition_id: "202401".to_string()
+            },
+            "a discovered partition may have been merged away -- non-fatal"
+        );
+    }
+
+    #[test]
+    fn freeze_evidence_scan_finds_staged_partitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = tmp.path().join("disk1");
+        let shadow = disk.join("shadow").join("chbackup_bk__db__t");
+        // Ordinary layout: data/{db}/{table}/{part}
+        std::fs::create_dir_all(shadow.join("data/db/t/202401_1_1_0")).unwrap();
+        // Atomic layout: store/{3char}/{uuid}/{part}
+        std::fs::create_dir_all(shadow.join("store/abc/abcdef/202402_5_5_0_7")).unwrap();
+
+        let disks = BTreeMap::from([("disk1".to_string(), disk.display().to_string())]);
+        let found = partitions_with_shadow_evidence(
+            &disks,
+            "chbackup_bk__db__t",
+            &[
+                "202401".to_string(),
+                "202402".to_string(),
+                "202403".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            found,
+            HashSet::from(["202401".to_string(), "202402".to_string()]),
+            "only partitions with a staged part count as evidence"
+        );
+    }
+
+    #[test]
+    fn freeze_evidence_scan_on_missing_shadow_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disks = BTreeMap::from([("disk1".to_string(), tmp.path().display().to_string())]);
+
+        assert!(
+            partitions_with_shadow_evidence(&disks, "never_frozen", &["202401".to_string()])
+                .is_empty()
+        );
     }
 
     #[test]
