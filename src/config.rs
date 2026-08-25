@@ -1031,6 +1031,18 @@ impl Config {
                 );
             }
         }
+        // Governs parallel server-side CopyObject during *restore* of S3 object-disk
+        // parts. Distinct from backup.object_disk_copy_concurrency, which governs upload.
+        if let Ok(v) = std::env::var("CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.general.object_disk_server_side_copy_concurrency = n;
+            } else {
+                warn!(
+                    "CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY='{}' is not a valid u32, ignoring",
+                    v
+                );
+            }
+        }
         if let Ok(v) = std::env::var("CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS") {
             if let Ok(n) = v.parse::<u64>() {
                 self.general.clean_broken_min_age_secs = n;
@@ -1325,6 +1337,21 @@ impl Config {
             } else {
                 warn!(
                     "CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY='{}' is not a valid u32, ignoring",
+                    v
+                );
+            }
+        }
+        // Concurrent CopyObject calls for S3 object-disk parts during upload. This is a
+        // separate semaphore from upload_concurrency (see upload/mod.rs): object-disk parts
+        // are copied server-side, so raising this costs no local CPU, disk or bandwidth.
+        // Objects *within* a part are copied sequentially, so this is the only lever on
+        // that queue's wall-clock.
+        if let Ok(v) = std::env::var("CHBACKUP_BACKUP_OBJECT_DISK_COPY_CONCURRENCY") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.backup.object_disk_copy_concurrency = n;
+            } else {
+                warn!(
+                    "CHBACKUP_BACKUP_OBJECT_DISK_COPY_CONCURRENCY='{}' is not a valid u32, ignoring",
                     v
                 );
             }
@@ -1943,6 +1970,9 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CHBACKUP_RETRIES_PAUSE" => Some("general.retries_pause"),
         "CHBACKUP_REMOTE_CACHE_TTL_SECS" => Some("general.remote_cache_ttl_secs"),
         "CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS" => Some("general.clean_broken_min_age_secs"),
+        "CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY" => {
+            Some("general.object_disk_server_side_copy_concurrency")
+        }
 
         // ClickHouse
         "CLICKHOUSE_HOST" => Some("clickhouse.host"),
@@ -1997,6 +2027,9 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CHBACKUP_BACKUP_COMPRESSION" => Some("backup.compression"),
         "CHBACKUP_BACKUP_UPLOAD_CONCURRENCY" => Some("backup.upload_concurrency"),
         "CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY" => Some("backup.download_concurrency"),
+        "CHBACKUP_BACKUP_OBJECT_DISK_COPY_CONCURRENCY" => {
+            Some("backup.object_disk_copy_concurrency")
+        }
         "CHBACKUP_BACKUP_RETRIES_ON_FAILURE" => Some("backup.retries_on_failure"),
         "CHBACKUP_BACKUP_RETRIES_DURATION" => Some("backup.retries_duration"),
         "CHBACKUP_BACKUP_TABLES" => Some("backup.tables"),
@@ -2300,6 +2333,8 @@ mod tests {
             std::env::set_var("CHBACKUP_BACKUP_RETRIES_ON_FAILURE", "10");
             std::env::set_var("CHBACKUP_BACKUP_RETRIES_DURATION", "20s");
             std::env::set_var("CHBACKUP_BACKUP_TABLES", "mydb.*");
+            std::env::set_var("CHBACKUP_BACKUP_OBJECT_DISK_COPY_CONCURRENCY", "32");
+            std::env::set_var("CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY", "48");
 
             // API env vars
             std::env::set_var("API_SECURE", "true");
@@ -2346,6 +2381,11 @@ mod tests {
         assert!(config.s3.disable_ssl);
         assert!(config.s3.disable_cert_verification);
         assert_eq!(config.s3.concurrency, 5);
+        // Both object-disk concurrency knobs must be settable by env: production deploys
+        // supply the entire config through env vars with no config.yml mounted, so a field
+        // missing from apply_env_overlay is permanently pinned to its default there.
+        assert_eq!(config.backup.object_disk_copy_concurrency, 32);
+        assert_eq!(config.general.object_disk_server_side_copy_concurrency, 48);
         assert_eq!(config.s3.object_disk_path, "custom/disk/path");
 
         // Verify Backup
@@ -2393,6 +2433,8 @@ mod tests {
             std::env::remove_var("S3_DISABLE_CERT_VERIFICATION");
             std::env::remove_var("S3_CONCURRENCY");
             std::env::remove_var("S3_OBJECT_DISK_PATH");
+            std::env::remove_var("CHBACKUP_BACKUP_OBJECT_DISK_COPY_CONCURRENCY");
+            std::env::remove_var("CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY");
             std::env::remove_var("CHBACKUP_BACKUP_COMPRESSION");
             std::env::remove_var("CHBACKUP_BACKUP_UPLOAD_CONCURRENCY");
             std::env::remove_var("CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY");
@@ -3162,6 +3204,14 @@ s3:
         assert_eq!(
             env_key_to_dot_notation("CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD"),
             Some("backup.streaming_upload_threshold")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("CHBACKUP_BACKUP_OBJECT_DISK_COPY_CONCURRENCY"),
+            Some("backup.object_disk_copy_concurrency")
+        );
+        assert_eq!(
+            env_key_to_dot_notation("CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY"),
+            Some("general.object_disk_server_side_copy_concurrency")
         );
     }
 

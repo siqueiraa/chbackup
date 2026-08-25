@@ -185,6 +185,17 @@ Controls compression, concurrency, and retry behavior specifically for backup da
 | `upload_concurrency` | int | `4` | Override `general.upload_concurrency` for backups |
 | `download_concurrency` | int | `4` | Override `general.download_concurrency` for backups |
 | `object_disk_copy_concurrency` | int | `8` | Concurrent S3 CopyObject for object disk parts |
+
+> **Tuning `object_disk_copy_concurrency`.** Upload runs two independent queues: local parts
+> are gated by `upload_concurrency`, S3 object-disk parts by this setting. They are separate
+> semaphores, so raising one does not affect the other. Object-disk parts are copied
+> **server-side** (CopyObject), consuming no local CPU, disk or bandwidth — and the objects
+> *within* a single part are copied sequentially, so this is the only lever on that queue's
+> wall-clock. On a cluster where the object disk holds a large share of active data, the
+> default of 8 is usually the binding constraint on total upload time, and raising it is far
+> cheaper than raising `upload_concurrency`, which contends for local disk read throughput.
+> `general.object_disk_server_side_copy_concurrency` is the equivalent knob for **restore**;
+> it has no effect on upload.
 | `upload_max_bytes_per_second` | int | `0` | Override upload rate limit |
 | `download_max_bytes_per_second` | int | `0` | Override download rate limit |
 | `retries_on_failure` | int | `5` | Override retry count |
@@ -303,6 +314,7 @@ The most common config parameters can be overridden via environment variables. O
 | `CHBACKUP_RETRIES_PAUSE` | `general.retries_pause` |
 | `CHBACKUP_REMOTE_CACHE_TTL_SECS` | `general.remote_cache_ttl_secs` |
 | `CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS` | `general.clean_broken_min_age_secs` |
+| `CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY` | `general.object_disk_server_side_copy_concurrency` |
 
 ### ClickHouse
 
@@ -361,6 +373,7 @@ The most common config parameters can be overridden via environment variables. O
 | `CHBACKUP_BACKUP_COMPRESSION` | `backup.compression` |
 | `CHBACKUP_BACKUP_UPLOAD_CONCURRENCY` | `backup.upload_concurrency` |
 | `CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY` | `backup.download_concurrency` |
+| `CHBACKUP_BACKUP_OBJECT_DISK_COPY_CONCURRENCY` | `backup.object_disk_copy_concurrency` |
 | `CHBACKUP_BACKUP_RETRIES_ON_FAILURE` | `backup.retries_on_failure` |
 | `CHBACKUP_BACKUP_RETRIES_DURATION` | `backup.retries_duration` |
 | `CHBACKUP_BACKUP_TABLES` | `backup.tables` |
