@@ -16,6 +16,20 @@ struct LockInfo {
     pid: u32,
     command: String,
     timestamp: String,
+    /// Start-time token of the holding process, pairing with `pid` to form an identity.
+    ///
+    /// `#[serde(default)]` is required, not cosmetic: without it a lock file written before this
+    /// field existed fails to deserialise and [`inspect_lock_file`] reports it as *corrupt*.
+    ///
+    /// When absent, liveness falls back to PID alone and the lock is treated as **held** while
+    /// that PID exists. That is the opposite direction from a deferred-freeze record's absent
+    /// token, and deliberately so: a record has the TTL as a backstop and the hazard is holding
+    /// forever, whereas a lock has no backstop and the hazard is *stealing* a live operation's
+    /// lock and running two writers over one backup. Transitional either way — locks are written
+    /// per operation and removed on drop, so one operation cycle after an upgrade every live lock
+    /// carries a token.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// A PID-based lock file.
@@ -49,10 +63,12 @@ impl PidLock {
     /// Returns `Ok(PidLock)` on success or `Err(ChBackupError::LockError)` if
     /// another live process already holds the lock.
     pub fn acquire(path: &Path, command: &str) -> Result<Self, ChBackupError> {
+        let pid = std::process::id();
         let info = LockInfo {
-            pid: std::process::id(),
+            pid,
             command: command.to_string(),
             timestamp: Utc::now().to_rfc3339(),
+            token: process_start_token(pid),
         };
 
         let json = serde_json::to_string_pretty(&info)
@@ -144,7 +160,7 @@ fn inspect_lock_file(path: &Path) -> ExistingLock {
         Err(e) => return ExistingLock::Unreadable(e.to_string()),
     };
     match serde_json::from_str::<LockInfo>(&contents) {
-        Ok(info) if is_pid_alive(info.pid) => ExistingLock::Live(info),
+        Ok(info) if holder_is_live(info.pid, info.token.as_deref()) => ExistingLock::Live(info),
         Ok(_) => ExistingLock::Stale,
         Err(e) => ExistingLock::Unreadable(e.to_string()),
     }
@@ -221,7 +237,10 @@ pub fn is_lock_file_active(path: &Path) -> bool {
         Some(p) => p as u32,
         None => return false,
     };
-    is_pid_alive(pid)
+    // Read as a raw value rather than `LockInfo` so a malformed-but-pid-bearing file keeps its
+    // current "held" answer instead of becoming "not held".
+    let token = info.get("token").and_then(|v| v.as_str());
+    holder_is_live(pid, token)
 }
 
 // ---------------------------------------------------------------------------
@@ -257,17 +276,20 @@ pub enum LockScope {
 /// Determine the lock scope for a given CLI command.
 ///
 /// Mapping per design doc section 2:
-/// - Backup-scoped: create, upload, download, restore, create_remote, restore_remote
+/// - Backup-scoped: create, upload, download, restore, create_remote, restore_remote,
+///   release-deferred
 /// - Global: clean, clean_broken, delete
 /// - None: list, tables, default-config, print-config, watch, server
+///
+/// Note the fall-through is `LockScope::None`, so a mutating command omitted from the lists above
+/// silently runs with **no lock at all**. Add new mutating commands here deliberately.
 pub fn lock_for_command(command: &str, backup_name: Option<&str>) -> LockScope {
     match command {
-        "create" | "upload" | "download" | "restore" | "create_remote" | "restore_remote" => {
-            match backup_name {
-                Some(name) if !name.is_empty() => LockScope::Backup(name.to_string()),
-                _ => LockScope::Global,
-            }
-        }
+        "create" | "upload" | "download" | "restore" | "create_remote" | "restore_remote"
+        | "release-deferred" => match backup_name {
+            Some(name) if !name.is_empty() => LockScope::Backup(name.to_string()),
+            _ => LockScope::Global,
+        },
         // API routes use "clean_broken_remote" / "clean_broken_local" as the
         // command name; they must also acquire the global lock.
         "clean" | "clean_broken" | "clean_broken_remote" | "clean_broken_local" | "delete" => {
@@ -424,7 +446,7 @@ fn backup_name_from_lock_file(file_name: &str) -> Option<&str> {
 fn live_lock_holder(path: &Path) -> Option<String> {
     let contents = fs::read_to_string(path).ok()?;
     let info: LockInfo = serde_json::from_str(&contents).ok()?;
-    is_pid_alive(info.pid).then(|| {
+    holder_is_live(info.pid, info.token.as_deref()).then(|| {
         format!(
             "PID {} (command: {}, since: {})",
             info.pid, info.command, info.timestamp
@@ -436,6 +458,72 @@ fn live_lock_holder(path: &Path) -> Option<String> {
 // Platform-specific PID liveness check
 // ---------------------------------------------------------------------------
 
+/// Extract the process start time -- field 22 of `/proc/<pid>/stat` -- from a stat line.
+///
+/// Takes the line rather than reading it, so the parse is testable on hosts without `/proc`
+/// (this project is developed on darwin). Field 2 is `comm`, which may contain spaces *and*
+/// parentheses, so the fields after it can only be located by splitting at the **last** `)`.
+/// Tokens after that point resume at field 3, putting start time at index 19.
+// Only called from the Linux branch of `process_start_token`, but always compiled so the parse
+// stays unit-testable on hosts without `/proc` -- which is where this project is developed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_start_time(stat_line: &str) -> Option<String> {
+    let after_comm = stat_line.rsplit_once(')')?.1;
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .map(|field| field.to_string())
+}
+
+/// Identity token for a running process: its kernel-reported start time.
+///
+/// A PID alone is not an identity. In a container the entrypoint is always PID 1, so a PID
+/// recorded by a process that has since been replaced still "exists" -- and `kill(pid, 0)`
+/// happily confirms it. Pairing the PID with its start time distinguishes *that* process from
+/// whatever occupies the number now.
+///
+/// `None` means "cannot establish identity": no `/proc` (non-Linux), no permission, or the
+/// process vanished between calls. Callers must decide the fail direction themselves, because
+/// it differs -- see `DeferredFreezeRecord::owner_is_live` (indeterminate ⇒ assume live) versus
+/// the lock-file readers (absent token ⇒ fall back to PID-only).
+pub fn process_start_token(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let content = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        parse_proc_start_time(&content)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether a lock file's recorded holder is still the process that took the lock.
+///
+/// A PID alone cannot answer this in a container, where the entrypoint is always PID 1: a lock
+/// left behind by a hard-killed PID-1 process looks held forever, because the replacement is
+/// PID 1 too. Pairing the PID with its start-time token distinguishes them.
+///
+/// Fail directions, both toward "still held":
+/// - `token` absent (legacy lock file, or no `/proc`) ⇒ PID-only, so held while the PID exists.
+/// - `token` present but the current one is unreadable ⇒ held, rather than steal a live lock.
+///
+/// This is deliberately the opposite of a deferred-freeze record's absent-token handling; see
+/// [`LockInfo::token`].
+fn holder_is_live(pid: u32, token: Option<&str>) -> bool {
+    if !is_pid_alive(pid) {
+        return false;
+    }
+    match token {
+        None => true,
+        Some(recorded) => match process_start_token(pid) {
+            Some(current) => current == recorded,
+            None => true,
+        },
+    }
+}
+
 /// Check if a process with the given PID is alive.
 ///
 /// Uses `kill(pid, 0)` on Unix.  Returns `false` on any error or on
@@ -446,6 +534,11 @@ fn live_lock_holder(path: &Path) -> Option<String> {
 /// - `ret == -1, ESRCH`  → no such process → dead
 /// - `ret == -1, EPERM`  → process exists but permission denied → alive
 ///   (can happen in containers with security contexts or cross-uid scenarios)
+///
+/// **A PID is not an identity.** This answers only "is *something* running under this number",
+/// which in a container is permanently true for PID 1. Pair it with [`process_start_token`] --
+/// or use [`holder_is_live`] for lock files -- when the question is whether a *specific* process
+/// is still running.
 pub fn is_pid_alive(pid: u32) -> bool {
     // PID 0 is never a real user process, but `kill(0, 0)` means "signal every process in
     // the caller's process group" and therefore SUCCEEDS -- which would report a zeroed or
@@ -537,6 +630,7 @@ mod tests {
             pid: 4_000_000,
             command: "stale".to_string(),
             timestamp: "2020-01-01T00:00:00Z".to_string(),
+            token: None,
         };
         fs::write(&path, serde_json::to_string(&stale_info).unwrap()).unwrap();
 
@@ -659,17 +753,107 @@ mod tests {
     const DEAD_PID: u32 = 4_000_000;
 
     /// Write a lock file as if another process had created it.
+    ///
+    /// `token: None` mirrors a lock written by a binary predating the field, which is also the
+    /// shape a non-Linux host produces.
     fn write_foreign_lock(path: &Path, pid: u32) {
         let info = LockInfo {
             pid,
             command: "foreign".to_string(),
             timestamp: "2020-01-01T00:00:00Z".to_string(),
+            token: None,
         };
         fs::write(path, serde_json::to_string(&info).unwrap()).unwrap();
     }
 
     fn backup_scope(name: &str) -> LockScope {
         LockScope::Backup(name.to_string())
+    }
+
+    // -- process identity token --
+
+    #[test]
+    fn test_parse_proc_start_time_plain_comm() {
+        // Field 22 is start time. Fields after `comm` resume at 3, so it is index 19 there.
+        let fields: Vec<String> = (3..=52).map(|n| n.to_string()).collect();
+        let line = format!("1 (chbackup) {}", fields.join(" "));
+        assert_eq!(parse_proc_start_time(&line).as_deref(), Some("22"));
+    }
+
+    #[test]
+    fn test_parse_proc_start_time_comm_with_spaces_and_parens() {
+        // The reason this cannot be a whitespace split from the left: `comm` is arbitrary bytes
+        // and routinely contains both spaces and parentheses. Splitting at the LAST ')' is what
+        // makes the field offsets correct.
+        let fields: Vec<String> = (3..=52).map(|n| n.to_string()).collect();
+        let line = format!("1 (weird (name) with spaces) {}", fields.join(" "));
+        assert_eq!(parse_proc_start_time(&line).as_deref(), Some("22"));
+    }
+
+    #[test]
+    fn test_parse_proc_start_time_rejects_truncated_line() {
+        assert!(parse_proc_start_time("1 (chbackup) S 1 2 3").is_none());
+        assert!(parse_proc_start_time("no parenthesis here").is_none());
+    }
+
+    // -- lock-file holder identity --
+
+    #[test]
+    fn test_holder_is_live_absent_token_falls_back_to_pid() {
+        // Deliberately the OPPOSITE fail direction from a deferred-freeze record's absent token.
+        // A lock has no TTL backstop, so the hazard is stealing a live operation's lock rather
+        // than holding forever. Absent token therefore means "held while the PID exists".
+        assert!(holder_is_live(std::process::id(), None));
+        assert!(!holder_is_live(DEAD_PID, None));
+    }
+
+    #[test]
+    fn test_holder_is_live_mismatched_token_is_not_held() {
+        // The container case: a hard-killed PID-1 holder leaves a lock file, and the replacement
+        // is PID 1 too. Without the token that lock would look held forever.
+        if process_start_token(std::process::id()).is_some() {
+            assert!(!holder_is_live(
+                std::process::id(),
+                Some("not-this-processes-start-time")
+            ));
+        }
+    }
+
+    #[test]
+    fn test_holder_is_live_matching_token_is_held() {
+        if let Some(token) = process_start_token(std::process::id()) {
+            assert!(holder_is_live(std::process::id(), Some(&token)));
+        }
+    }
+
+    #[test]
+    fn test_legacy_lock_json_without_token_is_not_corrupt() {
+        // Without `#[serde(default)]` on the field, a lock file written by an earlier binary
+        // fails to deserialise and `inspect_lock_file` reports it as Unreadable -- which would
+        // make every pre-upgrade lock look corrupt.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chbackup.legacy.pid");
+        fs::write(
+            &path,
+            r#"{"pid":4000000,"command":"upload","timestamp":"2020-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        match inspect_lock_file(&path) {
+            ExistingLock::Stale => {}
+            other => panic!("expected Stale for a legacy dead-PID lock, got {other:?}"),
+        }
+        assert!(!is_lock_file_active(&path));
+    }
+
+    #[test]
+    fn test_release_deferred_is_backup_scoped() {
+        // The fall-through in `lock_for_command` is `LockScope::None`, so a mutating command
+        // omitted from the match silently runs with no lock at all. `release-deferred` must not.
+        assert_eq!(
+            lock_for_command("release-deferred", Some("bk-1")),
+            LockScope::Backup("bk-1".to_string())
+        );
     }
 
     #[test]

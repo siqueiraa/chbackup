@@ -303,6 +303,18 @@ pub enum Command {
         name: Option<String>,
     },
 
+    /// Release a backup's held S3 object-disk FREEZE, ignoring its TTL
+    ///
+    /// For a deferred freeze that no automatic path will clear. Not a flag on `clean`, which
+    /// holds the global lock and therefore cannot acquire the per-backup lock a release needs.
+    /// Do not run this while an upload for the backup is in progress: the freeze is what keeps
+    /// its S3 objects alive, and releasing early makes CopyObject fail with NoSuchKey.
+    #[command(name = "release-deferred")]
+    ReleaseDeferred {
+        /// Backup whose deferred freeze should be released
+        backup_name: String,
+    },
+
     /// Remove broken backups with missing/corrupt metadata
     #[command(name = "clean_broken")]
     CleanBroken {

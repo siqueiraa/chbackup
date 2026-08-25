@@ -174,10 +174,18 @@ pub async fn create(
     named_collections: bool,
     skip_projections: &[String],
     // Hold the FREEZE on tables with S3 object-disk parts past the end of `create`, so
-    // their remote objects stay pinned until `upload` copies them. Only safe when the
-    // caller will actually run `upload` (`create_remote`, watch mode). Standalone `create`
-    // must pass `false`: nothing would ever release the freeze, and the shadow data would
-    // accumulate until `chbackup clean`.
+    // their remote objects stay pinned until `upload` copies them.
+    //
+    // **Every built-in path passes `true`, standalone `create` included.** An earlier
+    // version of this comment said standalone `create` "must pass false"; that was wrong and
+    // is why the production driver raced. The k8s CronJob enqueues `create` and `upload` as
+    // separate commands, so restricting deferral to `create_remote` left the common path
+    // unprotected -- object-disk parts could be merged away and their objects GC'd before
+    // CopyObject read them. The persisted record is what makes the cross-command handoff
+    // work; on success the record is demoted so the TTL bounds it, and an expired orphan is
+    // reaped at the next `create` pre-flight.
+    //
+    // Pass `false` only for a caller that genuinely has no upload phase at all.
     defer_unfreeze_s3: bool,
     cancel: CancellationToken,
 ) -> Result<BackupManifest> {
@@ -192,7 +200,9 @@ pub async fn create(
     // overwrite an existing record and strand whatever it described.
     //
     // Best-effort by design: a failure here must not block taking a backup.
-    let reaped = deferred::reap_expired(ch, &config.clickhouse.data_path).await;
+    // `create` holds this backup's own lock, so pass its name: for that one candidate the lock is
+    // self-noise, and excluding it is what makes the same-name case below actually work.
+    let reaped = deferred::reap_expired(ch, &config.clickhouse.data_path, Some(backup_name)).await;
     if reaped > 0 {
         info!(
             count = reaped,
@@ -1013,6 +1023,10 @@ pub async fn create(
         Vec::new()
     };
 
+    // Kept so the post-freeze failure path below can rewrite the record without inventing a
+    // fresh TTL or timestamp -- both must be the ones the freeze was published under.
+    let mut published_record: Option<deferred::DeferredFreezeRecord> = None;
+
     if !retained.is_empty() {
         // Write-ahead: publish the ownership record BEFORE skipping any unfreeze. A crash in
         // this gap then leaves a record with nothing retained (harmless) rather than a live
@@ -1039,6 +1053,7 @@ pub async fn create(
                 tables = retained.len(),
                 "Holding FREEZE for S3 object-disk tables until upload copies their objects"
             );
+            published_record = Some(record);
         }
     } else if !s3_tables.is_empty() {
         // Only reachable when a caller explicitly opts out of deferral. Every built-in path
@@ -1206,7 +1221,28 @@ pub async fn create(
     .await;
 
     match tail_result {
-        Ok(manifest) => Ok(manifest),
+        Ok(manifest) => {
+            // Hand ownership back. `create` is over; whatever releases this freeze is a
+            // *separate* operation -- the k8s driver enqueues `create` and `upload` as
+            // distinct commands, and even `create_remote` moves to a new phase here.
+            //
+            // Without this, a long-lived server keeps the record owner-live forever: the
+            // process that published it is still running and its start-time token still
+            // matches, so `protection_status` answers Protected on liveness and never
+            // reaches the TTL branch. That is precisely how records accumulate when an
+            // upload is delayed, fails to start, or is queued behind a stalled operation.
+            //
+            // Demoting is safe, and is the contract the TTL was designed for: the
+            // create -> upload gap is the documented cross-process case, protected by the
+            // unexpired TTL. When the caller holds the lock across both phases
+            // (`create_remote`), the lock protects the window instead. The later `upload`
+            // loads the record, finds it unowned, and *adopts* it -- reclaiming ownership
+            // for the duration of the copy while preserving `created_at_secs`.
+            if published_record.is_some() {
+                deferred::demote_on_operation_end(&backup_dir, backup_name);
+            }
+            Ok(manifest)
+        }
         Err(e) => {
             // Release the deferred freeze: no upload will run to do it for us.
             if !retained.is_empty() {
@@ -1222,8 +1258,17 @@ pub async fn create(
                         }
                     }
                     Err(failed) => {
-                        // Keep the record so the leak stays discoverable and retryable.
-                        deferred::retain_failed(&backup_dir, backup_name, failed);
+                        // Keep the record so the leak stays discoverable and retryable. A
+                        // non-empty `retained` implies publish succeeded above -- a failed
+                        // publish drains it -- so the record is always present here.
+                        if let Some(prior) = &published_record {
+                            deferred::retain_failed(&backup_dir, backup_name, failed, prior);
+                        } else {
+                            warn!(
+                                "Deferred freeze retained without a published record; cannot \
+                                 rewrite it. Run `chbackup release-deferred` to clear the freeze."
+                            );
+                        }
                     }
                 }
             }

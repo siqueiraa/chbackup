@@ -465,6 +465,29 @@ struct ValidatedAction {
     conflict_backup_name: Option<String>,
 }
 
+/// Extract `clean`'s optional backup-name filter from its command parts.
+///
+/// The CLI spells this `--name <NAME>`, but the actions endpoint's positional commands
+/// (`delete`, `clean_broken`) put their argument straight after the verb. Accept both so an
+/// operator copying either form gets the same behaviour, and return `None` for a bare
+/// `clean` (sweep every backup). A lone `--name` with no value is also `None` rather than
+/// a filter on the literal string "--name".
+fn clean_name_filter<S: AsRef<str>>(parts: &[S]) -> Option<&str> {
+    let mut it = parts.iter().skip(1).map(|s| s.as_ref());
+    while let Some(tok) = it.next() {
+        if let Some(rest) = tok.strip_prefix("--name=") {
+            return (!rest.is_empty()).then_some(rest);
+        }
+        if tok == "--name" {
+            return it.next();
+        }
+        if !tok.starts_with('-') {
+            return Some(tok);
+        }
+    }
+    None
+}
+
 /// Validate and parse an action command string.
 ///
 /// Returns the owned parts, parsed flags, and conflict backup name,
@@ -477,7 +500,7 @@ fn validate_action_command(
 
     match op_name {
         "create" | "upload" | "download" | "restore" | "create_remote" | "restore_remote"
-        | "delete" | "clean_broken" => {}
+        | "delete" | "clean" | "clean_broken" => {}
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -489,7 +512,7 @@ fn validate_action_command(
     }
 
     // Parse flags from command parts (skip for delete/clean_broken which have positional format)
-    let flags = if matches!(op_name, "delete" | "clean_broken") {
+    let flags = if matches!(op_name, "delete" | "clean" | "clean_broken") {
         ActionFlags {
             backup_name: parts.get(1).map(|s| s.to_string()),
             table_pattern: None,
@@ -533,6 +556,13 @@ fn validate_action_command(
     // Compute backup_name for per-backup conflict detection.
     let conflict_backup_name: Option<String> = if op_name == "delete" {
         parts.get(2).or_else(|| parts.get(1)).map(|s| s.to_string())
+    } else if op_name == "clean" {
+        // Not `flags.backup_name`: the positional group sets that from `parts[1]`, which for
+        // `clean --name foo` is the literal "--name". Every such invocation would then share
+        // one conflict key and spuriously collide under `allow_parallel`. Use the parsed
+        // filter, so `clean foo` and `clean --name foo` both conflict on `foo` and a bare
+        // `clean` conflicts with nothing.
+        clean_name_filter(&parts).map(|s| s.to_string())
     } else {
         flags.backup_name.clone()
     };
@@ -764,6 +794,20 @@ async fn dispatch_action_command(
                     loc,
                 )),
             }
+        }
+        "clean" => {
+            // Shadow-directory sweep. Deliberately reachable here as well as via
+            // POST /backup/clean: the Go-compat integration table is how the scheduled
+            // driver issues every other command, and `clean` being absent from the
+            // allowlist made it fail with a 400 that never reached the action log.
+            //
+            // NOTE: this sweeps shadow dirs only. It does NOT release a held deferred
+            // S3 object-disk freeze -- `clean` runs under the Global lock, and
+            // reap_expired needs a per-backup lock the two tiers forbid it from taking.
+            let name = clean_name_filter(parts);
+            list::clean_shadow(ch, &config.clickhouse.data_path, name)
+                .await
+                .map(|_| ())
         }
         "clean_broken" => {
             let location = parts.get(1).map(String::as_str).unwrap_or("");
@@ -2778,6 +2822,46 @@ mod tests {
     #[test]
     fn test_map_go_status_values() {
         assert_eq!(map_go_status("running"), "in progress");
+    }
+
+    #[test]
+    fn test_clean_is_an_accepted_action_command() {
+        // Regression: `clean` was missing from the allowlist, so an INSERT into
+        // system.backup_actions was rejected with a 400 *before* the action log was
+        // touched -- leaving no row and no error trail. `clean_broken` worked, which
+        // made the gap look like a silent no-op rather than a rejection.
+        assert!(validate_action_command("clean").is_ok());
+        assert!(validate_action_command("clean my-backup").is_ok());
+        assert!(validate_action_command("clean --name my-backup").is_ok());
+    }
+
+    #[test]
+    fn test_clean_name_filter_accepts_both_spellings() {
+        let parts = |c: &str| c.split_whitespace().map(String::from).collect::<Vec<_>>();
+
+        assert_eq!(clean_name_filter(&parts("clean")), None);
+        assert_eq!(clean_name_filter(&parts("clean bk-1")), Some("bk-1"));
+        assert_eq!(clean_name_filter(&parts("clean --name bk-1")), Some("bk-1"));
+        assert_eq!(clean_name_filter(&parts("clean --name=bk-1")), Some("bk-1"));
+        // A dangling flag must not become a filter on the literal string "--name".
+        assert_eq!(clean_name_filter(&parts("clean --name")), None);
+        assert_eq!(clean_name_filter(&parts("clean --name=")), None);
+    }
+
+    #[test]
+    fn test_clean_conflict_key_uses_parsed_name_not_the_flag_token() {
+        // The positional group sets flags.backup_name from parts[1], which for
+        // `clean --name foo` is the literal "--name". Using that as the conflict key made
+        // every `clean --name <anything>` share one key and collide under allow_parallel.
+        let v = validate_action_command("clean --name foo").unwrap();
+        assert_eq!(v.conflict_backup_name.as_deref(), Some("foo"));
+
+        let v = validate_action_command("clean foo").unwrap();
+        assert_eq!(v.conflict_backup_name.as_deref(), Some("foo"));
+
+        // A bare sweep targets no single backup, so it must not claim a conflict key.
+        let v = validate_action_command("clean").unwrap();
+        assert_eq!(v.conflict_backup_name, None);
         assert_eq!(map_go_status("completed"), "success");
         assert_eq!(map_go_status("failed"), "error");
         assert_eq!(map_go_status("killed"), "cancel");

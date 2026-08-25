@@ -32,6 +32,8 @@ fn backup_name_from_command(cmd: &Command) -> Option<&str> {
         | Command::CreateRemote { backup_name, .. }
         | Command::RestoreRemote { backup_name, .. } => backup_name.as_deref(),
         Command::Delete { backup_name, .. } => backup_name.as_deref(),
+        // Takes a required name, so it is already a `&str` rather than an `Option`.
+        Command::ReleaseDeferred { backup_name } => Some(backup_name.as_str()),
         _ => None,
     }
 }
@@ -591,6 +593,27 @@ async fn run() -> Result<()> {
             let data_path = &config.clickhouse.data_path;
             let count = list::clean_shadow(&ch, data_path, name.as_deref()).await?;
             info!(removed = count, "Clean command complete");
+        }
+
+        Command::ReleaseDeferred { backup_name } => {
+            // The name was already validated centrally, via `backup_name_from_command`.
+            //
+            // Backup-scoped, not Global: the release must hold the same per-backup lock an upload
+            // would, so it cannot run underneath one.
+            let _lock = acquire_lock("release-deferred", Some(&backup_name))?;
+            let ch = ChClient::new(&config.clickhouse)?;
+            let count =
+                backup::deferred::release_now(&ch, &config.clickhouse.data_path, &backup_name)
+                    .await?;
+            if count == 0 {
+                info!(backup_name = %backup_name, "No deferred S3 object-disk freeze recorded");
+            } else {
+                info!(
+                    backup_name = %backup_name,
+                    tables = count,
+                    "Released deferred S3 object-disk freeze"
+                );
+            }
         }
 
         Command::CleanBroken { location } => {

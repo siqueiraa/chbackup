@@ -1816,6 +1816,23 @@ impl Config {
             return Err(anyhow::anyhow!("s3.max_parts_count must be > 0"));
         }
 
+        // Sanity floor on the deferred-freeze TTL. This is validation, NOT a safety bound: the
+        // real requirement is that the TTL exceed the worst-case upload duration, and a startup
+        // check cannot know that. The floor sits well below a realistic multi-TiB object-disk
+        // upload (>4h observed), so it proves nothing about correctness -- it only rejects the
+        // plausible misconfiguration of setting minutes, which would let the reaper release a
+        // freeze underneath a running upload and surface as CopyObject NoSuchKey.
+        const MIN_DEFERRED_FREEZE_TTL_SECS: u64 = 3600;
+        if self.clickhouse.deferred_freeze_ttl_secs < MIN_DEFERRED_FREEZE_TTL_SECS {
+            return Err(anyhow::anyhow!(
+                "clickhouse.deferred_freeze_ttl_secs ({}) must be at least {} seconds; it has to \
+                 exceed your worst-case upload duration, or an in-flight upload's S3 objects can \
+                 be released before CopyObject reads them",
+                self.clickhouse.deferred_freeze_ttl_secs,
+                MIN_DEFERRED_FREEZE_TTL_SECS
+            ));
+        }
+
         // Validate mutation_wait_timeout parses as a duration
         parse_duration_secs(&self.clickhouse.mutation_wait_timeout)
             .context("Invalid clickhouse.mutation_wait_timeout duration")?;

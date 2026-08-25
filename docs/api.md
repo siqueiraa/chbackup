@@ -406,7 +406,9 @@ curl -X POST http://localhost:7171/api/v1/actions \
 
 The body also accepts a JSON array (`[{"command":"..."}]`) or JSONEachRow format (one JSON object per line) for ClickHouse URL engine compatibility.
 
-Supported commands: `create`, `upload`, `download`, `restore`, `create_remote`, `restore_remote`, `delete`, `clean_broken`.
+Supported commands: `create`, `upload`, `download`, `restore`, `create_remote`, `restore_remote`, `delete`, `clean`, `clean_broken`.
+
+`clean` sweeps leftover `shadow/` directories. It accepts an optional name filter in either spelling — `clean <name>` or `clean --name <name>` — and with no argument sweeps every backup. It does **not** release a held deferred S3 object-disk freeze: `clean` runs under the global lock, which is mutually exclusive with the per-backup lock the reaper requires. Use `release-deferred <name>` for that.
 
 #### Flag support
 

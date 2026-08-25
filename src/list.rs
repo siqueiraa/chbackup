@@ -548,7 +548,10 @@ pub fn delete_local(data_path: &str, backup_name: &str) -> Result<()> {
         return Err(anyhow::anyhow!(
             "refusing to delete local backup '{}': a deferred S3 object-disk freeze is still \
              held for it. Deleting now would strand the freeze in ClickHouse. Wait for its \
-             upload to finish, or run `chbackup clean` to release an expired one.",
+             upload to finish, or run `chbackup release-deferred {}` to release it. \
+             (`chbackup clean` cannot: it holds the global lock, so it can never acquire the \
+             per-backup lock the release needs.)",
+            backup_name,
             backup_name
         ));
     }
@@ -1620,7 +1623,13 @@ async fn clean_shadow_inner(
     // eligible for removal below. Without this, `clean` could never clear them: the guard
     // (correctly) refuses to rm -rf shadow data whose freeze is still registered with
     // ClickHouse, since that is not an UNFREEZE.
-    let reaped = crate::backup::deferred::reap_expired(ch, data_path).await;
+    //
+    // `force` is exactly the "caller already holds this backup's lock" case, so it is also the
+    // condition under which the reaper must ignore that lock as self-noise. Reached without
+    // `force`, the caller holds `Global` and the reaper can acquire nothing -- it logs a debug
+    // breadcrumb and releases nothing, which is expected rather than broken.
+    let own_lock = if force { name } else { None };
+    let reaped = crate::backup::deferred::reap_expired(ch, data_path, own_lock).await;
     if reaped > 0 {
         info!(
             count = reaped,

@@ -186,6 +186,47 @@ pub async fn upload(
     let diff_owned = diff_from_remote.map(|s| s.to_string());
 
     let handle = tokio::spawn(async move {
+        // CLAIM the deferred-freeze record before any copying starts.
+        //
+        // `create` demotes the record when it hands off, so between the two commands the
+        // freeze is bounded by its TTL alone -- the documented cross-process contract. Once
+        // *this* operation begins, it must own the record for the whole copy, otherwise the
+        // only thing protecting the freeze is the caller's PID lock, and that is not enough:
+        // cancellation drops the caller's future *and* its lock while this task keeps running
+        // detached (see the doc comment above). A demoted record could then reach its TTL and
+        // be reaped by `create` pre-flight mid-copy -- releasing objects CopyObject is still
+        // reading, which is the exact NoSuchKey failure this mechanism exists to prevent.
+        //
+        // Claiming is `deferred::load`'s adoption side effect: it takes ownership of an
+        // unowned or orphaned record, leaves a foreign *live* owner's record alone, and
+        // preserves `created_at_secs` so the TTL still bounds the freeze's absolute age. It
+        // is idempotent -- the finaliser calls `load` again and finds the record already ours.
+        match crate::backup::deferred::load(&dir_owned, &name_owned) {
+            crate::backup::deferred::LoadOutcome::None => {}
+            crate::backup::deferred::LoadOutcome::Usable(rec) => {
+                info!(
+                    backup = %name_owned,
+                    tables = rec.retained.len(),
+                    "Claimed deferred S3 object-disk freeze for the duration of this upload"
+                );
+            }
+            crate::backup::deferred::LoadOutcome::ForeignLive(rec) => {
+                warn!(
+                    backup = %name_owned,
+                    owner_pid = rec.owner_pid,
+                    "Deferred-freeze record is owned by another live process; not claiming it"
+                );
+            }
+            crate::backup::deferred::LoadOutcome::Corrupt(reason) => {
+                warn!(
+                    backup = %name_owned,
+                    reason = %reason,
+                    "Deferred-freeze record is unreadable; not claiming it. The FREEZE stays in \
+                     place and must be released with `chbackup release-deferred`."
+                );
+            }
+        }
+
         // Nested spawn: a panic in upload_inner must not skip the finaliser below.
         let work = tokio::spawn({
             let config = config_owned.clone();
@@ -280,13 +321,17 @@ async fn finalize_deferred_freeze(
                  retry still has its objects pinned. It is released on a successful upload, \
                  or reaped once the TTL expires."
             );
+            // Hand ownership back. This operation is over, so liveness must stop protecting the
+            // record -- otherwise a long-lived server keeps it alive forever and the TTL above
+            // is a promise that never comes due.
+            deferred::demote_on_operation_end(backup_dir, backup_name);
         }
         return;
     }
 
-    let retained = match deferred::load(backup_dir, backup_name) {
+    let mut record = match deferred::load(backup_dir, backup_name) {
         LoadOutcome::None => return,
-        LoadOutcome::Usable(record) => record.retained,
+        LoadOutcome::Usable(record) => record,
         LoadOutcome::ForeignLive(record) => {
             warn!(
                 backup = %backup_name,
@@ -310,6 +355,7 @@ async fn finalize_deferred_freeze(
         }
     };
 
+    let retained = std::mem::take(&mut record.retained);
     if retained.is_empty() {
         let _ = deferred::delete(backup_dir);
         return;
@@ -329,7 +375,7 @@ async fn finalize_deferred_freeze(
             }
         }
         Err(failed) => {
-            deferred::retain_failed(backup_dir, backup_name, failed);
+            deferred::retain_failed(backup_dir, backup_name, failed, &record);
         }
     }
 }

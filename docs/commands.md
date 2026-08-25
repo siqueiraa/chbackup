@@ -432,6 +432,43 @@ chbackup clean
 chbackup clean --name my-failed-backup
 ```
 
+> **`clean` does not release a held S3 object-disk freeze.** It takes the global lock, which is
+> mutually exclusive with the per-backup lock a release requires, so its reaper can never acquire
+> one. Use `release-deferred` for that.
+
+---
+
+## release-deferred
+
+Release a backup's held S3 object-disk FREEZE, ignoring its TTL.
+
+Tables with object-disk parts stay FROZEN between `create` and `upload`, because the staged shadow
+hardlinks are ClickHouse's only refcount on the referenced S3 objects. If the upload never
+completes, that freeze is deliberately kept so a retry stays protected, and it is released
+automatically only once its TTL expires — at the next `create`'s pre-flight, or during
+failed-backup cleanup. This command is the manual escape hatch when neither will run.
+
+```bash
+chbackup release-deferred <backup-name>
+```
+
+Takes the per-backup lock, so it cannot run while an operation on that backup holds it.
+
+> **Do not run this while an upload for the backup is in progress.** The freeze is what keeps the
+> S3 objects alive; releasing early makes CopyObject fail with `NoSuchKey`. Check that
+> `upload.state.json` under the backup directory is not being written before you run it — the
+> recorded `owner_pid` is *not* a reliable signal, since in a container it is `1`.
+
+### Examples
+
+```bash
+# Release the freeze held for a backup whose upload never finished
+chbackup release-deferred my-stuck-backup
+
+# Afterwards the local backup can be deleted normally
+chbackup delete local my-stuck-backup
+```
+
 ---
 
 ## clean_broken
