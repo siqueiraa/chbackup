@@ -779,6 +779,19 @@ pub async fn download(
                     .join("shadow")
                     .join(&url_db)
                     .join(&url_table);
+
+                // Create the table's shadow dir before anything writes into it. The temp
+                // archive below is opened directly at `{shadow_dir}/.{part}.download.tmp`, and
+                // nothing else creates the parent: a fresh download has no `shadow/` tree at
+                // all, and with per-disk staging the target may be on a disk this backup has
+                // never written to. The S3-disk branch already does this for its own path.
+                std::fs::create_dir_all(&shadow_dir).with_context(|| {
+                    format!(
+                        "Failed to create shadow dir for local disk part: {}",
+                        shadow_dir.display()
+                    )
+                })?;
+
                 let part_name = item.part.name.clone();
                 let expected_crc = item.part.checksum_crc64;
                 let backup_key = item.part.backup_key.clone();
