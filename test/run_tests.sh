@@ -127,6 +127,23 @@ verify_row_counts() {
 }
 
 # cleanup_backup <name> [<name2> ...] — deletes remote + local backups
+# Shadow dir of the S3 object disk, resolved from ClickHouse rather than hardcoded --
+# the disk is named "s3disk" everywhere else in this suite, and a stale literal here
+# aborts the whole run: `find` on a missing dir exits 1, and `set -o pipefail` (line 17)
+# turns that into a script-level failure.
+s3_shadow_dir() {
+    local p
+    p=$(clickhouse-client -q "SELECT path FROM system.disks WHERE name='s3disk'" 2>/dev/null || true)
+    [ -n "$p" ] || p="/var/lib/clickhouse/disks/s3disk/"
+    echo "${p%/}/shadow"
+}
+
+# Count chbackup shadow dirs matching a glob; 0 when the tree is absent. Never fails,
+# so it stays safe under `set -euo pipefail`.
+count_s3_shadows() {
+    { find "$(s3_shadow_dir)" -maxdepth 1 -name "$1" 2>/dev/null || true; } | wc -l | tr -d ' '
+}
+
 cleanup_backup() {
     for name in "$@"; do
         chbackup delete remote "$name" 2>&1 || true
@@ -4856,7 +4873,7 @@ if should_run "test_s3_disk_freeze_race"; then
     fi
 
     info "  Step 3: No shadow directories may be left frozen"
-    LEFTOVER=$(find /var/lib/clickhouse/disks/s3/shadow -maxdepth 1 -name "chbackup*${RACE_NAME}*" 2>/dev/null | wc -l | tr -d ' ')
+    LEFTOVER=$(count_s3_shadows "chbackup*${RACE_NAME}*")
     if [[ "$LEFTOVER" == "0" ]]; then
         pass "no leftover shadow directories for this backup"
     else
@@ -4911,7 +4928,7 @@ if should_run "test_s3_disk_freeze_race_separate"; then
     else
         fail "no deferred-freeze record after create -- the freeze was released, upload will race"
     fi
-    SHADOWS=$(find /var/lib/clickhouse/disks/s3/shadow -maxdepth 1 -name "chbackup*" 2>/dev/null | wc -l | tr -d ' ')
+    SHADOWS=$(count_s3_shadows "chbackup*")
     if [[ "$SHADOWS" -gt 0 ]]; then
         pass "shadow directory still present between create and upload"
     else
