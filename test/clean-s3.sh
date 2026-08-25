@@ -18,6 +18,13 @@
 #
 #   ./test/clean-s3.sh
 #   ./test/clean-s3.sh --dry-run    # list objects without deleting
+#
+# Scope:
+#   With S3_PATH set (as docker-compose.test.yml does), only that sub-prefix is
+#   deleted, which is safe in a shared bucket. Without it the whole
+#   chbackup-test/ and clickhouse-disks/ trees are targeted, and the script
+#   refuses to run unless CLEAN_S3_CONFIRM_BUCKET names the bucket. Deleting
+#   clickhouse-disks/ in a shared bucket would destroy live S3 disk data.
 # =============================================================================
 
 set -euo pipefail
@@ -53,10 +60,45 @@ if ! command -v aws &>/dev/null; then
 fi
 
 # --- Prefixes to clean ---
-PREFIXES=(
-    "chbackup-test/"     # backup data (manifests, compressed parts)
-    "clickhouse-disks/"  # ClickHouse S3 disk objects (table data)
-)
+#
+# These defaults assume a DEDICATED test bucket. Pointing S3_BUCKET at a shared
+# bucket makes them dangerous: "clickhouse-disks/" is where a real ClickHouse S3
+# disk keeps its object data, so deleting that tree wholesale in a shared bucket
+# destroys live table data rather than test leftovers.
+#
+# So when S3_PATH is set (docker-compose.test.yml always sets it, pointing at a
+# per-run sub-prefix), deletion is scoped to that sub-prefix. That is the layout
+# an integration run actually writes, and it is safe in a shared bucket. The wide
+# defaults apply only when S3_PATH is absent.
+if [[ -n "${S3_PATH:-}" ]]; then
+    PREFIXES=("${S3_PATH%/}/")
+    echo "Scoped to S3_PATH: s3://${S3_BUCKET}/${S3_PATH%/}/"
+else
+    PREFIXES=(
+        "chbackup-test/"     # backup data (manifests, compressed parts)
+        "clickhouse-disks/"  # ClickHouse S3 disk objects (table data)
+    )
+    # Whole-tree deletion, so make the operator name the bucket. A typo in
+    # S3_BUCKET, or a .env pointing at a shared bucket, is otherwise unrecoverable.
+    if [[ "$DRY_RUN" != "true" && "${CLEAN_S3_CONFIRM_BUCKET:-}" != "$S3_BUCKET" ]]; then
+        cat <<MSG
+ERROR: refusing to delete whole prefix trees without confirmation.
+
+  bucket:   $S3_BUCKET
+  prefixes: ${PREFIXES[*]}
+
+S3_PATH is not set, so this would delete EVERY object under those prefixes.
+In a shared bucket, "clickhouse-disks/" holds live ClickHouse S3 disk data.
+
+If that is genuinely what you want, name the bucket explicitly:
+
+  CLEAN_S3_CONFIRM_BUCKET=$S3_BUCKET $0
+
+Otherwise set S3_PATH to the run's own prefix, or pass --dry-run first.
+MSG
+        exit 1
+    fi
+fi
 
 total_deleted=0
 
