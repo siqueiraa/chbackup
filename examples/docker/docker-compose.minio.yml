@@ -53,7 +53,7 @@ services:
       "
 
   chbackup:
-    image: ghcr.io/user/chbackup:latest
+    image: siqueiraa/chbackup:latest
     depends_on:
       clickhouse:
         condition: service_healthy

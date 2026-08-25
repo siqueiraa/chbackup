@@ -50,7 +50,7 @@ services:
       retries: 10
 
   chbackup:
-    image: ghcr.io/user/chbackup:latest
+    image: siqueiraa/chbackup:latest
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -127,7 +127,7 @@ docker run --rm \
   -e S3_ACCESS_KEY=your-key \
   -e S3_SECRET_KEY=your-secret \
   --network container:clickhouse \
-  ghcr.io/user/chbackup:latest \
+  siqueiraa/chbackup:latest \
   create my-backup
 ```
 
@@ -148,7 +148,7 @@ docker run --rm --network ch-net \
   -e S3_BUCKET=my-backups \
   -e S3_ACCESS_KEY=your-key \
   -e S3_SECRET_KEY=your-secret \
-  ghcr.io/user/chbackup:latest \
+  siqueiraa/chbackup:latest \
   create my-backup
 ```
 
@@ -198,7 +198,7 @@ services:
       "
 
   chbackup:
-    image: ghcr.io/user/chbackup:latest
+    image: siqueiraa/chbackup:latest
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -312,7 +312,7 @@ services:
       retries: 10
 
   chbackup:
-    image: ghcr.io/user/chbackup:latest
+    image: siqueiraa/chbackup:latest
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -355,7 +355,7 @@ services:
       retries: 10
 
   chbackup:
-    image: ghcr.io/user/chbackup:latest
+    image: siqueiraa/chbackup:latest
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -418,7 +418,7 @@ services:
       retries: 10
 
   chbackup:
-    image: ghcr.io/user/chbackup:latest
+    image: siqueiraa/chbackup:latest
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -463,7 +463,7 @@ Build the Docker image from source:
 docker build -t chbackup:local .
 
 # Use it in docker-compose
-# Replace "ghcr.io/user/chbackup:latest" with "chbackup:local" in your compose file
+# Replace "siqueiraa/chbackup:latest" with "chbackup:local" in your compose file
 ```
 
 The Dockerfile uses a multi-stage build:

@@ -90,7 +90,7 @@ spec:
 
         # chbackup sidecar
         - name: chbackup
-          image: ghcr.io/user/chbackup:latest
+          image: siqueiraa/chbackup:latest
           args: ["server", "--watch"]
           ports:
             - name: api
@@ -180,7 +180,7 @@ kubectl create configmap chbackup-config \
 
 ```yaml
 - name: chbackup
-  image: ghcr.io/user/chbackup:latest
+  image: siqueiraa/chbackup:latest
   args: ["server", "--watch", "-c", "/etc/chbackup/config.yml"]
   volumeMounts:
     - name: data
@@ -374,7 +374,7 @@ spec:
               mountPath: /var/lib/clickhouse
 
         - name: chbackup
-          image: ghcr.io/user/chbackup:latest
+          image: siqueiraa/chbackup:latest
           args: ["server", "--watch"]
           env:
             - name: S3_BUCKET
