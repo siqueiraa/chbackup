@@ -120,6 +120,10 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so git describe can find the previous tag, and so the
+          # annotated tag object is available locally, not just the ref.
+          fetch-depth: 0
 
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -157,11 +161,33 @@ jobs:
           short-description: "ClickHouse backup & restore to S3. Static Rust binary, K8s sidecar, incremental, resumable."
           readme-filepath: ./README.md
 
+      # The changelog lives in the annotated tag, which is where this repo keeps it.
+      # generate_release_notes would replace it with a list of commit subjects, so the
+      # release body is built from the annotation instead.
+      - name: Build release notes from the annotated tag
+        id: notes
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+          # %(contents) is the annotation. Drop its subject line, which becomes the
+          # release title, then strip the leading blank lines that leaves behind.
+          git tag -l --format='%(contents)' "$TAG" | tail -n +2 | awk 'NF||seen{seen=1;print}' > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::warning::$TAG has no annotation body; the release body will be minimal."
+            printf 'Release %s\n' "$TAG" > notes.md
+          fi
+          if [ -n "$PREV" ]; then
+            printf '\n---\n\n**Full Changelog**: %s/compare/%s...%s\n' \
+              "${{ github.server_url }}/${{ github.repository }}" "$PREV" "$TAG" >> notes.md
+          fi
+          echo "Release notes: $(wc -c < notes.md) bytes"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: chbackup ${{ needs.prepare.outputs.version }}
-          generate_release_notes: true
+          body_path: notes.md
           draft: false
           prerelease: false
