@@ -258,6 +258,10 @@ Integration tests require real ClickHouse + S3 (no mocks).
 | `examples/kubernetes/sidecar.yaml` | K8s sidecar deployment example (server --watch) |
 | `test/fixtures/seed_data.sql` | Deterministic test data for round-trip verification |
 | `test/run_tests.sh` | Integration test runner with round-trip smoke test |
+| `Dockerfile.test` | Integration image: chbackup built into altinity/clickhouse-server, plus S3 disk config |
+| `docker-compose.test.yml` | Integration env (ZooKeeper + ClickHouse/chbackup). Needs S3_BUCKET/S3_ACCESS_KEY/S3_SECRET_KEY |
+| `test/clean-docker.sh` | Removes **only this project's** Docker containers, volumes and images. Never prunes system-wide, since a dev machine hosts unrelated projects. Leaves build cache alone: BuildKit entries carry no project label |
+| `test/clean-s3.sh` | Deletes S3 test data under both test prefixes, so integration runs stop accruing storage cost. Supports `--dry-run` |
 
 ## Git Conventions
 
