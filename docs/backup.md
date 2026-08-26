@@ -240,6 +240,20 @@ chbackup create --partitions="all,202401" my-backup
 
 > **Note:** that skip relies on `clickhouse.ignore_not_exists_error_during_freeze` (default `true`). With it set to `false`, the harmless "partition does not exist" error (code 218) raised by `all` against a partitioned table becomes fatal, so mixed lists are only safe under the default.
 
+### Partition IDs that match nothing
+
+An ID that stages no part in *any* table in the backup is treated as a typo and fails the
+backup, naming the offending IDs. Carrying on would hand back a backup silently missing the
+data you asked for.
+
+The check is deliberately backup-wide. An ID that misses one table is normal -- in
+`--partitions="all,202401"` the `all` applies to unpartitioned tables and `202401` to
+partitioned ones, so neither applies to both -- so only "matched nothing anywhere" is evidence
+of a mistake.
+
+To allow such a backup anyway, set `backup.allow_empty_backups: true`, which downgrades the
+failure to a warning. This is the same flag that governs a backup matching no tables at all.
+
 ## Compression
 
 Control compression algorithm and level:

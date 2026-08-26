@@ -147,6 +147,14 @@ count_s3_shadows() {
 cleanup_backup() {
     for name in "$@"; do
         chbackup delete remote "$name" 2>&1 || true
+        # A backup created but never uploaded still holds its deferred S3 object-disk
+        # freeze, and `delete local` rightly refuses while that record is unexpired -- the
+        # ownerless window is exactly the gap between a separate `create` and `upload`
+        # invocation, so releasing automatically there would strand a pending upload.
+        # In the harness nothing is uploading concurrently, so use the documented operator
+        # escape hatch. Without this the backup survives its whole 24h TTL and later tests
+        # that assert an empty backup list (T64) fail on the leftover.
+        chbackup release-deferred "$name" >/dev/null 2>&1 || true
         chbackup delete local "$name" 2>&1 || true
     done
 }
@@ -536,8 +544,10 @@ if should_run "test_partitioned_restore"; then
         fail "partitioned restore row count mismatch: expected=${ROWS_202401} got=${POST_ROWS}"
     fi
 
-    # Cleanup and restore full data
-    chbackup delete local "${PART_NAME}" 2>&1 || true
+    # Cleanup and restore full data. Goes through cleanup_backup so the deferred
+    # S3 object-disk freeze this create published is released first; a bare delete is
+    # refused for the record TTL and leaves the backup behind for T64 to trip over.
+    cleanup_backup "${PART_NAME}"
     info "  Re-seeding data after partitioned test"
     reseed_data
 fi

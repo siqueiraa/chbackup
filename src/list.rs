@@ -679,7 +679,24 @@ pub async fn delete_remote(s3: &S3Client, backup_name: &str) -> Result<()> {
 /// Delete all broken local backups (missing or corrupt metadata.json).
 ///
 /// Returns the count of deleted broken backups.
-pub fn clean_broken_local(data_path: &str) -> Result<usize> {
+/// Delete every local backup with a missing or corrupt manifest.
+///
+/// # Why this takes a ChClient
+///
+/// A broken backup may still hold a deferred S3 object-disk freeze, and delete_local rightly
+/// refuses to destroy the directory while one exists -- the record lives *in* that directory,
+/// so deleting it would strand the FREEZE in ClickHouse with nothing left to describe it.
+/// Without a way to release the freeze, clean_broken could never clean such a backup until the
+/// record TTL expired (24h by default), which defeats the point of the command.
+///
+/// Releasing here is safe because clean_broken holds the *Global* lock, and lock.rs makes the
+/// Global and Backup(name) tiers mutually exclusive: no create or upload can be running, so
+/// nothing can own the freeze being released. That is a stronger guarantee than the per-backup
+/// lock that release-deferred relies on.
+///
+/// `ch` is optional so callers without a ClickHouse client keep the old behaviour: the freeze is
+/// left alone and the backup is skipped rather than silently stranded.
+pub async fn clean_broken_local(data_path: &str, ch: Option<&ChClient>) -> Result<usize> {
     let backups = list_local(data_path)?;
     let broken: Vec<&BackupSummary> = backups.iter().filter(|b| b.is_broken).collect();
 
@@ -690,6 +707,32 @@ pub fn clean_broken_local(data_path: &str) -> Result<usize> {
 
     let mut deleted = 0;
     for b in &broken {
+        // Release any deferred freeze first, so delete_local has nothing to refuse.
+        if let Some(ch) = ch {
+            let record = crate::backup::deferred::record_path_for(data_path, &b.name);
+            if record.exists() {
+                info!(
+                    backup = %b.name,
+                    "Broken backup holds a deferred S3 object-disk freeze; releasing it before \
+                     deletion (safe: clean_broken holds the global lock, so no create or upload \
+                     can own it)"
+                );
+                match crate::backup::deferred::release_now(ch, data_path, &b.name).await {
+                    Ok(n) => info!(backup = %b.name, tables = n, "Released deferred freeze"),
+                    Err(e) => {
+                        // Leave the backup in place rather than strand the freeze.
+                        warn!(
+                            backup = %b.name,
+                            error = %e,
+                            "Failed to release deferred freeze; leaving this broken backup in \
+                             place so the FREEZE is not stranded"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
         match delete_local(data_path, &b.name) {
             Ok(()) => {
                 info!(backup = %b.name, "Deleted broken local backup");
@@ -922,12 +965,13 @@ pub async fn clean_broken_remote(s3: &S3Client, min_age_secs: u64) -> Result<usi
 pub async fn clean_broken(
     data_path: &str,
     s3: &S3Client,
+    ch: Option<&ChClient>,
     location: &Location,
     min_age_secs: u64,
 ) -> Result<()> {
     match location {
         Location::Local => {
-            let count = clean_broken_local(data_path)?;
+            let count = clean_broken_local(data_path, ch).await?;
             info!(count = count, "Clean broken local complete");
         }
         Location::Remote => {
@@ -2162,8 +2206,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_clean_broken_local() {
+    #[tokio::test]
+    async fn test_clean_broken_local() {
         let dir = tempfile::tempdir().unwrap();
         let backup_base = dir.path().join("backup");
         std::fs::create_dir_all(&backup_base).unwrap();
@@ -2182,7 +2226,9 @@ mod tests {
         assert!(broken_dir2.exists());
 
         // Clean broken
-        let count = clean_broken_local(dir.path().to_str().unwrap()).unwrap();
+        let count = clean_broken_local(dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
         assert_eq!(count, 2, "Should have deleted 2 broken backups");
 
         // Verify both are gone
@@ -2190,8 +2236,8 @@ mod tests {
         assert!(!broken_dir2.exists());
     }
 
-    #[test]
-    fn test_clean_broken_local_preserves_valid() {
+    #[tokio::test]
+    async fn test_clean_broken_local_preserves_valid() {
         let dir = tempfile::tempdir().unwrap();
         let backup_base = dir.path().join("backup");
         std::fs::create_dir_all(&backup_base).unwrap();
@@ -2211,7 +2257,9 @@ mod tests {
         std::fs::create_dir_all(&broken_dir).unwrap();
 
         // Clean broken
-        let count = clean_broken_local(dir.path().to_str().unwrap()).unwrap();
+        let count = clean_broken_local(dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
         assert_eq!(count, 1, "Should have deleted 1 broken backup");
 
         // Verify valid backup is preserved
@@ -4655,8 +4703,8 @@ mod tests {
     // clean_broken_local with no broken backups
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_clean_broken_local_none_broken() {
+    #[tokio::test]
+    async fn test_clean_broken_local_none_broken() {
         let dir = tempfile::tempdir().unwrap();
         let backup_base = dir.path().join("backup");
         std::fs::create_dir_all(&backup_base).unwrap();
@@ -4669,7 +4717,9 @@ mod tests {
             .save_to_file(&valid_dir.join("metadata.json"))
             .unwrap();
 
-        let count = clean_broken_local(dir.path().to_str().unwrap()).unwrap();
+        let count = clean_broken_local(dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
         assert_eq!(count, 0, "No broken backups to clean");
         assert!(valid_dir.exists(), "Valid backup should remain");
     }

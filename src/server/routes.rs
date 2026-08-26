@@ -813,25 +813,16 @@ async fn dispatch_action_command(
             let location = parts.get(1).map(String::as_str).unwrap_or("");
             let min_age_secs = config.general.clean_broken_min_age_secs;
             match location {
-                "local" => {
-                    let data_path = config.clickhouse.data_path.clone();
-                    tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
-                        .await
-                        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))
-                        .map(|_| ())
-                }
+                "local" => list::clean_broken_local(&config.clickhouse.data_path, Some(ch))
+                    .await
+                    .map(|_| ()),
                 "remote" => list::clean_broken_remote(s3, min_age_secs)
                     .await
                     .map(|_| ()),
                 _ => {
                     let s3_result = list::clean_broken_remote(s3, min_age_secs).await;
-                    let data_path = config.clickhouse.data_path.clone();
                     let local_result =
-                        tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
-                            .await
-                            .unwrap_or_else(|e| {
-                                Err(anyhow::anyhow!("spawn_blocking failed: {}", e))
-                            });
+                        list::clean_broken_local(&config.clickhouse.data_path, Some(ch)).await;
                     match (s3_result, local_result) {
                         (Ok(_), Ok(_)) => Ok(()),
                         (Err(s3_err), Err(local_err)) => Err(anyhow::anyhow!(
@@ -1778,12 +1769,9 @@ pub async fn clean_local_broken(
         "clean_broken_local",
         None,  // no specific backup name
         false, // no cache invalidation
-        |config, _ch, _s3, _cancel| async move {
+        |config, ch, _s3, _cancel| async move {
             info!("Starting clean_broken_local operation");
-            let data_path = config.clickhouse.data_path.clone();
-            let count = tokio::task::spawn_blocking(move || list::clean_broken_local(&data_path))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking failed: {}", e)))?;
+            let count = list::clean_broken_local(&config.clickhouse.data_path, Some(&ch)).await?;
             info!(count = count, "clean_broken_local operation completed");
             Ok(())
         },

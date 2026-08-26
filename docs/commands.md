@@ -475,6 +475,12 @@ chbackup delete local my-stuck-backup
 
 Remove broken backups that have missing or corrupt `metadata.json`.
 
+For `local`, a broken backup still holding a deferred S3 object-disk freeze has that freeze
+released before deletion, so it can be cleaned immediately instead of waiting out
+`clickhouse.deferred_freeze_ttl_secs`. This is safe because `clean_broken` takes the global
+lock, so no `create` or `upload` can be running against it. If the release fails, that backup
+is left in place rather than stranding the freeze in ClickHouse.
+
 ```bash
 chbackup clean_broken <local|remote>
 ```

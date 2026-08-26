@@ -570,6 +570,12 @@ pub async fn create(
     let frozen_so_far: Arc<std::sync::Mutex<Vec<FreezeInfo>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    // Union of the explicitly requested partition IDs that staged parts in *some* table.
+    // A --partitions list spans the backup, not one table, so the typo check has to be
+    // backup-wide; see freeze::unmatched_explicit_partitions.
+    let staged_ids: Arc<std::sync::Mutex<BTreeSet<String>>> =
+        Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+
     for table_row in &data_tables {
         let sem = semaphore.clone();
         let ch = ch.clone();
@@ -592,6 +598,7 @@ pub async fn create(
         let freeze_by_part = config.clickhouse.freeze_by_part;
         let freeze_by_part_where = config.clickhouse.freeze_by_part_where.clone();
         let frozen_so_far_clone = frozen_so_far.clone();
+        let staged_ids_clone = staged_ids.clone();
         let base_parts_clone = base_parts.clone();
         let cache_disk_names_clone = cache_disk_names.clone();
 
@@ -741,7 +748,7 @@ pub async fn create(
                     let info_for_evidence = freeze_info.clone();
                     let disks_for_evidence = disk_map_clone.clone();
                     let explicitly_requested = !from_discovery;
-                    tokio::task::spawn_blocking(move || {
+                    let staged = tokio::task::spawn_blocking(move || {
                         verify_partitions_staged(
                             &info_for_evidence,
                             &disks_for_evidence,
@@ -750,7 +757,17 @@ pub async fn create(
                         )
                     })
                     .await
-                    .context("spawn_blocking panicked during freeze evidence scan")??
+                    .context("spawn_blocking panicked during freeze evidence scan")??;
+
+                    // Publish this table's evidence so the backup-wide typo check can run once
+                    // every table has been seen. An explicitly requested ID that misses THIS
+                    // table may still match another, so the decision cannot be made here.
+                    let count = staged.len();
+                    staged_ids_clone
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend(staged);
+                    count
                 };
 
                 if frozen_partitions == 0 && from_discovery {
@@ -902,6 +919,7 @@ pub async fn create(
             .drain(..)
             .collect(),
     );
+
     let mut had_error = false;
     let mut first_error: Option<anyhow::Error> = None;
     let mut zero_parts_with_data: Vec<String> = Vec::new();
@@ -940,6 +958,52 @@ pub async fn create(
             tables = %zero_parts_with_data.join(", "),
             "Tables with data in system.tables but zero parts in backup"
         );
+    }
+
+    // Backup-wide typo check for an explicit --partitions list.
+    //
+    // Deliberately backup-wide rather than per-table: an ID that stages nothing in one table
+    // may legitimately match another (`--partitions all,202401` across a partitioned and an
+    // unpartitioned table can never have both apply to both), so failing per-table made mixed
+    // lists unusable. An ID that matched *nothing anywhere* is the real typo, and it must be
+    // loud, because carrying on hands back a backup silently missing what was asked for.
+    //
+    // Runs only when every table succeeded. A failed table contributes no evidence, so its
+    // partitions would look unmatched and this check would mask the real error with a bogus
+    // one. It also reports through `first_error` rather than bailing, so the failure path
+    // below performs the same unfreeze + backup-dir removal + shadow cleanup as any other
+    // create failure -- a bare bail would leave a partial backup dir looking broken.
+    //
+    // `allow_empty_backups` is the existing opt-out for "I asked for something and got
+    // nothing" -- it already gates the no-tables-matched case above -- so it gates this too.
+    if first_error.is_none() {
+        if let PartitionSpec::Ids(ref requested_ids) = partition_spec {
+            let unmatched = {
+                let staged = staged_ids.lock().unwrap_or_else(|e| e.into_inner());
+                freeze::unmatched_explicit_partitions(requested_ids, &staged)
+            };
+
+            if !unmatched.is_empty() {
+                if config.backup.allow_empty_backups {
+                    warn!(
+                        unmatched = ?unmatched,
+                        requested = ?requested_ids,
+                        "No part was staged for these --partitions IDs in any table. \
+                         Continuing because backup.allow_empty_backups is set, so the backup \
+                         may be missing data you asked for."
+                    );
+                } else {
+                    first_error = Some(anyhow::anyhow!(
+                        "no part was staged for --partitions ID(s) {:?} in any table \
+                         (requested: {:?}). Check the values against \
+                         system.parts.partition_id. Set backup.allow_empty_backups=true to \
+                         allow a backup that is missing them.",
+                        unmatched,
+                        requested_ids
+                    ));
+                }
+            }
+        }
     }
 
     // 10. UNFREEZE.

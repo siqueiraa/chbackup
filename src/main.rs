@@ -666,7 +666,12 @@ async fn run() -> Result<()> {
             // Only initialize S3 for remote clean_broken.
             match loc {
                 list::Location::Local => {
-                    let count = list::clean_broken_local(&config.clickhouse.data_path)?;
+                    // A ClickHouse client is needed to release any deferred S3 object-disk
+                    // freeze a broken backup still holds; without it clean_broken would refuse
+                    // to delete such a backup until the record's 24h TTL expired.
+                    let ch = ChClient::new(&config.clickhouse)?;
+                    let count =
+                        list::clean_broken_local(&config.clickhouse.data_path, Some(&ch)).await?;
                     info!(count = count, "CleanBroken local complete");
                 }
                 list::Location::Remote => {

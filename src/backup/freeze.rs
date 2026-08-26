@@ -4,11 +4,11 @@
 //! MUST call `unfreeze()` explicitly since Drop is synchronous and cannot
 //! await async operations.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
@@ -123,33 +123,44 @@ pub fn record_freeze(registry: &Mutex<Vec<FreezeInfo>>, info: &FreezeInfo) {
 /// Verify that the partitions frozen under `info` actually staged parts.
 ///
 /// `requested` holds only the IDs whose `FREEZE PARTITION` succeeded; the caller must already
-/// have recorded the freeze with [`record_freeze`], because this function can fail and the
-/// table stays frozen when it does. Returns how many requested IDs have parts staged.
-/// Blocking filesystem I/O -- call from `spawn_blocking`.
+/// have recorded the freeze with [`record_freeze`]. Returns the subset of `requested` that has
+/// parts staged. Blocking filesystem I/O -- call from `spawn_blocking`.
+///
+/// # Why an explicit zero-match is not fatal *here*
+///
+/// A `--partitions` list spans the whole backup, not one table, so an ID that stages nothing in
+/// *this* table is perfectly normal: `--partitions all,202401` against a partitioned and an
+/// unpartitioned table can never have both IDs apply to both tables. Failing per-table made
+/// mixed lists unusable.
+///
+/// The typo signal is an ID that stages nothing in **any** table, which only the caller can
+/// determine. So this function reports evidence and the caller aggregates across tables --
+/// see `unmatched_explicit_partitions`.
 pub fn verify_partitions_staged(
     info: &FreezeInfo,
     disk_paths: &BTreeMap<String, String>,
     requested: &[String],
     explicitly_requested: bool,
-) -> Result<usize> {
+) -> Result<BTreeSet<String>> {
     let with_evidence = partitions_with_shadow_evidence(disk_paths, &info.freeze_name, requested);
 
-    let mut frozen = 0usize;
+    let mut staged = BTreeSet::new();
     for partition_id in requested {
         match freeze_evidence_outcome(
             partition_id,
             with_evidence.contains(partition_id),
             explicitly_requested,
         ) {
-            FreezeOutcome::Frozen => frozen += 1,
+            FreezeOutcome::Frozen => {
+                staged.insert(partition_id.clone());
+            }
             FreezeOutcome::FailExplicitZeroMatch { partition_id } => {
-                bail!(
-                    "FREEZE PARTITION ID '{}' on {}.{} froze nothing: no part for that \
-                     partition was staged in the shadow directory. Check the --partitions \
-                     value against system.parts.partition_id",
-                    partition_id,
-                    info.database,
-                    info.table
+                // Not fatal per-table; the caller decides once it has seen every table.
+                debug!(
+                    db = %info.database,
+                    table = %info.table,
+                    partition = %partition_id,
+                    "requested partition staged nothing in this table (may apply to another)"
                 );
             }
             FreezeOutcome::WarnDiscoveryZeroMatch { partition_id } => {
@@ -164,7 +175,24 @@ pub fn verify_partitions_staged(
         }
     }
 
-    Ok(frozen)
+    Ok(staged)
+}
+
+/// Which explicitly requested partition IDs staged nothing anywhere in the backup.
+///
+/// This is the typo check, and it is deliberately backup-wide rather than per-table: an ID that
+/// misses one table may legitimately match another, but an ID that matches nothing at all means
+/// the operator asked for data that does not exist -- and carrying on would hand back a backup
+/// silently missing what they asked for.
+pub fn unmatched_explicit_partitions(
+    requested: &[String],
+    staged_anywhere: &BTreeSet<String>,
+) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|id| !staged_anywhere.contains(*id))
+        .cloned()
+        .collect()
 }
 
 /// Guard holding references to frozen tables. The caller MUST call
@@ -553,20 +581,22 @@ mod tests {
         let info = test_info();
 
         record_freeze(&registry, &info);
-        // Nothing staged: an operator-supplied ID that matched no partition.
-        let err =
-            verify_partitions_staged(&info, &disks, &["20240i".to_string()], true).unwrap_err();
+        // Nothing staged for an operator-supplied ID. This is NO LONGER an error here: the ID
+        // may still match another table, so only the backup-wide check can call it a typo (see
+        // unmatched_explicit_partitions). What must hold is that the table stays registered,
+        // because it is still frozen and something has to unfreeze it.
+        let staged =
+            verify_partitions_staged(&info, &disks, &["20240i".to_string()], true).unwrap();
 
-        let msg = err.to_string();
         assert!(
-            msg.contains("20240i"),
-            "error must name the partition: {msg}"
+            staged.is_empty(),
+            "an ID that staged nothing must not be reported as staged"
         );
-        assert!(msg.contains("db.t"), "error must name the table: {msg}");
         assert_eq!(
             registry.into_inner().unwrap().as_slice(),
             std::slice::from_ref(&info),
-            "verification does not unregister -- the table is still frozen after it fails"
+            "verification does not unregister -- the table is still frozen afterwards, and the \
+             caller unfreezes it before bailing on the backup-wide check"
         );
     }
 
@@ -577,10 +607,10 @@ mod tests {
         stage_part(tmp.path(), &info.freeze_name, "202401");
         let disks = BTreeMap::from([("disk1".to_string(), tmp.path().display().to_string())]);
 
-        let frozen =
+        let staged =
             verify_partitions_staged(&info, &disks, &["202401".to_string()], true).unwrap();
 
-        assert_eq!(frozen, 1);
+        assert_eq!(staged, BTreeSet::from(["202401".to_string()]));
     }
 
     #[test]
@@ -590,7 +620,7 @@ mod tests {
         stage_part(tmp.path(), &info.freeze_name, "202401");
         let disks = BTreeMap::from([("disk1".to_string(), tmp.path().display().to_string())]);
 
-        let frozen = verify_partitions_staged(
+        let staged = verify_partitions_staged(
             &info,
             &disks,
             &["202401".to_string(), "202402".to_string()],
@@ -599,8 +629,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            frozen, 1,
+            staged,
+            BTreeSet::from(["202401".to_string()]),
             "a discovered partition merged away since system.parts was queried only warns"
+        );
+    }
+
+    /// The regression this fixes: an explicitly requested ID that misses THIS table must not be
+    /// fatal, because a --partitions list spans the backup. `all,202401` against an
+    /// unpartitioned table stages `all` and misses `202401`, which is normal.
+    #[test]
+    fn freeze_evidence_explicit_miss_on_one_table_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = test_info();
+        stage_part(tmp.path(), &info.freeze_name, "all");
+        let disks = BTreeMap::from([("disk1".to_string(), tmp.path().display().to_string())]);
+
+        let staged = verify_partitions_staged(
+            &info,
+            &disks,
+            &["all".to_string(), "202401".to_string()],
+            true,
+        )
+        .expect("a per-table miss must not fail the backup");
+
+        assert_eq!(
+            staged,
+            BTreeSet::from(["all".to_string()]),
+            "only the ID that actually staged parts is reported"
+        );
+    }
+
+    #[test]
+    fn unmatched_explicit_partitions_identifies_only_global_misses() {
+        let requested = vec![
+            "all".to_string(),
+            "202401".to_string(),
+            "199001".to_string(),
+        ];
+
+        // Union across tables: the unpartitioned table staged "all", the partitioned one
+        // staged "202401". Neither staged "199001" -- that is the typo.
+        let staged_anywhere = BTreeSet::from(["all".to_string(), "202401".to_string()]);
+        assert_eq!(
+            unmatched_explicit_partitions(&requested, &staged_anywhere),
+            vec!["199001".to_string()]
+        );
+
+        // Everything matched somewhere -> nothing to report.
+        let all_staged = BTreeSet::from([
+            "all".to_string(),
+            "202401".to_string(),
+            "199001".to_string(),
+        ]);
+        assert!(unmatched_explicit_partitions(&requested, &all_staged).is_empty());
+
+        // Nothing matched -> every ID is reported, in request order.
+        assert_eq!(
+            unmatched_explicit_partitions(&requested, &BTreeSet::new()),
+            requested
         );
     }
 
