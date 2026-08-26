@@ -69,9 +69,48 @@ impl ProgressTracker {
     }
 }
 
+/// Throughput in units per second, or `0.0` when no time has elapsed.
+///
+/// Pure and clock-free so it is unit-testable: callers pass the measured `Duration`. Guards
+/// against a zero elapsed time, which would otherwise yield `inf` or `NaN` in a log field.
+pub fn rate_per_sec(count: u64, elapsed: std::time::Duration) -> f64 {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 || count == 0 {
+        return 0.0;
+    }
+    count as f64 / secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_rate_per_sec_zero_elapsed_is_not_infinite() {
+        // A zero-duration measurement must not yield inf/NaN in a log field.
+        let r = rate_per_sec(1024, Duration::ZERO);
+        assert_eq!(r, 0.0);
+        assert!(r.is_finite());
+    }
+
+    #[test]
+    fn test_rate_per_sec_zero_count() {
+        assert_eq!(rate_per_sec(0, Duration::from_secs(5)), 0.0);
+    }
+
+    #[test]
+    fn test_rate_per_sec_known_values() {
+        assert_eq!(rate_per_sec(1000, Duration::from_secs(2)), 500.0);
+        assert_eq!(rate_per_sec(1_048_576, Duration::from_secs(1)), 1_048_576.0);
+    }
+
+    #[test]
+    fn test_rate_per_sec_halving_duration_doubles_rate() {
+        let fast = rate_per_sec(4096, Duration::from_secs(1));
+        let slow = rate_per_sec(4096, Duration::from_secs(2));
+        assert!((fast - slow * 2.0).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn test_progress_tracker_disabled() {

@@ -174,8 +174,24 @@ s3:
   object_disk_path: ''
   # If CopyObject fails, fallback to streaming download+reupload
   allow_object_disk_streaming: false
-  # Verbose S3 SDK request/response logging
+  # Raises the aws_* tracing targets to debug AND promotes chbackup's own S3 request events to
+  # info. MAY PRINT CREDENTIALS -- the SDK logs access_key_id at debug level.
   debug: false
+  # Deadline for a single bodyless S3 request (HEAD/LIST/DELETE/copy/multipart lifecycle).
+  # Body-carrying requests are bounded by stalled_stream_grace_period instead, since a
+  # wall-clock deadline would kill a legitimately slow large transfer.
+  # '0s' disables all S3 deadlines and restores the previous unbounded behaviour.
+  request_timeout: 60s
+  # Assumed floor throughput for server-side copies. A copy's deadline is
+  # request_timeout + bytes / this, because copying a multi-GiB range legitimately takes
+  # minutes. A hang backstop, not a performance target. 0 = no size allowance.
+  copy_min_bytes_per_second: 1048576
+  # Stalled-stream protection grace period for body transfers. Matches the AWS SDK's own
+  # default; must be set explicitly because the SDK builder's constant is 20s. '0s' disables.
+  stalled_stream_grace_period: 5s
+  # SDK-internal retry attempts per request (1 = none). MULTIPLIES with retries_on_failure:
+  # at the defaults a failing UploadPart makes up to 6 x 2 = 12 HTTP attempts.
+  sdk_max_attempts: 2
 
 # -----------------------------------------------------------------------------
 # Backup operation settings.

@@ -44,13 +44,17 @@ use crate::resume::{
 use crate::storage::s3::{calculate_chunk_size, RetryConfig};
 use crate::storage::{parse_s3_uri, S3Client};
 
-/// Statistics from an upload operation, used for Prometheus metrics.
+/// Statistics from an upload operation, used for Prometheus metrics and completion logging.
 #[derive(Debug, Default)]
 pub struct UploadStats {
     /// Number of parts actually uploaded to S3.
     pub uploaded_count: u64,
     /// Number of parts carried from base backup (incremental skip).
     pub carried_count: u64,
+    /// Bytes written to S3 by this run, excluding carried parts.
+    pub uploaded_bytes: u64,
+    /// Wall-clock duration of the upload.
+    pub elapsed_secs: f64,
 }
 
 /// Multipart upload threshold: parts with compressed data larger than 32 MiB
@@ -394,6 +398,8 @@ async fn upload_inner(
     resume: bool,
     cancel: CancellationToken,
 ) -> Result<UploadStats> {
+    let start_time = std::time::Instant::now();
+
     info!(
         backup_name = %backup_name,
         backup_dir = %backup_dir.display(),
@@ -1349,12 +1355,15 @@ async fn upload_inner(
         .save_to_file(&manifest_path)
         .context("Failed to update local manifest with S3 keys")?;
 
+    let elapsed = start_time.elapsed();
     info!(
         backup_name = %backup_name,
         parts = total_parts,
         local_parts = total_local_parts,
         s3_disk_parts = total_s3_disk_parts,
         compressed_size = total_compressed_size,
+        elapsed_secs = elapsed.as_secs_f64(),
+        rate_bytes_per_sec = crate::progress::rate_per_sec(total_compressed_size, elapsed),
         "Upload complete"
     );
 
@@ -1370,6 +1379,8 @@ async fn upload_inner(
     Ok(UploadStats {
         uploaded_count,
         carried_count,
+        uploaded_bytes: total_compressed_size,
+        elapsed_secs: elapsed.as_secs_f64(),
     })
 }
 

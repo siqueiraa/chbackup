@@ -12,6 +12,7 @@ use chbackup::lock::{
 };
 use chbackup::logging;
 use chbackup::manifest::BackupManifest;
+use chbackup::progress;
 use chbackup::restore::remap;
 use chbackup::server::state::validate_backup_name;
 use chbackup::storage::S3Client;
@@ -20,7 +21,7 @@ use chbackup::{backup, download, list, restore, upload};
 use clap::Parser;
 use cli::{Cli, Command};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info, warn};
 
 /// Extract the optional backup name from a [`Command`], if applicable.
 fn backup_name_from_command(cmd: &Command) -> Option<&str> {
@@ -62,10 +63,19 @@ async fn main() {
         Ok(()) => 0,
         Err(e) => {
             let code = exit_code_from_error(&e);
-            // Use eprintln before logging is initialized for early errors,
-            // and tracing for errors after logging init.
-            eprintln!("Error: {e:#}");
-            info!(exit_code = code, "Exiting with code {}", code);
+            // Exactly one event, never both. Previously this printed to stderr *and* logged at
+            // info!, so in `log_format: json` the single most important line of the run was not
+            // JSON and landed on a different stream from every other log line.
+            if tracing::dispatcher::has_been_set() {
+                error!(
+                    exit_code = code,
+                    error = %format!("{e:#}"),
+                    "chbackup failed"
+                );
+            } else {
+                // Logging never came up (e.g. config load failed), so tracing would discard this.
+                eprintln!("Error: {e:#}");
+            }
             code
         }
     };
@@ -103,10 +113,21 @@ async fn run() -> Result<()> {
 
     // 1. Load config (with env overlay and CLI --env overrides).
     let config_path = resolve_config_path(cli.config.as_deref())?;
-    let config = Config::load(&config_path, &cli.env_overrides)?;
+    let (config, config_warnings) = Config::load_with_warnings(&config_path, &cli.env_overrides)?;
 
     // 2. Init logging.
-    logging::init_logging(&config.general.log_format, &config.general.log_level);
+    logging::init_logging(
+        &config.general.log_format,
+        &config.general.log_level,
+        config.s3.debug,
+    );
+
+    // 2b. Replay warnings buffered during config load. Config must be read *before* logging can
+    // be configured, so anything apply_env_overlay wanted to warn about was previously emitted
+    // into a void and silently dropped.
+    for w in &config_warnings {
+        warn!("{w}");
+    }
 
     // 2a. Startup banner with version and key config.
     let cmd_name = format!("{:?}", cli.command)
@@ -212,7 +233,7 @@ async fn run() -> Result<()> {
                 .join(&name);
 
             let effective_resume = resume && config.general.use_resumable_state;
-            let _stats = upload::upload(
+            let stats = upload::upload(
                 &config,
                 &ch,
                 &s3,
@@ -228,7 +249,18 @@ async fn run() -> Result<()> {
             // Apply retention after successful upload (design doc 3.6 step 7)
             list::apply_retention_after_upload(&config, &s3, Some(&name), None).await;
 
-            info!(backup_name = %name, "Upload command complete");
+            info!(
+                backup_name = %name,
+                parts = stats.uploaded_count,
+                carried = stats.carried_count,
+                bytes = stats.uploaded_bytes,
+                elapsed_secs = stats.elapsed_secs,
+                rate_bytes_per_sec = progress::rate_per_sec(
+                    stats.uploaded_bytes,
+                    std::time::Duration::from_secs_f64(stats.elapsed_secs)
+                ),
+                "Upload command complete"
+            );
         }
 
         Command::Download {
@@ -364,7 +396,7 @@ async fn run() -> Result<()> {
                 .join(&name);
 
             let effective_resume = resume && config.general.use_resumable_state;
-            let _stats = upload::upload(
+            let stats = upload::upload(
                 &config,
                 &ch,
                 &s3,
@@ -380,7 +412,18 @@ async fn run() -> Result<()> {
             // Apply retention after successful upload (design doc 3.6 step 7)
             list::apply_retention_after_upload(&config, &s3, Some(&name), None).await;
 
-            info!(backup_name = %name, "CreateRemote command complete");
+            info!(
+                backup_name = %name,
+                parts = stats.uploaded_count,
+                carried = stats.carried_count,
+                bytes = stats.uploaded_bytes,
+                elapsed_secs = stats.elapsed_secs,
+                rate_bytes_per_sec = progress::rate_per_sec(
+                    stats.uploaded_bytes,
+                    std::time::Duration::from_secs_f64(stats.elapsed_secs)
+                ),
+                "CreateRemote command complete"
+            );
         }
 
         Command::RestoreRemote {

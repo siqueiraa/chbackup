@@ -96,6 +96,19 @@ when its PID lock is held by a live process, when its newest object was written 
 that a surviving backup's manifest still references. Every skip is logged with its reason.
 Lower `clean_broken_min_age_secs` only if no upload can outlive the window.
 
+### Logging behaviour worth knowing
+
+- **`RUST_LOG` does not enable AWS SDK logging.** It replaces the base level, but the `aws_*`
+  target caps are applied afterwards and win, because the SDK logs `access_key_id` and
+  `provider_name` at debug level. `RUST_LOG=debug` therefore stays safe. To get SDK logs, either
+  name the target (`RUST_LOG=debug,aws_sdk_s3=debug`) or set `s3.debug: true` — both are
+  deliberate opt-ins that may print credentials.
+- **Level and format are start-time only.** SIGHUP config reload does not re-initialise logging,
+  and neither does `POST /api/v1/reload`. Changing `log_level` or `log_format` needs a restart.
+- **`server` does not imply JSON.** Only `log_format: json` selects JSON output.
+- **ANSI colour is automatic.** It is enabled only when stdout is a terminal, so `kubectl logs`
+  and `docker logs` stay free of escape sequences.
+
 ## ClickHouse
 
 Connection settings and backup/restore behavior. chbackup must run on the same host as ClickHouse.
@@ -170,7 +183,11 @@ S3 storage settings. See the [S3 guide](s3.md) for provider-specific setup.
 | `concurrency` | int | `1` | SDK internal concurrency per upload |
 | `object_disk_path` | string | _(empty)_ | Alternate prefix for S3 disk objects |
 | `allow_object_disk_streaming` | bool | `false` | Fallback to streaming download+reupload when CopyObject fails. Does **not** help when the source object is missing — streaming GETs the same key |
-| `debug` | bool | `false` | Verbose S3 SDK logging |
+| `debug` | bool | `false` | Raises the `aws_*` tracing targets to `debug` **and** promotes chbackup's own S3 request events to `info`. **May print credentials** (`access_key_id`, `provider_name`) — the SDK logs them at debug level, which is why they are suppressed by default |
+| `request_timeout` | string | `60s` | Deadline for a single **bodyless** S3 request. `0s` disables all S3 deadlines. See [Request timeouts](s3.md#request-timeouts-and-stall-detection) |
+| `copy_min_bytes_per_second` | int | `1048576` | Assumed floor throughput for server-side copies (1 MiB/s). A copy's deadline is `request_timeout + bytes / this`. `0` = no size allowance |
+| `stalled_stream_grace_period` | string | `5s` | Stalled-stream protection grace period for body transfers. Matches the AWS SDK's own default. `0s` disables |
+| `sdk_max_attempts` | int | `2` | SDK-internal retry attempts per request (`1` = none). Multiplies with `retries_on_failure` |
 
 ## Backup
 
@@ -365,6 +382,13 @@ The most common config parameters can be overridden via environment variables. O
 | `S3_CONCURRENCY` | `s3.concurrency` |
 | `S3_OBJECT_DISK_PATH` | `s3.object_disk_path` |
 | `S3_ALLOW_OBJECT_DISK_STREAMING` | `s3.allow_object_disk_streaming` |
+| `S3_CHUNK_SIZE` | `s3.chunk_size` |
+| `S3_MAX_PARTS_COUNT` | `s3.max_parts_count` |
+| `S3_DEBUG` | `s3.debug` |
+| `S3_REQUEST_TIMEOUT` | `s3.request_timeout` |
+| `S3_COPY_MIN_BYTES_PER_SECOND` | `s3.copy_min_bytes_per_second` |
+| `S3_STALLED_STREAM_GRACE_PERIOD` | `s3.stalled_stream_grace_period` |
+| `S3_SDK_MAX_ATTEMPTS` | `s3.sdk_max_attempts` |
 
 ### Backup
 

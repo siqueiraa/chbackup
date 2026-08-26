@@ -54,7 +54,18 @@ pub fn spawn_sighup_handler(reload_tx: tokio::sync::watch::Sender<bool>) {
     });
 }
 
-/// Spawn a SIGQUIT handler that dumps the stack trace to stderr.
+/// Spawn a SIGQUIT handler that dumps a backtrace through tracing.
+///
+/// **This does not show where other tasks are parked.** `Backtrace::force_capture` captures the
+/// calling thread, and the caller here is this handler's own task -- so during a stalled upload
+/// it prints the handler's frames and nothing about the stalled work. It is kept because it is
+/// occasionally useful and costs nothing, but it is not a diagnostic for a hung operation, and
+/// the log line says so rather than inviting the wrong conclusion.
+///
+/// Making it genuinely useful needs an application-level dump of in-flight work, not a thread
+/// backtrace: `tokio::runtime::Handle::dump()` requires `--cfg tokio_unstable` plus
+/// `tokio_taskdump` with no semver guarantee, and `tokio-console` would break the
+/// single-static-binary decision.
 #[cfg(unix)]
 pub fn spawn_sigquit_handler() {
     tokio::spawn(async move {
@@ -62,11 +73,19 @@ pub fn spawn_sigquit_handler() {
         let mut sigquit = signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
         loop {
             sigquit.recv().await;
-            tracing::info!("SIGQUIT received, dumping stack trace to stderr");
+            // Through tracing, not eprintln!, so the dump ships to the log aggregator in JSON
+            // mode like everything else instead of landing on a different stream as raw text.
             let bt = std::backtrace::Backtrace::force_capture();
-            eprintln!("=== SIGQUIT stack dump ===");
-            eprintln!("{bt}");
-            eprintln!("=== end stack dump ===");
+            tracing::warn!(
+                thread = "sigquit-handler",
+                backtrace = %bt,
+                "SIGQUIT received. This backtrace is the signal handler's own thread only -- it \
+                 does NOT show where other tasks are parked. To diagnose a stalled operation use \
+                 the phase heartbeat and /api/v1/status instead."
+            );
+            // SIGQUIT HOOK: once the progress registry lands, also dump the in-flight table here
+            // (op, phase, backup_name, done/total, bytes, elapsed, slowest in-flight item).
+            // That is the thing that actually answers "where is it stuck".
         }
     });
 }

@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use aws_config::sts::AssumeRoleProvider;
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::config::retry::RetryConfig as SdkRetryConfig;
+use aws_sdk_s3::config::{Credentials, Region, StalledStreamProtectionConfig};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, ServerSideEncryption,
@@ -49,6 +50,90 @@ pub struct RetryConfig {
     pub jitter_factor: f64,
 }
 
+/// Which deadline class an S3 operation falls into.
+///
+/// The split is by **request shape**, not by convenience: a bodyless request's total time is
+/// bounded by the service, while a body-carrying one is bounded by how much data is moving.
+/// Applying a wall-clock deadline to the latter would kill legitimately slow large transfers,
+/// which is why they are absent here and left to the SDK's throughput-based stalled-stream
+/// protection instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3OpClass {
+    /// Bodyless: head, list, delete, and the multipart lifecycle calls.
+    Metadata,
+    /// Bodyless but proportional to the bytes the service moves server-side: CopyObject,
+    /// UploadPartCopy, CompleteMultipartUpload.
+    Copy,
+}
+
+/// Resolved deadline settings, derived once from [`S3Config`].
+#[derive(Debug, Clone, Copy)]
+pub struct S3Timeouts {
+    /// Base per-request deadline in seconds. 0 disables every S3 deadline.
+    pub request_timeout_secs: u64,
+    /// Assumed floor throughput for server-side copies, in bytes/second. 0 = no size allowance.
+    pub copy_min_bytes_per_second: u64,
+}
+
+/// Best-effort cleanup deadline, deliberately fixed and not configurable.
+///
+/// Cleanup must never use `request_timeout`, because `"0s"` is a supported value that disables
+/// deadlines -- which would leave an abort able to hang forever, i.e. exactly the failure this
+/// module exists to prevent. A cleanup that gives up is strictly better than one that parks.
+pub const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Compute the deadline for one S3 request, or `None` when deadlines are disabled.
+///
+/// The `Copy` class adds a size allowance because a server-side copy of a multi-GiB range
+/// legitimately takes minutes: `request_timeout + bytes / copy_min_bytes_per_second`. When the
+/// size is unknown (a preceding HEAD failed) callers pass `None` and get the allowance for the
+/// largest object a single CopyObject can legally handle, since falling back to the bare
+/// metadata deadline would fail legitimate large copies.
+pub fn s3_deadline(
+    class: S3OpClass,
+    bytes: Option<u64>,
+    t: &S3Timeouts,
+) -> Option<std::time::Duration> {
+    if t.request_timeout_secs == 0 {
+        return None;
+    }
+    let base = std::time::Duration::from_secs(t.request_timeout_secs);
+    match class {
+        S3OpClass::Metadata => Some(base),
+        S3OpClass::Copy => {
+            if t.copy_min_bytes_per_second == 0 {
+                return Some(base);
+            }
+            // Unknown size: assume the legal maximum for a single CopyObject.
+            let bytes = bytes.unwrap_or(S3Client::COPY_OBJECT_MAX_SIZE);
+            let allowance_secs = bytes / t.copy_min_bytes_per_second;
+            Some(base.saturating_add(std::time::Duration::from_secs(allowance_secs)))
+        }
+    }
+}
+
+/// How much of a whole-object budget is left.
+///
+/// - `None` budget (deadlines disabled) -> `None` (no clamp).
+/// - Budget exhausted -> `Some(Err(..))`, so the caller can bail with a useful message.
+/// - Otherwise `Some(Ok(remaining))`.
+///
+/// Returning the exhausted case as an error rather than `Duration::ZERO` keeps callers from
+/// accidentally issuing a request with a zero deadline that fails with a confusing message.
+fn remaining_budget(
+    object_deadline: Option<std::time::Instant>,
+) -> Option<Result<std::time::Duration>> {
+    let deadline = object_deadline?;
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        Some(Err(anyhow::anyhow!(
+            "{TIMEOUT_ERR_PREFIX}: multipart copy exceeded its whole-object budget"
+        )))
+    } else {
+        Some(Ok(left))
+    }
+}
+
 /// S3 canned ACL type alias for convenience.
 type ObjectCannedAcl = aws_sdk_s3::types::ObjectCannedAcl;
 
@@ -90,6 +175,103 @@ macro_rules! apply_s3_object_options {
 ///
 /// Returns `(bucket, prefix)`. If the URI does not match `s3://` format,
 /// returns the whole string as the prefix with an empty bucket.
+/// Stable prefix for a deadline failure, matched by [`is_timeout_error`].
+///
+/// Kept as a constant so the classifier and the message cannot drift apart.
+const TIMEOUT_ERR_PREFIX: &str = "S3 request timed out";
+
+/// Whether an error is one of our own deadline expiries.
+///
+/// Deliberately matched against the exact prefix we emit rather than a loose substring like
+/// "timeout" or "timed out", which would also catch service-reported timeouts and unrelated
+/// errors whose context happens to mention one -- the same trap documented for
+/// [`is_missing_source_error`] below.
+pub fn is_timeout_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(TIMEOUT_ERR_PREFIX)
+}
+
+/// Identifying context for an S3 request, used only to build log fields and error messages.
+#[derive(Debug, Default, Clone)]
+pub struct S3OpCtx {
+    pub bucket: String,
+    pub key: String,
+    pub part_number: Option<i32>,
+    pub range: Option<String>,
+    pub size: Option<u64>,
+}
+
+impl S3OpCtx {
+    pub fn new(bucket: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            key: key.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_part(mut self, part_number: i32, range: impl Into<String>) -> Self {
+        self.part_number = Some(part_number);
+        self.range = Some(range.into());
+        self
+    }
+
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.size = Some(size);
+        self
+    }
+}
+
+/// Run an S3 request under a deadline.
+///
+/// Generic over the future's output `T` rather than over `Result`, and deliberately so: callers
+/// like `head_object` classify the SDK's own error type (`into_service_error().is_not_found()`)
+/// to turn a 404 into `Ok(None)`. Flattening that into `anyhow` here would not compile, and if
+/// forced through would convert "object absent" into "head failed" on a path `copy_object`
+/// depends on. So: wrap the `send()` future, leave every SDK-error `match` at the call site.
+///
+/// `None` deadline means unbounded, which is what `s3.request_timeout = "0s"` selects.
+///
+/// The `warn!` lives here rather than at the call sites so a deadline expiry is always visible
+/// even when a caller swallows the error.
+pub async fn with_deadline<T>(
+    op: &str,
+    ctx: &S3OpCtx,
+    deadline: Option<std::time::Duration>,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    let Some(deadline) = deadline else {
+        return Ok(fut.await);
+    };
+
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(v) => Ok(v),
+        Err(_elapsed) => {
+            let elapsed = started.elapsed();
+            warn!(
+                op = op,
+                bucket = %ctx.bucket,
+                key = %ctx.key,
+                part_number = ctx.part_number,
+                range = ctx.range.as_deref().unwrap_or(""),
+                size = ctx.size,
+                deadline_secs = deadline.as_secs_f64(),
+                elapsed_secs = elapsed.as_secs_f64(),
+                "S3 request exceeded deadline -- aborting request"
+            );
+            bail!(
+                "{TIMEOUT_ERR_PREFIX}: {op} on {}/{} after {:.1}s (deadline {:.1}s). \
+                 Raise s3.request_timeout or s3.copy_min_bytes_per_second, \
+                 or set s3.request_timeout: 0s to disable deadlines.",
+                ctx.bucket,
+                ctx.key,
+                elapsed.as_secs_f64(),
+                deadline.as_secs_f64()
+            )
+        }
+    }
+}
+
 /// Whether an S3 error means the referenced key or bucket does not exist.
 ///
 /// Used to classify a CopyObject failure as permanent so it is not retried. Kept narrow on
@@ -150,6 +332,14 @@ pub struct S3Client {
     sse_kms_key_id: String,
     /// S3 canned ACL to apply to new objects.
     acl: String,
+    /// Resolved request deadlines. See [`s3_deadline`].
+    timeouts: S3Timeouts,
+    /// Configured multipart chunk size (0 = auto).
+    chunk_size: u64,
+    /// Configured multipart part-count ceiling.
+    max_parts_count: u32,
+    /// Promote this client's own per-request `debug!` events to `info!` (`s3.debug`).
+    log_requests: bool,
 }
 
 /// Build an auto-refreshing STS AssumeRole credentials provider.
@@ -286,11 +476,74 @@ impl S3Client {
             s3_config_builder = s3_config_builder.endpoint_url(&effective_endpoint);
         }
 
+        // Make the SDK's protections explicit rather than inherited.
+        //
+        // Stalled-stream protection is already ON by default (behavior-version-latest), with a
+        // 5s grace period applied by the runtime plugin. Setting it here is not a change in
+        // behaviour -- it is what makes the value visible and configurable. The grace period MUST
+        // be passed explicitly: the builder's own DEFAULT_GRACE_PERIOD is 20s, so
+        // `enabled().build()` would silently *loosen* protection from 5s to 20s.
+        let grace_secs = crate::config::parse_duration_secs(&config.stalled_stream_grace_period)
+            .unwrap_or_else(|e| {
+                warn!(
+                    value = %config.stalled_stream_grace_period,
+                    error = %e,
+                    "Invalid s3.stalled_stream_grace_period, falling back to 5s"
+                );
+                5
+            });
+        let ssp = if grace_secs == 0 {
+            StalledStreamProtectionConfig::disabled()
+        } else {
+            StalledStreamProtectionConfig::enabled()
+                .grace_period(std::time::Duration::from_secs(grace_secs))
+                .build()
+        };
+        s3_config_builder = s3_config_builder.stalled_stream_protection(ssp);
+
+        // SDK-level retries multiply with chbackup's own retry wrappers, so make the factor
+        // explicit and smaller than the SDK default of 3. Keeping some SDK retries is still
+        // worthwhile: they are far cheaper than a project-level retry, which re-runs the HEAD
+        // and restarts an entire multipart copy.
+        s3_config_builder = s3_config_builder.retry_config(
+            SdkRetryConfig::standard().with_max_attempts(config.sdk_max_attempts.max(1)),
+        );
+
         let s3_config = s3_config_builder.build();
         let client = aws_sdk_s3::Client::from_conf(s3_config);
 
+        let request_timeout_secs = crate::config::parse_duration_secs(&config.request_timeout)
+            .unwrap_or_else(|e| {
+                warn!(
+                    value = %config.request_timeout,
+                    error = %e,
+                    "Invalid s3.request_timeout, falling back to 60s"
+                );
+                60
+            });
+        if request_timeout_secs == 0 {
+            warn!(
+                "s3.request_timeout is 0: S3 request deadlines are DISABLED, so a stalled \
+                 bodyless request (CopyObject, UploadPartCopy, HEAD, LIST) can hang indefinitely"
+            );
+        } else {
+            info!(
+                request_timeout_secs = request_timeout_secs,
+                copy_min_bytes_per_second = config.copy_min_bytes_per_second,
+                stalled_stream_grace_secs = grace_secs,
+                sdk_max_attempts = config.sdk_max_attempts,
+                "S3 request deadlines active"
+            );
+        }
+
         if config.debug {
-            info!("S3 debug mode enabled: verbose request/response logging active");
+            // Two distinct mechanisms: raising the aws_* tracing targets (done in
+            // logging::init_logging, which is what produces real SDK request/response logs) and
+            // promoting this client's own per-request events, which is what log_requests does.
+            info!(
+                "s3.debug enabled: chbackup S3 request events promoted to info, and the aws_* \
+                 tracing targets raised to debug (may print credentials)"
+            );
         }
 
         // Uppercase storage class to match AWS SDK expected format
@@ -305,6 +558,13 @@ impl S3Client {
             sse: config.sse.clone(),
             sse_kms_key_id: config.sse_kms_key_id.clone(),
             acl: config.acl.clone(),
+            timeouts: S3Timeouts {
+                request_timeout_secs,
+                copy_min_bytes_per_second: config.copy_min_bytes_per_second,
+            },
+            chunk_size: config.chunk_size,
+            max_parts_count: config.max_parts_count,
+            log_requests: config.debug,
         })
     }
 
@@ -319,17 +579,22 @@ impl S3Client {
             "Pinging S3 (ListObjectsV2 max_keys=1)"
         );
 
-        self.inner
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&self.prefix)
-            .max_keys(1)
-            .send()
-            .await
-            .context(format!(
-                "S3 ping failed (bucket={}, prefix={})",
-                self.bucket, self.prefix
-            ))?;
+        with_deadline(
+            "ListObjectsV2(ping)",
+            &S3OpCtx::new(&self.bucket, &self.prefix),
+            s3_deadline(S3OpClass::Metadata, None, &self.timeouts),
+            self.inner
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&self.prefix)
+                .max_keys(1)
+                .send(),
+        )
+        .await?
+        .context(format!(
+            "S3 ping failed (bucket={}, prefix={})",
+            self.bucket, self.prefix
+        ))?;
 
         info!("S3 ping succeeded");
         Ok(())
@@ -343,6 +608,20 @@ impl S3Client {
     /// Returns the configured key prefix.
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+
+    /// Log one of this client's own per-request events.
+    ///
+    /// Promoted from `debug!` to `info!` when `s3.debug` is set. This is chbackup's own request
+    /// tracing and is a **separate mechanism** from real AWS SDK request/response logs, which
+    /// come only from raising the `aws_*` tracing targets in `logging::init_logging`. Mirrors
+    /// the `clickhouse.debug` -> `log_sql_queries` pattern.
+    fn log_s3(&self, op: &str, key: &str, detail: &str) {
+        if self.log_requests {
+            info!(op = op, key = %key, detail = %detail, "S3 request");
+        } else {
+            debug!(op = op, key = %key, detail = %detail, "S3 request");
+        }
     }
 
     // -- Key helpers --
@@ -373,6 +652,12 @@ impl S3Client {
             sse: self.sse.clone(),
             sse_kms_key_id: self.sse_kms_key_id.clone(),
             acl: self.acl.clone(),
+            // Carried, not defaulted: this clone is used on the restore path to reach the
+            // object-disk bucket, which is precisely where copy deadlines matter most.
+            timeouts: self.timeouts,
+            chunk_size: self.chunk_size,
+            max_parts_count: self.max_parts_count,
+            log_requests: self.log_requests,
         }
     }
 
@@ -498,10 +783,14 @@ impl S3Client {
                 req = req.continuation_token(token);
             }
 
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("Failed to list prefixes under: {}", full_prefix))?;
+            let resp = with_deadline(
+                "ListObjectsV2(prefixes)",
+                &S3OpCtx::new(&self.bucket, &full_prefix),
+                s3_deadline(S3OpClass::Metadata, None, &self.timeouts),
+                req.send(),
+            )
+            .await?
+            .with_context(|| format!("Failed to list prefixes under: {}", full_prefix))?;
 
             for cp in resp.common_prefixes() {
                 if let Some(p) = cp.prefix() {
@@ -538,10 +827,14 @@ impl S3Client {
                 req = req.continuation_token(token);
             }
 
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("Failed to list objects under: {}", full_prefix))?;
+            let resp = with_deadline(
+                "ListObjectsV2",
+                &S3OpCtx::new(&self.bucket, &full_prefix),
+                s3_deadline(S3OpClass::Metadata, None, &self.timeouts),
+                req.send(),
+            )
+            .await?
+            .with_context(|| format!("Failed to list objects under: {}", full_prefix))?;
 
             for obj in resp.contents() {
                 let key = obj.key().unwrap_or_default().to_string();
@@ -578,13 +871,18 @@ impl S3Client {
 
         debug!(key = %full_key, "Deleting object from S3");
 
-        self.inner
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&full_key)
-            .send()
-            .await
-            .with_context(|| format!("Failed to delete object: {}", full_key))?;
+        with_deadline(
+            "DeleteObject",
+            &S3OpCtx::new(&self.bucket, &full_key),
+            s3_deadline(S3OpClass::Metadata, None, &self.timeouts),
+            self.inner
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&full_key)
+                .send(),
+        )
+        .await?
+        .with_context(|| format!("Failed to delete object: {}", full_key))?;
 
         Ok(())
     }
@@ -623,14 +921,18 @@ impl S3Client {
 
             debug!(count = chunk.len(), "Batch deleting objects from S3");
 
-            let resp = self
-                .inner
-                .delete_objects()
-                .bucket(&self.bucket)
-                .delete(delete)
-                .send()
-                .await
-                .context("Failed to batch delete objects")?;
+            let resp = with_deadline(
+                "DeleteObjects",
+                &S3OpCtx::new(&self.bucket, format!("<{} keys>", chunk.len())),
+                s3_deadline(S3OpClass::Metadata, None, &self.timeouts),
+                self.inner
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .send(),
+            )
+            .await?
+            .context("Failed to batch delete objects")?;
 
             let errors = resp.errors();
             if !errors.is_empty() {
@@ -669,14 +971,19 @@ impl S3Client {
 
         debug!(key = %full_key, "Checking object existence in S3");
 
-        match self
-            .inner
-            .head_object()
-            .bucket(&self.bucket)
-            .key(&full_key)
-            .send()
-            .await
-        {
+        let head = with_deadline(
+            "HeadObject",
+            &S3OpCtx::new(&self.bucket, &full_key),
+            s3_deadline(S3OpClass::Metadata, None, &self.timeouts),
+            self.inner
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&full_key)
+                .send(),
+        )
+        .await?;
+
+        match head {
             Ok(resp) => {
                 let size = resp.content_length().unwrap_or(0).max(0) as u64;
                 Ok(Some(size))
@@ -717,10 +1024,14 @@ impl S3Client {
         // Apply SSE, storage class, and ACL (same as put_object)
         let req = apply_s3_object_options!(req, self);
 
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to create multipart upload for: {}", full_key))?;
+        let resp = with_deadline(
+            "CreateMultipartUpload",
+            &S3OpCtx::new(&self.bucket, &full_key),
+            s3_deadline(S3OpClass::Metadata, None, &self.timeouts),
+            req.send(),
+        )
+        .await?
+        .with_context(|| format!("Failed to create multipart upload for: {}", full_key))?;
 
         let upload_id = resp
             .upload_id()
@@ -826,20 +1137,25 @@ impl S3Client {
             .set_parts(Some(completed_parts))
             .build();
 
-        self.inner
-            .complete_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&full_key)
-            .upload_id(upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to complete multipart upload for {}: upload_id={}",
-                    full_key, upload_id
-                )
-            })?;
+        with_deadline(
+            "CompleteMultipartUpload",
+            &S3OpCtx::new(&self.bucket, &full_key),
+            s3_deadline(S3OpClass::Copy, None, &self.timeouts),
+            self.inner
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&full_key)
+                .upload_id(upload_id)
+                .multipart_upload(completed)
+                .send(),
+        )
+        .await?
+        .with_context(|| {
+            format!(
+                "Failed to complete multipart upload for {}: upload_id={}",
+                full_key, upload_id
+            )
+        })?;
 
         debug!(key = %full_key, upload_id = %upload_id, "Multipart upload completed");
         Ok(())
@@ -858,19 +1174,26 @@ impl S3Client {
             "Aborting multipart upload"
         );
 
-        self.inner
-            .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&full_key)
-            .upload_id(upload_id)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to abort multipart upload for {}: upload_id={}",
-                    full_key, upload_id
-                )
-            })?;
+        with_deadline(
+            "AbortMultipartUpload",
+            &S3OpCtx::new(&self.bucket, &full_key),
+            // Fixed cleanup bound, not request_timeout: "0s" is a supported value for the latter
+            // and would leave this abort able to hang forever.
+            Some(CLEANUP_TIMEOUT),
+            self.inner
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&full_key)
+                .upload_id(upload_id)
+                .send(),
+        )
+        .await?
+        .with_context(|| {
+            format!(
+                "Failed to abort multipart upload for {}: upload_id={}",
+                full_key, upload_id
+            )
+        })?;
 
         debug!(key = %full_key, upload_id = %upload_id, "Multipart upload aborted");
         Ok(())
@@ -880,7 +1203,7 @@ impl S3Client {
 
     /// S3 CopyObject size limit: 5 GiB. Objects larger than this require
     /// multipart copy (upload_part_copy).
-    const COPY_OBJECT_MAX_SIZE: u64 = 5_368_709_120;
+    pub const COPY_OBJECT_MAX_SIZE: u64 = 5_368_709_120;
 
     /// Server-side copy of an object between buckets (or within a bucket).
     ///
@@ -897,18 +1220,32 @@ impl S3Client {
         dest_key: &str,
     ) -> Result<()> {
         // Check source object size to determine if we need multipart copy.
-        // If head_object fails, fall through to single CopyObject (will fail
-        // with a more descriptive error if the object truly doesn't exist).
-        let source_size = match self
-            .inner
-            .head_object()
-            .bucket(source_bucket)
-            .key(source_key)
-            .send()
-            .await
-        {
-            Ok(resp) => Some(resp.content_length().unwrap_or(0).max(0) as u64),
-            Err(_) => None,
+        //
+        // NOTE: this calls self.inner.head_object() directly rather than the public
+        // head_object() wrapper, so it needs its own deadline -- wrapping only the wrapper
+        // leaves the copy path (the one that actually stalled in production) uncovered.
+        let head_ctx = S3OpCtx::new(source_bucket, source_key);
+        let head_deadline = s3_deadline(S3OpClass::Metadata, None, &self.timeouts);
+        let head_result = with_deadline(
+            "HeadObject",
+            &head_ctx,
+            head_deadline,
+            self.inner
+                .head_object()
+                .bucket(source_bucket)
+                .key(source_key)
+                .send(),
+        )
+        .await;
+
+        let source_size = match head_result {
+            // A timeout is NOT evidence about the object's size. Falling through to a single
+            // CopyObject on a >5 GiB object sends an illegal request, which 400s, burns the
+            // retries, and then downloads the whole object via the streaming fallback. Only a
+            // genuine not-found/permission error justifies the unknown-size path.
+            Err(timeout_err) => return Err(timeout_err),
+            Ok(Ok(resp)) => Some(resp.content_length().unwrap_or(0).max(0) as u64),
+            Ok(Err(_sdk_err)) => None,
         };
 
         if let Some(size) = source_size {
@@ -928,10 +1265,10 @@ impl S3Client {
         let full_dest_key = self.full_key(dest_key);
         let copy_source = format!("{}/{}", source_bucket, percent_encode_s3_key(source_key));
 
-        debug!(
-            source = %copy_source,
-            dest = %full_dest_key,
-            "Copying object (server-side CopyObject)"
+        self.log_s3(
+            "CopyObject",
+            &full_dest_key,
+            &format!("source={copy_source}"),
         );
 
         let req = self
@@ -944,7 +1281,18 @@ impl S3Client {
         // Apply SSE, storage class, and ACL
         let req = apply_s3_object_options!(req, self);
 
-        req.send().await.with_context(|| {
+        let mut copy_ctx = S3OpCtx::new(&self.bucket, &full_dest_key);
+        if let Some(size) = source_size {
+            copy_ctx = copy_ctx.with_size(size);
+        }
+        with_deadline(
+            "CopyObject",
+            &copy_ctx,
+            s3_deadline(S3OpClass::Copy, source_size, &self.timeouts),
+            req.send(),
+        )
+        .await?
+        .with_context(|| {
             format!(
                 "CopyObject failed: {} -> {}/{}",
                 copy_source, self.bucket, full_dest_key
@@ -986,7 +1334,25 @@ impl S3Client {
         // Apply SSE, storage class, and ACL
         let create_req = apply_s3_object_options!(create_req, self);
 
-        let create_resp = create_req.send().await.with_context(|| {
+        // Whole-object budget, computed ONCE before the create so the create, every part, and
+        // the completion all draw from the same allowance. Without it, per-request deadlines
+        // alone permit part_count * per_part_deadline in total -- for the 1238-part object that
+        // triggered this work, roughly 22 hours.
+        //
+        // None means deadlines are disabled (request_timeout = 0), i.e. no clamp anywhere.
+        let object_deadline: Option<std::time::Instant> =
+            s3_deadline(S3OpClass::Copy, Some(source_size), &self.timeouts)
+                .map(|d| std::time::Instant::now() + d);
+
+        let create_ctx = S3OpCtx::new(&self.bucket, &full_dest_key).with_size(source_size);
+        let create_resp = with_deadline(
+            "CreateMultipartUpload",
+            &create_ctx,
+            s3_deadline(S3OpClass::Metadata, None, &self.timeouts),
+            create_req.send(),
+        )
+        .await?
+        .with_context(|| {
             format!(
                 "Multipart copy: failed to create multipart upload for {}",
                 full_dest_key
@@ -1003,8 +1369,11 @@ impl S3Client {
             })?
             .to_string();
 
-        // Calculate chunk size: auto mode (0), max 10000 parts
-        let chunk_size = calculate_chunk_size(source_size, 0, 10000);
+        // Honour the configured chunk size. Hardcoding auto mode here was the direct cause of
+        // 1238 sequential UploadPartCopy round-trips for a single 6.5 GB object: auto mode
+        // divides by max_parts_count and then floors at the 5 MiB minimum. With
+        // s3.chunk_size = 512 MiB the same object needs 13 parts.
+        let chunk_size = calculate_chunk_size(source_size, self.chunk_size, self.max_parts_count);
         let part_count = source_size.div_ceil(chunk_size);
 
         info!(
@@ -1025,31 +1394,48 @@ impl S3Client {
                 source_size,
                 chunk_size,
                 part_count,
+                object_deadline,
             )
             .await;
 
-        match result {
-            Ok(completed_parts) => {
-                // Complete the multipart upload
-                let completed = CompletedMultipartUpload::builder()
-                    .set_parts(Some(completed_parts))
-                    .build();
+        // Resolve copy AND completion into one Result so a single failure path funnels both to
+        // the abort. Do NOT hoist completion back into an Ok arm with `?`: that is the shape
+        // that leaked parts.
+        let outcome: Result<()> = async {
+            let completed_parts = result?;
+            let completed = CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build();
 
+            // Completion draws from what is left of the object budget rather than getting a
+            // fresh allowance, or the total could overrun by one full completion deadline.
+            let complete_deadline = remaining_budget(object_deadline).transpose()?;
+            let complete_ctx = S3OpCtx::new(&self.bucket, &full_dest_key).with_size(source_size);
+            with_deadline(
+                "CompleteMultipartUpload",
+                &complete_ctx,
+                complete_deadline,
                 self.inner
                     .complete_multipart_upload()
                     .bucket(&self.bucket)
                     .key(&full_dest_key)
                     .upload_id(&upload_id)
                     .multipart_upload(completed)
-                    .send()
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Multipart copy: failed to complete upload for {}",
-                            full_dest_key
-                        )
-                    })?;
+                    .send(),
+            )
+            .await?
+            .with_context(|| {
+                format!(
+                    "Multipart copy: failed to complete upload for {}",
+                    full_dest_key
+                )
+            })?;
+            Ok(())
+        }
+        .await;
 
+        match outcome {
+            Ok(()) => {
                 info!(
                     dest = %full_dest_key,
                     part_count = part_count,
@@ -1058,36 +1444,60 @@ impl S3Client {
                 Ok(())
             }
             Err(e) => {
-                // Abort the multipart upload to clean up orphaned parts
                 warn!(
                     dest = %full_dest_key,
                     upload_id = %upload_id,
                     error = %e,
                     "Multipart copy failed, aborting upload"
                 );
-                if let Err(abort_err) = self
-                    .inner
-                    .abort_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(&full_dest_key)
-                    .upload_id(&upload_id)
-                    .send()
-                    .await
-                {
-                    warn!(
-                        upload_id = %upload_id,
-                        error = %abort_err,
-                        "Failed to abort multipart upload (orphaned parts may remain)"
-                    );
-                }
+                self.abort_upload_best_effort(&full_dest_key, &upload_id)
+                    .await;
                 Err(e)
             }
+        }
+    }
+
+    /// Abort a multipart upload on the cleanup path.
+    ///
+    /// Uses the fixed [`CLEANUP_TIMEOUT`] rather than `request_timeout`, because `"0s"` is a
+    /// supported value for the latter -- which would leave this able to hang forever, i.e. the
+    /// exact failure it exists to prevent. Errors are logged, never propagated: this runs on a
+    /// path that already has a real error to report.
+    async fn abort_upload_best_effort(&self, full_dest_key: &str, upload_id: &str) {
+        let ctx = S3OpCtx::new(&self.bucket, full_dest_key);
+        let attempt = with_deadline(
+            "AbortMultipartUpload",
+            &ctx,
+            Some(CLEANUP_TIMEOUT),
+            self.inner
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(full_dest_key)
+                .upload_id(upload_id)
+                .send(),
+        )
+        .await;
+
+        let failure: Option<String> = match attempt {
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => Some(format!("{e}")),
+            Err(e) => Some(format!("{e:#}")),
+        };
+        if let Some(error) = failure {
+            warn!(
+                upload_id = %upload_id,
+                error = %error,
+                "Failed to abort multipart upload (orphaned parts may remain). An \
+                 AbortIncompleteMultipartUpload lifecycle rule on the bucket is the only \
+                 complete remedy for this."
+            );
         }
     }
 
     /// Copy byte-range parts from source to destination using upload_part_copy.
     ///
     /// Returns the completed parts on success, or an error on first failure.
+    #[allow(clippy::too_many_arguments)]
     async fn copy_parts(
         &self,
         full_dest_key: &str,
@@ -1096,6 +1506,7 @@ impl S3Client {
         source_size: u64,
         chunk_size: u64,
         part_count: u64,
+        object_deadline: Option<std::time::Instant>,
     ) -> Result<Vec<CompletedPart>> {
         let mut completed_parts = Vec::with_capacity(part_count as usize);
 
@@ -1104,30 +1515,67 @@ impl S3Client {
             let end = ((part_idx + 1) * chunk_size - 1).min(source_size - 1);
             let range = format!("bytes={}-{}", start, end);
             let part_number = (part_idx + 1) as i32;
+            let range_len = end - start + 1;
 
-            debug!(
-                part_number = part_number,
-                range = %range,
-                "Copying part via upload_part_copy"
+            // Bail early once the whole-object budget is gone, naming how far we got.
+            let remaining = match remaining_budget(object_deadline) {
+                Some(Err(e)) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "after {}/{} parts of {}",
+                            part_idx, part_count, full_dest_key
+                        )
+                    })
+                }
+                Some(Ok(left)) => Some(left),
+                None => None,
+            };
+
+            // The per-part deadline must never exceed what is left of the object budget. The
+            // pre-check above only provides the early exit -- THIS clamp is what actually bounds
+            // the total, since otherwise a part starting just under the deadline would still run
+            // a further full part timeout.
+            let part_deadline = match (
+                s3_deadline(S3OpClass::Copy, Some(range_len), &self.timeouts),
+                remaining,
+            ) {
+                (Some(d), Some(left)) => Some(d.min(left)),
+                (Some(d), None) => Some(d),
+                (None, _) => None,
+            };
+
+            // HEARTBEAT HOOK: this loop is the long silent stretch (1238 iterations took 2m41s
+            // for one object, all at debug!). When the progress registry lands, report
+            // part_number, part_count, bytes_copied, elapsed, and budget_remaining from here.
+            self.log_s3(
+                "UploadPartCopy",
+                full_dest_key,
+                &format!("part={part_number}/{part_count} range={range}"),
             );
 
-            let resp = self
-                .inner
-                .upload_part_copy()
-                .bucket(&self.bucket)
-                .key(full_dest_key)
-                .upload_id(upload_id)
-                .part_number(part_number)
-                .copy_source(copy_source)
-                .copy_source_range(&range)
-                .send()
-                .await
-                .with_context(|| {
-                    format!(
-                        "Multipart copy: upload_part_copy failed for part {} (range {})",
-                        part_number, range
-                    )
-                })?;
+            let resp = with_deadline(
+                "UploadPartCopy",
+                &S3OpCtx::new(&self.bucket, full_dest_key)
+                    .with_part(part_number, &range)
+                    .with_size(range_len),
+                part_deadline,
+                self.inner
+                    .upload_part_copy()
+                    .bucket(&self.bucket)
+                    .key(full_dest_key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .copy_source(copy_source)
+                    .copy_source_range(&range)
+                    .send(),
+            )
+            .await?
+            .with_context(|| {
+                format!(
+                    "Multipart copy: upload_part_copy failed for part {} (range {})",
+                    part_number, range
+                )
+            })?;
 
             let e_tag = resp
                 .copy_part_result()
@@ -1507,16 +1955,241 @@ pub fn calculate_chunk_size(data_len: u64, config_chunk_size: u64, max_parts_cou
     };
 
     // Enforce S3 minimum part size
-    chunk.max(S3_MIN_PART_SIZE)
+    let chunk = chunk.max(S3_MIN_PART_SIZE);
+
+    // Enforce the S3 maximum part size too. This was latent while auto mode was the only path
+    // (dividing by max_parts_count never exceeds 5 GiB in practice), but becomes reachable the
+    // moment a configured s3.chunk_size is honoured -- and an over-large part is rejected by
+    // UploadPart/UploadPartCopy at request time, mid-upload.
+    if chunk > S3Client::COPY_OBJECT_MAX_SIZE {
+        warn!(
+            requested_chunk_size = chunk,
+            clamped_to = S3Client::COPY_OBJECT_MAX_SIZE,
+            "s3.chunk_size exceeds S3's 5 GiB maximum part size, clamping"
+        );
+        return S3Client::COPY_OBJECT_MAX_SIZE;
+    }
+    chunk
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::S3Config;
+    use std::time::Duration;
 
     /// The provider must construct without contacting STS -- it resolves credentials
     /// lazily, which is what makes it refresh them in long-running modes.
+    fn test_timeouts(secs: u64, bps: u64) -> S3Timeouts {
+        S3Timeouts {
+            request_timeout_secs: secs,
+            copy_min_bytes_per_second: bps,
+        }
+    }
+
+    #[test]
+    fn test_s3_deadline_metadata_ignores_bytes() {
+        let t = test_timeouts(60, 1024 * 1024);
+        let a = s3_deadline(S3OpClass::Metadata, None, &t);
+        let b = s3_deadline(S3OpClass::Metadata, Some(5 * 1024 * 1024 * 1024), &t);
+        assert_eq!(a, Some(Duration::from_secs(60)));
+        assert_eq!(a, b, "size must not affect a metadata deadline");
+    }
+
+    #[test]
+    fn test_s3_deadline_copy_adds_size_allowance() {
+        let t = test_timeouts(60, 1024 * 1024); // 1 MiB/s
+                                                // 5 MiB part -> 60s + 5s
+        assert_eq!(
+            s3_deadline(S3OpClass::Copy, Some(5 * 1024 * 1024), &t),
+            Some(Duration::from_secs(65))
+        );
+        // 5 GiB -> 60s + 5120s == 86.3 min. Spelled out because the MiB-vs-MB distinction
+        // matters: at 1 MB/s decimal this would be ~90 min instead.
+        assert_eq!(
+            s3_deadline(S3OpClass::Copy, Some(5 * 1024 * 1024 * 1024), &t),
+            Some(Duration::from_secs(60 + 5120))
+        );
+    }
+
+    #[test]
+    fn test_s3_deadline_disabled_when_request_timeout_zero() {
+        let t = test_timeouts(0, 1024 * 1024);
+        assert_eq!(s3_deadline(S3OpClass::Metadata, None, &t), None);
+        assert_eq!(s3_deadline(S3OpClass::Copy, Some(1 << 30), &t), None);
+    }
+
+    #[test]
+    fn test_s3_deadline_copy_zero_rate_is_flat() {
+        let t = test_timeouts(60, 0);
+        assert_eq!(
+            s3_deadline(S3OpClass::Copy, Some(5 * 1024 * 1024 * 1024), &t),
+            Some(Duration::from_secs(60)),
+            "copy_min_bytes_per_second = 0 means no size allowance"
+        );
+    }
+
+    /// Unknown size means a preceding HEAD failed. Falling back to the bare metadata deadline
+    /// would fail legitimate large copies, so assume the largest a single CopyObject can handle.
+    #[test]
+    fn test_s3_deadline_copy_unknown_size_assumes_legal_max() {
+        let t = test_timeouts(60, 1024 * 1024);
+        let unknown = s3_deadline(S3OpClass::Copy, None, &t).unwrap();
+        let max = s3_deadline(S3OpClass::Copy, Some(S3Client::COPY_OBJECT_MAX_SIZE), &t).unwrap();
+        assert_eq!(unknown, max);
+        assert!(unknown > Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_s3_deadline_saturates_on_absurd_size() {
+        let t = test_timeouts(60, 1);
+        // Must not panic or wrap.
+        let d = s3_deadline(S3OpClass::Copy, Some(u64::MAX), &t);
+        assert!(d.is_some());
+    }
+
+    #[test]
+    fn test_is_timeout_error_is_narrow() {
+        let ours = anyhow::anyhow!("{TIMEOUT_ERR_PREFIX}: CopyObject on b/k after 1.0s");
+        assert!(is_timeout_error(&ours));
+
+        // Must NOT match a missing-source error, nor an unrelated message that merely mentions
+        // a timeout -- the same over-broad-substring trap is_missing_source_error documents.
+        let missing = anyhow::anyhow!("NoSuchKey: The specified key does not exist");
+        assert!(!is_timeout_error(&missing));
+        let unrelated = anyhow::anyhow!("connection timed out while reading response");
+        assert!(!is_timeout_error(&unrelated));
+    }
+
+    #[test]
+    fn test_remaining_budget_states() {
+        // Disabled budget -> no clamp.
+        assert!(remaining_budget(None).is_none());
+
+        // Live budget -> Some(Ok(..)).
+        let future = std::time::Instant::now() + Duration::from_secs(30);
+        match remaining_budget(Some(future)) {
+            Some(Ok(left)) => assert!(left <= Duration::from_secs(30) && !left.is_zero()),
+            other => panic!("expected Some(Ok(..)), got {other:?}"),
+        }
+
+        // Exhausted budget -> Some(Err(..)) carrying the timeout prefix so is_timeout_error
+        // classifies it.
+        let past = std::time::Instant::now() - Duration::from_secs(1);
+        match remaining_budget(Some(past)) {
+            Some(Err(e)) => assert!(is_timeout_error(&e), "got: {e:#}"),
+            other => panic!("expected Some(Err(..)), got {:?}", other.map(|r| r.is_ok())),
+        }
+    }
+
+    /// The incident: a 6,487,078,358-byte object took 1238 sequential UploadPartCopy calls
+    /// because the copy path hardcoded auto mode. Honouring s3.chunk_size fixes it.
+    #[test]
+    fn test_calculate_chunk_size_reproduces_incident_and_fix() {
+        const INCIDENT_SIZE: u64 = 6_487_078_358;
+
+        let auto = calculate_chunk_size(INCIDENT_SIZE, 0, 10_000);
+        assert_eq!(
+            auto,
+            5 * 1024 * 1024,
+            "auto mode floors at the 5 MiB minimum"
+        );
+        assert_eq!(
+            INCIDENT_SIZE.div_ceil(auto),
+            1238,
+            "the observed part count"
+        );
+
+        let configured = calculate_chunk_size(INCIDENT_SIZE, 512 * 1024 * 1024, 10_000);
+        assert_eq!(configured, 512 * 1024 * 1024);
+        assert_eq!(
+            INCIDENT_SIZE.div_ceil(configured),
+            13,
+            "tens, not thousands"
+        );
+    }
+
+    #[test]
+    fn test_calculate_chunk_size_clamps_to_s3_maximum() {
+        // Latent while auto mode was the only path; reachable once s3.chunk_size is honoured.
+        let over = calculate_chunk_size(1 << 40, 10 * 1024 * 1024 * 1024, 10_000);
+        assert_eq!(over, S3Client::COPY_OBJECT_MAX_SIZE, "must clamp to 5 GiB");
+
+        // The lower clamp still holds.
+        let under = calculate_chunk_size(1024, 1024, 10_000);
+        assert_eq!(under, 5 * 1024 * 1024);
+    }
+
+    /// with_bucket_and_prefix is used on the restore path to reach the object-disk bucket, so a
+    /// forgotten field there yields zero deadlines exactly where copy deadlines matter most.
+    #[test]
+    fn test_with_bucket_and_prefix_carries_timeout_fields() {
+        let base = mock_s3_fields("bucket-a", "prefix-a");
+        let derived = base.with_bucket_and_prefix("bucket-b", "prefix-b");
+
+        assert_eq!(derived.bucket, "bucket-b");
+        assert_eq!(
+            derived.timeouts.request_timeout_secs,
+            base.timeouts.request_timeout_secs
+        );
+        assert_eq!(
+            derived.timeouts.copy_min_bytes_per_second,
+            base.timeouts.copy_min_bytes_per_second
+        );
+        assert_eq!(derived.chunk_size, base.chunk_size);
+        assert_eq!(derived.max_parts_count, base.max_parts_count);
+        assert_eq!(derived.log_requests, base.log_requests);
+    }
+
+    /// with_deadline must not flatten the inner output: head_object classifies the SDK's own
+    /// error type to turn a 404 into Ok(None), which an anyhow-typed wrapper would destroy.
+    #[tokio::test]
+    async fn test_with_deadline_preserves_inner_output_type() {
+        let ctx = S3OpCtx::new("b", "k");
+
+        // Inner Result::Err survives as a value, not as the wrapper's error.
+        let inner: Result<u32, &str> = Err("inner");
+        let got = with_deadline(
+            "Op",
+            &ctx,
+            Some(Duration::from_secs(5)),
+            async move { inner },
+        )
+        .await
+        .expect("wrapper must succeed");
+        assert_eq!(got, Err("inner"));
+
+        // No deadline configured -> passthrough.
+        let got = with_deadline("Op", &ctx, None, async { 7u32 })
+            .await
+            .unwrap();
+        assert_eq!(got, 7);
+    }
+
+    #[tokio::test]
+    async fn test_with_deadline_expires_and_is_classified() {
+        let ctx = S3OpCtx::new("bucket", "key");
+        let err = with_deadline(
+            "UploadPartCopy",
+            &ctx,
+            Some(Duration::from_millis(10)),
+            async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                1u32
+            },
+        )
+        .await
+        .expect_err("should time out");
+
+        assert!(is_timeout_error(&err), "got: {err:#}");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bucket/key"), "should name the object: {msg}");
+        assert!(
+            msg.contains("s3.request_timeout"),
+            "should name the knob: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn test_assume_role_provider_constructs_without_network() {
         let provider = assume_role_provider(
@@ -2019,6 +2692,13 @@ mod tests {
             sse: String::new(),
             sse_kms_key_id: String::new(),
             acl: String::new(),
+            timeouts: S3Timeouts {
+                request_timeout_secs: 60,
+                copy_min_bytes_per_second: 1024 * 1024,
+            },
+            chunk_size: 0,
+            max_parts_count: 10_000,
+            log_requests: false,
         }
     }
 }

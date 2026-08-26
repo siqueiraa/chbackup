@@ -125,6 +125,73 @@ Constructed from `crate::config::effective_retries()`. Shared across `put_object
 - `delete_objects` batches in groups of 1000 (S3 API limit)
 - `head_object` returns `None` for 404 (object not found)
 
+### Request deadlines
+
+`with_deadline(op, ctx, deadline, fut)` wraps a single `.send()` future. `s3_deadline(class,
+bytes, timeouts)` computes the deadline, or `None` when `s3.request_timeout` is `"0s"`.
+
+**Enumerate by raw `.send()` call site, never by public method name.** There are 20; **15 are
+deadlined and 5 deliberately are not**, and that count is the completeness check when adding a
+new S3 call. `copy_object` calls `self.inner.head_object()` *directly* rather than the public
+`head_object` wrapper, which is why a wrapper-level approach would miss the object-disk copy
+path entirely.
+
+The five exclusions — `put_object`, the three `get_object` variants, `upload_part` — are all
+body-carrying. Do **not** add deadlines there: the response's first byte only arrives after the
+whole body is sent, so any value tight enough to catch a hung `UploadPartCopy` would kill a
+legitimately slow multi-GiB transfer. They are bounded by `stalled_stream_grace_period`, which
+measures throughput instead.
+
+`with_deadline` is generic over the future's **output type**, not over `anyhow::Result`. This is
+load-bearing: `head_object` calls `into_service_error().is_not_found()` to turn a 404 into
+`Ok(None)`. Flattening to `anyhow` would not compile, and forcing it through would silently
+convert "object absent" into "head failed".
+
+**Cleanup uses `CLEANUP_TIMEOUT` (fixed, 30s), never `request_timeout`.** `"0s"` is a supported
+value for the latter, which would leave an abort able to hang forever — the exact failure the
+deadlines exist to prevent.
+
+`copy_object_multipart` carries a **whole-object budget**, computed once before the create and
+clamped into every part deadline with `.min(remaining)`. The pre-request `Instant::now()` check
+alone bounds nothing: a part starting just under the deadline still runs a further full part
+timeout, so 1238 parts at 65s each is ~22 hours.
+
+Its copy and completion resolve into **one** `Result` that a single failure path funnels through
+`abort_upload_best_effort`. Do not hoist completion back into an `Ok` arm with `?` — that was
+the original shape, and it leaked every copied part on a completion failure because the abort
+lived only in the `Err` arm.
+
+### SDK retries vs project retries — they multiply
+
+Two different `RetryConfig` types are in play, so the SDK's is imported as `SdkRetryConfig`.
+
+- **SDK-level** (`s3.sdk_max_attempts`, default 2): retries one HTTP request inside the SDK.
+- **Project-level** (`RetryConfig` in this module): retries a whole logical operation.
+
+They compose multiplicatively. `retry_with_backoff` wraps a single request, so at
+`retries_on_failure = 5` that is 6 x 2 = **12** HTTP attempts (it was 18 before
+`sdk_max_attempts` was set explicitly, since the SDK default is 3).
+`copy_object_with_retry_jitter` is different: its 3 outer attempts each cover a *composite*
+operation — a head, a create, N part copies, a complete — and every one of those requests
+carries its own SDK attempts.
+
+### Constructors are bare struct literals
+
+`S3Client` is built in three places, none of which use a builder: `new()`, and the literals in
+`with_bucket_and_prefix()` and `mock_s3_fields()`. **Every new field must be added to all
+three.** `with_bucket_and_prefix` is the dangerous one — it is used on the restore path to reach
+the object-disk bucket, so a forgotten field there yields default or zero settings exactly where
+copy deadlines matter most. There is a test asserting the timeout fields are carried.
+
+### `s3.debug` is two mechanisms, not one
+
+1. Raising the `aws_*` tracing targets, done in `logging::init_logging`. This is the only thing
+   that produces real SDK request/response logs, and it may print credentials.
+2. `log_requests` on this struct, consumed by `log_s3()`, which promotes chbackup's *own*
+   per-request events from `debug!` to `info!`.
+
+Do not describe (2) as producing SDK logs.
+
 ## Parent Rules
 
 All rules from [/CLAUDE.md](../../CLAUDE.md) apply:

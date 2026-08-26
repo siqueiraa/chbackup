@@ -330,6 +330,8 @@ pub async fn download(
     let data_path = &config.clickhouse.data_path;
     let backup_dir = Path::new(data_path).join("backup").join(backup_name);
 
+    let start_time = std::time::Instant::now();
+
     info!(
         backup_name = %backup_name,
         backup_dir = %backup_dir.display(),
@@ -1131,11 +1133,14 @@ pub async fn download(
         delete_state_file(&state_path);
     }
 
+    let elapsed = start_time.elapsed();
     info!(
         backup_name = %backup_name,
         parts = total_parts,
         compressed_bytes = total_compressed_bytes,
         backup_dir = %backup_dir.display(),
+        elapsed_secs = elapsed.as_secs_f64(),
+        rate_bytes_per_sec = crate::progress::rate_per_sec(total_compressed_bytes, elapsed),
         "Download complete"
     );
 

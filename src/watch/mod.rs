@@ -632,14 +632,32 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
         .await;
         upload_shutdown_guard.abort();
 
-        if let Err(e) = upload_result {
+        if let Err(e) = &upload_result {
             warn!(error = %e, backup_name = %backup_name, "watch: upload failed");
             if let Some(exit) = handle_error(&mut ctx, retry_interval).await {
                 return exit;
             }
             continue;
         }
-        info!(backup_name = %backup_name, "watch: upload complete");
+
+        // Record the stats instead of dropping them. Watch is the long-running production path,
+        // so discarding UploadStats here is why parts_uploaded_total / parts_skipped_incremental
+        // read zero forever in a watch deployment -- they were only ever bumped by API-triggered
+        // uploads.
+        let stats = upload_result.expect("checked Err above");
+        if let Some(m) = &ctx.metrics {
+            m.parts_uploaded_total.inc_by(stats.uploaded_count);
+            m.parts_skipped_incremental_total
+                .inc_by(stats.carried_count);
+        }
+        info!(
+            backup_name = %backup_name,
+            parts = stats.uploaded_count,
+            carried = stats.carried_count,
+            bytes = stats.uploaded_bytes,
+            elapsed_secs = stats.elapsed_secs,
+            "watch: upload complete"
+        );
 
         // Invalidate manifest cache after successful upload adds a new backup
         if let Some(cache) = &ctx.manifest_cache {

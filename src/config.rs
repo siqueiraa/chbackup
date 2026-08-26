@@ -1,7 +1,41 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::path::Path;
 use tracing::{debug, warn};
+
+thread_local! {
+    /// Sink for warnings raised while parsing config, active only inside
+    /// [`Config::load_with_warnings`].
+    ///
+    /// Config has to be read *before* logging can be configured (the format and level live in
+    /// it), so a `warn!` emitted during `apply_env_overlay` reaches no subscriber and is
+    /// silently dropped -- which is how a mistyped env var became invisible. When the sink is
+    /// armed the message is buffered for the caller to replay once logging is up; when it is
+    /// not (the reload/restart paths, where a subscriber already exists) the message goes
+    /// straight to `warn!` as before.
+    static CONFIG_WARNINGS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// `warn!` that survives being called before the tracing subscriber exists.
+///
+/// Takes the same format-string arguments as `warn!`; structured fields are not supported
+/// because the message has to be renderable to a `String` for buffering.
+macro_rules! cfg_warn {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        let buffered = CONFIG_WARNINGS.with(|sink| match sink.borrow_mut().as_mut() {
+            Some(buf) => {
+                buf.push(msg.clone());
+                true
+            }
+            None => false,
+        });
+        if !buffered {
+            warn!("{}", msg);
+        }
+    }};
+}
 
 /// Top-level configuration for chbackup.
 /// Matches §12 of the design doc with ~106 params across 7 sections.
@@ -363,6 +397,44 @@ pub struct S3Config {
     /// verbose S3 SDK request/response logging
     #[serde(default)]
     pub debug: bool,
+
+    /// Deadline for a single S3 request, as a duration string ("60s", "5m").
+    ///
+    /// Applied to the **bodyless** operations only -- head, list, delete, copy, and the
+    /// multipart lifecycle calls. Body-carrying operations (put_object, get_object,
+    /// upload_part) are deliberately excluded: the SDK bounds those by throughput via
+    /// stalled-stream protection, and a wall-clock deadline tight enough to catch a hung
+    /// UploadPartCopy would kill a legitimately slow multi-GiB transfer.
+    ///
+    /// "0s" disables every S3 deadline, restoring the pre-existing behaviour exactly.
+    #[serde(default = "default_s3_request_timeout")]
+    pub request_timeout: String,
+
+    /// Assumed floor throughput for server-side copies, in bytes/second.
+    ///
+    /// A copy's deadline is `request_timeout + bytes / copy_min_bytes_per_second`, because a
+    /// server-side UploadPartCopy of a multi-GiB range legitimately takes minutes. This is a
+    /// floor for hang detection, not a performance expectation. 0 means no size allowance.
+    #[serde(default = "default_s3_copy_min_bps")]
+    pub copy_min_bytes_per_second: u64,
+
+    /// Stalled-stream protection grace period, as a duration string.
+    ///
+    /// Defaults to "5s", which is the value the AWS SDK's runtime defaults already apply. Note
+    /// the SDK *builder* constant is 20s while the runtime plugin overrides it to 5s, so this
+    /// must always be passed explicitly -- omitting it would silently loosen protection.
+    /// "0s" disables it.
+    #[serde(default = "default_s3_stalled_stream_grace")]
+    pub stalled_stream_grace_period: String,
+
+    /// SDK-internal retry attempts per request (1 = no retries).
+    ///
+    /// Multiplies with chbackup's own retry wrappers: `retries_on_failure = 5` means 6 outer
+    /// attempts, each of which the SDK may retry this many times. The SDK default is 3, which
+    /// made the effective total 18; 2 keeps SDK-level retries (they are cheaper than restarting
+    /// a whole multipart copy) while making the product smaller and explicit.
+    #[serde(default = "default_s3_sdk_max_attempts")]
+    pub sdk_max_attempts: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +713,10 @@ impl Default for S3Config {
             object_disk_path: String::new(),
             allow_object_disk_streaming: false,
             debug: false,
+            request_timeout: default_s3_request_timeout(),
+            copy_min_bytes_per_second: default_s3_copy_min_bps(),
+            stalled_stream_grace_period: default_s3_stalled_stream_grace(),
+            sdk_max_attempts: default_s3_sdk_max_attempts(),
         }
     }
 }
@@ -855,6 +931,23 @@ fn default_storage_class() -> String {
     "STANDARD".to_string()
 }
 
+fn default_s3_request_timeout() -> String {
+    "60s".to_string()
+}
+
+fn default_s3_copy_min_bps() -> u64 {
+    1024 * 1024 // 1 MiB/s
+}
+
+fn default_s3_stalled_stream_grace() -> String {
+    // Matches the AWS SDK runtime default; see the field doc for why it is set explicitly.
+    "5s".to_string()
+}
+
+fn default_s3_sdk_max_attempts() -> u32 {
+    2
+}
+
 fn default_max_parts_count() -> u32 {
     10000
 }
@@ -912,6 +1005,29 @@ impl Config {
     /// returns default config. After loading, applies environment variable overlay
     /// and CLI --env overrides.
     pub fn load(path: &Path, cli_env_overrides: &[String]) -> Result<Self> {
+        Self::load_inner(path, cli_env_overrides)
+    }
+
+    /// Load config and return any warnings raised while parsing, instead of logging them.
+    ///
+    /// Config has to be read before `init_logging` can run -- the format and level live in it --
+    /// so warnings emitted during `apply_env_overlay` reach no subscriber and vanish. Callers
+    /// that own logging setup (i.e. `main`) use this and replay the warnings once the subscriber
+    /// is installed. Callers where logging is already up (reload, restart) use `load`, and their
+    /// warnings go straight to `warn!` as before.
+    pub fn load_with_warnings(
+        path: &Path,
+        cli_env_overrides: &[String],
+    ) -> Result<(Self, Vec<String>)> {
+        // Arm the sink for the duration of this call, and disarm it on every exit path
+        // (including the `?` returns below) so a later `load` is not silently buffered.
+        CONFIG_WARNINGS.with(|sink| *sink.borrow_mut() = Some(Vec::new()));
+        let result = Self::load_inner(path, cli_env_overrides);
+        let warnings = CONFIG_WARNINGS.with(|sink| sink.borrow_mut().take().unwrap_or_default());
+        result.map(|config| (config, warnings))
+    }
+
+    fn load_inner(path: &Path, cli_env_overrides: &[String]) -> Result<Self> {
         let mut config = if path.exists() {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -970,7 +1086,7 @@ impl Config {
             if let Ok(n) = v.parse::<i32>() {
                 self.general.backups_to_keep_local = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_BACKUPS_TO_KEEP_LOCAL='{}' is not a valid i32, ignoring",
                     v
                 );
@@ -982,7 +1098,7 @@ impl Config {
             if let Ok(n) = v.parse::<i32>() {
                 self.general.backups_to_keep_remote = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_BACKUPS_TO_KEEP_REMOTE='{}' is not a valid i32, ignoring",
                     v
                 );
@@ -992,7 +1108,7 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.upload_concurrency = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_UPLOAD_CONCURRENCY='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1002,7 +1118,7 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.download_concurrency = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_DOWNLOAD_CONCURRENCY='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1012,7 +1128,7 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.retries_on_failure = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_RETRIES_ON_FAILURE='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1025,7 +1141,7 @@ impl Config {
             if let Ok(n) = v.parse::<u64>() {
                 self.general.remote_cache_ttl_secs = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_REMOTE_CACHE_TTL_SECS='{}' is not a valid u64, ignoring",
                     v
                 );
@@ -1037,7 +1153,7 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.general.object_disk_server_side_copy_concurrency = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1047,7 +1163,7 @@ impl Config {
             if let Ok(n) = v.parse::<u64>() {
                 self.general.clean_broken_min_age_secs = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS='{}' is not a valid u64, ignoring",
                     v
                 );
@@ -1061,7 +1177,7 @@ impl Config {
         if let Ok(v) = std::env::var("CLICKHOUSE_PORT") {
             if let Ok(port) = v.parse::<u16>() {
                 if port == 9000 {
-                    warn!(
+                    cfg_warn!(
                         "CLICKHOUSE_PORT=9000 detected — Go clickhouse-backup uses native TCP \
                          but chbackup uses HTTP. Remapping to 8123. \
                          Set CLICKHOUSE_PORT=8123 to suppress."
@@ -1071,7 +1187,7 @@ impl Config {
                     self.clickhouse.port = port;
                 }
             } else {
-                warn!("CLICKHOUSE_PORT='{}' is not a valid u16, ignoring", v);
+                cfg_warn!("CLICKHOUSE_PORT='{}' is not a valid u16, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_USERNAME") {
@@ -1087,14 +1203,14 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.secure = b;
             } else {
-                warn!("CLICKHOUSE_SECURE='{}' is not a valid bool, ignoring", v);
+                cfg_warn!("CLICKHOUSE_SECURE='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_SKIP_VERIFY") {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.skip_verify = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "CLICKHOUSE_SKIP_VERIFY='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1113,7 +1229,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.sync_replicated_tables = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "CLICKHOUSE_SYNC_REPLICATED_TABLES='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1123,7 +1239,7 @@ impl Config {
             if let Ok(n) = v.parse::<u64>() {
                 self.clickhouse.check_replicas_before_attach_timeout = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CLICKHOUSE_CHECK_REPLICAS_BEFORE_ATTACH_TIMEOUT='{}' is not a valid u64, ignoring",
                     v
                 );
@@ -1133,7 +1249,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.strict_replica_sync = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "CLICKHOUSE_STRICT_REPLICA_SYNC='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1143,7 +1259,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.attach_table_require_complete = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "CLICKHOUSE_ATTACH_TABLE_REQUIRE_COMPLETE='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1153,7 +1269,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.zk_check_strict = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "CLICKHOUSE_ZK_CHECK_STRICT='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1163,7 +1279,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.replace_uuid_macro = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "CLICKHOUSE_REPLACE_UUID_MACRO='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1173,7 +1289,7 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.clickhouse.max_connections = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CLICKHOUSE_MAX_CONNECTIONS='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1189,7 +1305,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.debug = b;
             } else {
-                warn!("CLICKHOUSE_DEBUG='{}' is not a valid bool, ignoring", v);
+                cfg_warn!("CLICKHOUSE_DEBUG='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("CLICKHOUSE_SKIP_TABLE_ENGINES") {
@@ -1224,7 +1340,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.clickhouse.freeze_by_part = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "CLICKHOUSE_FREEZE_BY_PART='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1260,7 +1376,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.s3.force_path_style = b;
             } else {
-                warn!("S3_FORCE_PATH_STYLE='{}' is not a valid bool, ignoring", v);
+                cfg_warn!("S3_FORCE_PATH_STYLE='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("S3_ACL") {
@@ -1279,14 +1395,14 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.s3.disable_ssl = b;
             } else {
-                warn!("S3_DISABLE_SSL='{}' is not a valid bool, ignoring", v);
+                cfg_warn!("S3_DISABLE_SSL='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("S3_DISABLE_CERT_VERIFICATION") {
             if let Ok(b) = v.parse::<bool>() {
                 self.s3.disable_cert_verification = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "S3_DISABLE_CERT_VERIFICATION='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1296,17 +1412,64 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.s3.concurrency = n;
             } else {
-                warn!("S3_CONCURRENCY='{}' is not a valid u32, ignoring", v);
+                cfg_warn!("S3_CONCURRENCY='{}' is not a valid u32, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("S3_OBJECT_DISK_PATH") {
             self.s3.object_disk_path = v;
         }
+        // S3_CHUNK_SIZE / S3_MAX_PARTS_COUNT / S3_DEBUG had dot-keys in set_field but were
+        // never read from the environment. The first two become load-bearing once chunk_size is
+        // honoured on the copy paths, and S3_DEBUG is needed for the s3.debug wiring.
+        if let Ok(v) = std::env::var("S3_CHUNK_SIZE") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.s3.chunk_size = n;
+            } else {
+                cfg_warn!("S3_CHUNK_SIZE='{}' is not a valid u64, ignoring", v);
+            }
+        }
+        if let Ok(v) = std::env::var("S3_MAX_PARTS_COUNT") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.s3.max_parts_count = n;
+            } else {
+                cfg_warn!("S3_MAX_PARTS_COUNT='{}' is not a valid u32, ignoring", v);
+            }
+        }
+        if let Ok(v) = std::env::var("S3_DEBUG") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.s3.debug = b;
+            } else {
+                cfg_warn!("S3_DEBUG='{}' is not a valid bool, ignoring", v);
+            }
+        }
+        if let Ok(v) = std::env::var("S3_REQUEST_TIMEOUT") {
+            self.s3.request_timeout = v;
+        }
+        if let Ok(v) = std::env::var("S3_COPY_MIN_BYTES_PER_SECOND") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.s3.copy_min_bytes_per_second = n;
+            } else {
+                cfg_warn!(
+                    "S3_COPY_MIN_BYTES_PER_SECOND='{}' is not a valid u64, ignoring",
+                    v
+                );
+            }
+        }
+        if let Ok(v) = std::env::var("S3_STALLED_STREAM_GRACE_PERIOD") {
+            self.s3.stalled_stream_grace_period = v;
+        }
+        if let Ok(v) = std::env::var("S3_SDK_MAX_ATTEMPTS") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.s3.sdk_max_attempts = n;
+            } else {
+                cfg_warn!("S3_SDK_MAX_ATTEMPTS='{}' is not a valid u32, ignoring", v);
+            }
+        }
         if let Ok(v) = std::env::var("S3_ALLOW_OBJECT_DISK_STREAMING") {
             if let Ok(b) = v.parse::<bool>() {
                 self.s3.allow_object_disk_streaming = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "S3_ALLOW_OBJECT_DISK_STREAMING='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1323,7 +1486,7 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.upload_concurrency = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_BACKUP_UPLOAD_CONCURRENCY='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1335,7 +1498,7 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.download_concurrency = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_BACKUP_DOWNLOAD_CONCURRENCY='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1350,7 +1513,7 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.object_disk_copy_concurrency = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_BACKUP_OBJECT_DISK_COPY_CONCURRENCY='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1360,7 +1523,7 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() {
                 self.backup.retries_on_failure = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_BACKUP_RETRIES_ON_FAILURE='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1383,7 +1546,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.backup.strict_projection_gate = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_BACKUP_STRICT_PROJECTION_GATE='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1393,7 +1556,7 @@ impl Config {
             if let Ok(n) = v.parse::<u64>() {
                 self.backup.streaming_upload_threshold = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "CHBACKUP_BACKUP_STREAMING_UPLOAD_THRESHOLD='{}' is not a valid u64, ignoring",
                     v
                 );
@@ -1403,14 +1566,14 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.backup.allow_empty_backups = b;
             } else {
-                warn!("ALLOW_EMPTY_BACKUPS='{}' is not a valid bool, ignoring", v);
+                cfg_warn!("ALLOW_EMPTY_BACKUPS='{}' is not a valid bool, ignoring", v);
             }
         }
 
         // Go compat: silently accept REMOTE_STORAGE=s3 or empty; warn on anything else
         if let Ok(v) = std::env::var("REMOTE_STORAGE") {
             if !v.is_empty() && v != "s3" {
-                warn!(
+                cfg_warn!(
                     "chbackup only supports S3 storage; REMOTE_STORAGE='{}' ignored",
                     v
                 );
@@ -1425,7 +1588,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.api.secure = b;
             } else {
-                warn!("API_SECURE='{}' is not a valid bool, ignoring", v);
+                cfg_warn!("API_SECURE='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("API_USERNAME") {
@@ -1438,7 +1601,7 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.api.create_integration_tables = b;
             } else {
-                warn!(
+                cfg_warn!(
                     "API_CREATE_INTEGRATION_TABLES='{}' is not a valid bool, ignoring",
                     v
                 );
@@ -1456,14 +1619,14 @@ impl Config {
             if let Ok(b) = v.parse::<bool>() {
                 self.watch.enabled = b;
             } else {
-                warn!("WATCH_ENABLED='{}' is not a valid bool, ignoring", v);
+                cfg_warn!("WATCH_ENABLED='{}' is not a valid bool, ignoring", v);
             }
         }
         if let Ok(v) = std::env::var("WATCH_MAX_CONSECUTIVE_ERRORS") {
             if let Ok(n) = v.parse::<u32>() {
                 self.watch.max_consecutive_errors = n;
             } else {
-                warn!(
+                cfg_warn!(
                     "WATCH_MAX_CONSECUTIVE_ERRORS='{}' is not a valid u32, ignoring",
                     v
                 );
@@ -1712,6 +1875,16 @@ impl Config {
                 self.s3.allow_object_disk_streaming = value.parse().context("Invalid bool")?
             }
             "s3.debug" => self.s3.debug = value.parse().context("Invalid bool")?,
+            "s3.request_timeout" => self.s3.request_timeout = value.to_string(),
+            "s3.copy_min_bytes_per_second" => {
+                self.s3.copy_min_bytes_per_second = value.parse().context("Invalid u64")?
+            }
+            "s3.stalled_stream_grace_period" => {
+                self.s3.stalled_stream_grace_period = value.to_string()
+            }
+            "s3.sdk_max_attempts" => {
+                self.s3.sdk_max_attempts = value.parse().context("Invalid u32")?
+            }
 
             // Backup
             "backup.tables" => self.backup.tables = value.to_string(),
@@ -1841,6 +2014,48 @@ impl Config {
         }
         if self.s3.max_parts_count == 0 {
             return Err(anyhow::anyhow!("s3.max_parts_count must be > 0"));
+        }
+        // S3's hard per-upload cap. Previously unreachable because auto-sizing never exceeded
+        // it, but honouring s3.chunk_size on the copy paths makes an over-large value produce an
+        // upload that fails at part 10001 instead of at startup.
+        if self.s3.max_parts_count > 10_000 {
+            return Err(anyhow::anyhow!(
+                "s3.max_parts_count must be <= 10000 (S3's per-upload part limit), got {}",
+                self.s3.max_parts_count
+            ));
+        }
+        // Deadlines: 0 is the documented "disabled" value; anything else must parse and be
+        // sane. The upper bound is a day, which is far past any legitimate single request.
+        let request_timeout_secs = parse_duration_secs(&self.s3.request_timeout).with_context(|| {
+            format!(
+                "s3.request_timeout '{}' is not a valid duration (e.g. \"60s\", \"5m\", \"0s\" to disable)",
+                self.s3.request_timeout
+            )
+        })?;
+        if request_timeout_secs != 0 && !(1..=86_400).contains(&request_timeout_secs) {
+            return Err(anyhow::anyhow!(
+                "s3.request_timeout must be between 1s and 24h, or 0s to disable (got {}s)",
+                request_timeout_secs
+            ));
+        }
+        let grace_secs =
+            parse_duration_secs(&self.s3.stalled_stream_grace_period).with_context(|| {
+                format!(
+                    "s3.stalled_stream_grace_period '{}' is not a valid duration",
+                    self.s3.stalled_stream_grace_period
+                )
+            })?;
+        if grace_secs != 0 && !(1..=3_600).contains(&grace_secs) {
+            return Err(anyhow::anyhow!(
+                "s3.stalled_stream_grace_period must be between 1s and 1h, or 0s to disable (got {}s)",
+                grace_secs
+            ));
+        }
+        if !(1..=10).contains(&self.s3.sdk_max_attempts) {
+            return Err(anyhow::anyhow!(
+                "s3.sdk_max_attempts must be between 1 and 10 (1 = no SDK retries), got {}",
+                self.s3.sdk_max_attempts
+            ));
         }
 
         // Sanity floor on the deferred-freeze TTL. This is validation, NOT a safety bound: the
@@ -2022,6 +2237,14 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "S3_CONCURRENCY" => Some("s3.concurrency"),
         "S3_OBJECT_DISK_PATH" => Some("s3.object_disk_path"),
         "S3_ALLOW_OBJECT_DISK_STREAMING" => Some("s3.allow_object_disk_streaming"),
+        // These three had dot-keys in set_field but were never read from the environment.
+        "S3_CHUNK_SIZE" => Some("s3.chunk_size"),
+        "S3_MAX_PARTS_COUNT" => Some("s3.max_parts_count"),
+        "S3_DEBUG" => Some("s3.debug"),
+        "S3_REQUEST_TIMEOUT" => Some("s3.request_timeout"),
+        "S3_COPY_MIN_BYTES_PER_SECOND" => Some("s3.copy_min_bytes_per_second"),
+        "S3_STALLED_STREAM_GRACE_PERIOD" => Some("s3.stalled_stream_grace_period"),
+        "S3_SDK_MAX_ATTEMPTS" => Some("s3.sdk_max_attempts"),
 
         // Backup
         "CHBACKUP_BACKUP_COMPRESSION" => Some("backup.compression"),
@@ -2880,6 +3103,140 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("s3.max_parts_count must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_s3_max_parts_count_above_s3_limit() {
+        // Previously unreachable, but honouring s3.chunk_size on the copy paths makes an
+        // over-large value produce an upload that dies at part 10001 rather than at startup.
+        let mut config = Config::default();
+        config.s3.max_parts_count = 10_001;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("must be <= 10000"), "got: {err}");
+
+        config.s3.max_parts_count = 10_000;
+        assert!(config.validate().is_ok(), "10000 is the legal maximum");
+    }
+
+    #[test]
+    fn test_validate_s3_request_timeout() {
+        let mut config = Config::default();
+
+        // "0s" is the documented way to disable every S3 deadline.
+        config.s3.request_timeout = "0s".to_string();
+        assert!(
+            config.validate().is_ok(),
+            "0s must be accepted (disables deadlines)"
+        );
+
+        config.s3.request_timeout = "nonsense".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("s3.request_timeout"), "got: {err}");
+
+        config.s3.request_timeout = "48h".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("between 1s and 24h"), "got: {err}");
+
+        // 2s must be legal: the black-hole timeout test configures it deliberately below the
+        // SDK's 3.1s connect timeout so a pass proves our deadline fired, not the SDK's.
+        config.s3.request_timeout = "2s".to_string();
+        assert!(config.validate().is_ok(), "2s must be accepted");
+    }
+
+    #[test]
+    fn test_validate_s3_stalled_stream_grace_period() {
+        let mut config = Config::default();
+
+        config.s3.stalled_stream_grace_period = "0s".to_string();
+        assert!(
+            config.validate().is_ok(),
+            "0s disables stalled-stream protection"
+        );
+
+        config.s3.stalled_stream_grace_period = "banana".to_string();
+        assert!(config.validate().is_err());
+
+        config.s3.stalled_stream_grace_period = "2h".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("between 1s and 1h"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_s3_sdk_max_attempts() {
+        let mut config = Config::default();
+
+        config.s3.sdk_max_attempts = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("s3.sdk_max_attempts"), "got: {err}");
+
+        config.s3.sdk_max_attempts = 11;
+        assert!(config.validate().is_err());
+
+        // 1 means "no SDK retries", which is a legitimate choice.
+        config.s3.sdk_max_attempts = 1;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_s3_timeout_defaults() {
+        let c = Config::default();
+        assert_eq!(c.s3.request_timeout, "60s");
+        assert_eq!(c.s3.copy_min_bytes_per_second, 1024 * 1024);
+        // Must match the AWS SDK runtime default; the builder constant is 20s, so passing this
+        // explicitly is what stops protection being silently loosened.
+        assert_eq!(c.s3.stalled_stream_grace_period, "5s");
+        assert_eq!(c.s3.sdk_max_attempts, 2);
+        assert!(c.validate().is_ok(), "defaults must validate");
+    }
+
+    #[test]
+    fn test_s3_new_keys_round_trip_through_set_field() {
+        let mut config = Config::default();
+        for (key, value) in [
+            ("s3.request_timeout", "90s"),
+            ("s3.copy_min_bytes_per_second", "2097152"),
+            ("s3.stalled_stream_grace_period", "10s"),
+            ("s3.sdk_max_attempts", "3"),
+            ("s3.chunk_size", "536870912"),
+            ("s3.debug", "true"),
+        ] {
+            config
+                .set_field(key, value)
+                .unwrap_or_else(|e| panic!("{key}: {e}"));
+        }
+        assert_eq!(config.s3.request_timeout, "90s");
+        assert_eq!(config.s3.copy_min_bytes_per_second, 2_097_152);
+        assert_eq!(config.s3.stalled_stream_grace_period, "10s");
+        assert_eq!(config.s3.sdk_max_attempts, 3);
+        assert_eq!(config.s3.chunk_size, 536_870_912);
+        assert!(config.s3.debug);
+    }
+
+    /// These three had dot-keys in `set_field` but no environment mapping, so the documented
+    /// env-var override silently did nothing.
+    #[test]
+    fn test_previously_missing_s3_env_mappings() {
+        for (env, dotted) in [
+            ("S3_CHUNK_SIZE", "s3.chunk_size"),
+            ("S3_MAX_PARTS_COUNT", "s3.max_parts_count"),
+            ("S3_DEBUG", "s3.debug"),
+            ("S3_REQUEST_TIMEOUT", "s3.request_timeout"),
+            (
+                "S3_COPY_MIN_BYTES_PER_SECOND",
+                "s3.copy_min_bytes_per_second",
+            ),
+            (
+                "S3_STALLED_STREAM_GRACE_PERIOD",
+                "s3.stalled_stream_grace_period",
+            ),
+            ("S3_SDK_MAX_ATTEMPTS", "s3.sdk_max_attempts"),
+        ] {
+            assert_eq!(
+                env_key_to_dot_notation(env),
+                Some(dotted),
+                "{env} should map to {dotted}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
