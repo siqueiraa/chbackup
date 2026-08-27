@@ -84,8 +84,48 @@ Example response (idle):
 Example response (operation running):
 
 ```json
-{"status": "running", "command": "upload my-backup", "start": "2024-01-15T12:05:00Z"}
+{
+  "status": "running",
+  "command": "upload my-backup",
+  "start": "2024-01-15T12:05:00Z",
+  "id": 7,
+  "progress": {
+    "op": "upload",
+    "phase": "copy_objects",
+    "unit": "objects",
+    "done": 412,
+    "total": 1238,
+    "percent": 33.3,
+    "bytes_done": 2147483648,
+    "rate_bytes_per_sec": 8388608.0,
+    "elapsed_secs": 256.0,
+    "eta_secs": 512.0,
+    "stalled_secs": 0.4,
+    "inflight": 8,
+    "slowest_item": "part-6-9-1",
+    "slowest_item_secs": 12.1
+  },
+  "operations": [
+    {"id": 7, "command": "upload my-backup", "backup_name": "my-backup", "phases": []}
+  ]
+}
 ```
+
+The `id`, `progress` and `operations` fields are **additive**. `status`, `command` and
+`start` keep their names, types and null behaviour, and an idle response still serializes
+as exactly `{"status": "idle", "command": null, "start": null}` -- the added fields are
+omitted rather than set to null, so existing consumers are unaffected.
+
+- `id` correlates this operation with `/api/v1/actions` and `DELETE /api/v1/kill?id=N`.
+- `progress` is the most recently started live phase of the reported operation.
+- `operations` lists **every** running operation. With `api.allow_parallel` enabled the
+  top-level fields describe only one of them; the others were previously invisible.
+
+`stalled_secs` is the field to watch: it is seconds since that phase last advanced, so a
+wedged operation shows a frozen `done` and a climbing `stalled_secs`.
+
+Which operation the top-level fields describe is the one with the **lowest id**. This was
+previously arbitrary HashMap order and could differ between two calls with no state change.
 
 ## Backup operations
 
@@ -375,6 +415,50 @@ curl http://localhost:7171/metrics
 ```
 
 See the [Kubernetes guide](kubernetes.md#prometheus-monitoring) for scraping configuration.
+
+#### Phase progress gauges
+
+Labelled `operation`, `phase`, `backup_name`:
+
+| Metric | Meaning |
+|--------|---------|
+| `chbackup_phase_items_total` | Items the phase intends to process |
+| `chbackup_phase_items_done` | Items completed so far |
+| `chbackup_phase_bytes_total` | Bytes the phase intends to transfer |
+| `chbackup_phase_bytes_done` | Bytes transferred so far |
+| `chbackup_phase_elapsed_seconds` | Seconds since the phase started |
+| `chbackup_phase_stalled_seconds` | **Seconds since the phase last advanced** |
+
+Plus the unlabelled `chbackup_operations_in_progress`, a count of running operations.
+
+`chbackup_in_progress` is deliberately left as 0/1 for compatibility with
+Altinity-derived dashboards; use `chbackup_operations_in_progress` for a count.
+
+**These series exist only while a phase is live.** Every family is cleared and
+repopulated at scrape time, so a finished phase disappears rather than leaving its last
+values behind forever. Cardinality is therefore bounded by (concurrent operations x
+phases), not by the number of backups ever taken -- but it also means you cannot use these
+gauges for history. Alert on them; graph the counters.
+
+The stall alert needs no `rate()` window:
+
+```yaml
+- alert: ChbackupPhaseStalled
+  expr: chbackup_phase_stalled_seconds > 600
+  annotations:
+    summary: >-
+      chbackup {{ $labels.operation }}/{{ $labels.phase }} on
+      {{ $labels.backup_name }} has not advanced for 10 minutes
+```
+
+This is the alert that would have caught the 25-minute silent object-disk copy that
+motivated the phase instrumentation.
+
+`chbackup_phase_stalled_seconds` is deliberately **0 once a phase reaches its total**, even
+if the phase has not closed yet. Some phases legitimately stay open after finishing their
+work -- restore closes `attach_parts` and `restore_s3_objects` together, so the object phase
+can sit at 100% while parts are still attaching -- and reporting that as a stall would page
+on a healthy long restore.
 
 ## Command dispatcher
 

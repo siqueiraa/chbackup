@@ -87,6 +87,7 @@ Controls logging, concurrency, retry behavior, and progress tracking. These appl
 | `retries_jitter` | int | `30` | Percent jitter on retry pause (0-100) |
 | `use_resumable_state` | bool | `true` | Track progress in state files for `--resume` |
 | `remote_cache_ttl_secs` | int | `300` | TTL for in-memory remote manifest cache (server mode). 0 = disabled |
+| `progress_heartbeat_interval` | duration | `"30s"` | How often to log an aggregate progress line per running phase. `"0s"` disables it |
 | `clean_broken_min_age_secs` | int | `3600` | Minimum age of a broken remote backup's newest object before `clean_broken` deletes it. 0 = delete regardless of age |
 
 Upload writes `metadata.json` **last**, so a backup still being uploaded is
@@ -96,7 +97,30 @@ when its PID lock is held by a live process, when its newest object was written 
 that a surviving backup's manifest still references. Every skip is logged with its reason.
 Lower `clean_broken_min_age_secs` only if no upload can outlive the window.
 
-### Logging behaviour worth knowing
+### Progress heartbeat
+
+At the default log level this is the only thing that distinguishes a slow operation from a
+wedged one, so leave it enabled unless log volume is a hard constraint.
+
+Every `progress_heartbeat_interval`, one `Phase progress` line is emitted per running
+phase, carrying `done`/`total`, `bytes_done`, `rate_bytes_per_sec`, `eta_secs` and
+`stalled_secs`. Output is bounded by (live phases x 1 line per interval) -- not by backup
+size -- and **nothing is emitted while no operation is running**, so an idle server stays
+silent.
+
+Three details matter when reading it:
+
+- It fires on a **wall-clock timer, not on progress events**. "Log every N parts" prints
+  nothing during a stall, which is exactly when you need output.
+- It is **never suppressed because nothing changed**. A stall reads as `done` frozen while
+  `stalled_secs` climbs.
+- It runs on a dedicated OS thread, so it keeps printing even if the async runtime is
+  wedged.
+
+The **absence** of heartbeat lines during an operation is itself diagnostic: it means no
+phase was ever published, so the operation is stuck before its work started.
+
+## Logging behaviour worth knowing
 
 - **`RUST_LOG` does not enable AWS SDK logging.** It replaces the base level, but the `aws_*`
   target caps are applied afterwards and win, because the SDK logs `access_key_id` and
@@ -330,6 +354,7 @@ The most common config parameters can be overridden via environment variables. O
 | `CHBACKUP_RETRIES_ON_FAILURE` | `general.retries_on_failure` |
 | `CHBACKUP_RETRIES_PAUSE` | `general.retries_pause` |
 | `CHBACKUP_REMOTE_CACHE_TTL_SECS` | `general.remote_cache_ttl_secs` |
+| `CHBACKUP_PROGRESS_HEARTBEAT_INTERVAL` / `PROGRESS_HEARTBEAT_INTERVAL` | `general.progress_heartbeat_interval` |
 | `CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS` | `general.clean_broken_min_age_secs` |
 | `CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY` | `general.object_disk_server_side_copy_concurrency` |
 

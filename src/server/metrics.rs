@@ -13,8 +13,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
-use std::sync::atomic::AtomicI64;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 
 /// Label set for per-operation metrics (duration, errors, successes).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -29,6 +28,24 @@ impl OperationLabels {
             operation: operation.to_string(),
         }
     }
+}
+
+/// Label set for per-phase progress gauges.
+///
+/// `backup_name` is required, not optional. `api.allow_parallel` permits concurrent
+/// operations and `running_ops` tracks several ids at once, so with only
+/// {operation, phase} two simultaneous uploads would write the *same* series and the
+/// scrape-time repopulate would silently overwrite one with the other -- making the gauges
+/// and the stall alert wrong in exactly the configuration that most needs them.
+///
+/// Cardinality is bounded *because* the families are cleared before each repopulate: only
+/// live phases are ever written, so the ceiling is (concurrent ops x phases), not every
+/// backup name ever seen.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PhaseLabels {
+    pub operation: String,
+    pub phase: String,
+    pub backup_name: String,
 }
 
 /// Holds all Prometheus metric instances for the chbackup server.
@@ -69,6 +86,22 @@ pub struct Metrics {
 
     /// 1 if an operation is currently running, 0 otherwise.
     pub in_progress: Gauge<i64, AtomicI64>,
+
+    /// Per-phase progress gauges (labels: operation, phase, backup_name).
+    ///
+    /// These are repopulated from the progress registry at scrape time and cleared first,
+    /// so a finished phase disappears instead of leaving a frozen series behind.
+    pub phase_items_total: Family<PhaseLabels, Gauge<i64, AtomicI64>>,
+    pub phase_items_done: Family<PhaseLabels, Gauge<i64, AtomicI64>>,
+    pub phase_bytes_total: Family<PhaseLabels, Gauge<i64, AtomicI64>>,
+    pub phase_bytes_done: Family<PhaseLabels, Gauge<i64, AtomicI64>>,
+    pub phase_elapsed_seconds: Family<PhaseLabels, Gauge<f64, AtomicU64>>,
+    /// Seconds since this phase last advanced. `chbackup_phase_stalled_seconds > 600` is
+    /// the alert that catches the incident this work came from, with no rate() window.
+    pub phase_stalled_seconds: Family<PhaseLabels, Gauge<f64, AtomicU64>>,
+    /// Count of running operations. Deliberately separate from `in_progress`, which stays
+    /// 0/1 for compatibility with Altinity-derived dashboards.
+    pub operations_in_progress: Gauge<i64, AtomicI64>,
 
     /// Watch state gauge (registered, set to 0 until Phase 3d).
     pub watch_state: Gauge<i64, AtomicI64>,
@@ -230,6 +263,50 @@ impl Metrics {
             let _ = successful_operations_total.get_or_create(&labels);
         }
 
+        // Phase progress gauges.
+        let phase_items_total = Family::<PhaseLabels, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "chbackup_phase_items_total",
+            "Total items in a running phase",
+            phase_items_total.clone(),
+        );
+        let phase_items_done = Family::<PhaseLabels, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "chbackup_phase_items_done",
+            "Completed items in a running phase",
+            phase_items_done.clone(),
+        );
+        let phase_bytes_total = Family::<PhaseLabels, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "chbackup_phase_bytes_total",
+            "Total bytes in a running phase",
+            phase_bytes_total.clone(),
+        );
+        let phase_bytes_done = Family::<PhaseLabels, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "chbackup_phase_bytes_done",
+            "Transferred bytes in a running phase",
+            phase_bytes_done.clone(),
+        );
+        let phase_elapsed_seconds = Family::<PhaseLabels, Gauge<f64, AtomicU64>>::default();
+        registry.register(
+            "chbackup_phase_elapsed_seconds",
+            "Seconds since a running phase started",
+            phase_elapsed_seconds.clone(),
+        );
+        let phase_stalled_seconds = Family::<PhaseLabels, Gauge<f64, AtomicU64>>::default();
+        registry.register(
+            "chbackup_phase_stalled_seconds",
+            "Seconds since a running phase last advanced",
+            phase_stalled_seconds.clone(),
+        );
+        let operations_in_progress: Gauge<i64, AtomicI64> = Gauge::default();
+        registry.register(
+            "chbackup_operations_in_progress",
+            "Number of operations currently running",
+            operations_in_progress.clone(),
+        );
+
         Self {
             registry,
             backup_duration_seconds,
@@ -246,6 +323,53 @@ impl Metrics {
             watch_last_full_timestamp,
             watch_last_incremental_timestamp,
             watch_consecutive_errors,
+            phase_items_total,
+            phase_items_done,
+            phase_bytes_total,
+            phase_bytes_done,
+            phase_elapsed_seconds,
+            phase_stalled_seconds,
+            operations_in_progress,
+        }
+    }
+
+    /// Repopulate the phase gauges from the progress registry.
+    ///
+    /// Every family is cleared first. Without that, a phase that finished between scrapes
+    /// would leave its last values behind as a frozen series forever -- and a frozen
+    /// `stalled_seconds` would fire the stall alert on an operation that completed fine.
+    pub fn refresh_phase_gauges(&self, snapshots: &[crate::progress::PhaseSnapshot]) {
+        self.phase_items_total.clear();
+        self.phase_items_done.clear();
+        self.phase_bytes_total.clear();
+        self.phase_bytes_done.clear();
+        self.phase_elapsed_seconds.clear();
+        self.phase_stalled_seconds.clear();
+
+        for s in snapshots {
+            let labels = PhaseLabels {
+                operation: s.op.to_string(),
+                phase: s.phase.to_string(),
+                backup_name: s.backup_name.clone(),
+            };
+            self.phase_items_total
+                .get_or_create(&labels)
+                .set(s.total as i64);
+            self.phase_items_done
+                .get_or_create(&labels)
+                .set(s.done as i64);
+            self.phase_bytes_total
+                .get_or_create(&labels)
+                .set(s.bytes_total as i64);
+            self.phase_bytes_done
+                .get_or_create(&labels)
+                .set(s.bytes_done as i64);
+            self.phase_elapsed_seconds
+                .get_or_create(&labels)
+                .set(s.elapsed_secs);
+            self.phase_stalled_seconds
+                .get_or_create(&labels)
+                .set(s.stalled_secs);
         }
     }
 
@@ -259,6 +383,67 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+    /// A finished phase must vanish from the exposition rather than leaving a frozen
+    /// series behind. A stale `stalled_seconds` would fire the stall alert against an
+    /// operation that had already completed successfully.
+    #[test]
+    fn refresh_phase_gauges_clears_series_for_phases_that_ended() {
+        use crate::progress::{PhaseId, PhaseProgress};
+
+        let metrics = Metrics::new();
+        let p = PhaseProgress::start_with(
+            PhaseId::new("upload", "upload_parts", "parts"),
+            "metrics-test",
+            10,
+            None,
+            true,
+        );
+        p.inc();
+
+        metrics.refresh_phase_gauges(&[p.snapshot()]);
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("chbackup_phase_items_done") && text.contains("metrics-test"),
+            "a live phase must be exposed: {text}"
+        );
+
+        // Next scrape with no live phases.
+        metrics.refresh_phase_gauges(&[]);
+        let text2 = metrics.encode().unwrap();
+        assert!(
+            !text2.contains("metrics-test"),
+            "a finished phase must not leave a frozen series: {text2}"
+        );
+        p.finish();
+    }
+
+    /// Two concurrent operations on different backups must not collide into one series.
+    /// This is why backup_name is part of the label set.
+    #[test]
+    fn concurrent_phases_on_different_backups_get_distinct_series() {
+        let metrics = Metrics::new();
+        let a = PhaseLabels {
+            operation: "upload".to_string(),
+            phase: "upload_parts".to_string(),
+            backup_name: "backup-a".to_string(),
+        };
+        let b = PhaseLabels {
+            operation: "upload".to_string(),
+            phase: "upload_parts".to_string(),
+            backup_name: "backup-b".to_string(),
+        };
+        metrics.phase_items_done.get_or_create(&a).set(3);
+        metrics.phase_items_done.get_or_create(&b).set(7);
+
+        let text = metrics.encode().unwrap();
+        assert!(text.contains("backup-a"), "{text}");
+        assert!(text.contains("backup-b"), "{text}");
+        assert_eq!(
+            metrics.phase_items_done.get_or_create(&a).get(),
+            3,
+            "one backup's value must not be overwritten by the other's"
+        );
+    }
     use super::*;
 
     #[test]

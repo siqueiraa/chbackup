@@ -150,6 +150,8 @@ pub async fn restore(
     partitions: Option<&str>,
     skip_empty_tables: bool,
     cancel: CancellationToken,
+    // API operation id for phase correlation; None for CLI invocations.
+    op_id: Option<u64>,
 ) -> Result<()> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = PathBuf::from(data_path).join("backup").join(backup_name);
@@ -758,6 +760,10 @@ pub async fn restore(
                 clickhouse_uid: ch_uid,
                 clickhouse_gid: ch_gid,
                 engine: table_manifest.engine.clone(),
+                // Injected below, once restore_items has been filtered and the real
+                // totals are known.
+                progress: None,
+                object_progress: None,
                 s3_client: s3_client.clone(),
                 disk_type_map: manifest.disk_types.clone(),
                 object_disk_server_side_copy_concurrency: object_disk_concurrency,
@@ -887,6 +893,45 @@ pub async fn restore(
     let max_conn = effective_max_connections(config) as usize;
     let table_count = restore_items.len();
 
+    // Publish the restore phases now that the work list is final: tables refused by the
+    // attach pre-flight and tables whose replicas were behind have already been filtered
+    // out, so these totals are what will actually be attempted rather than what was hoped.
+    //
+    // Parts and objects are counted separately because one part can hold thousands of S3
+    // objects; folding them together would make both numbers meaningless.
+    let total_parts_to_attach: u64 = restore_items
+        .iter()
+        .map(|(_, params)| params.parts.len() as u64)
+        .sum();
+    let total_objects_to_restore: u64 = restore_items
+        .iter()
+        .flat_map(|(_, params)| params.parts.iter())
+        .map(|part| part.s3_objects.as_ref().map_or(0, |o| o.len() as u64))
+        .sum();
+
+    let phase_attach = (total_parts_to_attach > 0).then(|| {
+        crate::progress::PhaseOwner::start(
+            crate::progress::PhaseId::new("restore", "attach_parts", "parts"),
+            backup_name,
+            total_parts_to_attach,
+            op_id,
+            config.general.disable_progress_bar,
+        )
+    });
+    let phase_objects = (total_objects_to_restore > 0).then(|| {
+        crate::progress::PhaseOwner::start(
+            crate::progress::PhaseId::new("restore", "restore_s3_objects", "objects"),
+            backup_name,
+            total_objects_to_restore,
+            op_id,
+            config.general.disable_progress_bar,
+        )
+    });
+    for (_, params) in restore_items.iter_mut() {
+        params.progress = phase_attach.as_ref().map(|p| p.handle());
+        params.object_progress = phase_objects.as_ref().map(|p| p.handle());
+    }
+
     if table_count > 0 {
         info!(
             "Restoring {} tables via per-part ATTACH (max_connections={})",
@@ -929,6 +974,13 @@ pub async fn restore(
     // recheck before executing mutations, postponed tables, DDL objects, RBAC, etc.
     if cancel.is_cancelled() {
         bail!("Restore cancelled");
+    }
+
+    // The owner finishes the phases -- never a worker. A spawned table task holds a clone,
+    // so if a worker were responsible and it panicked, the phase would stay published and
+    // the heartbeat would report it as live forever.
+    for phase in [&phase_attach, &phase_objects].into_iter().flatten() {
+        phase.finish();
     }
 
     // Merge ATTACH TABLE mode results

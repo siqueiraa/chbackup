@@ -4,6 +4,7 @@ pub mod concurrency;
 pub mod config;
 pub mod download;
 pub mod error;
+pub mod heartbeat;
 pub mod list;
 pub mod lock;
 pub mod logging;

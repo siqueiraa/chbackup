@@ -45,6 +45,13 @@ general:
   # TTL in seconds for remote backup manifest cache (server mode only)
   remote_cache_ttl_secs: 300
 
+  # How often to log one aggregate progress line per running phase. "0s" disables it.
+  #
+  # At the default log level this is the only signal that separates a slow operation from a
+  # wedged one: each line carries done/total, byte rate, ETA and stalled_secs. Output is
+  # bounded by (live phases x 1 line per interval), and nothing is logged while idle.
+  progress_heartbeat_interval: 30s
+
 # -----------------------------------------------------------------------------
 # ClickHouse connection and behavior settings.
 # Controls how chbackup connects to ClickHouse and manages backup/restore ops.

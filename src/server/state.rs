@@ -408,7 +408,12 @@ pub async fn run_operation<F, Fut>(
     f: F,
 ) -> Result<Json<OperationStarted>, (StatusCode, Json<ErrorResponse>)>
 where
-    F: FnOnce(Arc<Config>, Arc<ChClient>, Arc<S3Client>, CancellationToken) -> Fut + Send + 'static,
+    // The trailing u64 is the operation id. Passed explicitly rather than via a
+    // tokio::task_local, because upload() spawns twice internally and a task-local set here
+    // would be invisible to upload_inner -- None for exactly the pipeline that motivated this.
+    F: FnOnce(Arc<Config>, Arc<ChClient>, Arc<S3Client>, CancellationToken, u64) -> Fut
+        + Send
+        + 'static,
     Fut: Future<Output = Result<(), anyhow::Error>> + Send,
 {
     // Clone before try_start_op so the spawned task can use them for PID lock.
@@ -460,7 +465,7 @@ where
                 let s3 = state_clone.s3.load_full();
                 let start_time = std::time::Instant::now();
 
-                let result = f(config, ch, s3, f_token).await;
+                let result = f(config, ch, s3, f_token, id).await;
                 let duration = start_time.elapsed().as_secs_f64();
 
                 match result {
@@ -684,6 +689,9 @@ pub async fn auto_resume(state: &AppState) {
                                 None,  // diff_from_remote
                                 true,  // resume = true
                                 token.clone(),
+                                // Auto-resumed work is a registered operation, so its phases
+                                // correlate with /api/v1/status and /kill?id=N like any other.
+                                Some(id),
                             )
                             .await
                             {
@@ -744,6 +752,7 @@ pub async fn auto_resume(state: &AppState) {
                                 true,  // resume = true
                                 false, // hardlink_exists_files = false
                                 token.clone(),
+                                Some(id),
                             )
                             .await
                             {
@@ -850,6 +859,7 @@ pub async fn auto_resume(state: &AppState) {
                                 restore_params.partitions.as_deref(),
                                 restore_params.skip_empty_tables,
                                 token.clone(),
+                                Some(id),
                             )
                             .await
                             {

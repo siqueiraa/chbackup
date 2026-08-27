@@ -36,6 +36,7 @@ use crate::concurrency::effective_max_connections;
 use crate::config::Config;
 use crate::manifest::{BackupManifest, DatabaseInfo, TableManifest};
 use crate::object_disk;
+use crate::progress::{PhaseId, PhaseOwner};
 use crate::table_filter::{is_engine_excluded, is_excluded, TableFilter};
 
 use self::collect::collect_parts;
@@ -188,6 +189,8 @@ pub async fn create(
     // Pass `false` only for a caller that genuinely has no upload phase at all.
     defer_unfreeze_s3: bool,
     cancel: CancellationToken,
+    // API operation id for phase correlation; None for CLI and watch invocations.
+    op_id: Option<u64>,
 ) -> Result<BackupManifest> {
     let start_time = Instant::now();
 
@@ -576,6 +579,21 @@ pub async fn create(
     let staged_ids: Arc<std::sync::Mutex<BTreeSet<String>>> =
         Arc::new(std::sync::Mutex::new(BTreeSet::new()));
 
+    // A phase over tables, not parts. create previously reported nothing at all between
+    // "Starting backup creation" and "Backup created successfully", which on a 524-table
+    // cluster is a multi-minute silence. Per-part progress inside collect_parts is not wired:
+    // the hardlink walk runs inside spawn_blocking, and a per-table item already names the
+    // table a stalled create is stuck on, which is the question actually being asked.
+    let phase_freeze = (!data_tables.is_empty()).then(|| {
+        PhaseOwner::start(
+            PhaseId::new("create", "freeze", "tables"),
+            backup_name,
+            data_tables.len() as u64,
+            op_id,
+            config.general.disable_progress_bar,
+        )
+    });
+
     for table_row in &data_tables {
         let sem = semaphore.clone();
         let ch = ch.clone();
@@ -601,6 +619,7 @@ pub async fn create(
         let staged_ids_clone = staged_ids.clone();
         let base_parts_clone = base_parts.clone();
         let cache_disk_names_clone = cache_disk_names.clone();
+        let phase_clone = phase_freeze.as_ref().map(|p| p.handle());
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -610,6 +629,13 @@ pub async fn create(
 
             let full_name = format!("{}.{}", db, table);
             let fname = freeze_name(&backup_name_owned, &db, &table);
+
+            // The guard counts this table done only on the success path below. A table that
+            // errors or is cancelled counts as failed, never done -- otherwise a half-failed
+            // create reports full progress.
+            let item = phase_clone
+                .as_ref()
+                .map(|p| p.start_item(full_name.clone()));
 
             // Determine effective partition list:
             // 1. Explicit --partitions IDs take precedence
@@ -856,6 +882,10 @@ pub async fn create(
                 dependencies: deps_clone.get(&full_name).cloned().unwrap_or_default(),
             };
 
+            if let Some(item) = item {
+                item.succeed();
+            }
+
             Ok(Some((full_name, table_manifest, stripped_projections)))
         });
 
@@ -886,6 +916,11 @@ pub async fn create(
                             warn!(error = %e, "Failed to unfreeze tables after task panic");
                         }
                     }
+                    // Fail the phase before returning: a worker clone keeps the Arc alive,
+                    // so an unfinished phase would stay published for the process lifetime.
+                    if let Some(ref phase) = phase_freeze {
+                        phase.fail();
+                    }
                     return Err(anyhow::Error::new(join_err).context("A FREEZE+collect task panicked"));
                 }
             }
@@ -905,6 +940,9 @@ pub async fn create(
                     warn!(error = %e, "Failed to unfreeze tables after cancellation");
                 }
             }
+            if let Some(ref phase) = phase_freeze {
+                phase.fail();
+            }
             return Err(anyhow::anyhow!("backup::create cancelled"));
         }
     };
@@ -912,6 +950,13 @@ pub async fn create(
     // Build the cleanup guard from the shared vec, not from the task results: a task that
     // failed *after* its FREEZE succeeded (a rejected --partitions ID) has no result to read
     // a FreezeInfo out of, and its table would stay frozen with nothing tracking it.
+    // Every task has been awaited, so the freeze+collect phase is over regardless of
+    // individual table outcomes. finish() is idempotent, and the early-return paths above
+    // already failed it, so this cannot double-report.
+    if let Some(ref phase) = phase_freeze {
+        phase.finish();
+    }
+
     let mut freeze_guard = FreezeGuard::from_frozen(
         frozen_so_far
             .lock()

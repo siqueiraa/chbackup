@@ -2857,8 +2857,17 @@ else:
     fi
 
     # Step 4: Clean broken remote (always safe to run, no-op if nothing broken)
-    info "  Step 4: Run clean_broken remote"
-    run_cmd "clean_broken remote completed" chbackup clean_broken remote
+    #
+    # clean_broken_min_age_secs=0 is REQUIRED here, not incidental. Remotely, "broken" is
+    # indistinguishable from "still uploading" -- upload writes the manifest last -- so the
+    # default 3600s guard deliberately refuses to delete a backup whose newest object is
+    # seconds old. This test creates exactly such a backup on purpose, so without the
+    # override step 5 fails whenever step 2 actually succeeds in producing a broken backup.
+    # It passed before only by accident, when the kill landed before any S3 write and there
+    # was nothing broken to delete.
+    info "  Step 4: Run clean_broken remote (min age 0 -- the backup is seconds old by design)"
+    run_cmd "clean_broken remote completed" \
+        chbackup --env general.clean_broken_min_age_secs=0 clean_broken remote
 
     # Step 5: Verify no broken backups remain with this name
     REMOTE_JSON2=$(RUST_LOG=error chbackup list remote --format json 2>/dev/null || echo "[]")
@@ -4983,6 +4992,142 @@ if should_run "test_s3_disk_freeze_race_separate"; then
     clickhouse-client -q "DROP TABLE IF EXISTS ${SEP_TBL} SYNC"
 fi
 
+# ---------------------------------------------------------------------------
+# T77: Phase observability -- heartbeat, bounded output, live status and metrics
+# ---------------------------------------------------------------------------
+if should_run "test_phase_observability"; then
+    info "T77: Phase observability (heartbeat, status, metrics)"
+    T77_NAME="t77_obs_$"
+    T77_LOG="/tmp/t77_server.log"
+
+    # A 2s heartbeat so a short operation still produces lines. Production default is 30s.
+    export CHBACKUP_PROGRESS_HEARTBEAT_INTERVAL=2s
+
+    info "  Step 1: create+upload at info level, capturing output"
+    # LOG_LEVEL=info explicitly: the container defaults to debug, which would make the
+    # bounded-output assertions below vacuous.
+    LOG_LEVEL=info chbackup create "${T77_NAME}" > "${T77_LOG}" 2>&1
+    CREATE_RC=$?
+    LOG_LEVEL=info chbackup upload "${T77_NAME}" >> "${T77_LOG}" 2>&1
+    UPLOAD_RC=$?
+    if [[ $CREATE_RC -eq 0 && $UPLOAD_RC -eq 0 ]]; then
+        pass "create+upload succeeded with heartbeat enabled"
+    else
+        fail "create/upload failed (create=$CREATE_RC upload=$UPLOAD_RC)"
+    fi
+
+    info "  Step 2: phases are announced and completed at info level"
+    STARTED=$(grep -c "Phase started" "${T77_LOG}" || true)
+    COMPLETE=$(grep -c "Phase complete" "${T77_LOG}" || true)
+    if [[ "$STARTED" -ge 2 ]]; then
+        pass "phases announced at info (${STARTED} \"Phase started\" lines)"
+    else
+        fail "expected >=2 Phase started lines, got ${STARTED}"
+    fi
+    if [[ "$COMPLETE" -ge 2 ]]; then
+        pass "phases completed at info (${COMPLETE} \"Phase complete\" lines)"
+    else
+        fail "expected >=2 Phase complete lines, got ${COMPLETE}"
+    fi
+
+    info "  Step 3: every phase that started also ended (no leaked live phase)"
+    # A phase left published forever is the specific failure the registry's finished-flag
+    # filter exists to prevent: the heartbeat would report it as live indefinitely.
+    ENDED=$(( $(grep -c "Phase complete" "${T77_LOG}" || true) + $(grep -c "Phase failed" "${T77_LOG}" || true) ))
+    if [[ "$STARTED" -eq "$ENDED" ]]; then
+        pass "every started phase ended (${STARTED} started, ${ENDED} ended)"
+    else
+        fail "phase leak: ${STARTED} started but only ${ENDED} ended"
+    fi
+
+    info "  Step 4: output stays bounded at info level"
+    # The guard against someone later promoting a per-part line back to info. These are
+    # unbounded in backup size; the phase counters carry the same information in aggregate.
+    for MSG in "Part uploaded" "S3 disk part CopyObject complete" "Skipping existing S3 object"; do
+        N=$(grep -c "${MSG}" "${T77_LOG}" || true)
+        if [[ "$N" -eq 0 ]]; then
+            pass "per-part line \"${MSG}\" absent at info level"
+        else
+            fail "\"${MSG}\" appeared ${N} times at info -- output is no longer bounded"
+        fi
+    done
+
+    info "  Step 5: live status and metrics during an operation"
+    chbackup server > /tmp/t77_srv.log 2>&1 &
+    T77_SRV=$!
+    sleep 2
+    if wait_for_server 10; then
+        pass "server ready"
+
+        # Idle status must remain byte-compatible for existing consumers.
+        IDLE=$(curl -s http://localhost:7171/api/v1/status)
+        if echo "$IDLE" | jq -e '.status == "idle" and .command == null and .start == null' >/dev/null 2>&1; then
+            pass "idle status keeps its original three fields"
+        else
+            fail "idle status changed shape: ${IDLE}"
+        fi
+        # The additive fields must be omitted rather than null when idle.
+        if echo "$IDLE" | jq -e 'has("id") == false' >/dev/null 2>&1; then
+            pass "additive fields omitted when idle"
+        else
+            fail "idle status should omit id, got: ${IDLE}"
+        fi
+
+        # Start an upload and poll for a live phase.
+        T77_B="t77_live_$"
+        chbackup create "${T77_B}" >/dev/null 2>&1 || true
+        curl -s -X POST http://localhost:7171/api/v1/upload \
+            -H "Content-Type: application/json" \
+            -d "{\"backup_name\": \"${T77_B}\"}" >/dev/null 2>&1 || true
+
+        SAW_PROGRESS=0; SAW_METRIC=0
+        for _ in $(seq 1 40); do
+            ST=$(curl -s http://localhost:7171/api/v1/status)
+            if echo "$ST" | jq -e '.progress.op != null and .id != null' >/dev/null 2>&1; then
+                SAW_PROGRESS=1
+            fi
+            if curl -s http://localhost:7171/metrics | grep -q "chbackup_phase_items_done"; then
+                SAW_METRIC=1
+            fi
+            [[ $SAW_PROGRESS -eq 1 && $SAW_METRIC -eq 1 ]] && break
+            sleep 0.5
+        done
+
+        if [[ $SAW_PROGRESS -eq 1 ]]; then
+            pass "status exposed a live phase with a correlatable id"
+        else
+            # Not a hard failure: a tiny fixture can finish inside the poll interval.
+            skip "no live phase observed (upload finished too fast to sample)"
+        fi
+        if [[ $SAW_METRIC -eq 1 ]]; then
+            pass "chbackup_phase_items_done exposed during the operation"
+        else
+            skip "phase metric not sampled (upload finished too fast)"
+        fi
+
+        sleep 3
+        # After completion the phase series must be gone -- that is the clear() behaviour.
+        # A frozen chbackup_phase_stalled_seconds would fire the stall alert on a run that
+        # succeeded.
+        if curl -s http://localhost:7171/metrics | grep -q "chbackup_phase_stalled_seconds{"; then
+            fail "phase series survived completion -- clear() is not working"
+        else
+            pass "phase series cleared after completion"
+        fi
+
+        kill "$T77_SRV" 2>/dev/null || true
+        wait "$T77_SRV" 2>/dev/null || true
+        cleanup_backup "${T77_B}"
+    else
+        fail "server did not become ready"
+        kill "$T77_SRV" 2>/dev/null || true
+    fi
+
+    info "  Cleanup"
+    unset CHBACKUP_PROGRESS_HEARTBEAT_INTERVAL
+    cleanup_backup "${T77_NAME}"
+    rm -f "${T77_LOG}" /tmp/t77_srv.log
+fi
 # ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------

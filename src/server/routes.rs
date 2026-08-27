@@ -243,6 +243,29 @@ pub struct StatusResponse {
     pub status: String,
     pub command: Option<String>,
     pub start: Option<String>,
+    /// Operation id, closing the correlation gap with /api/v1/actions and /kill?id=N.
+    /// Additive: absent for an idle response, so existing consumers are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    /// The most recently started live phase of the reported operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<crate::progress::PhaseSnapshot>,
+    /// Every running operation, fixing the api.allow_parallel blind spot: the top-level
+    /// fields describe only one operation, and with parallel operations enabled the others
+    /// were previously invisible.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<RunningOpSummary>,
+}
+
+/// One running operation, for the additive `operations` field on /api/v1/status.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RunningOpSummary {
+    pub id: u64,
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_name: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<crate::progress::PhaseSnapshot>,
 }
 
 /// Response for GET /api/v1/actions -- matches system.backup_actions table schema
@@ -376,10 +399,40 @@ pub async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     // action_log. Holding running_ops while waiting for action_log would invert the
     // lock order used by try_start_op/finish_op/fail_op (action_log first) and
     // create a deadlock under concurrent status + operation-start/finish traffic.
-    let running_op: Option<(u64, String)> = {
+    // Snapshot every running op, then drop the lock. Selection of the top-level operation
+    // is by LOWEST id, not HashMap iteration order: values().next() was arbitrary and could
+    // differ between two calls with no state change, so making it deterministic is a fix
+    // rather than a compatibility break.
+    let mut running: Vec<(u64, String, Option<String>)> = {
         let ops = state.running_ops.lock().await;
-        ops.values().next().map(|op| (op.id, op.command.clone()))
+        ops.values()
+            .map(|op| (op.id, op.command.clone(), op.backup_name.clone()))
+            .collect()
     }; // running_ops lock dropped here
+    running.sort_by_key(|(id, _, _)| *id);
+
+    // The registry sits outside the documented action_log -> running_ops lock order, and
+    // snapshots() takes a std::sync::Mutex for a Vec copy with no .await, so this cannot
+    // participate in a deadlock. No AppState lock is held here.
+    let all_phases = crate::progress::registry().snapshots();
+
+    let operations: Vec<RunningOpSummary> = running
+        .iter()
+        .map(|(id, command, backup_name)| RunningOpSummary {
+            id: *id,
+            command: command.clone(),
+            backup_name: backup_name.clone(),
+            phases: all_phases
+                .iter()
+                .filter(|p| p.op_id == Some(*id))
+                .cloned()
+                .collect(),
+        })
+        .collect();
+
+    let running_op: Option<(u64, String)> = running
+        .first()
+        .map(|(id, command, _)| (*id, command.clone()));
 
     if let Some((id, command)) = running_op {
         let start_time = {
@@ -391,16 +444,28 @@ pub async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
                 .map(|e| e.start.to_rfc3339())
         };
 
+        // Most recently started live phase of this operation: phase ids increase, so the
+        // last match is the innermost work rather than an outer phase that merely contains it.
+        let progress = all_phases.iter().rfind(|p| p.op_id == Some(id)).cloned();
+
         Json(StatusResponse {
             status: "running".to_string(),
             command: Some(command),
             start: start_time,
+            id: Some(id),
+            progress,
+            operations,
         })
     } else {
+        // Idle must still serialize exactly as before: status/command/start present, and
+        // every added field skipped. An existing consumer sees no change at all.
         Json(StatusResponse {
             status: "idle".to_string(),
             command: None,
             start: None,
+            id: None,
+            progress: None,
+            operations: Vec::new(),
         })
     }
 }
@@ -591,6 +656,10 @@ async fn dispatch_action_command(
     metrics: &Option<Arc<Metrics>>,
     cancel: CancellationToken,
     state: &AppState,
+    // Operation id for phase correlation. /api/v1/actions and /backup/actions bypass
+    // run_operation, and actions are how the ClickHouse integration tables drive backups --
+    // i.e. the common production path -- so this must be threaded here too, not just there.
+    op_id: u64,
 ) -> Result<(), anyhow::Error> {
     let op = parts[0].as_str();
     match op {
@@ -614,6 +683,7 @@ async fn dispatch_action_command(
             // between them or the upload's CopyObject races ClickHouse's object GC.
             true,
             cancel,
+            Some(op_id),
         )
         .await
         .map(|_| ()),
@@ -632,6 +702,7 @@ async fn dispatch_action_command(
                 flags.diff_from_remote.as_deref(),
                 effective_resume,
                 cancel,
+                Some(op_id),
             )
             .await;
 
@@ -653,9 +724,17 @@ async fn dispatch_action_command(
         }
         "download" => {
             let effective_resume = config.general.use_resumable_state;
-            crate::download::download(config, s3, backup_name, effective_resume, false, cancel)
-                .await
-                .map(|_| ())
+            crate::download::download(
+                config,
+                s3,
+                backup_name,
+                effective_resume,
+                false,
+                cancel,
+                Some(op_id),
+            )
+            .await
+            .map(|_| ())
         }
         "restore" => {
             let effective_resume = config.general.use_resumable_state;
@@ -676,6 +755,7 @@ async fn dispatch_action_command(
                 None,  // partitions
                 false, // skip_empty_tables
                 cancel,
+                Some(op_id),
             )
             .await
         }
@@ -697,6 +777,7 @@ async fn dispatch_action_command(
                 &config.backup.skip_projections,
                 true, // defer_unfreeze_s3: upload follows and will release the freeze
                 cancel.clone(),
+                Some(op_id),
             )
             .await;
             match create_result {
@@ -715,6 +796,7 @@ async fn dispatch_action_command(
                         flags.diff_from_remote.as_deref(),
                         effective_resume,
                         cancel,
+                        Some(op_id),
                     )
                     .await;
 
@@ -746,6 +828,7 @@ async fn dispatch_action_command(
                 effective_resume,
                 false, // hardlink_exists_files
                 cancel.clone(),
+                Some(op_id),
             )
             .await;
             match dl {
@@ -767,6 +850,7 @@ async fn dispatch_action_command(
                         None,  // partitions
                         false, // skip_empty_tables
                         cancel,
+                        Some(op_id),
                     )
                     .await
                 }
@@ -980,6 +1064,7 @@ async fn execute_action_command(
                 &state.metrics,
                 cancel_for_ops,
                 state,
+                id,
             )
             .await;
 
@@ -1120,6 +1205,7 @@ pub async fn go_post_actions(
                         &state_clone.metrics,
                         cancel_for_ops,
                         &state_clone,
+                        cmd_id,
                     )
                     .await;
 
@@ -1244,7 +1330,7 @@ pub async fn create_backup(
         "create",
         Some(backup_name.clone()),
         false, // no cache invalidation
-        move |config, ch, _s3, cancel| async move {
+        move |config, ch, _s3, cancel, op_id| async move {
             info!(backup_name = %backup_name, "Starting create operation");
             let manifest = crate::backup::create(
                 &config,
@@ -1266,6 +1352,7 @@ pub async fn create_backup(
                 // defer_unfreeze_s3: a later `upload` adopts the record and releases it.
                 true,
                 cancel,
+                Some(op_id),
             )
             .await?;
 
@@ -1314,7 +1401,7 @@ pub async fn upload_backup(
         "upload",
         Some(name.clone()), // per-backup conflict detection
         true,               // invalidate cache after upload
-        move |config, ch, s3, cancel| async move {
+        move |config, ch, s3, cancel, op_id| async move {
             info!(backup_name = %name, "Starting upload operation");
             let backup_dir = std::path::PathBuf::from(&config.clickhouse.data_path)
                 .join("backup")
@@ -1330,6 +1417,7 @@ pub async fn upload_backup(
                 req.diff_from_remote.as_deref(),
                 effective_resume,
                 cancel,
+                Some(op_id),
             )
             .await?;
 
@@ -1374,10 +1462,10 @@ pub async fn download_backup(
         "download",
         Some(name.clone()), // per-backup conflict detection
         false,              // no cache invalidation
-        move |config, _ch, s3, cancel| async move {
+        move |config, _ch, s3, cancel, op_id| async move {
             info!(backup_name = %name, hardlink_exists_files = hardlink, "Starting download operation");
             let effective_resume = resume_override.unwrap_or(config.general.use_resumable_state);
-            crate::download::download(&config, &s3, &name, effective_resume, hardlink, cancel)
+            crate::download::download(&config, &s3, &name, effective_resume, hardlink, cancel, Some(op_id))
                 .await
                 .map(|_| ())
         },
@@ -1436,7 +1524,7 @@ pub async fn restore_backup(
         "restore",
         Some(name.clone()), // per-backup conflict detection
         false,              // no cache invalidation
-        move |config, ch, _s3, cancel| async move {
+        move |config, ch, _s3, cancel, op_id| async move {
             info!(backup_name = %name, "Starting restore operation");
             let effective_resume = req.resume.unwrap_or(config.general.use_resumable_state);
             crate::restore::restore(
@@ -1456,6 +1544,7 @@ pub async fn restore_backup(
                 req.partitions.as_deref(),
                 req.skip_empty_tables.unwrap_or(false),
                 cancel,
+                Some(op_id),
             )
             .await
         },
@@ -1514,7 +1603,7 @@ pub async fn create_remote(
         "create_remote",
         Some(backup_name.clone()),
         true, // invalidate cache after upload
-        move |config, ch, s3, cancel| async move {
+        move |config, ch, s3, cancel, op_id| async move {
             info!(backup_name = %backup_name, "Starting create_remote operation");
 
             // Step 1: Create local backup (with optional diff-from-remote)
@@ -1537,6 +1626,7 @@ pub async fn create_remote(
                     .unwrap_or(&config.backup.skip_projections),
                 true, // defer_unfreeze_s3: upload follows and will release the freeze
                 cancel.clone(),
+                Some(op_id),
             )
             .await?;
 
@@ -1556,6 +1646,7 @@ pub async fn create_remote(
                 req.diff_from_remote.as_deref(),
                 effective_resume,
                 cancel,
+                Some(op_id),
             )
             .await?;
 
@@ -1632,15 +1723,23 @@ pub async fn restore_remote(
         "restore_remote",
         Some(name.clone()), // per-backup conflict detection
         false,              // no cache invalidation
-        move |config, ch, s3, cancel| async move {
+        move |config, ch, s3, cancel, op_id| async move {
             info!(backup_name = %name, "Starting restore_remote operation");
 
             let effective_resume = req.resume.unwrap_or(config.general.use_resumable_state);
 
             // Step 1: Download from S3
-            crate::download::download(&config, &s3, &name, effective_resume, false, cancel.clone())
-                .await
-                .map(|_| ())?;
+            crate::download::download(
+                &config,
+                &s3,
+                &name,
+                effective_resume,
+                false,
+                cancel.clone(),
+                Some(op_id),
+            )
+            .await
+            .map(|_| ())?;
 
             // Step 2: Restore with remap.
             // restore_remote does not support schema-only, data-only, or partition
@@ -1662,6 +1761,7 @@ pub async fn restore_remote(
                 None, // partitions: not supported by restore_remote
                 req.skip_empty_tables.unwrap_or(false),
                 cancel,
+                Some(op_id),
             )
             .await
         },
@@ -1721,7 +1821,7 @@ pub async fn delete_backup(
         "delete",
         Some(name.clone()), // per-backup conflict detection
         invalidate,
-        move |config, _ch, s3, _cancel| async move {
+        move |config, _ch, s3, _cancel, _op_id| async move {
             info!(backup_name = %name, location = %location, "Starting delete operation");
             let data_path = config.clickhouse.data_path.clone();
             match loc {
@@ -1748,7 +1848,7 @@ pub async fn clean_remote_broken(
         "clean_broken_remote",
         None, // no specific backup name
         true, // invalidate cache
-        |config, _ch, s3, _cancel| async move {
+        |config, _ch, s3, _cancel, _op_id| async move {
             info!("Starting clean_broken_remote operation");
             let count =
                 list::clean_broken_remote(&s3, config.general.clean_broken_min_age_secs).await?;
@@ -1769,7 +1869,7 @@ pub async fn clean_local_broken(
         "clean_broken_local",
         None,  // no specific backup name
         false, // no cache invalidation
-        |config, ch, _s3, _cancel| async move {
+        |config, ch, _s3, _cancel, _op_id| async move {
             info!("Starting clean_broken_local operation");
             let count = list::clean_broken_local(&config.clickhouse.data_path, Some(&ch)).await?;
             info!(count = count, "clean_broken_local operation completed");
@@ -1815,7 +1915,7 @@ pub async fn clean(
         "clean",
         None,  // no specific backup name
         false, // no cache invalidation
-        |config, ch, _s3, _cancel| async move {
+        |config, ch, _s3, _cancel, _op_id| async move {
             info!("Starting clean operation");
             let data_path = config.clickhouse.data_path.clone();
             let count = list::clean_shadow(&ch, &data_path, None).await?;
@@ -2708,6 +2808,14 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     // Refresh backup count gauges (expensive -- OK for 15-30s scrape intervals)
     refresh_backup_counts(&state, metrics).await;
 
+    // Refresh phase gauges from the progress registry. Cheap: a Vec copy under a
+    // std::sync::Mutex with no .await, and no AppState lock is held across it.
+    metrics.refresh_phase_gauges(&crate::progress::registry().snapshots());
+    {
+        let ops = state.running_ops.lock().await;
+        metrics.operations_in_progress.set(ops.len() as i64);
+    }
+
     match metrics.encode() {
         Ok(text) => (StatusCode::OK, text),
         Err(e) => {
@@ -2757,6 +2865,101 @@ async fn refresh_backup_counts(state: &AppState, metrics: &Metrics) {
 
 #[cfg(test)]
 mod tests {
+    // -- /api/v1/status compatibility (Stage 2) ---------------------------
+
+    /// The idle response must serialize byte-for-byte as it did before the additive
+    /// fields were introduced, or every existing consumer breaks.
+    #[test]
+    fn idle_status_response_is_unchanged_for_existing_consumers() {
+        let r = StatusResponse {
+            status: "idle".to_string(),
+            command: None,
+            start: None,
+            id: None,
+            progress: None,
+            operations: Vec::new(),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+
+        assert_eq!(v["status"], "idle");
+        assert!(v["command"].is_null(), "command must stay present and null");
+        assert!(v["start"].is_null(), "start must stay present and null");
+        assert!(
+            v.get("id").is_none(),
+            "added fields must be skipped, not null"
+        );
+        assert!(v.get("progress").is_none());
+        assert!(v.get("operations").is_none());
+
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            3,
+            "an idle response must contain exactly status/command/start, got {obj:?}"
+        );
+    }
+
+    /// Top-level operation selection is by lowest id. The previous
+    /// `ops.values().next()` was HashMap order: arbitrary, and unstable between two calls
+    /// with no state change.
+    #[test]
+    fn top_level_operation_is_the_lowest_id_not_hashmap_order() {
+        let mut running: Vec<(u64, String, Option<String>)> = vec![
+            (3, "restore".to_string(), None),
+            (1, "create".to_string(), None),
+            (2, "upload".to_string(), None),
+        ];
+        running.sort_by_key(|(id, _, _)| *id);
+
+        assert_eq!(running.first().map(|(id, _, _)| *id), Some(1));
+        assert_eq!(
+            running.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// A phase belongs to the operation whose id it carries. With api.allow_parallel two
+    /// uploads run at once, and attributing one's phases to the other would be worse than
+    /// reporting none.
+    #[test]
+    fn phases_are_attributed_to_their_own_operation() {
+        use crate::progress::{PhaseId, PhaseProgress};
+
+        let a = PhaseProgress::start_with(
+            PhaseId::new("upload", "upload_parts", "parts"),
+            "backup-a",
+            1,
+            Some(1),
+            true,
+        );
+        let b = PhaseProgress::start_with(
+            PhaseId::new("upload", "copy_objects", "objects"),
+            "backup-b",
+            1,
+            Some(2),
+            true,
+        );
+        let all = [a.snapshot(), b.snapshot()];
+
+        let for_one: Vec<_> = all.iter().filter(|p| p.op_id == Some(1)).collect();
+        assert_eq!(for_one.len(), 1);
+        assert_eq!(for_one[0].backup_name, "backup-a");
+
+        // A CLI phase (op_id None) belongs to no API operation and must not be adopted.
+        let cli = PhaseProgress::start_with(
+            PhaseId::new("create", "freeze", "tables"),
+            "cli",
+            1,
+            None,
+            true,
+        );
+        let all2 = [cli.snapshot()];
+        assert!(all2.iter().filter(|p| p.op_id == Some(1)).count() == 0);
+
+        a.finish();
+        b.finish();
+        cli.finish();
+    }
     use super::*;
 
     #[test]

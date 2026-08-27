@@ -36,7 +36,7 @@ use crate::error::ChBackupError;
 use crate::manifest::{BackupManifest, PartInfo, S3ObjectInfo};
 use crate::object_disk::{is_s3_disk, upload_source_key};
 use crate::path_encoding::encode_path_component;
-use crate::progress::ProgressTracker;
+use crate::progress::{PhaseId, PhaseOwner};
 use crate::rate_limiter::RateLimiter;
 use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, UploadState,
@@ -180,6 +180,9 @@ pub async fn upload(
     diff_from_remote: Option<&str>,
     resume: bool,
     cancel: CancellationToken,
+    // API operation id, for correlating phase logs and /api/v1/status with /kill?id=N.
+    // None for CLI invocations, which have no operation registry.
+    op_id: Option<u64>,
 ) -> Result<UploadStats> {
     // Owned clones: spawn requires 'static and the public signature takes borrows.
     let config_owned = config.clone();
@@ -249,6 +252,7 @@ pub async fn upload(
                     diff.as_deref(),
                     resume,
                     cancel,
+                    op_id,
                 )
                 .await
             }
@@ -397,6 +401,9 @@ async fn upload_inner(
     diff_from_remote: Option<&str>,
     resume: bool,
     cancel: CancellationToken,
+    // API operation id, for correlating phase logs and /api/v1/status with /kill?id=N.
+    // None for CLI invocations, which have no operation registry.
+    op_id: Option<u64>,
 ) -> Result<UploadStats> {
     let start_time = std::time::Instant::now();
 
@@ -722,12 +729,30 @@ async fn upload_inner(
         );
     }
 
-    // Create progress tracker for upload
-    let progress = ProgressTracker::new(
-        "Upload",
-        total_parts as u64,
-        config.general.disable_progress_bar,
-    );
+    // Two phases, not one: local parts and S3-disk objects have separate totals, separate
+    // concurrency limits and completely different failure modes, and the object copies are
+    // the ones that went silent in production. Each is created only when it has work, so an
+    // all-local backup does not publish a phantom copy_objects phase that the heartbeat would
+    // report as live forever.
+    let disable_bar = config.general.disable_progress_bar;
+    let phase_parts = (total_local_parts > 0).then(|| {
+        PhaseOwner::start(
+            PhaseId::new("upload", "upload_parts", "parts"),
+            backup_name,
+            total_local_parts as u64,
+            op_id,
+            disable_bar,
+        )
+    });
+    let phase_objects = (total_s3_disk_parts > 0).then(|| {
+        PhaseOwner::start(
+            PhaseId::new("upload", "copy_objects", "objects"),
+            backup_name,
+            total_s3_disk_parts as u64,
+            op_id,
+            disable_bar,
+        )
+    });
 
     // 3. Upload both queues in parallel
     let upload_semaphore = Arc::new(Semaphore::new(concurrency));
@@ -772,7 +797,7 @@ async fn upload_inner(
         let rate_limiter = rate_limiter.clone();
         let resume_state = resume_state.clone();
         let data_format_clone = data_format.clone();
-        let progress = progress.clone();
+        let phase = phase_parts.as_ref().map(|p| p.handle());
         let cancel_clone = cancel.clone();
 
         let handle = tokio::spawn(async move {
@@ -1057,7 +1082,10 @@ async fn upload_inner(
                 save_state_graceful(&guard.1, &guard.0);
             }
 
-            progress.inc();
+            if let Some(ref phase) = phase {
+                phase.add_bytes(compressed_size);
+                phase.inc();
+            }
 
             Ok((
                 item.table_key,
@@ -1078,7 +1106,7 @@ async fn upload_inner(
         let sem = object_disk_copy_semaphore.clone();
         let s3 = s3.clone();
         let resume_state = resume_state.clone();
-        let progress = progress.clone();
+        let phase = phase_objects.as_ref().map(|p| p.handle());
         let cancel_clone = cancel.clone();
 
         let handle = tokio::spawn(async move {
@@ -1225,7 +1253,10 @@ async fn upload_inner(
                 save_state_graceful(&guard.1, &guard.0);
             }
 
-            progress.inc();
+            if let Some(ref phase) = phase {
+                phase.add_bytes(item.part.size);
+                phase.inc();
+            }
 
             Ok((item.table_key, item.disk_name, updated_part, 0u64))
 
@@ -1251,7 +1282,9 @@ async fn upload_inner(
         return Err(anyhow::anyhow!("upload cancelled"));
     }
 
-    progress.finish();
+    for phase in [&phase_parts, &phase_objects].into_iter().flatten() {
+        phase.finish();
+    }
 
     // 4. Apply results to manifest sequentially
     // Group results by (table_key, disk_name)

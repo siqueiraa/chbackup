@@ -129,6 +129,15 @@ pub struct GeneralConfig {
     #[serde(default = "default_remote_cache_ttl_secs")]
     pub remote_cache_ttl_secs: u64,
 
+    /// How often to log an aggregate progress line per running phase. "0s" disables it.
+    ///
+    /// This is the only thing that distinguishes a slow operation from a wedged one at the
+    /// default log level, so leave it on unless log volume is a hard constraint. Output is
+    /// bounded by (live phases x 1 line per interval), not by backup size, and nothing is
+    /// emitted while no operation is running.
+    #[serde(default = "default_progress_heartbeat_interval")]
+    pub progress_heartbeat_interval: String,
+
     /// Minimum age of a broken remote backup's newest object before
     /// `clean_broken` may delete it. Because upload writes the manifest last, a
     /// backup that is still being uploaded looks exactly like a broken one, so
@@ -635,6 +644,7 @@ impl Default for GeneralConfig {
             retries_jitter: default_retries_jitter_30(),
             use_resumable_state: true,
             remote_cache_ttl_secs: default_remote_cache_ttl_secs(),
+            progress_heartbeat_interval: default_progress_heartbeat_interval(),
             clean_broken_min_age_secs: default_clean_broken_min_age_secs(),
         }
     }
@@ -828,6 +838,10 @@ fn default_streaming_upload_threshold() -> u64 {
 }
 
 /// Default TTL for remote manifest cache: 300 seconds (5 minutes) per design 8.4.
+fn default_progress_heartbeat_interval() -> String {
+    "30s".to_string()
+}
+
 fn default_remote_cache_ttl_secs() -> u64 {
     300
 }
@@ -1137,6 +1151,12 @@ impl Config {
         if let Ok(v) = std::env::var("CHBACKUP_RETRIES_PAUSE") {
             self.general.retries_pause = v;
         }
+        if let Ok(v) = std::env::var("CHBACKUP_PROGRESS_HEARTBEAT_INTERVAL")
+            .or_else(|_| std::env::var("PROGRESS_HEARTBEAT_INTERVAL"))
+        {
+            self.general.progress_heartbeat_interval = v;
+        }
+
         if let Ok(v) = std::env::var("CHBACKUP_REMOTE_CACHE_TTL_SECS") {
             if let Ok(n) = v.parse::<u64>() {
                 self.general.remote_cache_ttl_secs = n;
@@ -1712,6 +1732,9 @@ impl Config {
             "general.use_resumable_state" => {
                 self.general.use_resumable_state = value.parse().context("Invalid bool")?
             }
+            "general.progress_heartbeat_interval" => {
+                self.general.progress_heartbeat_interval = value.to_string();
+            }
             "general.remote_cache_ttl_secs" => {
                 self.general.remote_cache_ttl_secs = value.parse().context("Invalid u64")?
             }
@@ -2024,6 +2047,22 @@ impl Config {
                 self.s3.max_parts_count
             ));
         }
+        // The heartbeat interval must parse even when disabled, so a typo like "30" surfaces
+        // at startup rather than silently turning off the only stall signal there is.
+        let hb = parse_duration_secs(&self.general.progress_heartbeat_interval).with_context(|| {
+            format!(
+                "general.progress_heartbeat_interval {:?} is not a valid duration (e.g. \"30s\", \"1m\", \"0s\" to disable)",
+                self.general.progress_heartbeat_interval
+            )
+        })?;
+        if hb != 0 && !(1..=3_600).contains(&hb) {
+            return Err(anyhow::anyhow!(
+                "general.progress_heartbeat_interval must be between 1s and 1h, or 0s to \
+                 disable (got {}s)",
+                hb
+            ));
+        }
+
         // Deadlines: 0 is the documented "disabled" value; anything else must parse and be
         // sane. The upper bound is a day, which is far past any legitimate single request.
         let request_timeout_secs = parse_duration_secs(&self.s3.request_timeout).with_context(|| {
@@ -2184,6 +2223,7 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
         "CHBACKUP_RETRIES_ON_FAILURE" => Some("general.retries_on_failure"),
         "CHBACKUP_RETRIES_PAUSE" => Some("general.retries_pause"),
         "CHBACKUP_REMOTE_CACHE_TTL_SECS" => Some("general.remote_cache_ttl_secs"),
+        "CHBACKUP_PROGRESS_HEARTBEAT_INTERVAL" => Some("general.progress_heartbeat_interval"),
         "CHBACKUP_CLEAN_BROKEN_MIN_AGE_SECS" => Some("general.clean_broken_min_age_secs"),
         "CHBACKUP_OBJECT_DISK_SERVER_SIDE_COPY_CONCURRENCY" => {
             Some("general.object_disk_server_side_copy_concurrency")
@@ -2269,6 +2309,7 @@ fn env_key_to_dot_notation(key: &str) -> Option<&'static str> {
 
         // Go-compatible aliases
         "LOG_LEVEL" => Some("general.log_level"),
+        "PROGRESS_HEARTBEAT_INTERVAL" => Some("general.progress_heartbeat_interval"),
         "BACKUPS_TO_KEEP_LOCAL" => Some("general.backups_to_keep_local"),
         "BACKUPS_TO_KEEP_REMOTE" => Some("general.backups_to_keep_remote"),
         "S3_PATH" => Some("s3.prefix"),

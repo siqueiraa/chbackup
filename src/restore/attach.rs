@@ -73,6 +73,8 @@ pub struct AttachParams<'a> {
     pub source_table: &'a str,
     /// Parts grouped by disk name, for building part -> disk reverse map.
     pub parts_by_disk: &'a BTreeMap<String, Vec<PartInfo>>,
+    /// Phase counter for attached parts. Cloned into each spawned ATTACH task.
+    pub progress: Option<crate::progress::PhaseProgress>,
 }
 
 /// Owned parameters for attaching parts to a table.
@@ -136,6 +138,13 @@ pub struct OwnedAttachParams {
     /// Disk name -> local filesystem path for S3 disks. Used to write S3 metadata
     /// pointer files to the correct disk's detached directory on tiered storage policies.
     pub disk_local_paths: BTreeMap<String, String>,
+    /// Phase counter for attached parts. Carried here rather than added to a signature
+    /// because this struct exists precisely to move owned state across a tokio::spawn.
+    pub progress: Option<crate::progress::PhaseProgress>,
+    /// Phase counter for restored S3 objects. Deliberately separate from the part counter:
+    /// one part can hold thousands of objects, so counting objects as parts would make
+    /// both numbers meaningless.
+    pub object_progress: Option<crate::progress::PhaseProgress>,
 }
 
 /// Derive the UUID-based S3 path prefix for restore.
@@ -182,6 +191,8 @@ struct S3RestoreParams<'a> {
     /// Disk name -> local filesystem path for S3 disks. Used to write S3 metadata
     /// to the correct disk's detached directory on tiered storage policies.
     disk_local_paths: &'a BTreeMap<String, String>,
+    /// Phase counter for restored objects, so a long CopyObject run reports a rate.
+    object_progress: Option<crate::progress::PhaseProgress>,
 }
 
 /// Restore S3 disk parts for a single table.
@@ -324,7 +335,9 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
                 _ => continue,
             };
 
-            info!(
+            // debug, not info: one line per part is unbounded in backup size, and the
+            // restore_s3_objects phase now carries the same information in aggregate.
+            debug!(
                 db = %db,
                 table = %table,
                 part = %part.name,
@@ -364,11 +377,19 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
                 let full_dest_key = data_s3.full_key(&dest_key);
                 if let Some(&existing_size) = existing_map.get(&full_dest_key) {
                     if existing_size as u64 == s3_obj.size {
-                        info!(
+                        // debug, not info: one line per object, and a large table has
+                        // thousands of them. The phase counter carries the aggregate.
+                        debug!(
                             path = %s3_obj.path,
                             size = s3_obj.size,
                             "Skipping existing S3 object (same-name optimization)"
                         );
+                        // Counted as done: it is present at the destination, which is all
+                        // the caller cares about. Skipping the count would leave the phase
+                        // permanently short of its total and looking stalled at the end.
+                        if let Some(ref phase) = p.object_progress {
+                            phase.inc();
+                        }
                         continue;
                     }
                 }
@@ -383,6 +404,8 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
                 };
 
                 let sem = semaphore.clone();
+                let object_phase = p.object_progress.clone();
+                let obj_size = s3_obj.size;
                 let data_s3_clone = data_s3.clone();
                 let backup_bucket_clone = backup_bucket.clone();
 
@@ -404,7 +427,13 @@ async fn restore_s3_disk_parts(p: &S3RestoreParams<'_>) -> Result<u64> {
                         )
                         .await
                     {
-                        Ok(()) => Ok(true),
+                        Ok(()) => {
+                            if let Some(ref phase) = object_phase {
+                                phase.add_bytes(obj_size);
+                                phase.inc();
+                            }
+                            Ok(true)
+                        }
                         Err(e) => {
                             if is_s3_not_found(&e) {
                                 warn!(
@@ -754,6 +783,7 @@ pub(crate) async fn attach_parts_owned(params: OwnedAttachParams) -> Result<Atta
                 source_table: &params.source_table,
                 disk_remote_paths: &params.disk_remote_paths,
                 disk_local_paths: &params.disk_local_paths,
+                object_progress: params.object_progress.clone(),
             };
             s3_skipped = restore_s3_disk_parts(&s3_params).await?;
         }
@@ -774,6 +804,7 @@ pub(crate) async fn attach_parts_owned(params: OwnedAttachParams) -> Result<Atta
         source_db: &params.source_db,
         source_table: &params.source_table,
         parts_by_disk: &params.parts_by_disk,
+        progress: params.progress.clone(),
     };
 
     let inner_result = attach_parts_inner(
@@ -974,6 +1005,7 @@ async fn attach_parts_inner(
             let part_name = part.name.clone();
             let resume_key = resume_key_owned.clone();
             let resume_state = resume_state_clone.clone();
+            let part_phase = params.progress.clone();
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem
@@ -995,6 +1027,9 @@ async fn attach_parts_inner(
                                 .push(part_name.clone());
                             let state_path = guard.1.clone();
                             save_state_graceful(&state_path, &guard.0);
+                        }
+                        if let Some(ref phase) = part_phase {
+                            phase.inc();
                         }
                         // None = attached; Some(class) = not attached, with its classification.
                         Ok(None)
@@ -1055,6 +1090,9 @@ async fn attach_parts_inner(
             match params.ch.attach_part(db, table, &part.name).await {
                 Ok(()) => {
                     count += 1;
+                    if let Some(ref phase) = params.progress {
+                        phase.inc();
+                    }
                     if let Some(state_mutex) = &params.resume_state {
                         let mut guard = state_mutex.lock().await;
                         guard
@@ -1678,6 +1716,8 @@ mod tests {
             source_db: "default".to_string(),
             source_table: "trades".to_string(),
             disk_local_paths: BTreeMap::new(),
+            progress: None,
+            object_progress: None,
         };
 
         assert_eq!(params.object_disk_server_side_copy_concurrency, 32);
@@ -1722,6 +1762,8 @@ mod tests {
             source_db: "default".to_string(),
             source_table: "trades".to_string(),
             disk_local_paths: BTreeMap::new(),
+            progress: None,
+            object_progress: None,
         };
 
         assert_eq!(params.already_attached.len(), 2);

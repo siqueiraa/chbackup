@@ -98,7 +98,8 @@ Phase 1 downloads full objects to memory via `s3.get_object()`, then decompresse
 - Performance note: scans all local backups for each part (O(backups * parts * disks)), acceptable because directory listing is fast and typically few backups exist locally
 
 ### Progress Bar Integration (Phase 5)
-- `ProgressTracker` from `progress.rs` is created before the parallel download loop
+- A `PhaseProgress` (`download_parts`) from `progress.rs` is created before the parallel
+  download loop, and only when there are parts to download
 - Disabled when `config.general.disable_progress_bar` is true or when not running in a TTY
 - `Clone`d into each spawned download task; `tracker.inc()` called after each successful part download
 - `tracker.finish()` called after all tasks join

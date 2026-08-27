@@ -32,7 +32,7 @@ use crate::error::ChBackupError;
 use crate::manifest::{BackupManifest, PartInfo};
 use crate::object_disk::is_s3_disk;
 use crate::path_encoding::{encode_path_component, validate_disk_path};
-use crate::progress::ProgressTracker;
+use crate::progress::{PhaseId, PhaseOwner};
 use crate::rate_limiter::RateLimiter;
 use crate::resume::{
     compute_params_hash, delete_state_file, load_state_file, save_state_graceful, DownloadState,
@@ -326,6 +326,9 @@ pub async fn download(
     resume: bool,
     hardlink_exists_files: bool,
     cancel: CancellationToken,
+    // API operation id, for correlating phase logs and /api/v1/status with /kill?id=N.
+    // None for CLI invocations, which have no operation registry.
+    op_id: Option<u64>,
 ) -> Result<PathBuf> {
     let data_path = &config.clickhouse.data_path;
     let backup_dir = Path::new(data_path).join("backup").join(backup_name);
@@ -580,12 +583,17 @@ pub async fn download(
         total_parts, concurrency
     );
 
-    // Create progress tracker for download
-    let progress = ProgressTracker::new(
-        "Download",
-        total_parts as u64,
-        config.general.disable_progress_bar,
-    );
+    // Only publish a phase when there is work: a metadata-only backup would otherwise leave
+    // an empty phase that the heartbeat reports as live forever.
+    let phase = (total_parts > 0).then(|| {
+        PhaseOwner::start(
+            PhaseId::new("download", "download_parts", "parts"),
+            backup_name,
+            total_parts as u64,
+            op_id,
+            config.general.disable_progress_bar,
+        )
+    });
 
     // 4. Download parts in parallel with semaphore and rate limiter
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -627,7 +635,7 @@ pub async fn download(
         let data_format_clone = manifest.data_format.clone();
         let data_path_clone = data_path_str.clone();
         let backup_name_clone = backup_name.to_string();
-        let progress = progress.clone();
+        let phase = phase.as_ref().map(|p| p.handle());
         let manifest_disks = manifest_disks.clone();
         let cancel_clone = cancel.clone();
 
@@ -765,7 +773,11 @@ pub async fn download(
                     save_state_graceful(&guard.1, &guard.0);
                 }
 
-                progress.inc();
+                if let Some(ref phase) = phase {
+
+                    phase.inc();
+
+                }
 
                 Ok::<(String, u64), anyhow::Error>((item.table_key, total_metadata_bytes))
             } else {
@@ -835,7 +847,11 @@ pub async fn download(
                                     save_state_graceful(&guard.1, &guard.0);
                                 }
 
-                                progress.inc();
+                                if let Some(ref phase) = phase {
+
+                                    phase.inc();
+
+                                }
 
                                 return Ok::<(String, u64), anyhow::Error>((item.table_key, 0));
                             }
@@ -1032,7 +1048,11 @@ pub async fn download(
                         save_state_graceful(&guard.1, &guard.0);
                     }
 
-                    progress.inc();
+                    if let Some(ref phase) = phase {
+
+                        phase.inc();
+
+                    }
 
                     return Ok::<(String, u64), anyhow::Error>((item.table_key, compressed_size));
                 }
@@ -1063,7 +1083,9 @@ pub async fn download(
         return Err(anyhow::anyhow!("download cancelled"));
     }
 
-    progress.finish();
+    if let Some(ref phase) = phase {
+        phase.finish();
+    }
 
     // 5. Tally totals
     let mut total_compressed_bytes = 0u64;

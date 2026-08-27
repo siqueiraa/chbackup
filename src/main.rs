@@ -129,6 +129,25 @@ async fn run() -> Result<()> {
         warn!("{w}");
     }
 
+    // 2c. Start the heartbeat once, here, so every entry point gets it: one-shot CLI
+    // commands, `server`, and standalone `watch` alike. The guard lives to the end of run(),
+    // and its Drop stops and joins the thread.
+    //
+    // It emits nothing while no phase is live, so this is silent for `list` and friends.
+    let heartbeat_secs =
+        chbackup::config::parse_duration_secs(&config.general.progress_heartbeat_interval)
+            .unwrap_or_else(|_| {
+                // validate() already rejected an unparseable value; this arm only guards a caller
+                // that skipped validation, and falling back to silence would remove the stall signal.
+                warn!(
+                    value = %config.general.progress_heartbeat_interval,
+                    "Unparseable general.progress_heartbeat_interval, falling back to 30s"
+                );
+                30
+            });
+    let _heartbeat =
+        chbackup::heartbeat::spawn_heartbeat(std::time::Duration::from_secs(heartbeat_secs));
+
     // 2a. Startup banner with version and key config.
     let cmd_name = format!("{:?}", cli.command)
         .split_whitespace()
@@ -210,6 +229,7 @@ async fn run() -> Result<()> {
                 // releases the freeze; an expired orphan is reaped at the next `create`.
                 true,
                 CancellationToken::new(),
+                None, // CLI: no operation registry
             )
             .await?;
 
@@ -243,6 +263,7 @@ async fn run() -> Result<()> {
                 diff_from_remote.as_deref(),
                 effective_resume,
                 CancellationToken::new(),
+                None, // CLI: no operation registry, so no op_id
             )
             .await?;
 
@@ -281,6 +302,7 @@ async fn run() -> Result<()> {
                 effective_resume,
                 hardlink_exists_files,
                 CancellationToken::new(),
+                None, // CLI: no operation registry, so no op_id
             )
             .await?;
 
@@ -334,6 +356,7 @@ async fn run() -> Result<()> {
                 partitions.as_deref(),
                 skip_empty_tables,
                 CancellationToken::new(),
+                None, // CLI: no operation registry
             )
             .await?;
 
@@ -387,6 +410,7 @@ async fn run() -> Result<()> {
                 &effective_skip_projections,
                 true, // defer_unfreeze_s3: upload follows and will release the freeze
                 CancellationToken::new(),
+                None, // CLI: no operation registry
             )
             .await?;
 
@@ -406,6 +430,7 @@ async fn run() -> Result<()> {
                 diff_from_remote.as_deref(),
                 effective_resume,
                 CancellationToken::new(),
+                None, // CLI: no operation registry, so no op_id
             )
             .await?;
 
@@ -458,6 +483,7 @@ async fn run() -> Result<()> {
                 effective_resume,
                 false,
                 CancellationToken::new(),
+                None, // CLI: no operation registry, so no op_id
             )
             .await?;
 
@@ -479,6 +505,7 @@ async fn run() -> Result<()> {
                 None, // partitions (not a flag on restore_remote per design)
                 skip_empty_tables,
                 CancellationToken::new(),
+                None, // CLI: no operation registry
             )
             .await?;
 

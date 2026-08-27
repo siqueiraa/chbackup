@@ -590,6 +590,7 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             &ctx.config.backup.skip_projections,
             true, // defer_unfreeze_s3: watch uploads after create, so it releases the freeze
             create_cancel,
+            None, // a watch cycle is not an API operation
         )
         .await;
         create_shutdown_guard.abort();
@@ -628,6 +629,9 @@ pub async fn run_watch_loop(mut ctx: WatchContext) -> WatchLoopExit {
             diff_from.as_deref(),
             ctx.config.general.use_resumable_state,
             upload_cancel,
+            // A watch cycle is not an API operation, so it has no id. Its phases are still
+            // published to the registry and surface via /api/v1/watch/status.
+            None,
         )
         .await;
         upload_shutdown_guard.abort();

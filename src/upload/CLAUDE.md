@@ -121,7 +121,11 @@ Phase 1 uses in-memory buffered upload: tar the part directory to `Vec<u8>`, LZ4
 - Logs `"Manifest uploaded atomically"` on success
 
 ### Progress Bar Integration (Phase 5)
-- `ProgressTracker` from `progress.rs` is created before the parallel upload loop
+- Two `PhaseProgress` phases from `progress.rs` are created before the parallel upload loops:
+  `upload_parts` (local parts) and `copy_objects` (S3-disk objects). Separate on purpose: they
+  have different totals, concurrency limits and failure modes, and the object copies are the
+  ones that went silent in production. Each is created only when it has work, so an all-local
+  backup publishes no phantom `copy_objects` phase for the heartbeat to report as live forever.
 - Disabled when `config.general.disable_progress_bar` is true or when not running in a TTY
 - `Clone`d into each spawned upload task (both local and S3 disk CopyObject tasks); `tracker.inc()` called after each successful part upload
 - `tracker.finish()` called after all tasks from both queues join
